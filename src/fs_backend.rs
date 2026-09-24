@@ -1,17 +1,32 @@
-//! Client-side file I/O backend for the ACP `fs/read_text_file` and
-//! `fs/write_text_file` methods.
+//! A sandboxed client-side file I/O backend (the pre-approval read path).
 //!
-//! The agent delegates file reads/writes to the client. Because the agent
-//! runs as a separate (potentially untrusted) process, every path it asks for
-//! is validated against the session's `cwd` (the sandbox root) before any I/O
-//! happens. The validation is done on the *canonicalized* path, which
-//! resolves `..` components and symlinks, so neither `../..` traversal nor a
-//! symlink that points outside the root can escape the sandbox.
+//! The desktop validates every path a session asks for against the
+//! session's `cwd` (the sandbox root) before any I/O happens. The
+//! validation is done on the *canonicalized* path, which resolves `..`
+//! components and symlinks, so neither `../..` traversal nor a symlink
+//! that points outside the root can escape the sandbox.
+//!
+//! `FsError` is local to this module (it used to ride on the ACP
+//! `AcpError`, which died with the pi-RPC swap): `Io` for filesystem
+//! failures, `PathEscape` for a path that escaped the sandbox.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::agent::errors::AcpError;
+/// A filesystem failure in the sandboxed backend: an I/O error, or a path
+/// that escaped the session's sandbox root.
+#[derive(Debug, thiserror::Error, serde::Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FsError {
+    /// A filesystem operation failed (I/O error, permission, encoding, …).
+    #[error("file operation failed: {detail}")]
+    Io { detail: String },
+
+    /// The requested path escaped the session's sandbox root (via `..`, a
+    /// symlink, or an absolute path outside the root).
+    #[error("path escapes the session sandbox: {path}")]
+    PathEscape { path: String },
+}
 
 /// A sandboxed view over a directory tree.
 ///
@@ -25,9 +40,9 @@ pub struct FsBackend {
 
 impl FsBackend {
     /// Read a text file, rejecting any path that escapes the sandbox.
-    pub fn read(&self, path: &Path) -> Result<String, AcpError> {
+    pub fn read(&self, path: &Path) -> Result<String, FsError> {
         let resolved = self.resolve(path)?;
-        fs::read_to_string(&resolved).map_err(|e| AcpError::Io {
+        fs::read_to_string(&resolved).map_err(|e| FsError::Io {
             detail: e.to_string(),
         })
     }
@@ -36,14 +51,14 @@ impl FsBackend {
     ///
     /// Parent directories that do not yet exist are created (still inside the
     /// sandbox) so the agent can write to a fresh path.
-    pub fn write(&self, path: &Path, content: &str) -> Result<(), AcpError> {
+    pub fn write(&self, path: &Path, content: &str) -> Result<(), FsError> {
         let resolved = self.resolve(path)?;
         if let Some(parent) = resolved.parent() {
-            fs::create_dir_all(parent).map_err(|e| AcpError::Io {
+            fs::create_dir_all(parent).map_err(|e| FsError::Io {
                 detail: e.to_string(),
             })?;
         }
-        fs::write(&resolved, content).map_err(|e| AcpError::Io {
+        fs::write(&resolved, content).map_err(|e| FsError::Io {
             detail: e.to_string(),
         })
     }
@@ -53,8 +68,8 @@ impl FsBackend {
     /// For a path that does not exist yet (a write target), the deepest
     /// existing ancestor is canonicalized and the remaining components are
     /// appended, so a brand-new file can still be validated.
-    fn resolve(&self, path: &Path) -> Result<PathBuf, AcpError> {
-        let root = self.root.canonicalize().map_err(|e| AcpError::Io {
+    fn resolve(&self, path: &Path) -> Result<PathBuf, FsError> {
+        let root = self.root.canonicalize().map_err(|e| FsError::Io {
             detail: format!("cannot resolve sandbox root: {e}"),
         })?;
 
@@ -95,7 +110,7 @@ impl FsBackend {
                     if !ancestor.pop() {
                         // Reached the filesystem root without finding an
                         // existing ancestor: the path is not under a real dir.
-                        return Err(AcpError::Io {
+                        return Err(FsError::Io {
                             detail: "path does not exist under the sandbox root".to_string(),
                         });
                     }
@@ -105,11 +120,11 @@ impl FsBackend {
     }
 
     /// Confirm `canon` (already canonicalized) is `root` or a descendant of it.
-    fn check_under_root(&self, canon: &Path, root: &Path) -> Result<PathBuf, AcpError> {
+    fn check_under_root(&self, canon: &Path, root: &Path) -> Result<PathBuf, FsError> {
         if canon.starts_with(root) {
             Ok(canon.to_path_buf())
         } else {
-            Err(AcpError::PathEscape {
+            Err(FsError::PathEscape {
                 path: canon.display().to_string(),
             })
         }

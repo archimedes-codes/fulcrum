@@ -1,5 +1,5 @@
-//! The permission bridge: turns the agent's `session/request_permission`
-//! request into a UI prompt, and delivers the user's answer back to the agent.
+//! The permission bridge: turns the agent's `extension_ui_request` dialog
+//! into a UI prompt, and delivers the user's answer back to the agent.
 //!
 //! The SDK runs every handler callback on a single event-loop task, and while a
 //! handler is running no new messages are processed. A permission prompt is
@@ -9,10 +9,29 @@
 //!   1. registers a oneshot sender in the manager's `pending_permissions` map
 //!      (keyed by `"{session_id}/{request_id}"`),
 //!   2. emits a `permission-request` Tauri event (the UI shows the prompt), and
-//!   3. `cx.spawn`s a task that owns the responder + oneshot receiver, awaits
-//!      the answer (bounded by a 300 s timeout), and responds to the agent.
+//!   3. spawns a task that owns the oneshot receiver, awaits the answer
+//!      (bounded by a 300 s timeout), and responds to the agent via
+//!      `PiRpcHandle::respond_extension_ui`.
 //!
 //! The handler then returns immediately.
+//!
+//! Which dialogs become prompts (and which responses they map to):
+//!
+//! - `confirm` → a prompt with the fixed options `[allow/Allow,
+//!   reject/Block]`; the user's choice maps to `confirmed: true / false`
+//!   (any other choice — or a timeout / a session close — maps to
+//!   `cancelled`).
+//! - `select` → a prompt whose options are the request's option labels;
+//!   the user's choice maps to the `value` response.
+//! - `input` / `editor` → NO prompt: the desktop cannot collect free-form
+//!   input in this shape, so the request is answered `cancelled` IMMEDIATELY
+//!   (the agent's `createDialogPromise` resolves `undefined` and the
+//!   extension proceeds; an unanswered `input` / `editor` would hang the
+//!   agent's event loop, since those requests are awaited by pi).
+//! - `notify` / `set_status` / `set_widget` / `set_title` /
+//!   `set_editor_text` → IGNORED (fire-and-forget on the pi side — pi does
+//!   not register a pending response for them, so there is nothing to
+//!   answer and nothing to hang on).
 //!
 //! The compound key is what lets the driver-task cleanup (Task 2) drain every
 //! entry for a closing session: dropping the senders makes the spawned tasks
@@ -23,15 +42,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome,
-};
-use agent_client_protocol::{Agent, ConnectionTo, Responder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
+use crate::agent::rpc::{ExtensionUiRequest, ExtensionUiResponse, PiRpcHandle};
 use crate::agent::session::EventSink;
 
 /// The user's decision on a permission prompt, as chosen via the
@@ -68,27 +83,110 @@ pub fn session_key_prefix(session_id: &str) -> String {
 /// How long a permission prompt stays open before it auto-cancels.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Handle an incoming `session/request_permission` without blocking the event
+/// Handle an incoming `extension_ui_request` without blocking the event
 /// loop. See the module docs for the full flow.
-pub async fn handle_permission_request(
-    req: &RequestPermissionRequest,
-    responder: Responder<RequestPermissionResponse>,
-    cx: &ConnectionTo<Agent>,
+pub async fn handle_extension_ui_request(
+    session_id: &str,
+    req: ExtensionUiRequest,
+    handle: &PiRpcHandle,
     sink: &Arc<dyn EventSink>,
     pending_permissions: &PendingPermissions,
 ) {
-    let request_id = responder.id().to_string();
-    let session_id = req.session_id.to_string();
-    let key = permission_key(&session_id, &request_id);
+    match req {
+        ExtensionUiRequest::Confirm { id, title, .. } => {
+            // The fixed options: `[allow/Allow, reject/Block]` (the gate
+            // extension's confirm dialogs are yes/no).
+            spawn_permission_waiter(
+                session_id,
+                id,
+                json!({
+                    "sessionId": session_id,
+                    "toolCall": { "title": title },
+                    "options": [
+                        { "optionId": "allow", "name": "Allow", "kind": "allow" },
+                        { "optionId": "reject", "name": "Block", "kind": "reject" },
+                    ],
+                }),
+                ResponseKind::Confirm,
+                handle,
+                sink,
+                pending_permissions,
+            )
+            .await;
+        }
+        ExtensionUiRequest::Select {
+            id, title, options, ..
+        } => {
+            // The options are the request's option labels (the `ask`
+            // extension's select dialogs).
+            let opts: Vec<Value> = options
+                .iter()
+                .map(|label| json!({ "optionId": label, "name": label }))
+                .collect();
+            spawn_permission_waiter(
+                session_id,
+                id,
+                json!({
+                    "sessionId": session_id,
+                    "toolCall": { "title": title },
+                    "options": opts,
+                }),
+                ResponseKind::Select,
+                handle,
+                sink,
+                pending_permissions,
+            )
+            .await;
+        }
+        // `input` / `editor`: answer `cancelled` IMMEDIATELY (a prompt is
+        // not possible in this shape, and an unanswered request would hang
+        // the agent — pi awaits these two).
+        ExtensionUiRequest::Input { id, .. } | ExtensionUiRequest::Editor { id, .. } => {
+            let _ = handle
+                .respond_extension_ui(ExtensionUiResponse::Cancelled { id })
+                .await;
+        }
+        // `notify` / `set_status` / `set_widget` / `set_title` /
+        // `set_editor_text`: fire-and-forget on the pi side — ignore.
+        ExtensionUiRequest::Notify { .. }
+        | ExtensionUiRequest::SetStatus { .. }
+        | ExtensionUiRequest::SetWidget { .. }
+        | ExtensionUiRequest::SetTitle { .. }
+        | ExtensionUiRequest::SetEditorText { .. } => {}
+    }
+}
+
+/// The response shape a pending dialog maps to (decided by the request
+/// method: `confirm` frames answer `confirmed`, `select` frames answer
+/// `value`).
+#[derive(Clone, Copy)]
+enum ResponseKind {
+    Confirm,
+    Select,
+}
+
+/// Register the oneshot the user's answer will flow through, emit the
+/// `permission-request` event, and spawn the waiter. See the module docs for
+/// the full flow.
+async fn spawn_permission_waiter(
+    session_id: &str,
+    request_id: String,
+    request_payload: Value,
+    kind: ResponseKind,
+    handle: &PiRpcHandle,
+    sink: &Arc<dyn EventSink>,
+    pending_permissions: &PendingPermissions,
+) {
+    let key = permission_key(session_id, &request_id);
 
     // (a) Register the oneshot the user's answer will flow through — BEFORE
-    // the event is emitted. The UI (and the acp_flow test) calls
+    // the event is emitted. The UI (and the rpc_flow test) calls
     // `respond_permission` the instant it sees the event; if the entry were
     // not in the map yet, that call would miss and be a no-op, and the agent
     // would block on its response until the 300 s timeout. Registering first
     // makes the lookup total: by the time the event is observed, the entry
     // is already there. (This ordering is a load-dependent microsecond race
-    // to test deterministically, so it is verified by running the acp_flow
+    // to test deterministically, so it is verified by running the rpc_flow
     // integration test repeatedly rather than a unit test.)
     let (tx, rx) = oneshot::channel();
     {
@@ -102,15 +200,16 @@ pub async fn handle_permission_request(
     let payload = json!({
         "sessionId": session_id,
         "requestId": request_id,
-        "request": serde_json::to_value(req).unwrap_or(Value::Null),
+        "request": request_payload,
     });
     sink.emit("permission-request", payload);
 
-    // (c) Spawn the waiter. It owns the responder and the receiver.
+    // (c) Spawn the waiter. It owns the receiver.
     let key_owned = key.clone();
+    let handle = handle.clone();
     let pp = pending_permissions.clone();
 
-    let spawn_result = cx.spawn(async move {
+    tokio::spawn(async move {
         // Await the user's answer, a timeout, or a Canceled oneshot (the
         // session closed before the user answered).
         let outcome = match tokio::time::timeout(PERMISSION_TIMEOUT, rx).await {
@@ -118,13 +217,33 @@ pub async fn handle_permission_request(
             _ => PermissionOutcome::Cancelled,
         };
 
-        // Map to the ACP response.
-        let response = match outcome {
-            PermissionOutcome::Selected { option_id } => RequestPermissionResponse::new(
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
-            ),
-            PermissionOutcome::Cancelled => {
-                RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
+        // Map to the extension-UI response.
+        let response = match (kind, outcome) {
+            (ResponseKind::Confirm, PermissionOutcome::Selected { option_id }) => {
+                match option_id.as_str() {
+                    "allow" => ExtensionUiResponse::Confirmed {
+                        id: request_id,
+                        confirmed: true,
+                    },
+                    "reject" => ExtensionUiResponse::Confirmed {
+                        id: request_id,
+                        confirmed: false,
+                    },
+                    // A non-allow/reject selection is a dismissal.
+                    _ => ExtensionUiResponse::Cancelled { id: request_id },
+                }
+            }
+            (ResponseKind::Confirm, PermissionOutcome::Cancelled) => {
+                ExtensionUiResponse::Cancelled { id: request_id }
+            }
+            (ResponseKind::Select, PermissionOutcome::Selected { option_id }) => {
+                ExtensionUiResponse::Value {
+                    id: request_id,
+                    value: option_id,
+                }
+            }
+            (ResponseKind::Select, PermissionOutcome::Cancelled) => {
+                ExtensionUiResponse::Cancelled { id: request_id }
             }
         };
 
@@ -137,28 +256,16 @@ pub async fn handle_permission_request(
 
         // Respond exactly once, best-effort. A spawned task must return
         // Ok(()) on every path: returning Err would tear down the whole
-        // connection. Dropping the responder instead would leave the agent's
+        // connection. Dropping the sender instead would leave the agent's
         // request hanging forever.
-        let _ = responder.respond(response);
-        Ok(())
+        let _ = handle.respond_extension_ui(response).await;
     });
-
-    if let Err(err) = spawn_result {
-        // Spawning failed (the connection is already shutting down): the
-        // responder was consumed by the spawn call, so we can no longer
-        // respond. Clean up the map entry; the agent's request will be
-        // dropped along with the connection.
-        {
-            let mut map = pending_permissions.lock().await;
-            map.remove(&key);
-        }
-        eprintln!("archimedes: failed to spawn permission waiter: {err}");
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn key_prefix_carries_the_trailing_slash() {
