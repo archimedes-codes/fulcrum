@@ -50,6 +50,9 @@ pub struct SubagentSessionManager {
     worker: WorkerRuntime,
     registry: Registry,
     config_dir: PathBuf,
+    /// The installed gate extension's path (`None` when the install
+    /// failed — the dispatch runs ungated rather than broken).
+    gate_path: Option<PathBuf>,
 }
 
 impl SubagentSessionManager {
@@ -74,11 +77,22 @@ impl SubagentSessionManager {
         // another's final output).
         let driver = SessionDriver::new();
         let worker = WorkerRuntime::new()?;
+        // Install the bundled gate extension (idempotent — the main
+        // manager installs the same file; the write is skipped when it
+        // matches). A failure is NON-fatal: dispatches run ungated.
+        let gate_path = match crate::agent::gate::install_gate_extension(&config_dir) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("gate extension install failed: {e} (dispatches run ungated)");
+                None
+            }
+        };
         Ok(Self {
             driver: Arc::new(driver),
             worker,
             registry,
             config_dir,
+            gate_path,
         })
     }
 
@@ -185,6 +199,9 @@ impl SubagentSessionManager {
         // error is reported as "cancelled", not the prompt's error.
         let close_probe = ec.rx.clone();
 
+        // The gate path (an OWNED clone — the task closure is `'static`
+        // and cannot borrow `self`).
+        let gate_path = self.gate_path.clone();
         let handle = self.worker.spawn_task(async move {
             let start = std::time::Instant::now();
 
@@ -242,7 +259,15 @@ impl SubagentSessionManager {
                     None => (entry.env.clone(), None, None),
                 };
 
-            let rpc = match PiRpc::spawn(&entry.command, &entry.args, &agent_env, &parent_cwd) {
+            // The gate injection (Task 4): `-e <gate.ts>` +
+            // `PI_ARCHIMEDES_GATE=1` (the extension is inert without the
+            // env var).
+            let args = crate::agent::gate::gate_spawn_args(gate_path.as_deref(), &entry.args);
+            let mut agent_env = agent_env;
+            if gate_path.is_some() {
+                crate::agent::gate::gate_env(&mut agent_env);
+            }
+            let rpc = match PiRpc::spawn(&entry.command, &args, &agent_env, &parent_cwd) {
                 Ok(r) => r,
                 Err(e) => {
                     if let Some(p) = &wrapper_path {
