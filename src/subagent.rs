@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, watch};
 
 use crate::agent::bridge;
-use crate::agent::launch_wrapper::{self, LaunchConfig};
 use crate::agent::permission::{self, PermissionOutcome};
 use crate::agent::rpc::{PiRpc, PiRpcHandle};
 use crate::agent::session::{
@@ -53,6 +52,58 @@ pub struct SubagentSessionManager {
     /// The installed gate extension's path (`None` when the install
     /// failed — the dispatch runs ungated rather than broken).
     gate_path: Option<PathBuf>,
+}
+
+/// Per-dispatch pi configuration for a subagent session (moved verbatim
+/// from `launch_wrapper.rs` — the wrapper script is deleted in this task;
+/// the flags are now passed directly to the `pi` spawn).
+pub struct LaunchConfig {
+    /// The agent file body (named agents); `None` for config-less dispatch.
+    pub system_prompt: Option<String>,
+    /// Resolved model ("provider/id" or "provider/id:<thinking>"); `None` = pi default.
+    pub model: Option<String>,
+    /// Explicit thinking level from the agent file; `None` = pi's own resolution.
+    pub thinking: Option<String>,
+    /// Tool allowlist (named agents with `tools`); `None` → `--exclude-tools subagent`.
+    pub tools: Option<Vec<String>>,
+}
+
+/// The `pi` CLI args for a subagent dispatch (the flags the wrapper script
+/// used to `exec`, now passed directly). Each of `--system-prompt` /
+/// `--model` / `--thinking` is emitted only when its field is `Some`;
+/// `--tools <csv>` is emitted when `tools` is `Some`, and
+/// `--exclude-tools subagent` when it is `None`; `--no-session` is always
+/// appended.
+pub fn subagent_pi_args(cfg: &LaunchConfig) -> Vec<String> {
+    let mut args = vec![
+        "--mode".to_string(),
+        "rpc".to_string(),
+        "--no-themes".to_string(),
+    ];
+    if let Some(sp) = &cfg.system_prompt {
+        args.push("--system-prompt".to_string());
+        args.push(sp.clone());
+    }
+    if let Some(model) = &cfg.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    if let Some(thinking) = &cfg.thinking {
+        args.push("--thinking".to_string());
+        args.push(thinking.clone());
+    }
+    match &cfg.tools {
+        Some(tools) => {
+            args.push("--tools".to_string());
+            args.push(tools.join(","));
+        }
+        None => {
+            args.push("--exclude-tools".to_string());
+            args.push("subagent".to_string());
+        }
+    }
+    args.push("--no-session".to_string());
+    args
 }
 
 impl SubagentSessionManager {
@@ -212,11 +263,9 @@ impl SubagentSessionManager {
             let client_session_id = uuid::Uuid::new_v4().to_string();
 
             // 2. Bridge setup (4 env vars + per-spawn socket, the parent's
-            // registry entry) + the per-dispatch launch wrapper (ADR 0005)
-            // in the socket's dir (the `archimedes-bridge-<uid>` dir).
-            // `None` when the agent is not a bridge agent / the bridge is
-            // unavailable (the suite's fork path covers that — no wrapper,
-            // no bridge env).
+            // registry entry). `None` when the agent is not a bridge
+            // agent / the bridge is unavailable (the suite's fork path
+            // covers that — no bridge env).
             let entry = match registry.get(&parent_agent_id) {
                 Some(e) => e,
                 None => {
@@ -225,54 +274,29 @@ impl SubagentSessionManager {
                     }
                 }
             };
-            let (agent_env, bridge_setup, wrapper_path) =
-                match bridge_spawn_setup(entry, &client_session_id) {
-                    Some((mut env, sid, socket_path)) => {
-                        let dir = match socket_path.parent() {
-                            Some(d) => d,
-                            None => {
-                                return SubagentOutcome::Failed {
-                                    error: "bridge socket path has no parent dir".to_string(),
-                                }
-                            }
-                        };
-                        match launch_wrapper::write_wrapper(dir, &launch, "pi") {
-                            Ok(p) => {
-                                // The wrapper is the subagent's `pi` command — export it
-                                // as `PI_ACP_PI_COMMAND` (the suite's pi honors it; the
-                                // fake agent's mode rule reads it). ONLY the subagent
-                                // spawn gets the wrapper env (the `None` arm — non-bridge
-                                // agents — does not, and neither do main sessions).
-                                env.insert(
-                                    "PI_ACP_PI_COMMAND".to_string(),
-                                    p.to_string_lossy().to_string(),
-                                );
-                                (env, Some((sid, socket_path)), Some(p))
-                            }
-                            Err(e) => {
-                                return SubagentOutcome::Failed {
-                                    error: format!("launch wrapper: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    None => (entry.env.clone(), None, None),
-                };
+            let (mut agent_env, bridge_setup) = match bridge_spawn_setup(entry, &client_session_id)
+            {
+                Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
+                None => (entry.env.clone(), None),
+            };
 
-            // The gate injection (Task 4): `-e <gate.ts>` +
+            // 2a. The gate injection (Task 4): `-e <gate.ts>` +
             // `PI_ARCHIMEDES_GATE=1` (the extension is inert without the
-            // env var).
-            let args = crate::agent::gate::gate_spawn_args(gate_path.as_deref(), &entry.args);
-            let mut agent_env = agent_env;
+            // env var) — appended to the `pi` CLI args (the per-dispatch
+            // config flags the wrapper script used to `exec` are now
+            // passed DIRECTLY — the wrapper is deleted, Task 5).
+            let args = subagent_pi_args(&launch);
+            let args = crate::agent::gate::gate_spawn_args(gate_path.as_deref(), &args);
             if gate_path.is_some() {
                 crate::agent::gate::gate_env(&mut agent_env);
             }
+            // A dedicated discriminator env (harmless in production; lets
+            // a `fake_pi`-based test distinguish subagent children).
+            agent_env.insert("ARCHIMEDES_SUBAGENT".to_string(), "1".to_string());
+
             let rpc = match PiRpc::spawn(&entry.command, &args, &agent_env, &parent_cwd) {
                 Ok(r) => r,
                 Err(e) => {
-                    if let Some(p) = &wrapper_path {
-                        let _ = std::fs::remove_file(p);
-                    }
                     return SubagentOutcome::Failed {
                         error: e.to_string(),
                     };
@@ -329,9 +353,6 @@ impl SubagentSessionManager {
             let info = match info {
                 Ok(i) => i,
                 Err(e) => {
-                    if let Some(p) = &wrapper_path {
-                        let _ = std::fs::remove_file(p);
-                    }
                     return SubagentOutcome::Failed {
                         error: e.to_string(),
                     };
@@ -377,16 +398,12 @@ impl SubagentSessionManager {
                     // (the accumulated `cost_update` usage, defaulting to 0)
                     // + `duration_ms` (wall clock since step 1).
                     let (output, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    // The worker task owns the wrapper path — unlink it.
-                    if let Some(p) = &wrapper_path {
-                        let _ = std::fs::remove_file(p);
-                    }
                     sink.emit(
                         "subagent-closed",
                         json!({
                             "sessionId": sid,
                             "status": "completed",
-                            "metrics": metrics_json(metrics),
+                            "metrics": metrics_json(&metrics),
                         }),
                     );
                     SubagentOutcome::Completed { output, metrics }
@@ -395,16 +412,13 @@ impl SubagentSessionManager {
                     // The preflight failed (the turn never started).
                     let error = e.to_string();
                     let (_, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    if let Some(p) = &wrapper_path {
-                        let _ = std::fs::remove_file(p);
-                    }
                     sink.emit(
                         "subagent-closed",
                         json!({
                             "sessionId": sid,
                             "status": "failed",
                             "error": error.clone(),
-                            "metrics": metrics_json(metrics),
+                            "metrics": metrics_json(&metrics),
                         }),
                     );
                     SubagentOutcome::Failed { error }
@@ -419,16 +433,13 @@ impl SubagentSessionManager {
                         e.to_string()
                     };
                     let (_, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    if let Some(p) = &wrapper_path {
-                        let _ = std::fs::remove_file(p);
-                    }
                     sink.emit(
                         "subagent-closed",
                         json!({
                             "sessionId": sid,
                             "status": "failed",
                             "error": error.clone(),
-                            "metrics": metrics_json(metrics),
+                            "metrics": metrics_json(&metrics),
                         }),
                     );
                     SubagentOutcome::Failed { error }
@@ -569,13 +580,15 @@ fn captures(driver: &SessionDriver, duration_ms: u64) -> (String, SubagentMetric
             })
         })
         .unwrap_or_default();
+    metrics.output = output.clone();
     (output, metrics)
 }
 
 /// The `metrics` object shape (the wire contract: `inputTokens` /
 /// `outputTokens` / `cost` / `durationMs`).
-fn metrics_json(m: SubagentMetrics) -> Value {
+fn metrics_json(m: &SubagentMetrics) -> Value {
     json!({
+        "output": m.output,
         "inputTokens": m.input_tokens,
         "outputTokens": m.output_tokens,
         "cost": m.cost,
@@ -589,8 +602,11 @@ fn metrics_json(m: SubagentMetrics) -> Value {
 /// Task 1); the token/cost fields are real when the session pushed usage (0
 /// when it didn't — the `CostAccumulator` default) and `duration_ms` is
 /// always the wall clock (see the wire contract's metrics note).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SubagentMetrics {
+    /// The last message's accumulated text ("" when the turn produced no
+    /// assistant text — the stale-carry-over test's EMPTY sentinel).
+    pub output: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost: f64,
@@ -624,7 +640,7 @@ mod tests {
     use crate::agent::session::{CloseKind, EventSink, ExternalClose, SessionDriver, SessionInfo};
     use crate::config::Registry;
 
-    use super::{SubagentCancel, SubagentSessionManager};
+    use super::{LaunchConfig, SubagentCancel, SubagentSessionManager};
 
     /// The `fake_pi` binary path. These tests spawn it DIRECTLY (no copy):
     /// they never reap processes by binary path (the driver kills via the
@@ -663,6 +679,106 @@ mod tests {
             }
         }
         let _ = close_tx.send(true);
+    }
+
+    /// (1) Named agent with tools: every flag present, in order.
+    #[test]
+    fn subagent_pi_args_named_with_tools() {
+        let args = super::subagent_pi_args(&LaunchConfig {
+            system_prompt: Some("You are a careful reviewer.".into()),
+            model: Some("anthropic/claude-sonnet-4-5".into()),
+            thinking: Some("high".into()),
+            tools: Some(vec!["read".into(), "bash".into()]),
+        });
+        assert_eq!(
+            args,
+            vec![
+                "--mode",
+                "rpc",
+                "--no-themes",
+                "--system-prompt",
+                "You are a careful reviewer.",
+                "--model",
+                "anthropic/claude-sonnet-4-5",
+                "--thinking",
+                "high",
+                "--tools",
+                "read,bash",
+                "--no-session",
+            ]
+        );
+    }
+
+    /// (2) Named agent without tools: `--exclude-tools subagent`, no `--tools`.
+    #[test]
+    fn subagent_pi_args_named_without_tools() {
+        let args = super::subagent_pi_args(&LaunchConfig {
+            system_prompt: Some("body".into()),
+            model: None,
+            thinking: None,
+            tools: None,
+        });
+        assert_eq!(
+            args,
+            vec![
+                "--mode",
+                "rpc",
+                "--no-themes",
+                "--system-prompt",
+                "body",
+                "--exclude-tools",
+                "subagent",
+                "--no-session"
+            ]
+        );
+    }
+
+    /// (3) Config-less dispatch (all `None`): only the base + exclude + no-session.
+    #[test]
+    fn subagent_pi_args_config_less_is_minimal() {
+        let args = super::subagent_pi_args(&LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        });
+        assert_eq!(
+            args,
+            vec![
+                "--mode",
+                "rpc",
+                "--no-themes",
+                "--exclude-tools",
+                "subagent",
+                "--no-session"
+            ]
+        );
+    }
+
+    /// (4) Model + thinking only (a common partial config).
+    #[test]
+    fn subagent_pi_args_model_and_thinking_only() {
+        let args = super::subagent_pi_args(&LaunchConfig {
+            system_prompt: None,
+            model: Some("openai/gpt-5".into()),
+            thinking: Some("medium".into()),
+            tools: Some(vec!["read".into()]),
+        });
+        assert_eq!(
+            args,
+            vec![
+                "--mode",
+                "rpc",
+                "--no-themes",
+                "--model",
+                "openai/gpt-5",
+                "--thinking",
+                "medium",
+                "--tools",
+                "read",
+                "--no-session"
+            ]
+        );
     }
 
     fn temp_config_dir() -> PathBuf {
