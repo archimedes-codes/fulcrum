@@ -6,9 +6,9 @@
 //! components and symlinks, so neither `../..` traversal nor a symlink
 //! that points outside the root can escape the sandbox.
 //!
-//! `FsError` is local to this module (it used to ride on the ACP
-//! `AcpError`, which died with the pi-RPC swap): `Io` for filesystem
-//! failures, `PathEscape` for a path that escaped the sandbox.
+//! `FsError` is local to this module (it used to ride on the protocol
+//! layer's error type, which died with the pi-RPC swap): `Io` for
+//! filesystem failures, `PathEscape` for a path that escaped the sandbox.
 
 use std::fs;
 use std::path::{Path, PathBuf};
