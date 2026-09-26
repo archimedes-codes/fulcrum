@@ -52,6 +52,10 @@ pub struct SubagentSessionManager {
     /// The installed gate extension's path (`None` when the install
     /// failed — the dispatch runs ungated rather than broken).
     gate_path: Option<PathBuf>,
+    /// The installed tools-override extension's path (`None` when the
+    /// install failed — the dispatch runs on the suite's original tools
+    /// rather than broken).
+    tools_path: Option<PathBuf>,
 }
 
 /// Per-dispatch pi configuration for a subagent session (moved verbatim
@@ -138,12 +142,26 @@ impl SubagentSessionManager {
                 None
             }
         };
+        // Install the desktop-provided tools override (idempotent — the main
+        // manager installs the same file; the write is skipped when it
+        // matches). A failure is NON-fatal: dispatches run on the suite's
+        // original tools.
+        let tools_path = match crate::agent::tools::install_tools_extension(&config_dir) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!(
+                    "tools extension install failed: {e} (dispatches run on the suite's tools)"
+                );
+                None
+            }
+        };
         Ok(Self {
             driver: Arc::new(driver),
             worker,
             registry,
             config_dir,
             gate_path,
+            tools_path,
         })
     }
 
@@ -221,6 +239,15 @@ impl SubagentSessionManager {
             sessions: base.sessions.clone(),
             pending_permissions: base.pending_permissions.clone(),
             pending_bridge: base.pending_bridge.clone(),
+            // Phase 2 (Task 1): the shared `todo_update` / `sudo_exec`
+            // handler state — cloned the same way `pending_bridge` is
+            // (the subagent children get the bridge env via
+            // `bridge_spawn_setup` and can resolve their prompts through
+            // the shared maps).
+            todo_store: base.todo_store.clone(),
+            pending_sudo: base.pending_sudo.clone(),
+            sudo_password: base.sudo_password.clone(),
+            runner: base.runner.clone(),
             establish_timeout: base.establish_timeout,
             db: base.db.clone(),
             text_capture: Some(Arc::new(StdMutex::new(std::collections::HashMap::new()))),
@@ -253,6 +280,10 @@ impl SubagentSessionManager {
         // The gate path (an OWNED clone — the task closure is `'static`
         // and cannot borrow `self`).
         let gate_path = self.gate_path.clone();
+        // The tools path (an OWNED clone — same `'static` constraint; a
+        // verbatim `self.tools_path` inside the closure is a compile
+        // error).
+        let tools_path = self.tools_path.clone();
         let handle = self.worker.spawn_task(async move {
             let start = std::time::Instant::now();
 
@@ -285,8 +316,12 @@ impl SubagentSessionManager {
             // env var) — appended to the `pi` CLI args (the per-dispatch
             // config flags the wrapper script used to `exec` are now
             // passed DIRECTLY — the wrapper is deleted, Task 5).
+            // The tools override (Phase 2): a SECOND `-e <tools.ts>` (the
+            // extension is inert without the bridge env the setup above
+            // already set when available).
             let args = subagent_pi_args(&launch);
             let args = crate::agent::gate::gate_spawn_args(gate_path.as_deref(), &args);
+            let args = crate::agent::tools::tools_spawn_args(tools_path.as_deref(), &args);
             if gate_path.is_some() {
                 crate::agent::gate::gate_env(&mut agent_env);
             }
@@ -470,7 +505,25 @@ impl SubagentSessionManager {
                 let _ = sender.send(result);
                 true
             }
-            None => false,
+            None => {
+                // Phase 2: the `pending_bridge` lookup missed — check the
+                // `pending_sudo` sub-prompt oneshots (the `sudo_exec`
+                // `:confirm` / `:password` keys, `"{sid}/{id}:confirm"` /
+                // `"{sid}/{id}:password"`). The legacy `confirm` /
+                // `password` flow still resolves via `pending_bridge` (the
+                // lookup above is NOT removed). NOTE the plain-`bool`
+                // return (NOT `Result<bool>` — the command shim computes
+                // `main_hit || subagent_state.respond_bridge_request(…)`
+                // as a `bool`).
+                let sudo_sender = self.driver.pending_sudo.lock().await.remove(&key);
+                match sudo_sender {
+                    Some(sender) => {
+                        let _ = sender.send(result);
+                        true
+                    }
+                    None => false,
+                }
+            }
         }
     }
 
