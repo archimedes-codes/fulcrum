@@ -262,6 +262,7 @@ impl SubagentSessionManager {
             sudo_password: base.sudo_password.clone(),
             runner: base.runner.clone(),
             establish_timeout: base.establish_timeout,
+            settle_timeout: base.settle_timeout,
             db: base.db.clone(),
             trust_db: base.trust_db.clone(),
             text_capture: Some(Arc::new(StdMutex::new(std::collections::HashMap::new()))),
@@ -286,9 +287,11 @@ impl SubagentSessionManager {
         let (ec, cancel) = SubagentCancel::new_external_close();
         let task_cancel = cancel.clone();
         // A probe receiver (cloned BEFORE `ec` moves into `drive_session`):
-        // after a failed prompt, a flipped flag means the prompt failed
-        // because the session was closed (a cancel won the race) — the
-        // error is reported as "cancelled", not the prompt's error.
+        // read BEFORE the unconditional teardown cancel, a flipped flag
+        // means a USER cancel won the race (the `(Ok(_), Err(e))` arm
+        // reports "cancelled"); a SettleTimeout / agent death has NO
+        // flipped flag yet (the arm reports the `wait_for_settle` error,
+        // not "cancelled").
         let close_probe = ec.rx.clone();
 
         // The gate path (an OWNED clone — the task closure is `'static`
@@ -355,6 +358,10 @@ impl SubagentSessionManager {
             let hint = format!(
                 "could not spawn the subagent agent '{}' (parent session {parent_session_id})",
                 entry.command
+            );
+            eprintln!(
+                "[subagent-dispatch] SPAWNED agent '{agent_name}' (parent {parent_session_id}); task: {}",
+                &task[..task.len().min(60)]
             );
 
             // 3. Establish: `get_state` (the pi session's id + capability
@@ -424,21 +431,27 @@ impl SubagentSessionManager {
 
             // 5. The task as the first `prompt` (the `prompt` response is
             // the preflight — the turn's OUTCOME comes from the driver's
-            // `agent_settled` watch, awaited UNBOUNDED below: no timeout;
-            // cancellation is the external close, which tears the session
-            // down and resolves the wait via the dropped watch sender).
+            // `agent_settled` watch, awaited BOUNDED below by the
+            // `settle_timeout`: a hung turn resolves `SettleTimeout` and
+            // the unconditional cancel tears the session down; a user
+            // cancel is the external close, which tears the session down
+            // and resolves the wait via the dropped watch sender).
             let sid = info.session_id.clone();
+            eprintln!("[subagent-dispatch] established {sid}; sending prompt");
             let prompt = handle
                 .send(json!({ "type": "prompt", "content": task }))
                 .await;
+            eprintln!("[subagent-dispatch] prompt send returned for {sid}: {prompt:?}");
             let settle = driver.wait_for_settle(&sid).await;
-
+            eprintln!("[subagent-dispatch] settled for {sid}: {settle:?}");
+            // Read the cancel probe BEFORE the unconditional teardown
+            // cancel: a flipped flag here means a USER cancel won the
+            // race (the `(Ok(_), Err(e))` arm reports "cancelled"); a
+            // SettleTimeout / agent death has NO flipped flag yet (the
+            // arm reports the `wait_for_settle` error, not "cancelled").
+            let cancelled = *close_probe.borrow();
             // Ensure teardown on completion or failure.
             task_cancel.cancel();
-
-            // 6 / 7 / 8. Close + emit + resolve (the `end_turn` path) or
-            // fail (cancellation / the agent died mid-turn).
-            let cancelled = *close_probe.borrow();
             match (prompt, settle) {
                 (Ok(_), Ok(_)) => {
                     // `output` = the accumulated text of the
@@ -702,6 +715,7 @@ mod tests {
 
     use tokio::sync::oneshot;
 
+    use crate::agent::errors::RpcError;
     use crate::agent::permission::PermissionOutcome;
     use crate::agent::rpc::{PiRpc, PiRpcHandle};
     use crate::agent::session::{CloseKind, EventSink, ExternalClose, SessionDriver, SessionInfo};
@@ -1165,5 +1179,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// (5) `wait_for_settle` is BOUNDED (the zombie-subagent fix): a
+    /// hung turn (the `FAKE_PI_HANG_PROMPT` fake acks the prompt but
+    /// never emits `agent_settled`) resolves `Err(SettleTimeout)` after
+    /// `settle_timeout` — the wait does not linger forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wait_for_settle_times_out_on_a_hung_turn() {
+        let config_dir = temp_config_dir();
+        write_agents_json_pi(&config_dir, &[("FAKE_PI_HANG_PROMPT", "1")]);
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let registry = Registry::load(&config_dir).unwrap();
+        let entry = registry.get("fake").unwrap();
+        let cwd = config_dir.clone();
+
+        let mut driver = SessionDriver::new();
+        driver.settle_timeout = Duration::from_millis(500);
+        let driver = Arc::new(driver);
+
+        // Drive the session (the fake in `FAKE_PI_HANG_PROMPT` mode
+        // answers `get_state`, acks the prompt, but NEVER settles — the
+        // hung-turn condition).
+        let info = crate::test_support::run_with_retry(|| {
+            let driver = driver.clone();
+            let sink = sink.clone();
+            let entry = entry.clone();
+            let cwd = cwd.clone();
+            async move {
+                let rpc = make_rpc(&entry, &cwd)?;
+                let handle: PiRpcHandle = rpc.handle();
+                let cwd = cwd.clone();
+                driver
+                    .drive_session(
+                        handle,
+                        "fake",
+                        String::new(),
+                        cwd.clone(),
+                        &sink,
+                        None,
+                        None,
+                        move |h: PiRpcHandle| async move {
+                            let state = h.send(serde_json::json!({ "type": "get_state" })).await?;
+                            let session_id = state
+                                .get("sessionId")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            Ok(SessionInfo {
+                                session_id,
+                                agent_id: "fake".to_string(),
+                                cwd,
+                                capabilities: serde_json::Value::Null,
+                                config_options: None,
+                            })
+                        },
+                    )
+                    .await
+            }
+        })
+        .await
+        .expect("drive_session should establish");
+
+        // Ack the prompt (the fake NEVER settles it — the hung turn).
+        let sid = info.session_id.clone();
+        let handle = {
+            let sessions = driver.sessions.lock().await;
+            sessions.get(&sid).unwrap().handle.clone()
+        };
+        handle
+            .send(serde_json::json!({ "type": "prompt", "content": "hi" }))
+            .await
+            .expect("prompt should succeed");
+
+        // The bounded wait resolves `Err(SettleTimeout)` (well inside the
+        // 5 s test deadline — NOT a test hang).
+        let r = tokio::time::timeout(Duration::from_secs(5), driver.wait_for_settle(&sid))
+            .await
+            .expect("wait_for_settle should resolve (the timeout, not a test hang)")
+            .unwrap_err();
+        assert!(
+            matches!(r, RpcError::SettleTimeout { .. }),
+            "expected SettleTimeout, got {r:?}"
+        );
+
+        // Teardown (best effort — the process dies on close).
+        close_session_internal(&driver, &info.session_id).await;
+        let _ = std::fs::remove_dir_all(&config_dir);
     }
 }
