@@ -31,7 +31,8 @@ use crate::storage::Db;
 
 /// Manages all live SUBAGENT sessions (on the worker runtime).
 ///
-/// Owns a shared [`SessionDriver`] (db: `None`, subagent: `None`) whose
+/// Owns a shared [`SessionDriver`] (db: `None` — ephemeral, `trust_db`:
+/// threaded via [`Self::new`], subagent: `None`) whose
 /// `sessions` / `pending_*` maps EVERY per-dispatch driver shares (the
 /// manager's `respond_*` and the driver-task cleanup operate on the shared
 /// maps), plus a [`WorkerRuntime`]. Each dispatch builds a FRESH driver on
@@ -41,7 +42,8 @@ use crate::storage::Db;
 /// text). The one-live policy does NOT apply to subagents (ADR 0002 —
 /// subagent sessions are excluded by definition).
 pub struct SubagentSessionManager {
-    /// The shared driver (db: `None`, subagent: `None`), behind an `Arc`:
+    /// The shared driver (db: `None` — ephemeral, `trust_db` threaded via
+    /// `new` — the ADR 0010 trust lookup, `subagent: None`), behind an `Arc`:
     /// its `sessions` / `pending_*` maps are shared by every per-dispatch
     /// driver (see `dispatch`), and `respond_*` reads them here.
     driver: Arc<SessionDriver>,
@@ -113,7 +115,13 @@ pub fn subagent_pi_args(cfg: &LaunchConfig) -> Vec<String> {
 impl SubagentSessionManager {
     /// Create a manager (a shared driver with the capture hooks enabled per
     /// dispatch, a dedicated worker runtime, the agent registry from
-    /// `config_dir`).
+    /// `config_dir`). `trust_db` is the TRUST lookup source threaded onto
+    /// the shared driver (ADR 0010 — subagent Sessions inherit Space trust
+    /// through it; `None` = fail-closed, the gate always prompts). It is
+    /// SEPARATE from the driver's `db` (transcript persistence — always
+    /// `None` for subagents, which are ephemeral): threading the full db
+    /// here would make subagent updates attempt transcript inserts (a FK
+    /// failure — subagent sessions have no `sessions` row).
     ///
     /// The `WorkerRuntime` is built here (two idle threads, negligible);
     /// a spawn / build failure (EAGAIN under load) is an `io::Error` —
@@ -121,7 +129,7 @@ impl SubagentSessionManager {
     /// degrades instead of crashing at startup). Dropping the manager drops
     /// the runtime (the shutdown `Sender` is dropped, unblocking the
     /// dedicated thread — the app-exit path).
-    pub fn new(config_dir: PathBuf) -> Result<Self, ConfigError> {
+    pub fn new(config_dir: PathBuf, trust_db: Option<Arc<Db>>) -> Result<Self, ConfigError> {
         let registry = Registry::load(&config_dir)?;
         // The shared driver (db: `None` — ephemeral; `subagent: None` —
         // subagents cannot dispatch subagents): its `sessions` /
@@ -130,7 +138,12 @@ impl SubagentSessionManager {
         // these maps). The captures are per-dispatch (a fresh `Some`
         // instance in `dispatch` — a concurrent dispatch must not clobber
         // another's final output).
-        let driver = SessionDriver::new();
+        let mut driver = SessionDriver::new();
+        // The trust lookup source (ADR 0010 — subagent Sessions inherit
+        // Space trust through `trust_db`; the driver's `db` stays `None`
+        // — subagents are ephemeral and must not attempt transcript
+        // inserts).
+        driver.trust_db = trust_db;
         let worker = WorkerRuntime::new()?;
         // Install the bundled gate extension (idempotent — the main
         // manager installs the same file; the write is skipped when it
@@ -250,6 +263,7 @@ impl SubagentSessionManager {
             runner: base.runner.clone(),
             establish_timeout: base.establish_timeout,
             db: base.db.clone(),
+            trust_db: base.trust_db.clone(),
             text_capture: Some(Arc::new(StdMutex::new(std::collections::HashMap::new()))),
             last_message_id: Some(Arc::new(StdMutex::new(None))),
             cost_capture: Some(Arc::new(StdMutex::new(CostAccumulator::default()))),
@@ -896,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_bridge_request_resolves_and_misses() {
-        let manager = SubagentSessionManager::new(temp_config_dir()).unwrap();
+        let manager = SubagentSessionManager::new(temp_config_dir(), None).unwrap();
         let (tx, rx) = oneshot::channel();
         manager
             .driver()
@@ -922,7 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn respond_permission_resolves_and_misses() {
-        let manager = SubagentSessionManager::new(temp_config_dir()).unwrap();
+        let manager = SubagentSessionManager::new(temp_config_dir(), None).unwrap();
         let (tx, rx) = oneshot::channel();
         manager
             .driver()

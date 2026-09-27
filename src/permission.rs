@@ -17,12 +17,20 @@
 //!
 //! Which dialogs become prompts (and which responses they map to):
 //!
-//! - `confirm` → a prompt with the fixed options `[allow/Allow,
-//!   reject/Block]`; the user's choice maps to `confirmed: true / false`
-//!   (any other choice — or a timeout / a session close — maps to
-//!   `cancelled`).
+//! - `confirm` → a TRUSTED Space (ADR 0010, looked up via the `Db`
+//!   `space_trusted` — fail-closed: no db / db error / no space row /
+//!   canonicalize failure is untrusted) is answered `confirmed: true`
+//!   IMMEDIATELY — no prompt, no event, no oneshot. An UNTRUSTED Space gets
+//!   a prompt with the options `[allow/Allow, reject/Block,
+//!   trust-space/Don't ask again for this Space]`; the user's choice maps
+//!   to `confirmed: true / false / true` (`trust-space` answers
+//!   `confirmed: true` FIRST, then sets the flag best-effort — a failed
+//!   write is logged and the Space stays untrusted) — any other choice,
+//!   a timeout, or a session close maps to `cancelled`.
 //! - `select` → a prompt whose options are the request's option labels;
-//!   the user's choice maps to the `value` response.
+//!   the user's choice maps to the `value` response. `select` is NEVER
+//!   auto-answered, trusted or not (the `ask` tool's questions are the
+//!   user's to answer).
 //! - `input` / `editor` → NO prompt: the desktop cannot collect free-form
 //!   input in this shape, so the request is answered `cancelled` IMMEDIATELY
 //!   (the agent's `createDialogPromise` resolves `undefined` and the
@@ -48,6 +56,7 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::agent::rpc::{ExtensionUiRequest, ExtensionUiResponse, PiRpcHandle};
 use crate::agent::session::EventSink;
+use crate::storage::Db;
 
 /// The user's decision on a permission prompt, as chosen via the
 /// `respond_permission` Tauri command.
@@ -91,11 +100,35 @@ pub async fn handle_extension_ui_request(
     handle: &PiRpcHandle,
     sink: &Arc<dyn EventSink>,
     pending_permissions: &PendingPermissions,
+    db: Option<&Arc<Db>>,
+    cwd: &std::path::Path,
 ) {
     match req {
         ExtensionUiRequest::Confirm { id, title, .. } => {
-            // The fixed options: `[allow/Allow, reject/Block]` (the gate
-            // extension's confirm dialogs are yes/no).
+            // Trusted Space (ADR 0010): auto-approve — no prompt, no event,
+            // no oneshot. Fail-closed: no db / db error / no space row /
+            // canonicalize failure = untrusted = today's flow.
+            let trusted = match db {
+                Some(d) => d.space_trusted(cwd).unwrap_or(false),
+                None => false,
+            };
+            if trusted {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    let _ = handle
+                        .respond_extension_ui(ExtensionUiResponse::Confirmed {
+                            id,
+                            confirmed: true,
+                        })
+                        .await;
+                });
+                return;
+            }
+            // Untrusted: today's flow, with the third option (always present
+            // — the `db` here is the driver's `trust_db` (fail-closed for
+            // main AND subagent Sessions — ADR 0010), so a prompt only ever
+            // appears for an untrusted Space and the option is always
+            // actionable).
             spawn_permission_waiter(
                 session_id,
                 id,
@@ -105,12 +138,19 @@ pub async fn handle_extension_ui_request(
                     "options": [
                         { "optionId": "allow", "name": "Allow", "kind": "allow" },
                         { "optionId": "reject", "name": "Block", "kind": "reject" },
+                        {
+                            "optionId": "trust-space",
+                            "name": "Don't ask again for this Space",
+                            "kind": "allow"
+                        },
                     ],
                 }),
                 ResponseKind::Confirm,
                 handle,
                 sink,
                 pending_permissions,
+                db.cloned(),
+                cwd.display().to_string(),
             )
             .await;
         }
@@ -135,6 +175,8 @@ pub async fn handle_extension_ui_request(
                 handle,
                 sink,
                 pending_permissions,
+                db.cloned(),
+                cwd.display().to_string(),
             )
             .await;
         }
@@ -168,6 +210,7 @@ enum ResponseKind {
 /// Register the oneshot the user's answer will flow through, emit the
 /// `permission-request` event, and spawn the waiter. See the module docs for
 /// the full flow.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_permission_waiter(
     session_id: &str,
     request_id: String,
@@ -176,6 +219,8 @@ async fn spawn_permission_waiter(
     handle: &PiRpcHandle,
     sink: &Arc<dyn EventSink>,
     pending_permissions: &PendingPermissions,
+    db: Option<Arc<Db>>,
+    cwd: String,
 ) {
     let key = permission_key(session_id, &request_id);
 
@@ -229,7 +274,33 @@ async fn spawn_permission_waiter(
                         id: request_id,
                         confirmed: false,
                     },
-                    // A non-allow/reject selection is a dismissal.
+                    // Trust this Space: the flag write is best-effort and
+                    // happens BEFORE the response is sent (the match arm
+                    // runs, then the tail ships the returned value) — so a
+                    // failed respond can never lose the trust decision (a
+                    // db ERROR is logged and the response still ships; the
+                    // Space stays untrusted and the next call prompts again).
+                    // (A poisoned-mutex panic inside the db is the
+                    // pre-existing db.rs pattern — out of scope here.)
+                    "trust-space" => {
+                        if let Some(d) = &db {
+                            match d.set_space_trusted(&cwd, true) {
+                                Ok(true) => {}
+                                Ok(false) => eprintln!(
+                                    "trust-space: no space row for {cwd}; trust not persisted"
+                                ),
+                                Err(e) => {
+                                    eprintln!("trust-space: failed to set trusted for {cwd}: {e}")
+                                }
+                            }
+                        }
+                        ExtensionUiResponse::Confirmed {
+                            id: request_id,
+                            confirmed: true,
+                        }
+                    }
+                    // A non-allow/reject/trust-space selection is a
+                    // dismissal.
                     _ => ExtensionUiResponse::Cancelled { id: request_id },
                 }
             }
