@@ -495,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn native_gate_trusted_space_auto_approves() {
         let (db, cwd) = temp_db_cwd();
-        db.upsert_space(&cwd.display().to_string()).unwrap();
+        db.upsert_space(&cwd.display().to_string(), false).unwrap();
         db.set_space_trusted(&cwd.display().to_string(), true)
             .unwrap();
         let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
@@ -535,7 +535,7 @@ mod tests {
     #[tokio::test]
     async fn native_gate_untrusted_prompts_and_maps_the_outcome() {
         let (db, cwd) = temp_db_cwd();
-        db.upsert_space(&cwd.display().to_string()).unwrap();
+        db.upsert_space(&cwd.display().to_string(), false).unwrap();
         // Untrusted (the default) → the prompt flow.
         let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
@@ -600,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn native_gate_trust_space_allows_and_sets_the_flag() {
         let (db, cwd) = temp_db_cwd();
-        db.upsert_space(&cwd.display().to_string()).unwrap();
+        db.upsert_space(&cwd.display().to_string(), false).unwrap();
         assert!(!db.space_trusted(&cwd).unwrap(), "untrusted by default");
         let (sink_tx, _sink_rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
