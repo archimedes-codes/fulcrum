@@ -1912,6 +1912,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/tmp"),
             capabilities: serde_json::json!({}),
             config_options: None,
+            archived: false,
         })
         .expect("record_session");
         let model = Model {

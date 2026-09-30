@@ -586,6 +586,8 @@ impl SubagentSessionManager {
                             cwd: establish_cwd,
                             capabilities: Value::Null,
                             config_options: None,
+                            // Ephemeral (subagent) sessions are never archived (ADR 0016).
+                            archived: false,
                         })
                     },
                 )
@@ -907,6 +909,8 @@ impl SubagentSessionManager {
                 cwd: parent_cwd.clone(),
                 capabilities: json!({}),
                 config_options: None,
+                // Ephemeral (subagent) sessions are never archived (ADR 0016).
+                archived: false,
             }) {
                 let _ = dispatch_tx.send(SubagentOutcome::Failed {
                     error: format!("record the throwaway child session: {e}"),
@@ -1865,6 +1869,8 @@ mod tests {
                                 cwd,
                                 capabilities: serde_json::Value::Null,
                                 config_options: None,
+                                // Ephemeral (subagent) sessions are never archived (ADR 0016).
+                                archived: false,
                             })
                         },
                     )
@@ -1980,6 +1986,8 @@ mod tests {
                             cwd: config_dir.clone(),
                             capabilities: serde_json::Value::Null,
                             config_options: None,
+                            // Ephemeral (subagent) sessions are never archived (ADR 0016).
+                            archived: false,
                         })
                     },
                 )
@@ -2070,6 +2078,8 @@ mod tests {
                                 cwd,
                                 capabilities: serde_json::Value::Null,
                                 config_options: None,
+                                // Ephemeral (subagent) sessions are never archived (ADR 0016).
+                                archived: false,
                             })
                         },
                     )
