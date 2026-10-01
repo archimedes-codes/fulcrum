@@ -62,6 +62,23 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(300);
 /// `find` / `grep` / `ls` are read-only and skip the gate).
 const MUTATING_TOOLS: &[&str] = &["bash", "edit", "write"];
 
+/// The compaction SUMMARY's prefix (harness-generated — `run_compaction`
+/// prepends it to the summarized text): the ONE place the prefix lives
+/// (the summary construction + `is_compaction_summary` share it). A
+/// summary is a `System` message carrying this prefix — the only
+/// reliable way to tell it from a REAL system prompt (a summary is
+/// CONVERSATION state, not prompt state: it must be foldable by the
+/// next compaction; only a non-summary leading `System` message is
+/// prompt state).
+const SUMMARY_PREFIX: &str = "Summary of previous conversation:";
+
+/// A message is a compaction SUMMARY (a `System` message with the
+/// harness-generated `SUMMARY_PREFIX` text) — conversation state, never
+/// prompt state.
+fn is_compaction_summary(m: &ChatMessage) -> bool {
+    matches!(&m.content, MessageContent::Text(t) if t.starts_with(SUMMARY_PREFIX))
+}
+
 /// A prompt to the loop (the `prompt_queue` item).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
@@ -282,7 +299,9 @@ impl AgentLoop {
     /// `dispatch_native` `launch.system_prompt` seed — pushed to the
     /// FRONT of `self.messages` + the `Compactor` is re-estimated, the
     /// `load_transcript` shape; the `model_request` sends
-    /// `messages: self.messages.clone()`, so it leads every model call).
+    /// `messages: self.messages.clone()`, so it leads every model call),
+    /// and persisted at seq 0 (a resume replays it; a compaction
+    /// preserves it).
     ///
     /// **Call AT MOST ONCE per session**: this PREPENDS (it does not
     /// replace) — a second call stacks another `System` message at index
@@ -299,6 +318,7 @@ impl AgentLoop {
             },
         );
         self.compactor.reestimate(&self.messages);
+        self.persist_system_message();
     }
 
     /// Seed the provider transcript (resume: `SessionStore::load_messages`
@@ -1080,7 +1100,26 @@ impl AgentLoop {
             reason: "context_limit".to_string(),
         });
         let keep = self.catalog.compaction.keep_recent_tokens;
-        let (older, recent) = split_for_compaction(&self.messages, keep);
+        // The leading system message (if any) is prompt state, not
+        // conversation (pi's compaction: "System messages are prompt
+        // state, not conversation; the compaction entry carries their
+        // replay"): EXCLUDE it from the compaction target and RE-PREPEND
+        // it to the compacted transcript. A compaction SUMMARY is NOT
+        // prompt state — it is CONVERSATION state (harness-generated,
+        // the `SUMMARY_PREFIX` text): it must be foldable, so the next
+        // compaction compacts it into the new summary (a summary at
+        // index 0 — a legacy pre-ADR-0017 resume / a child with no
+        // system message — is NOT a leading system message).
+        let system_head = self
+            .messages
+            .first()
+            .filter(|m| matches!(m.role, ChatRole::System) && !is_compaction_summary(m))
+            .cloned();
+        let compactable: &[ChatMessage] = match &system_head {
+            Some(_) => &self.messages[1..],
+            None => &self.messages[..],
+        };
+        let (older, recent) = split_for_compaction(compactable, keep);
         let mut aborted = false;
         let mut error_message: Option<String> = None;
         if !older.is_empty() {
@@ -1088,13 +1127,15 @@ impl AgentLoop {
                 Ok(summary) => {
                     let summary_msg = ChatMessage {
                         role: ChatRole::System,
-                        content: MessageContent::Text(format!(
-                            "Summary of previous conversation:\n{summary}"
-                        )),
+                        content: MessageContent::Text(format!("{SUMMARY_PREFIX}\n{summary}")),
                         tool_call_id: None,
                         tool_calls: None,
                     };
-                    let mut compacted = Vec::with_capacity(1 + recent.len());
+                    let mut compacted =
+                        Vec::with_capacity(1 + usize::from(system_head.is_some()) + recent.len());
+                    if let Some(s) = system_head.clone() {
+                        compacted.push(s);
+                    }
                     compacted.push(summary_msg);
                     compacted.extend(recent);
                     self.messages = compacted;
@@ -1249,6 +1290,14 @@ impl AgentLoop {
         }
     }
 
+    /// The tool specs advertised to the model (the `enabled_tools` filter +
+    /// the subagent drop for a child) — the SAME value `model_request` sends
+    /// as `tools[]`, so the prompt's `<tools>` section can never disagree
+    /// with the API param (ADR 0017).
+    pub fn advertised_specs(&self) -> Vec<ToolSpec> {
+        Self::advertised_tool_specs(&self.enabled_tools, self.subagent.is_none())
+    }
+
     /// The tool specs advertised to the model (finding B): `tool_specs()`
     /// filtered by (a) `enabled_tools` (`None` = all; `Some(v)` = exactly
     /// `v` — `Some(vec![])` = NO tools) and (b) dropping `subagent` when
@@ -1307,6 +1356,37 @@ impl AgentLoop {
             &content_json,
         ) {
             eprintln!("harness: transcript persist failed: {e}");
+        }
+    }
+
+    /// Persist the LEADING system message (if any) at seq 0 (an idempotent
+    /// upsert — the transcript record of the session's system prompt;
+    /// ADR 0017). A resume replays it verbatim via `load_transcript`.
+    /// The `len == 1` guard makes `prepend_system`'s "call AT MOST ONCE"
+    /// contract explicit: a second call on a non-empty transcript is
+    /// LOUDLY skipped (the in-memory prepend happened, but the seq-0
+    /// row is left untouched — the eprintln is the only trace).
+    fn persist_system_message(&self) {
+        let m = match self.messages.first() {
+            Some(m) if self.messages.len() == 1 => m,
+            Some(_) => {
+                eprintln!(
+                    "harness: system message persist skipped (the transcript already has {} messages — the 'call AT MOST ONCE' contract is broken; the seq-0 row is left untouched)",
+                    self.messages.len()
+                );
+                return;
+            }
+            None => return, // empty transcript — nothing to persist
+        };
+        if !matches!(m.role, ChatRole::System) {
+            return;
+        }
+        let content_json = serde_json::to_string(m).unwrap_or_default();
+        if let Err(e) =
+            self.store
+                .insert_message(&self.session_id, 0, role_str(m.role), &content_json)
+        {
+            eprintln!("harness: system message persist failed: {e}");
         }
     }
 
@@ -1889,17 +1969,18 @@ mod tests {
         }
     }
 
-    /// Build an `AgentLoop` (the harness unit-test seam — a temp-dir `Db`,
-    /// a single `fake/m1` catalog model, a scripted provider; the
-    /// `events` / `turn_cancel` / `settle_tx` wiring mirrors
-    /// `build_native_session`).
-    fn build_loop(
+    /// Build an `AgentLoop` + its `Db` (the harness unit-test seam — a
+    /// temp-dir `Db`, a single `fake/m1` catalog model, a scripted
+    /// provider; the `events` / `turn_cancel` / `settle_tx` wiring mirrors
+    /// `build_native_session`). The `Db` is returned (the tests assert on
+    /// the STORE via `loop_.store` against the same `Db`).
+    fn build_loop_with_db(
         provider: Box<dyn Provider>,
         events: mpsc::Sender<RpcEvent>,
         turn_cancel: Arc<StdMutex<CancellationToken>>,
         settle_tx: watch::Sender<u64>,
         retry: RetryPolicy,
-    ) -> AgentLoop {
+    ) -> (AgentLoop, Arc<Db>) {
         let dir = std::env::temp_dir().join(format!("harness-loop-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
@@ -1937,13 +2018,13 @@ mod tests {
         let sink: Arc<dyn EventSink> = Arc::new(TestSink {
             updates: Arc::new(StdMutex::new(Vec::new())),
         });
-        AgentLoop::new(
+        let loop_ = AgentLoop::new(
             "s1".to_string(),
             dir,
             model,
             provider,
             catalog,
-            SessionStore::new(db),
+            SessionStore::new(db.clone()),
             events,
             CancellationToken::new(),
             turn_cancel,
@@ -1958,7 +2039,20 @@ mod tests {
             None,
             SudoDeps::default(),
             retry,
-        )
+        );
+        (loop_, db)
+    }
+
+    /// Build an `AgentLoop` (drops the `Db` — the tests that need the
+    /// `Db` use `build_loop_with_db`).
+    fn build_loop(
+        provider: Box<dyn Provider>,
+        events: mpsc::Sender<RpcEvent>,
+        turn_cancel: Arc<StdMutex<CancellationToken>>,
+        settle_tx: watch::Sender<u64>,
+        retry: RetryPolicy,
+    ) -> AgentLoop {
+        build_loop_with_db(provider, events, turn_cancel, settle_tx, retry).0
     }
 
     /// Await the first event matching `pred` (bounded — the tests must
@@ -2569,6 +2663,406 @@ mod tests {
         };
         assert!(aborted, "the compaction was aborted");
         assert!(error_message.is_some(), "the error was reported");
+    }
+
+    /// (ADR 0017) `prepend_system` PERSISTS the leading system message at
+    /// seq 0 (the transcript record of the session's system prompt — a
+    /// resume replays it verbatim via `load_transcript`). Asserted on the
+    /// STORE (`load_messages` returns the rows in seq order — the seq-0
+    /// row is `loaded[0]`).
+    #[tokio::test]
+    async fn prepend_system_persists_at_seq_zero() {
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let (mut loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.prepend_system("the prompt".to_string());
+        let loaded = loop_.store.load_messages("s1").unwrap();
+        assert_eq!(loaded.len(), 1, "the system message was persisted at seq 0");
+        let m = &loaded[0];
+        assert!(
+            matches!(m.role, ChatRole::System),
+            "the persisted row is the system message, got {:?}",
+            m.role
+        );
+        assert_eq!(
+            m.content,
+            MessageContent::Text("the prompt".to_string()),
+            "the persisted content is the prompt text"
+        );
+    }
+
+    /// (ADR 0017) `run_compaction` PRESERVES the leading system message
+    /// (the system message is prompt state, not conversation — it is
+    /// excluded from the compaction target and re-prepended to the
+    /// compacted transcript; the `replace_messages` rewrite keeps it at
+    /// seq 0, the summary following it).
+    #[tokio::test]
+    async fn compaction_preserves_leading_system_message() {
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::TextDelta("the summary".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("hi".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (mut loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.catalog.compaction.keep_recent_tokens = 1;
+        loop_.load_transcript(vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: MessageContent::Text("the prompt".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ]);
+        loop_.run_compaction(&CancellationToken::new()).await;
+        // The leading system message SURVIVES at index 0 (the ORIGINAL
+        // message — NOT replaced by the summary).
+        assert!(
+            matches!(loop_.messages[0].role, ChatRole::System),
+            "the system message survives compaction"
+        );
+        assert_eq!(
+            loop_.messages[0].content,
+            MessageContent::Text("the prompt".to_string()),
+            "the system message is the original, verbatim"
+        );
+        // The summary follows it.
+        assert!(
+            matches!(loop_.messages[1].role, ChatRole::System),
+            "the summary is a system message at index 1"
+        );
+        match &loop_.messages[1].content {
+            MessageContent::Text(t) => assert!(
+                t.starts_with("Summary of previous conversation:"),
+                "the summary message, got {t:?}"
+            ),
+            other => panic!("expected a text summary, got {other:?}"),
+        }
+        // The `replace_messages` rewrite kept the system message at seq 0.
+        let loaded = loop_.store.load_messages("s1").unwrap();
+        assert!(
+            matches!(loaded[0].role, ChatRole::System),
+            "the system message is the seq-0 row after the rewrite"
+        );
+        assert_eq!(
+            loaded[0].content,
+            MessageContent::Text("the prompt".to_string()),
+            "the seq-0 row is the original prompt, verbatim"
+        );
+    }
+
+    /// (ADR 0017) a transcript WITHOUT a leading system message compacts
+    /// EXACTLY as today (the summary leads the compacted transcript —
+    /// today's behavior preserved).
+    #[tokio::test]
+    async fn compaction_without_system_message_unchanged() {
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::TextDelta("the summary".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("hi".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (mut loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.catalog.compaction.keep_recent_tokens = 1;
+        loop_.load_transcript(vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ]);
+        loop_.run_compaction(&CancellationToken::new()).await;
+        // No system message was seeded: the summary leads (today's
+        // behavior).
+        assert!(
+            matches!(loop_.messages[0].role, ChatRole::System),
+            "the summary leads the compacted transcript"
+        );
+        match &loop_.messages[0].content {
+            MessageContent::Text(t) => assert!(
+                t.starts_with("Summary of previous conversation:"),
+                "the summary message, got {t:?}"
+            ),
+            other => panic!("expected a text summary, got {other:?}"),
+        }
+    }
+
+    /// (review finding 1) TWO compactions on a transcript WITHOUT a real
+    /// system prompt FOLD the old summary into the new one: the summary
+    /// is CONVERSATION state (harness-generated — the `Summary of
+    /// previous conversation:` prefix), not prompt state, so the second
+    /// compaction compacts it too. (A legacy pre-ADR-0017 resume / a
+    /// child with no system message: the first compaction puts the
+    /// summary at index 0; the second must NOT freeze it there.)
+    #[tokio::test]
+    async fn compaction_twice_without_system_message_folds_the_old_summary() {
+        // Distinct canned response per `summarize` call: the FIRST
+        // compaction gets "the summary one", the SECOND gets "the
+        // summary two" (the old summary folded into it).
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::TextDelta("the summary one".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("the summary two".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (mut loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.catalog.compaction.keep_recent_tokens = 1;
+        loop_.load_transcript(vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u3".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ]);
+        loop_.run_compaction(&CancellationToken::new()).await;
+        loop_.run_compaction(&CancellationToken::new()).await;
+        // The NEW summary leads (the old summary was FOLDED into it —
+        // not preserved verbatim at index 0).
+        assert!(
+            matches!(loop_.messages[0].role, ChatRole::System),
+            "the new summary leads the compacted transcript"
+        );
+        match &loop_.messages[0].content {
+            MessageContent::Text(t) => assert!(
+                t.contains("the summary two"),
+                "the leading summary is the NEW one (the old summary was folded into it), got {t:?}"
+            ),
+            other => panic!("expected a text summary, got {other:?}"),
+        }
+        assert_eq!(
+            loop_.messages.len(),
+            2,
+            "the compacted transcript is the new summary + the kept recent message"
+        );
+    }
+
+    /// (review finding 1) a transcript WITH a real leading system prompt
+    /// keeps it verbatim across TWO compactions (a non-summary leading
+    /// System message is prompt state — excluded from the compaction
+    /// target and re-prepended), and the second compaction folds the
+    /// old summary into the new one behind it.
+    #[tokio::test]
+    async fn compaction_twice_with_system_message() {
+        // Distinct canned response per `summarize` call: the FIRST
+        // compaction gets "the summary one", the SECOND gets "the
+        // summary two" (the old summary folded into it).
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::TextDelta("the summary one".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("the summary two".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (mut loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.catalog.compaction.keep_recent_tokens = 1;
+        loop_.load_transcript(vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: MessageContent::Text("the prompt".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ]);
+        loop_.run_compaction(&CancellationToken::new()).await;
+        loop_.run_compaction(&CancellationToken::new()).await;
+        // The ORIGINAL system message survives verbatim at index 0.
+        assert!(
+            matches!(loop_.messages[0].role, ChatRole::System),
+            "the system message survives the second compaction"
+        );
+        assert_eq!(
+            loop_.messages[0].content,
+            MessageContent::Text("the prompt".to_string()),
+            "the system message is the original, verbatim"
+        );
+        // The NEW summary follows it (the old summary was folded into
+        // it — the second compaction compacted the first's summary).
+        match &loop_.messages[1].content {
+            MessageContent::Text(t) => assert!(
+                t.contains("the summary two"),
+                "the summary at index 1 is the NEW one, got {t:?}"
+            ),
+            other => panic!("expected a text summary at index 1, got {other:?}"),
+        }
+    }
+
+    /// (ADR 0017) a resume REPLAYS the stored system message verbatim
+    /// (the `load_transcript` of the stored rows restores it
+    /// byte-identically — same role, same content JSON).
+    #[tokio::test]
+    async fn resume_replays_system_message_verbatim() {
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let (mut loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.prepend_system("the prompt".to_string());
+        let loaded = loop_.store.load_messages("s1").unwrap();
+        loop_.load_transcript(loaded.clone());
+        assert_eq!(
+            loop_.messages.len(),
+            1,
+            "the replayed transcript has the stored row"
+        );
+        assert!(
+            matches!(loop_.messages[0].role, ChatRole::System),
+            "the replayed message is the system message"
+        );
+        assert_eq!(
+            loop_.messages[0].content,
+            MessageContent::Text("the prompt".to_string()),
+            "the replayed content is the prompt text"
+        );
+        assert_eq!(
+            serde_json::to_string(&loop_.messages[0]).unwrap(),
+            serde_json::to_string(&loaded[0]).unwrap(),
+            "the replayed message is byte-identical to the stored row"
+        );
     }
 
     /// (finding 13b) `enabled_tools` is wired into `dispatch_tool`:

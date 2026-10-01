@@ -23,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::bridge;
 use crate::agent::harness::{
-    tool_specs, AgentLoop, Model, ModelCatalog, Prompt, RetryPolicy, SessionStore, SudoDeps,
+    build_child_system_message, tool_specs, AgentLoop, Model, ModelCatalog, Prompt, RetryPolicy,
+    SessionStore, SudoDeps,
 };
 use crate::agent::permission::{self, PermissionOutcome};
 use crate::agent::rpc::{PiRpc, PiRpcHandle};
@@ -1005,8 +1006,18 @@ impl SubagentSessionManager {
             if let Some(level) = &thinking {
                 loop_.set_thinking_level(Some(level.clone()));
             }
-            if let Some(sp) = &launch.system_prompt {
-                loop_.prepend_system(sp.clone());
+            // The child's system message (ADR 0017): [launch.systemPrompt,
+            // if any] + the todo guidance line (when the child has the
+            // manage_todo_list tool — its tools = the parent's minus
+            // subagent); `None` → no system message (today's behavior).
+            // `prepend_system` persists it at seq 0 (the child's
+            // throwaway Db — the child is ephemeral; the persist is the
+            // uniform code path, not a resume record).
+            let has_todo_tool = child_tools.iter().any(|t| t == "manage_todo_list");
+            if let Some(msg) =
+                build_child_system_message(launch.system_prompt.as_deref(), has_todo_tool)
+            {
+                loop_.prepend_system(msg);
             }
             // 8. Spawn the child loop (it owns `prompt_tx` +
             // `control_tx` — `run()` exits ONLY via `self.cancel`).
@@ -1033,7 +1044,7 @@ impl SubagentSessionManager {
             );
             // 10. The task (the preflight — a `SendError` means the
             // child died before the turn started → `Failed`). The
-            // `system_prompt` was already seeded in step 7 (BEFORE the
+            // system message was already seeded in step 7 (BEFORE the
             // task prompt).
             let preflight = prompt_tx.send(Prompt { text: task.clone() }).await;
             // 11. Race: the child's settle (a `changed()` `Err` = the
@@ -1452,8 +1463,8 @@ mod tests {
 
     use crate::agent::errors::RpcError;
     use crate::agent::harness::{
-        FinishReason, Model, ModelCatalog, ModelRequest, Provider, ProviderError, ProviderEvent,
-        SudoDeps,
+        ChatRole, FinishReason, MessageContent, Model, ModelCatalog, ModelRequest, Provider,
+        ProviderError, ProviderEvent, SudoDeps,
     };
     use crate::agent::permission::PermissionOutcome;
     use crate::agent::rpc::{PiRpc, PiRpcHandle};
@@ -2169,6 +2180,40 @@ mod tests {
         }
     }
 
+    /// A `Provider` that RECORDS each `ModelRequest` (a `CannedProvider`
+    /// that pushes `req.clone()` into a shared `Vec` before returning the
+    /// canned stream — the child system-message tests assert on the
+    /// recorded `messages`).
+    struct RecordingCannedProvider {
+        events: Vec<ProviderEvent>,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    impl RecordingCannedProvider {
+        fn new(events: Vec<ProviderEvent>) -> (Self, Arc<StdMutex<Vec<ModelRequest>>>) {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    events,
+                    requests: requests.clone(),
+                },
+                requests,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RecordingCannedProvider {
+        async fn complete(
+            &self,
+            req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            self.requests.lock().unwrap().push(req.clone());
+            Ok(futures_util::stream::iter(self.events.clone()).boxed())
+        }
+    }
+
     /// A `Provider` wrapper (the factory closure returns a CONCRETE type
     /// — `Box<dyn Provider>` itself does not implement `Provider`).
     struct ArcBoxProvider(Arc<dyn Provider>);
@@ -2417,6 +2462,178 @@ mod tests {
         // The temp file is STILL cleaned up on the teardown exit (the
         // `TempFileGuard` is dropped at the driver task's scope end).
         wait_for_temp_file_cleanup(before).await;
+    }
+
+    /// Dispatch a native child (a `RecordingCannedProvider` + the
+    /// default 20s settle bound) and return the child's recorded
+    /// `ModelRequest`s (the child's system message is seeded in step 7
+    /// — BEFORE the task prompt — so the child's first model request
+    /// shows it at `messages[0]`).
+    async fn dispatch_and_record(
+        config_dir: &std::path::Path,
+        launch: LaunchConfig,
+        parent_enabled_tools: Vec<String>,
+    ) -> Vec<ModelRequest> {
+        let (provider, requests) = RecordingCannedProvider::new(vec![
+            ProviderEvent::TextDelta("hello".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]);
+        let provider: Arc<dyn Provider> = Arc::new(provider);
+        let manager = make_native_manager(config_dir, provider, Duration::from_secs(20));
+        let sink = native_rec_sink();
+        let (dispatch_rx, _cancel) = manager.dispatch_native_force_temp_file(
+            "parent-1",
+            config_dir,
+            &native_test_model(),
+            parent_enabled_tools,
+            "tester".to_string(),
+            launch,
+            "do the thing".to_string(),
+            &sink,
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(30), dispatch_rx)
+            .await
+            .expect("the dispatch must resolve (the teardown cannot hang)")
+            .expect("the oneshot must not be dropped");
+        assert!(
+            matches!(outcome, SubagentOutcome::Completed { .. }),
+            "the dispatch completes — got {outcome:?}"
+        );
+        let recorded = requests.lock().unwrap().clone();
+        recorded
+    }
+
+    /// (H) **the child's system message — `launch.systemPrompt` + the
+    /// todo line (ADR 0017)**: a `Some` prompt + the full parent tool
+    /// set (the child's tools = the parent's minus `subagent` → the
+    /// child HAS `manage_todo_list`) → the child's first model request
+    /// leads with a `System` message of EXACTLY the prompt + the todo
+    /// guidance line (the task `User` message follows).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_child_system_prompt_plus_todo_line() {
+        let config_dir = temp_config_dir();
+        let launch = LaunchConfig {
+            system_prompt: Some("You are a careful reviewer.".to_string()),
+            ..default_native_launch()
+        };
+        // `Vec::new()` = ALL parent tools → the child HAS
+        // `manage_todo_list`.
+        let requests = dispatch_and_record(&config_dir, launch, Vec::new()).await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "the canned turn settles in one model call"
+        );
+        let system = &requests[0].messages[0];
+        assert_eq!(system.role, ChatRole::System, "the system message leads");
+        assert_eq!(
+            system.content,
+            MessageContent::Text(
+                "You are a careful reviewer.\nUse manage_todo_list to track multi-step work — write the plan before starting, mark items completed as you go"
+                    .to_string()
+            ),
+            "the system message is EXACTLY the prompt + the todo line"
+        );
+        // The task `User` message follows (the system message LEADS the
+        // task prompt — the step-7 seed is BEFORE the step-10 task).
+        let task = &requests[0].messages[1];
+        assert_eq!(task.role, ChatRole::User, "the task prompt follows");
+        assert_eq!(
+            task.content,
+            MessageContent::Text("do the thing".to_string()),
+            "the task prompt is verbatim"
+        );
+    }
+
+    /// (I) **the child's system message — `launch.systemPrompt` ALONE
+    /// (no todo tool)**: a `Some` prompt + a parent tool set WITHOUT
+    /// `manage_todo_list` (the child's tools = those minus `subagent`
+    /// → no todo tool) → the child's `System` message is the prompt
+    /// VERBATIM (no todo line).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_child_system_prompt_alone_without_todo_tool() {
+        let config_dir = temp_config_dir();
+        let launch = LaunchConfig {
+            system_prompt: Some("You are a careful reviewer.".to_string()),
+            ..default_native_launch()
+        };
+        // The child's tools = the parent's minus `subagent` — NO
+        // `manage_todo_list`.
+        let requests =
+            dispatch_and_record(&config_dir, launch, vec!["read".into(), "bash".into()]).await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "the canned turn settles in one model call"
+        );
+        let system = &requests[0].messages[0];
+        assert_eq!(system.role, ChatRole::System, "the system message leads");
+        assert_eq!(
+            system.content,
+            MessageContent::Text("You are a careful reviewer.".to_string()),
+            "the system message is the prompt VERBATIM (no todo line)"
+        );
+    }
+
+    /// (J) **the child's system message — the todo line ALONE (the
+    /// DEFAULT dispatch)**: `launch.system_prompt = None` + the full
+    /// parent tool set (the child HAS `manage_todo_list`) → the
+    /// child's `System` message is EXACTLY the todo guidance line (the
+    /// `has_todo_tool` derivation from `child_tools` in the `None`
+    /// case — the common default).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_child_todo_line_only_when_no_system_prompt() {
+        let config_dir = temp_config_dir();
+        // `Vec::new()` = ALL parent tools → the child HAS
+        // `manage_todo_list`.
+        let requests = dispatch_and_record(&config_dir, default_native_launch(), Vec::new()).await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "the canned turn settles in one model call"
+        );
+        let system = &requests[0].messages[0];
+        assert_eq!(system.role, ChatRole::System, "the system message leads");
+        assert_eq!(
+            system.content,
+            MessageContent::Text(
+                "Use manage_todo_list to track multi-step work — write the plan before starting, mark items completed as you go"
+                    .to_string()
+            ),
+            "the system message is EXACTLY the todo line"
+        );
+    }
+
+    /// (K) **the child's system message — NONE (the `None` + no-todo-
+    /// tool case, today's behavior preserved)**: `launch.system_prompt
+    /// = None` + a parent tool set WITHOUT `manage_todo_list` → the
+    /// child's first model request leads with the TASK `User` message
+    /// (NO system message).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_child_no_system_message_when_neither() {
+        let config_dir = temp_config_dir();
+        let requests = dispatch_and_record(
+            &config_dir,
+            default_native_launch(),
+            vec!["read".into(), "bash".into()],
+        )
+        .await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "the canned turn settles in one model call"
+        );
+        let first = &requests[0].messages[0];
+        assert_eq!(
+            first.role,
+            ChatRole::User,
+            "no system message — the task leads"
+        );
+        assert_eq!(
+            first.content,
+            MessageContent::Text("do the thing".to_string()),
+            "the task prompt leads"
+        );
     }
 
     /// (G) **drop order — the `record_session` failure path (the
