@@ -17,8 +17,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// A model with no metadata in `models-store.json` gets this window
-/// (best-effort).
-const DEFAULT_CONTEXT_WINDOW: u32 = 128000;
+/// (best-effort). Also the `effective_catalog` fallback for a user
+/// provider's discovered model (ADR 0014 — a user model has no static
+/// metadata).
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 128000;
 /// The `Compactor` (Task 6) thresholds when `settings.json` has no
 /// `compaction` block (pi's own defaults).
 const DEFAULT_RESERVE_TOKENS: u32 = 16384;
@@ -174,6 +176,45 @@ impl ModelCatalog {
             default_model: resolve_default(&settings),
             compaction: settings.compaction.map(Into::into).unwrap_or_default(),
         }
+    }
+}
+
+/// Merge the seeded catalog with the user-provider models (ADR 0014).
+/// `user_models` are the discovered models; `shadowed_provider_ids` are
+/// the ids of EVERY user provider configured in `settings.json` (regardless
+/// of whether its discovery succeeded — a provider that discovered 0 models
+/// STILL shadows the seeded models for its id: user-wins-on-clash, even
+/// on failure). For every id in `shadowed_provider_ids` the seeded models
+/// for that id are REPLACED by the user models with that id (possibly none).
+/// `default_model` is the seeded default unless it belongs to a shadowed
+/// provider (then `None` — the caller's resolution chain degrades).
+pub fn merge_catalog(
+    seeded: &ModelCatalog,
+    user_models: &[Model],
+    shadowed_provider_ids: &[String],
+) -> ModelCatalog {
+    let kept_seeded: Vec<Model> = seeded
+        .models
+        .iter()
+        .filter(|m| !shadowed_provider_ids.contains(&m.provider))
+        .cloned()
+        .collect();
+    let mut models = kept_seeded;
+    models.extend_from_slice(user_models);
+    // The seeded default is kept only when it still EXISTS in the merged
+    // result: a shadowed provider's default model was replaced (possibly by
+    // nothing) → `None` (the caller's resolution chain degrades). A
+    // default pointing at a model absent from `seeded.models` (a stale
+    // key) also degrades to `None` (it is not in the merged result either).
+    let default_model = seeded.default_model.clone().filter(|key| {
+        models
+            .iter()
+            .any(|m| format!("{}/{}", m.provider, m.id) == key.as_str())
+    });
+    ModelCatalog {
+        models,
+        default_model,
+        compaction: seeded.compaction,
     }
 }
 
@@ -869,6 +910,80 @@ mod tests {
         assert!(c.enabled);
         assert_eq!(c.reserve_tokens, 16384);
         assert_eq!(c.keep_recent_tokens, 5000);
+    }
+
+    // ── `merge_catalog` (ADR 0014: the effective catalog) ─────────────
+
+    /// A full `Model` literal (the `model` helper above pins `provider` to
+    /// `"p"` — a `provider` field needs the full literal; `Model` has no
+    /// `Default` derive).
+    fn full_model(id: &str, provider: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            base_url: "https://x/v1".to_string(),
+            api_key: "k".to_string(),
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    #[test]
+    fn merge_catalog_replaces_shadowed_providers_even_with_zero_models() {
+        let seeded = ModelCatalog {
+            models: vec![full_model("a", "p"), full_model("b", "q")],
+            default_model: Some("p/a".to_string()),
+            ..Default::default()
+        };
+        // A discovered model under `p` REPLACES the seeded `p/a` (the user
+        // wins on a provider-id clash); the seeded default belongs to the
+        // shadowed provider → `None` (the resolution chain degrades).
+        let user = vec![full_model("x", "p")];
+        let merged = merge_catalog(&seeded, &user, &["p".to_string()]);
+        let mut keys: Vec<String> = merged
+            .models
+            .iter()
+            .map(|m| format!("{}/{}", m.provider, m.id))
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["p/x".to_string(), "q/b".to_string()]);
+        assert_eq!(merged.default_model, None);
+
+        // ZERO discovered models STILL shadow: the provider's id is in
+        // `shadowed_provider_ids` with an empty `user_models` → 0 models
+        // for `p` (the stale seeded `p/a` does NOT resurrect — a
+        // two-argument signature cannot express this, since `p` would be
+        // absent from `user_models` entirely).
+        let merged = merge_catalog(&seeded, &[], &["p".to_string()]);
+        let keys: Vec<String> = merged
+            .models
+            .iter()
+            .map(|m| format!("{}/{}", m.provider, m.id))
+            .collect();
+        assert_eq!(keys, vec!["q/b".to_string()]);
+        assert_eq!(merged.default_model, None);
+        // The `compaction` carries over from the seeded catalog.
+        assert_eq!(merged.compaction, seeded.compaction);
+    }
+
+    #[test]
+    fn merge_catalog_with_no_user_providers_is_the_seeded_catalog() {
+        let seeded = ModelCatalog {
+            models: vec![full_model("a", "p")],
+            default_model: Some("p/a".to_string()),
+            compaction: CompactionConfig {
+                enabled: false,
+                reserve_tokens: 1,
+                keep_recent_tokens: 2,
+            },
+        };
+        let merged = merge_catalog(&seeded, &[], &[]);
+        assert_eq!(merged, seeded);
     }
 
     // ── the sparse `models-store.json` shape ──────────────────────────
