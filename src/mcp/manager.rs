@@ -5,7 +5,7 @@
 //! (never silently dropped).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -16,6 +16,7 @@ use super::http::{HttpClient, TokenProvider};
 use super::oauth;
 use super::stdio::StdioClient;
 use super::types::{AuthSpec, McpState, ServerDef, ToolCallResult, ToolInfo};
+use crate::commands::settings::load_settings;
 
 /// A connected MCP server (a stdio or HTTP client — the unified interface
 /// the manager routes `list_tools` / `call_tool` through).
@@ -71,10 +72,16 @@ pub struct McpManager {
 
 impl McpManager {
     /// Create a manager (load the servers from the config — Task 1's
-    /// `load_servers`: global `~/.pi/agent/mcp.json` + project
-    /// `<cwd>/.pi/mcp.json`).
-    pub fn new(home_dir: PathBuf, project_cwd: PathBuf) -> Self {
-        let servers = load_servers(&home_dir, &project_cwd)
+    /// `load_servers`: global `~/.pi/agent/mcp.json` + the desktop
+    /// `settings.json` `mcpServers` (ADR 0019 — `config_dir: None` =
+    /// absent) + project `<cwd>/.pi/mcp.json`).
+    pub fn new(home_dir: PathBuf, project_cwd: PathBuf, config_dir: Option<&Path>) -> Self {
+        // (ADR 0019) The desktop layer: the `settings.json` `mcpServers`
+        // (best-effort — a missing / corrupt file is the `load_settings`
+        // defaults = an empty map). Merged at global precedence (project
+        // > desktop > global).
+        let desktop = config_dir.map(|d| load_settings(d).mcp_servers);
+        let servers = load_servers(&home_dir, &project_cwd, desktop.as_ref())
             .into_iter()
             .map(|(name, def)| {
                 (
@@ -290,6 +297,43 @@ fn stored_token_provider(server_name: &str) -> Option<TokenProvider> {
     Some(Box::new(move || Some(token.clone())))
 }
 
+/// A one-shot test of a server definition (the Settings page's Test
+/// action, ADR 0019): build a FRESH client (bypassing the manager's
+/// entries — the manager is per-session, the Settings page is not),
+/// `tools/list` (bounded by `timeout`), drop the client (a stdio child is
+/// `kill_on_drop`). `Ok` = the tool count; `Err` = the error text (a
+/// `needs-auth` / a network failure) surfaced verbatim.
+pub async fn test_server(
+    def: &ServerDef,
+    project_cwd: &Path,
+    timeout: Duration,
+) -> Result<usize, String> {
+    let cancel = CancellationToken::new();
+    let tools = match def {
+        ServerDef::Stdio(def) => {
+            let mut client = StdioClient::connect(def, project_cwd, timeout, &cancel).await?;
+            let tools = client.list_tools(timeout, &cancel).await?;
+            drop(client); // kill the child.
+            tools
+        }
+        ServerDef::Http(def) => {
+            // An OAuth server: the stored token, if any (a `settings-test`
+            // name has no credentials entry → `None` → a 401 →
+            // `needs-auth`).
+            let get_token = if matches!(def.auth, AuthSpec::OAuth { .. }) {
+                stored_token_provider("settings-test")
+            } else {
+                None
+            };
+            let mut client = HttpClient::connect(def, timeout, &cancel, get_token).await?;
+            let tools = client.list_tools(&cancel).await?;
+            drop(client);
+            tools
+        }
+    };
+    Ok(tools.len())
+}
+
 /// The production `open_browser` (the platform default browser,
 /// fire-and-forget; a failure is non-fatal — the URL is in the result).
 fn production_open_browser(url: &str) {
@@ -306,6 +350,7 @@ fn production_open_browser(url: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{HttpDef, StdioDef};
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -329,7 +374,7 @@ mod tests {
                 .expect("creates the dir");
             std::fs::write(&project_path, p).expect("writes the project mcp.json");
         }
-        (McpManager::new(home_dir, project_cwd), dir)
+        (McpManager::new(home_dir, project_cwd, None), dir)
     }
 
     /// A `mcp.json` with a single stdio server (the fake binary).
@@ -417,6 +462,37 @@ mod tests {
             .expect("the second call reuses the connection");
         assert_eq!(r.text, "again");
         manager.close_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_server_a_stdio_server_reports_the_tool_count() {
+        // (ADR 0019) The Settings page's Test action: a one-shot connect +
+        // `tools/list` (the fake binary — three canned tools).
+        let bin = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_mcp_stdio"
+        ));
+        let def = ServerDef::Stdio(StdioDef {
+            command: bin.display().to_string(),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+        });
+        let count = test_server(&def, std::path::Path::new("."), Duration::from_secs(5))
+            .await
+            .expect("the fake server answers");
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_server_a_dead_port_is_an_error() {
+        let def = ServerDef::Http(HttpDef {
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            auth: AuthSpec::None,
+        });
+        let result = test_server(&def, std::path::Path::new("."), Duration::from_secs(2)).await;
+        assert!(result.is_err(), "a dead port is an error");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

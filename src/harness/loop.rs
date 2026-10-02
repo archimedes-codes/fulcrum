@@ -226,15 +226,19 @@ impl AgentLoop {
         subagent: Option<Arc<SubagentSessionManager>>,
         sudo: SudoDeps,
         retry: RetryPolicy,
+        // The settings dir (the `settings.json` home — ADR 0019: the MCP
+        // manager's desktop layer; `None` = no desktop layer).
+        config_dir: Option<PathBuf>,
     ) -> Self {
         let compactor = Compactor::new(catalog.compaction, model.context_window);
         let (control_tx, control_queue) = mpsc::channel(8);
         // The MCP manager (ADR 0018 — the `mcp` tool's machinery): the
-        // global `~/.pi/agent/mcp.json` + the project `<space_cwd>/.pi/
-        // mcp.json`.
+        // global `~/.pi/agent/mcp.json` + the desktop `settings.json`
+        // `mcpServers` (ADR 0019) + the project `<space_cwd>/.pi/mcp.json`.
         let mcp = McpManager::new(
             dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
             space_cwd.clone(),
+            config_dir.as_deref(),
         );
         Self {
             session_id,
@@ -2193,6 +2197,7 @@ mod tests {
             None,
             SudoDeps::default(),
             retry,
+            None,
         );
         (loop_, db)
     }
@@ -3831,7 +3836,7 @@ mod tests {
         );
         // Swap in the temp-config MCP manager (the `build_loop` default reads
         // the real home — this one reads the temp `mcp.json`).
-        loop_.mcp = McpManager::new(dir.clone(), dir.clone());
+        loop_.mcp = McpManager::new(dir.clone(), dir.clone(), None);
         loop_.handle_prompt(&text_prompt("call the mcp tool")).await;
         // The `mcp` tool result round-tripped (the `echo` → "hi").
         let end = wait_for_event(&mut events_rx, 10000, |e| {
@@ -3893,7 +3898,7 @@ mod tests {
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
-        loop_.mcp = McpManager::new(dir.clone(), dir.clone());
+        loop_.mcp = McpManager::new(dir.clone(), dir.clone(), None);
         let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("call mcp")).await });
         // The `mcp` tool starts (the `hang` never answers).
         wait_for_event(

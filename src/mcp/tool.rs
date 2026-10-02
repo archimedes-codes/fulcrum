@@ -296,7 +296,7 @@ mod tests {
             serde_json::json!({ "mcpServers": mcp }).to_string(),
         )
         .expect("writes the mcp.json");
-        (McpManager::new(home, project), dir)
+        (McpManager::new(home, project, None), dir)
     }
 
     fn cancel() -> CancellationToken {

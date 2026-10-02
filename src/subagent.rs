@@ -111,6 +111,9 @@ pub struct NativeDeps {
     /// onto its child). `None` = fail-closed (the gate prompts on every
     /// `bash` / `edit` / `write` in the child).
     pub trust_db: Option<Arc<Db>>,
+    /// The settings dir (ADR 0019: the child `AgentLoop`'s MCP manager
+    /// loads the desktop `mcpServers` layer from `settings.json`).
+    pub config_dir: Option<PathBuf>,
 }
 
 /// An `EventSink` decorator (the `dispatch_native` child's sink): wraps
@@ -969,6 +972,7 @@ impl SubagentSessionManager {
                 None,
                 deps.sudo.clone(),
                 RetryPolicy::new(),
+                deps.config_dir.clone(),
             );
             // 7. Configure the child (ALL of this happens BEFORE
             // `run()` consumes the loop — `run(mut self)` moves it, so
@@ -1804,6 +1808,7 @@ mod tests {
             sudo: crate::agent::harness::SudoDeps::default(),
             settle_timeout: Duration::from_secs(30 * 60),
             trust_db: None,
+            config_dir: None,
         };
         manager.set_native_deps(first.clone());
         // The first `set_native_deps` stored the deps (readable through
@@ -2287,6 +2292,7 @@ mod tests {
             sudo: SudoDeps::default(),
             settle_timeout,
             trust_db: None,
+            config_dir: None,
         });
         manager
     }
