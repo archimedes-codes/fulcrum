@@ -43,6 +43,7 @@ use crate::agent::harness::provider::{
 };
 use crate::agent::harness::retry::RetryPolicy;
 use crate::agent::harness::store::SessionStore;
+use crate::agent::mcp::{mcp_tool, McpManager};
 use crate::agent::permission::{native_permission_gate, PendingPermissions, PermissionOutcome};
 use crate::agent::rpc::RpcEvent;
 use crate::agent::session::{normalize, persist_update, EventSink, ThoughtState, TurnState};
@@ -167,6 +168,11 @@ pub struct AgentLoop {
     /// / `session-update` frames).
     pub sink: Arc<dyn EventSink>,
     pub todo_store: Arc<TodoStore>,
+    /// The MCP server manager (ADR 0018 — the `mcp` tool's machinery;
+    /// `pub` so a test can swap in a temp-config manager; constructed in
+    /// `new` with `home_dir` = `dirs::home_dir` + `project_cwd` =
+    /// `space_cwd`).
+    pub mcp: McpManager,
     /// The subagent dispatch handle (a native parent spawns an IN-PROCESS
     /// native child — `dispatch_native`; `None` when the manager is
     /// absent).
@@ -223,6 +229,13 @@ impl AgentLoop {
     ) -> Self {
         let compactor = Compactor::new(catalog.compaction, model.context_window);
         let (control_tx, control_queue) = mpsc::channel(8);
+        // The MCP manager (ADR 0018 — the `mcp` tool's machinery): the
+        // global `~/.pi/agent/mcp.json` + the project `<space_cwd>/.pi/
+        // mcp.json`.
+        let mcp = McpManager::new(
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            space_cwd.clone(),
+        );
         Self {
             session_id,
             space_cwd,
@@ -244,6 +257,7 @@ impl AgentLoop {
             trust_db,
             sink,
             todo_store,
+            mcp,
             subagent,
             sudo,
             retry,
@@ -432,6 +446,9 @@ impl AgentLoop {
                 },
             }
         }
+        // Session teardown: kill the MCP stdio children (dropping a
+        // `StdioClient` kills the child via `kill_on_drop`) + clear the state.
+        self.mcp.close_all();
     }
 
     /// Handle one prompt (the model → tool → retry/compaction loop).
@@ -999,6 +1016,15 @@ impl AgentLoop {
             }
             "ask" => self.ask_flow(&tc.arguments, &tc.id, turn).await,
             "subagent" | "dispatch_subagent" => self.dispatch_subagent(&tc.arguments, turn).await,
+            "mcp" => {
+                // RACED against the TURN token (finding 8b, round 2 — a Stop
+                // mid-mcp-call cancels the in-flight request + kills the stdio
+                // child; the flow's internal `cancel` is the TURN token too).
+                tokio::select! {
+                    r = mcp_tool(&mut self.mcp, &tc.arguments, turn) => r,
+                    _ = turn.cancelled() => Self::cancelled_tool_result(),
+                }
+            }
             other => ToolResult {
                 content: vec![ContentBlock::Text {
                     text: format!("unknown tool: {other}"),
@@ -1691,6 +1717,38 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                     "tools": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["task"]
+            }),
+        },
+        ToolSpec {
+            name: "mcp".into(),
+            description: [
+                "Gateway to MCP (Model Context Protocol) servers. Use this tool to discover and call tools from connected MCP servers.",
+                "",
+                "Workflow:",
+                "1. Search: mcp({ search: 'keyword' }) — find available tools",
+                "2. Describe: mcp({ describe: 'tool_name' }) — see full parameters",
+                "3. Call: mcp({ tool: 'tool_name', args: { ... } }) — execute the tool",
+                "",
+                "Other actions:",
+                "  Status:  mcp({}) or mcp({ action: 'status' }) — list all servers and their connection status",
+                "  List:    mcp({ server: 'name' }) — list all tools on a specific server",
+                "  Connect: mcp({ connect: 'name' }) — eagerly connect to a server",
+                "  Auth:    mcp({ action: 'auth', server: 'name' }) — run the interactive OAuth flow",
+                "",
+                "Use 'server' to disambiguate when two servers export a tool with the same name.",
+            ]
+            .join("\n"),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "tool": { "type": "string", "description": "Tool name to call" },
+                    "args": { "description": "Tool arguments (a JSON string or an object)" },
+                    "search": { "type": "string", "description": "Search tools by name/description keyword" },
+                    "describe": { "type": "string", "description": "Tool name to show full parameter schema for" },
+                    "connect": { "type": "string", "description": "Server name to eagerly connect" },
+                    "server": { "type": "string", "description": "Filter to a specific server (for list, search, or disambiguating calls)" },
+                    "action": { "type": "string", "description": "Action string ('status' or 'auth')" }
+                }
             }),
         },
     ]
@@ -3724,5 +3782,154 @@ mod tests {
         let sessions = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
         assert_eq!(sessions.len(), 1, "expected 1 model call for summarize");
         assert_eq!(sessions[0], Some("s1".to_string()));
+    }
+
+    /// (ADR 0018) A session with a temp `mcp.json` (the fake stdio server)
+    /// where the model emits an `mcp` tool call → the tool result
+    /// round-trips into the transcript (a `tool_execution_end` with the
+    /// echoed text).
+    #[tokio::test]
+    async fn an_mcp_tool_call_round_trips_into_the_transcript() {
+        // A temp dir with a `.pi/mcp.json` (the fake stdio server).
+        let dir = std::env::temp_dir().join(format!("mcp-loop-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".pi")).unwrap();
+        let bin = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_mcp_stdio"
+        ));
+        std::fs::write(
+            dir.join(".pi/mcp.json"),
+            serde_json::json!({
+                "mcpServers": { "a": { "command": bin.display().to_string() } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The model emits an `mcp` tool call (a `echo`), then a final
+        // response.
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "m1".to_string(),
+                    name: "mcp".to_string(),
+                    arguments: json!({ "tool": "echo", "args": { "text": "hi" } }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        // Swap in the temp-config MCP manager (the `build_loop` default reads
+        // the real home — this one reads the temp `mcp.json`).
+        loop_.mcp = McpManager::new(dir.clone(), dir.clone());
+        loop_.handle_prompt(&text_prompt("call the mcp tool")).await;
+        // The `mcp` tool result round-tripped (the `echo` → "hi").
+        let end = wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "m1")
+        })
+        .await
+        .expect("the `mcp` tool_execution_end");
+        let RpcEvent::tool_execution_end {
+            result, is_error, ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert!(!is_error, "the `mcp` call succeeded: {result:?}");
+        assert_eq!(result["content"][0]["text"], "hi");
+    }
+
+    /// (ADR 0018) A Stop mid-`mcp`-call cancels (the in-flight request is
+    /// cancelled — the tool result is `cancelled`; the turn settles, the
+    /// stdio child is killed via `kill_on_drop`).
+    #[tokio::test]
+    async fn a_stop_mid_mcp_call_cancels() {
+        let dir = std::env::temp_dir().join(format!("mcp-loop-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".pi")).unwrap();
+        let bin = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_mcp_stdio"
+        ));
+        std::fs::write(
+            dir.join(".pi/mcp.json"),
+            serde_json::json!({
+                "mcpServers": { "a": { "command": bin.display().to_string() } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The model emits an `mcp` tool call (a `hang` — never answers), then
+        // a final response.
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "m1".to_string(),
+                    name: "mcp".to_string(),
+                    arguments: json!({ "tool": "hang", "args": {} }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.mcp = McpManager::new(dir.clone(), dir.clone());
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("call mcp")).await });
+        // The `mcp` tool starts (the `hang` never answers).
+        wait_for_event(
+            &mut events_rx,
+            5000,
+            |e| matches!(e, RpcEvent::tool_execution_start { tool_name, .. } if tool_name == "mcp"),
+        )
+        .await
+        .expect("the `mcp` tool started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A Stop (the TURN cancel) mid-`mcp`-call.
+        turn_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel();
+        match tokio::time::timeout(Duration::from_secs(5), task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("the turn task failed: {e}"),
+            Err(_) => panic!("the turn did not settle after the Stop (it waited out the `hang`)"),
+        }
+        // The tool result is `cancelled` (the in-flight request was cancelled).
+        let end = wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "m1")
+        })
+        .await
+        .expect("the `mcp` tool_execution_end");
+        let RpcEvent::tool_execution_end {
+            result, is_error, ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert!(
+            is_error,
+            "a cancelled `mcp` call is an error result: {result:?}"
+        );
+        assert_eq!(result["content"][0]["text"], "cancelled");
     }
 }
