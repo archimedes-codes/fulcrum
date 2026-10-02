@@ -171,7 +171,7 @@ pub async fn register_client(
         return Err("the auth server has no registration endpoint (DCR unsupported)".to_string());
     };
     let body = json!({
-        "client_name": client_name,
+        "client_name": client_name.unwrap_or("archimedes"),
         "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
