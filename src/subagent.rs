@@ -621,6 +621,8 @@ impl SubagentSessionManager {
                     "parentSessionId": parent_session_id,
                     "agentName": agent_name,
                     "task": task,
+                    "model": launch.model.as_deref(),
+                    "thinkingLevel": launch.thinking.as_deref(),
                 }),
             );
 
