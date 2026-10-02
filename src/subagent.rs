@@ -76,6 +76,7 @@ pub struct SubagentSessionManager {
 /// Per-dispatch pi configuration for a subagent session (moved verbatim
 /// from `launch_wrapper.rs` — the wrapper script is deleted in this task;
 /// the flags are now passed directly to the `pi` spawn).
+#[derive(Clone, Debug, PartialEq)]
 pub struct LaunchConfig {
     /// The agent file body (named agents); `None` for config-less dispatch.
     pub system_prompt: Option<String>,
@@ -981,15 +982,16 @@ impl SubagentSessionManager {
             // nothing may touch `loop_` after the spawn). The child tool
             // set: `launch.tools` VERBATIM (a non-empty set that empties
             // out after the minus yields NO tools — NOT re-expanded) else
-            // the parent's — MINUS `subagent` (the recursion guard). The
-            // "empty = all" expansion applies ONLY to the inherited
-            // `parent_enabled_tools` case (where `[]` is the documented
-            // harness convention) — `tool_specs()`' names minus
-            // `subagent`.
+            // the parent's — MINUS `subagent` AND `list_agents` (the
+            // recursion guard — a child cannot dispatch, so it gets
+            // neither). The "empty = all" expansion applies ONLY to the
+            // inherited `parent_enabled_tools` case (where `[]` is the
+            // documented harness convention) — `tool_specs()`' names minus
+            // `subagent` and `list_agents`.
             let child_tools: Vec<String> = match &launch.tools {
                 Some(tools) => tools
                     .iter()
-                    .filter(|t| t.as_str() != "subagent")
+                    .filter(|t| !matches!(t.as_str(), "subagent" | "list_agents"))
                     .cloned()
                     .collect(),
                 None => {
@@ -997,12 +999,12 @@ impl SubagentSessionManager {
                         tool_specs()
                             .into_iter()
                             .map(|t| t.name)
-                            .filter(|t| t != "subagent")
+                            .filter(|t| !matches!(t.as_str(), "subagent" | "list_agents"))
                             .collect()
                     } else {
                         parent_enabled_tools
                             .iter()
-                            .filter(|t| t.as_str() != "subagent")
+                            .filter(|t| !matches!(t.as_str(), "subagent" | "list_agents"))
                             .cloned()
                             .collect()
                     }
@@ -2475,6 +2477,58 @@ mod tests {
         // The temp file is STILL cleaned up on the teardown exit (the
         // `TempFileGuard` is dropped at the driver task's scope end).
         wait_for_temp_file_cleanup(before).await;
+    }
+
+    /// (ADR 0020) a native child's `enabledTools` (the
+    /// `subagent-session-started` payload) NEVER contains `subagent` (the
+    /// recursion guard) nor `list_agents` (a child cannot dispatch, so
+    /// listing dispatch targets is pointless token burn) — even when the
+    /// PARENT's enabled tools carry `list_agents`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_native_child_excludes_subagent_and_list_agents_tools() {
+        let config_dir = temp_config_dir();
+        let provider: Arc<dyn Provider> = Arc::new(CannedProvider::new(vec![
+            ProviderEvent::TextDelta("hello".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]));
+        let manager = make_native_manager(&config_dir, provider, Duration::from_secs(20));
+        // A LIVE receiver (NOT `native_rec_sink` — it drops the
+        // receiver) + the existing `TestSink` (its `emit` records EVERY
+        // `(event, payload)` pair, so the `subagent-session-started`
+        // frame is captured).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
+
+        let (dispatch_rx, _cancel) = manager.dispatch_native(
+            "parent-1",
+            &config_dir,
+            &native_test_model(),
+            vec!["read".to_string(), "list_agents".to_string()],
+            "tester".to_string(),
+            default_native_launch(),
+            "do the thing".to_string(),
+            &sink,
+        );
+        // AWAIT the outcome BEFORE asserting: `dispatch_native` returns
+        // immediately and the `subagent-session-started` emit happens
+        // inside the `tokio::spawn`ed driver task (the emit
+        // happens-before the outcome resolves, so the frame is guaranteed
+        // present after the `await` — a `try_iter` called immediately
+        // could observe an empty channel).
+        let _ = tokio::time::timeout(Duration::from_secs(10), dispatch_rx)
+            .await
+            .expect("the dispatch must resolve within 10 s");
+        let started = rx
+            .try_iter()
+            .into_iter()
+            .find(|(event, _)| event == "subagent-session-started")
+            .expect("the `subagent-session-started` frame was emitted");
+        let (_, payload) = &started;
+        assert_eq!(
+            payload["enabledTools"],
+            serde_json::json!(["read"]),
+            "the child's `enabledTools` never contains `subagent` or `list_agents`"
+        );
     }
 
     /// Dispatch a native child (a `RecordingCannedProvider` + the

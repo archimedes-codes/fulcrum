@@ -47,7 +47,7 @@ use crate::agent::mcp::{mcp_tool, McpManager};
 use crate::agent::permission::{native_permission_gate, PendingPermissions, PermissionOutcome};
 use crate::agent::rpc::RpcEvent;
 use crate::agent::session::{normalize, persist_update, EventSink, ThoughtState, TurnState};
-use crate::agent::subagent::SubagentSessionManager;
+use crate::agent::subagent::{LaunchConfig, SubagentSessionManager};
 use crate::agent::todo::TodoStore;
 use crate::agent::tools::{execute_tool, ContentBlock, ImageRef, ToolCtx, ToolResult};
 use crate::storage::Db;
@@ -1020,6 +1020,7 @@ impl AgentLoop {
             }
             "ask" => self.ask_flow(&tc.arguments, &tc.id, turn).await,
             "subagent" | "dispatch_subagent" => self.dispatch_subagent(&tc.arguments, turn).await,
+            "list_agents" => self.list_agents_tool().await,
             "mcp" => {
                 // RACED against the TURN token (finding 8b, round 2 — a Stop
                 // mid-mcp-call cancels the in-flight request + kills the stdio
@@ -1108,6 +1109,10 @@ impl AgentLoop {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // ADR 0020: resolve `agentName` against the discovered Agent
+        // definitions (layered — explicit params win; no match / empty =
+        // config-less, never an error).
+        let launch = self.resolve_launch(&launch, &agent_name);
         let (dispatch_rx, cancel) = manager.dispatch_native(
             &self.session_id,
             &self.space_cwd,
@@ -1155,6 +1160,130 @@ impl AgentLoop {
                 details: None,
                 is_error: true,
             },
+        }
+    }
+
+    /// Resolve `agentName` against the discovered Agent definitions and
+    /// layer the frontmatter UNDER the explicit launch params (ADR 0020
+    /// — explicit > frontmatter > parent defaults). `agentName` empty /
+    /// no match → the `launch` is returned VERBATIM (the label-only,
+    /// config-less behavior — never an error).
+    fn resolve_launch(&self, launch: &LaunchConfig, agent_name: &str) -> LaunchConfig {
+        let name = agent_name.trim();
+        if name.is_empty() {
+            return launch.clone();
+        }
+        let Some(def) = crate::agents::discover_agents(Some(&self.space_cwd))
+            .into_iter()
+            .find(|d| d.name.eq_ignore_ascii_case(name))
+        else {
+            return launch.clone();
+        };
+        // A frontmatter `model` that resolves to NOTHING (not in the
+        // catalog — a stale file) degrades to the next layer (the
+        // explicit param, else the parent model) — a stale file must not
+        // fail the dispatch. The `:<level>` suffix is stripped ONLY for
+        // the resolvability check (mirroring `dispatch_native_inner`'s
+        // `rsplit_once(':')`); the stored value is the VERBATIM
+        // frontmatter string (the suffix is a thinking-level candidate
+        // handled downstream). An explicit `model` param is NEVER
+        // degraded here (it is the model's current intent —
+        // `dispatch_native` still fails it when unknown, unchanged).
+        let model = launch.model.clone().or_else(|| {
+            def.model.as_ref().and_then(|m| {
+                let bare = m
+                    .rsplit_once(':')
+                    .map(|(b, _)| b.to_string())
+                    .unwrap_or_else(|| m.clone());
+                crate::agent::session::resolve_composed_model(&self.catalog, &bare)
+                    .is_some()
+                    .then_some(m.clone())
+            })
+        });
+        // Unknown tool names in the frontmatter are DROPPED (a file
+        // hint, not precise intent), as are the parent-guarded
+        // `subagent` / `list_agents` (they can never reach the child —
+        // `dispatch_native_inner` strips them — so a file `tools:
+        // [subagent]` must degrade to ABSENT, not zero the child out).
+        // A list that empties out is treated as ABSENT (the child is
+        // never zeroed out by a stale file). An explicit `tools` param
+        // is NEVER filtered here (its semantics — verbatim,
+        // `dispatch_native` minus `subagent`/`list_agents` — are
+        // unchanged). `then_some` (NOT `then`) — the codebase precedent
+        // is `bridge.rs:1393`.
+        let specs = tool_specs();
+        let tools = launch.tools.clone().or_else(|| {
+            def.tools.as_ref().and_then(|t| {
+                let known: Vec<String> = t
+                    .iter()
+                    .filter(|name| {
+                        name.as_str() != "subagent"
+                            && name.as_str() != "list_agents"
+                            && specs.iter().any(|s| s.name == **name)
+                    })
+                    .cloned()
+                    .collect();
+                (!known.is_empty()).then_some(known)
+            })
+        });
+        // An EMPTY frontmatter body means "no system prompt" (the
+        // `or_else` must not turn it into `Some("")` — `dispatch_native`
+        // would prepend an empty message).
+        let system_prompt = launch
+            .system_prompt
+            .clone()
+            .or_else(|| (!def.system_prompt.is_empty()).then(|| def.system_prompt.clone()));
+        let thinking = launch.thinking.clone().or_else(|| def.thinking.clone());
+        LaunchConfig {
+            system_prompt,
+            model,
+            thinking,
+            tools,
+        }
+    }
+
+    /// The `list_agents` tool result: one line per discovered Agent
+    /// definition (ADR 0020), or `"none"`.
+    async fn list_agents_tool(&self) -> ToolResult {
+        let agents = crate::agents::discover_agents(Some(&self.space_cwd));
+        let text = if agents.is_empty() {
+            "none".to_string()
+        } else {
+            agents
+                .iter()
+                .map(|a| {
+                    // `description` may be a block scalar (`|`) with embedded
+                    // newlines — flatten it so the one-line-per-agent contract
+                    // holds. Only `description` is flattened: a block-scalar
+                    // `model` / `thinking` / `tools` is pathological (a
+                    // block-scalar `model` fails `resolve_composed_model` and
+                    // degrades; a block-scalar `tools` yields names that fail
+                    // the known-name filter and are dropped), so no flattening
+                    // is needed there.
+                    let description = a.description.replace('\n', " ");
+                    let mut line = format!("{} ({}): {}", a.name, a.scope, description);
+                    let mut notes: Vec<String> = Vec::new();
+                    if let Some(m) = &a.model {
+                        notes.push(format!("model: {m}"));
+                    }
+                    if let Some(t) = &a.thinking {
+                        notes.push(format!("thinking: {t}"));
+                    }
+                    if let Some(t) = &a.tools {
+                        notes.push(format!("tools: {}", t.join(", ")));
+                    }
+                    if !notes.is_empty() {
+                        line.push_str(&format!(" [{}]", notes.join(", ")));
+                    }
+                    line
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        ToolResult {
+            content: vec![ContentBlock::Text { text }],
+            details: None,
+            is_error: false,
         }
     }
 
@@ -1370,9 +1499,10 @@ impl AgentLoop {
 
     /// The tool specs advertised to the model (finding B): `tool_specs()`
     /// filtered by (a) `enabled_tools` (`None` = all; `Some(v)` = exactly
-    /// `v` — `Some(vec![])` = NO tools) and (b) dropping `subagent` when
-    /// the session is a subagent child (`is_child` — `subagent: None`; the
-    /// child cannot dispatch subagents, but a native parent may). The
+    /// `v` — `Some(vec![])` = NO tools) and (b) dropping `subagent` AND
+    /// `list_agents` when the session is a subagent child (`is_child` —
+    /// `subagent: None`; the child cannot dispatch subagents, so listing
+    /// dispatch targets is pointless token burn — but a native parent may). The
     /// `dispatch_tool` gate remains as defense in depth.
     fn advertised_tool_specs(enabled_tools: &Option<Vec<String>>, is_child: bool) -> Vec<ToolSpec> {
         tool_specs()
@@ -1382,8 +1512,9 @@ impl AgentLoop {
                     Some(tools) => tools.contains(&spec.name),
                     None => true,
                 };
-                let not_child_subagent = !is_child || spec.name != "subagent";
-                enabled && not_child_subagent
+                let not_child =
+                    !is_child || (spec.name != "subagent" && spec.name != "list_agents");
+                enabled && not_child
             })
             .collect()
     }
@@ -1710,7 +1841,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "subagent".into(),
-            description: "Dispatch a subagent to run a task in a separate session.".into(),
+            description: "Delegate tasks to subagents. `task` is required. Optional: `agentName` (a discovered Agent definition — its frontmatter model/thinking/tools + system-prompt body apply, layered under any explicit params), `model`, `systemPrompt`, `tools`. Omit `agentName` for a config-less dispatch (parent model, all tools, no system prompt). Model override is rarely needed.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1722,6 +1853,11 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["task"]
             }),
+        },
+        ToolSpec {
+            name: "list_agents".into(),
+            description: "List available subagent configurations (name, description, source, model/tools overrides). Call before dispatching if unsure which agents exist or which fits the task.".into(),
+            parameters: json!({ "type": "object" }),
         },
         ToolSpec {
             name: "mcp".into(),
@@ -3453,6 +3589,1022 @@ mod tests {
                 "tool `{name}`: advertised {advertised:?} != executor keys {expected:?}"
             );
         }
+    }
+
+    /// `HOME` restore guard for the `list_agents_tool` tests (a scope-exit
+    /// `Drop` — the Task 1 `RestoreHome` pattern: the restore happens even
+    /// when an assertion panics mid-test).
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                // SAFETY: the `ENV_LOCK` is still held at drop time (this
+                // guard is declared after the `_lock` guard and outlives
+                // it in reverse); no other thread mutates HOME concurrently.
+                Some(v) => unsafe {
+                    std::env::set_var("HOME", v);
+                },
+                // SAFETY: the `ENV_LOCK` is still held at drop time (this
+                // guard is declared after the `_lock` guard and outlives
+                // it in reverse); no other thread mutates HOME concurrently.
+                None => unsafe {
+                    std::env::remove_var("HOME");
+                },
+            }
+        }
+    }
+
+    /// (ADR 0020) `list_agents` is advertised to a native PARENT: it is in
+    /// `tool_specs()` with its description, and in the parent's advertised
+    /// specs (the `enabled_tools` filter `None` = all).
+    #[test]
+    fn list_agents_is_in_the_default_tool_specs() {
+        let specs = tool_specs();
+        let spec = specs
+            .iter()
+            .find(|s| s.name == "list_agents")
+            .expect("`list_agents` in `tool_specs`");
+        assert_eq!(
+            spec.description,
+            "List available subagent configurations (name, description, source, model/tools overrides). Call before dispatching if unsure which agents exist or which fits the task."
+        );
+        let advertised = AgentLoop::advertised_tool_specs(&None, false);
+        assert!(
+            advertised.iter().any(|s| s.name == "list_agents"),
+            "a native parent advertises `list_agents`"
+        );
+    }
+
+    /// (ADR 0020) a subagent CHILD gets neither `subagent` (the recursion
+    /// guard) nor `list_agents` (a child cannot dispatch, so listing
+    /// dispatch targets is pointless token burn). The CONTRAST assertions
+    /// (the parent advertises BOTH) are what keep this test from passing
+    /// VACUOUSLY — without them, "the child drops `list_agents`" is
+    /// trivially true while the spec is not in `tool_specs()` yet.
+    #[test]
+    fn a_child_does_not_advertise_subagent_or_list_agents() {
+        let child = AgentLoop::advertised_tool_specs(&None, true);
+        assert!(
+            !child.iter().any(|s| s.name == "subagent"),
+            "a child does not advertise `subagent`"
+        );
+        assert!(
+            !child.iter().any(|s| s.name == "list_agents"),
+            "a child does not advertise `list_agents`"
+        );
+        // CONTRAST: the parent advertises BOTH.
+        let parent = AgentLoop::advertised_tool_specs(&None, false);
+        assert!(
+            parent.iter().any(|s| s.name == "subagent"),
+            "a parent advertises `subagent` (contrast)"
+        );
+        assert!(
+            parent.iter().any(|s| s.name == "list_agents"),
+            "a parent advertises `list_agents` (contrast)"
+        );
+    }
+
+    /// (ADR 0020) the `list_agents` handler lists the DISCOVERED Agent
+    /// definitions (one line each: `name (scope): description [+ the
+    /// model / thinking / tools notes]`). The user-level roots are
+    /// ISOLATED first (a developer's real `~/.agents/agents` /
+    /// `~/.pi/agent/agents` files would add lines and break the exact
+    /// assertion: hold `ENV_LOCK` for the WHOLE set→assert→restore span;
+    /// `HOME` → an empty scratch; restore via the drop guard).
+    /// `#[allow(clippy::await_holding_lock)]` is INTENTIONAL: the handler reads
+    /// `HOME` (via `user_roots`), so the guard must stay held ACROSS the
+    /// `.await` to serialize against the other HOME-reading tests — dropping
+    /// it before the await would open a window where a sibling test could
+    /// flip `HOME` mid-discovery.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn list_agents_tool_lists_discovered_agents() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let (events_tx, _events_rx) = mpsc::channel(8);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let (settle_tx, _settle_rx) = watch::channel(0u64);
+        let loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel,
+            settle_tx,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let empty_home =
+            std::env::temp_dir().join(format!("harness-list-agents-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty_home).unwrap();
+        // The `env_lock` helper is poison-tolerant (a sibling test
+        // panicking while holding the lock must not turn this test's
+        // failure into an opaque `PoisonError` panic — see its docs).
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &empty_home);
+        }
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\ntools: [read, bash]\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let result = loop_.list_agents_tool().await;
+        assert_eq!(
+            result_text(&result),
+            "scout (space): Fast recon. [model: fake/m2, tools: read, bash]"
+        );
+    }
+
+    /// (ADR 0020) with NO discovered definitions, the `list_agents` result
+    /// is `none` (same `ENV_LOCK` + `HOME`-to-empty-scratch isolation —
+    /// the developer's user-level files must not appear; the guard is held
+    /// across the `.await` for the same reason as above — `#[allow]` is
+    /// intentional).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn list_agents_tool_returns_none_when_empty() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let (events_tx, _events_rx) = mpsc::channel(8);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let (settle_tx, _settle_rx) = watch::channel(0u64);
+        let loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel,
+            settle_tx,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let empty_home =
+            std::env::temp_dir().join(format!("harness-list-agents-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty_home).unwrap();
+        // The `env_lock` helper is poison-tolerant (a sibling test
+        // panicking while holding the lock must not turn this test's
+        // failure into an opaque `PoisonError` panic — see its docs).
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &empty_home);
+        }
+        let result = loop_.list_agents_tool().await;
+        assert_eq!(result_text(&result), "none");
+    }
+
+    /// (ADR 0020) a block-scalar `description` (`|` with embedded
+    /// newlines) is FLATTENED to one line in the `list_agents` output
+    /// (the one-line-per-agent contract holds — the block's internal
+    /// newlines become single spaces). The agent is written to the
+    /// space-level `.pi/agents` root (the other space root,
+    /// `.agents/agents`, is covered by the sibling test above); same
+    /// `ENV_LOCK` + `HOME`-to-empty-scratch isolation (the developer's
+    /// user-level files must not appear; the guard is held across the
+    /// `.await` — `#[allow]` is intentional).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn list_agents_tool_flattens_block_scalar_descriptions() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let (events_tx, _events_rx) = mpsc::channel(8);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let (settle_tx, _settle_rx) = watch::channel(0u64);
+        let loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel,
+            settle_tx,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let empty_home =
+            std::env::temp_dir().join(format!("harness-list-agents-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty_home).unwrap();
+        // The `env_lock` helper is poison-tolerant (a sibling test
+        // panicking while holding the lock must not turn this test's
+        // failure into an opaque `PoisonError` panic — see its docs).
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &empty_home);
+        }
+        // The space-level `.pi/agents` root (the other space root,
+        // `.agents/agents`, is covered by the sibling test above).
+        let agent_file = loop_.space_cwd.join(".pi/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: |\n  line one\n  line two\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let result = loop_.list_agents_tool().await;
+        let text = result_text(&result);
+        assert!(
+            text.contains("line one line two"),
+            "a block-scalar description is flattened to one line: {text:?}"
+        );
+        // The one-line-per-agent contract holds: a raw embedded newline
+        // leaking from the block scalar would split the output into
+        // extra lines (we wrote exactly one agent).
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "one line per agent (a leaked block-scalar newline would add lines): {text:?}"
+        );
+    }
+
+    /// A `Model` for a given bare id (a `fake` provider — the unit
+    /// tests' catalog entry; the single-model `build_loop` catalog is
+    /// `fake/m1`, so a frontmatter `model: fake/m2` is STALE by
+    /// construction — exactly the degrade case).
+    fn fake_model(id: &str) -> Model {
+        Model {
+            id: id.to_string(),
+            provider: "fake".to_string(),
+            base_url: "http://fake".to_string(),
+            api_key: "k".to_string(),
+            context_window: 128000,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// Build an `AgentLoop` with a `subagent` manager + a MULTI-model
+    /// catalog (a copy of `build_loop_with_db`'s body with the `Db`
+    /// assertion seam dropped — the `models` vec in the `ModelCatalog`,
+    /// the `subagent` `AgentLoop::new` arg set to `subagent_manager`,
+    /// the `sink` passed through instead of the fixed `TestSink`). The
+    /// PARENT's `model` arg is `models[0]`; the parent's `ModelCatalog`
+    /// gets the full `models` vec.
+    #[allow(clippy::too_many_arguments)]
+    fn build_loop_with_subagent(
+        provider: Box<dyn Provider>,
+        events: mpsc::Sender<RpcEvent>,
+        turn_cancel: Arc<StdMutex<CancellationToken>>,
+        settle_tx: watch::Sender<u64>,
+        retry: RetryPolicy,
+        sink: Arc<dyn EventSink>,
+        subagent_manager: Option<Arc<SubagentSessionManager>>,
+        models: Vec<Model>,
+    ) -> AgentLoop {
+        let dir = std::env::temp_dir().join(format!("harness-loop-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
+        let catalog = ModelCatalog {
+            models: models.clone(),
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let (prompt_tx, prompt_rx) = mpsc::channel(8);
+        AgentLoop::new(
+            "s1".to_string(),
+            dir,
+            models[0].clone(),
+            provider,
+            catalog,
+            SessionStore::new(db),
+            events,
+            CancellationToken::new(),
+            turn_cancel,
+            settle_tx,
+            prompt_tx,
+            prompt_rx,
+            Arc::new(TokioMutex::new(HashMap::new())),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            None,
+            sink,
+            Arc::new(crate::agent::todo::TodoStore::new()),
+            subagent_manager,
+            SudoDeps::default(),
+            retry,
+            None,
+        )
+    }
+
+    /// A recorded child-model request (the `complete` argument's
+    /// `model` / the first `System` message's text / the tool names).
+    #[derive(Clone)]
+    struct RecordedRequest {
+        model: String,
+        system: Option<String>,
+        tool_names: Vec<String>,
+    }
+
+    /// A `Provider` that RECORDS each `complete` request's `model` +
+    /// the first `System` message's text + the tool names into a shared
+    /// `Arc<StdMutex<Vec<RecordedRequest>>>` and returns a fixed
+    /// single-response stream (the test-12 child — every model call
+    /// settles the child's turn).
+    struct RequestRecordingProvider {
+        recorded: Arc<StdMutex<Vec<RecordedRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RequestRecordingProvider {
+        async fn complete(
+            &self,
+            req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            let system = req
+                .messages
+                .iter()
+                .find(|m| m.role == ChatRole::System)
+                .and_then(|m| match &m.content {
+                    MessageContent::Text(t) => Some(t.clone()),
+                    _ => None,
+                });
+            let tool_names = req.tools.iter().map(|t| t.name.clone()).collect();
+            self.recorded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(RecordedRequest {
+                    model: req.model.clone(),
+                    system,
+                    tool_names,
+                });
+            Ok(futures_util::stream::iter(vec![
+                ProviderEvent::TextDelta("scout done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ])
+            .boxed())
+        }
+    }
+
+    /// Build a `SubagentSessionManager` with `NativeDeps` set (a
+    /// `provider_factory` returning a `RequestRecordingProvider`
+    /// (sharing `recorded`) for ANY model + the given catalog + settle
+    /// bound) — the `subagent.rs` `make_native_manager` mirror (its
+    /// `.expect("subagent manager should build")` included).
+    fn make_native_manager(
+        config_dir: &std::path::Path,
+        recorded: Arc<StdMutex<Vec<RecordedRequest>>>,
+        catalog: ModelCatalog,
+        settle_timeout: Duration,
+    ) -> Arc<SubagentSessionManager> {
+        let manager = Arc::new(
+            SubagentSessionManager::new(config_dir.to_path_buf(), None)
+                .expect("subagent manager should build"),
+        );
+        let factory: crate::agent::session::ProviderFactory = Arc::new(move |_m: &Model| {
+            Box::new(RequestRecordingProvider {
+                recorded: recorded.clone(),
+            })
+        });
+        manager.set_native_deps(crate::agent::subagent::NativeDeps {
+            provider_factory: factory,
+            catalog,
+            todo_store: Arc::new(crate::agent::todo::TodoStore::new()),
+            sudo: SudoDeps::default(),
+            settle_timeout,
+            trust_db: None,
+            config_dir: None,
+        });
+        manager
+    }
+
+    /// A recording `EventSink` (pushes EVERY event's `(name, payload)`
+    /// — the `TestSink` captures only `session-update` and cannot see
+    /// `subagent-session-started`).
+    struct RecordingSink {
+        events: Arc<StdMutex<Vec<(String, Value)>>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((event.to_string(), payload));
+        }
+    }
+
+    /// (ADR 0020) `agent_name: ""` → the launch is returned VERBATIM
+    /// (the label-only, config-less behavior — never an error).
+    #[test]
+    fn resolve_launch_no_agent_name_returns_the_launch_verbatim() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let launch = LaunchConfig {
+            system_prompt: Some("explicit prompt".to_string()),
+            model: Some("fake/m1".to_string()),
+            thinking: Some("high".to_string()),
+            tools: Some(vec!["bash".to_string()]),
+        };
+        assert_eq!(
+            loop_.resolve_launch(&launch, ""),
+            launch,
+            "an empty agentName returns the launch verbatim"
+        );
+    }
+
+    /// (ADR 0020) an `agent_name` matching NO discovered definition →
+    /// the launch is returned VERBATIM. The user-level roots are
+    /// ISOLATED first (a developer's real `~/.pi/agent/agents/nope.md`
+    /// would match and break the "no match" case — the same
+    /// `ENV_LOCK` / `HOME`-to-empty-scratch drop-guard pattern as the
+    /// `list_agents_tool` tests).
+    #[test]
+    fn resolve_launch_unknown_agent_name_returns_the_launch_verbatim() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let empty_home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&empty_home).unwrap();
+        // The `env_lock` helper is poison-tolerant (a sibling test
+        // panicking while holding the lock must not turn this test's
+        // failure into an opaque `PoisonError` panic — see its docs).
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &empty_home);
+        }
+        let launch = LaunchConfig {
+            system_prompt: Some("explicit prompt".to_string()),
+            model: Some("fake/m1".to_string()),
+            thinking: Some("high".to_string()),
+            tools: Some(vec!["bash".to_string()]),
+        };
+        assert_eq!(
+            loop_.resolve_launch(&launch, "nope"),
+            launch,
+            "an unknown agentName returns the launch verbatim"
+        );
+    }
+
+    /// (ADR 0020) a CASE-INSENSITIVE exact match applies the frontmatter
+    /// (the file's `name: scout` matches `agentName: "Scout"`).
+    #[test]
+    fn resolve_launch_case_insensitive_match() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "Scout");
+        assert_eq!(resolved.model, Some("fake/m1".to_string()));
+        assert_eq!(resolved.thinking, Some("low".to_string()));
+        assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
+        assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
+    }
+
+    /// (ADR 0020) an all-`None` launch + a file with `model` (IN the
+    /// catalog), `thinking`, `tools` + a body → ALL FOUR fields are
+    /// populated from the file (the frontmatter fills the gaps).
+    #[test]
+    fn resolve_launch_frontmatter_fills_gaps() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [read, bash]\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
+        assert_eq!(resolved.model, Some("fake/m1".to_string()));
+        assert_eq!(resolved.thinking, Some("low".to_string()));
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["read".to_string(), "bash".to_string()])
+        );
+    }
+
+    /// (ADR 0020) a launch with ALL FOUR fields set to values X + a file
+    /// with DIFFERENT values Y, EXCEPT `launch.thinking` is `None` →
+    /// the three set fields keep X (the explicit params win) AND
+    /// `thinking` becomes Y (the `None` field is filled from the file —
+    /// the second assertion fails under the verbatim stub, which would
+    /// leave `thinking` `None`).
+    #[test]
+    fn resolve_launch_explicit_params_win_over_frontmatter() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: Some("X prompt".to_string()),
+            model: Some("fake/m1".to_string()),
+            thinking: None,
+            tools: Some(vec!["bash".to_string()]),
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        // The explicit params win (the file's `model: fake/m2` is stale
+        // anyway — the explicit `fake/m1` is the next layer):
+        assert_eq!(resolved.system_prompt, Some("X prompt".to_string()));
+        assert_eq!(resolved.model, Some("fake/m1".to_string()));
+        assert_eq!(resolved.tools, Some(vec!["bash".to_string()]));
+        // The `None` field is filled from the file:
+        assert_eq!(resolved.thinking, Some("low".to_string()));
+    }
+
+    /// (ADR 0020) a frontmatter `model` that resolves to NOTHING (not in
+    /// the catalog — a stale file) degrades to the next layer (the
+    /// explicit param, else the parent model) — a stale file must not
+    /// fail the dispatch. `thinking` (unaffected by the model degrade)
+    /// is still filled from the file — the second assertion fails under
+    /// the verbatim stub.
+    #[test]
+    fn resolve_launch_stale_frontmatter_model_degrades_to_explicit_param() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\n---\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: Some("fake/m1".to_string()),
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "the stale frontmatter model degrades to the explicit param"
+        );
+        assert_eq!(
+            resolved.thinking,
+            Some("low".to_string()),
+            "the thinking is still filled from the file"
+        );
+    }
+
+    /// (ADR 0020) a stale frontmatter `model` + an all-`None` launch →
+    /// `model` degrades to `None` (the parent model applies downstream)
+    /// AND `tools` is still filled from the file (the second assertion
+    /// fails under the verbatim stub).
+    #[test]
+    fn resolve_launch_stale_frontmatter_model_degrades_to_none() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\ntools: [read]\n---\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.model, None,
+            "the stale frontmatter model degrades to `None` (the parent model applies downstream)"
+        );
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["read".to_string()]),
+            "the tools are still filled from the file"
+        );
+    }
+
+    /// (ADR 0020) a stale frontmatter `model` WITH a `:<level>` suffix:
+    /// the suffix is stripped ONLY for the resolvability check (the bare
+    /// `fake/m2` is not in the catalog — the suffix does not save it)
+    /// AND `system_prompt` is still filled from the body (the second
+    /// assertion fails under the verbatim stub).
+    #[test]
+    fn resolve_launch_stale_model_with_level_suffix_degrades() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2:high\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.model, None,
+            "the bare `fake/m2` is not in the catalog — the suffix does not save it"
+        );
+        assert_eq!(
+            resolved.system_prompt,
+            Some("You are a scout.".to_string()),
+            "the body is still filled from the file"
+        );
+    }
+
+    /// (ADR 0020) unknown tool names in the frontmatter are DROPPED (a
+    /// file hint, not precise intent) — known names are kept.
+    #[test]
+    fn resolve_launch_unknown_tool_names_are_dropped() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\ntools: [read, bogus_tool]\n---\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["read".to_string()]),
+            "known names are kept, unknown names are dropped"
+        );
+    }
+
+    /// (ADR 0020) a frontmatter `tools` list that empties out after the
+    /// unknown-name drop is treated as ABSENT (the child is never
+    /// zeroed out by a stale file) AND `model` (IN the catalog) is
+    /// still filled from the file (the second assertion fails under the
+    /// verbatim stub).
+    #[test]
+    fn resolve_launch_tools_emptied_out_degrades_to_none() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [bogus_tool]\n---\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.tools, None,
+            "an emptied-out list degrades to `None` (never an empty allowlist)"
+        );
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "the model (in the catalog) is still filled from the file"
+        );
+    }
+
+    /// (ADR 0020) a frontmatter `tools` list that holds ONLY the
+    /// parent-guarded names (`subagent` / `list_agents` — they can never
+    /// reach the child) is treated as ABSENT (the child is never
+    /// zeroed out by a stale file) AND `model` (IN the catalog) is
+    /// still filled from the file (the second assertion fails under a
+    /// no-op change).
+    ///
+    /// No `env_lock()` here (intentional): `resolve_launch` reads `HOME`
+    /// (via `discover_agents` → `user_roots`) concurrently with the
+    /// `HOME`-mutating tests, but the isolation is safe by construction:
+    /// (1) the space-level roots are scanned FIRST (first-wins dedupe),
+    /// so a user-level same-name file can never shadow the space-level
+    /// definition written below; (2) the mutators' scratch homes contain
+    /// no agent files. Asserting on a USER-level definition would
+    /// require `env_lock()` first.
+    #[test]
+    fn resolve_launch_guarded_tool_names_in_frontmatter_degrade_to_none() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [subagent, list_agents]\n---\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.tools, None,
+            "a guarded-only list degrades to `None` (never an empty allowlist)"
+        );
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "the model (in the catalog) is still filled from the file"
+        );
+    }
+
+    /// (ADR 0020) an EMPTY frontmatter body means "no system prompt" (an
+    /// `or_else` must not turn it into `Some("")` — `dispatch_native`
+    /// would prepend an empty message) AND `thinking` is still filled
+    /// from the file (the second assertion fails under the verbatim
+    /// stub).
+    #[test]
+    fn resolve_launch_empty_body_means_no_system_prompt() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let loop_ = build_loop(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nthinking: low\n---\n",
+        )
+        .unwrap();
+        let launch = LaunchConfig {
+            system_prompt: None,
+            model: None,
+            thinking: None,
+            tools: None,
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.system_prompt, None,
+            "an empty body means `None` (NOT `Some(\"\")` )"
+        );
+        assert_eq!(
+            resolved.thinking,
+            Some("low".to_string()),
+            "the thinking is still filled from the file"
+        );
+    }
+
+    /// (ADR 0020) End-to-end: a native subagent dispatched with an
+    /// `agentName` matching a discovered definition runs the FRONTMATTER
+    /// config (the `dispatch_subagent` → `resolve_launch` layering — the
+    /// child's `subagent-session-started` payload carries the
+    /// frontmatter's `model` + `tools`, and the child's first model
+    /// request carries the frontmatter body as its system message with
+    /// exactly the frontmatter's tool).
+    ///
+    /// No `env_lock()` here (intentional): `resolve_launch` reads `HOME`
+    /// (via `discover_agents` → `user_roots`), concurrently with the
+    /// `HOME`-mutating tests — but the isolation is safe by construction:
+    /// (1) the space-level roots are scanned FIRST (first-wins dedupe),
+    /// so a user-level `scout` file can never shadow the space-level
+    /// `scout` written below; (2) the mutators' scratch homes contain no
+    /// agent files. If this test ever asserts on a USER-level definition,
+    /// it must take `env_lock()` (and set `HOME`) first.
+    #[tokio::test]
+    async fn a_native_subagent_with_a_matching_agent_name_runs_the_frontmatter_config() {
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "recon the auth code", "agentName": "scout" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        // A TWO-model catalog: `fake/m1` (the parent) + `fake/m2` (the
+        // frontmatter target — IN the catalog, so it is NOT stale).
+        let models = vec![fake_model("m1"), fake_model("m2")];
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-agent-def-e2e-cfg-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let recorded = Arc::new(StdMutex::new(Vec::<RecordedRequest>::new()));
+        let manager = make_native_manager(
+            &config_dir,
+            recorded.clone(),
+            ModelCatalog {
+                models: models.clone(),
+                default_model: None,
+                compaction: CompactionConfig::default(),
+            },
+            Duration::from_secs(30),
+        );
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        });
+        let mut loop_ = build_loop_with_subagent(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            Some(manager),
+            models,
+        );
+        // The Agent definition (the loop's `space_cwd` is the Space root
+        // — the frontmatter's `model` is IN the catalog, so it is NOT
+        // stale).
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        loop_.handle_prompt(&text_prompt("go")).await;
+        // The parent turn settled (bounded — the `ScriptedProvider`
+        // settles it; the child ran to completion inside the dispatch).
+        wait_for_event(&mut events_rx, 20000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the parent turn settled");
+        // The `subagent-session-started` frame (the `TestSink` cannot
+        // see it — the `RecordingSink` records EVERY event): the child's
+        // RESOLVED model / tools / thinking carry the frontmatter.
+        let events = sink_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let started = events
+            .iter()
+            .find(|(name, _)| name == "subagent-session-started")
+            .expect("the `subagent-session-started` frame was emitted");
+        assert_eq!(
+            started.1["model"], "fake/m2",
+            "the child runs the frontmatter's model (the catalog's `fake/m2`)"
+        );
+        assert_eq!(
+            started.1["enabledTools"],
+            json!(["read"]),
+            "the child's tools are the frontmatter's allowlist"
+        );
+        assert_eq!(
+            started.1["thinkingLevel"], "low",
+            "the child's thinking level is the frontmatter's"
+        );
+        // The child's FIRST model request (the `RequestRecordingProvider`
+        // records every request — the parent's are `m1`, the child's is
+        // `m2`): the frontmatter body is the system message, and the
+        // tool list is exactly the frontmatter's.
+        let recorded = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let child = recorded
+            .iter()
+            .find(|r| r.model == "m2")
+            .expect("the child requested `fake/m2` (NOT the parent's `fake/m1`)");
+        assert_eq!(
+            child.system,
+            Some("You are a scout.".to_string()),
+            "the frontmatter body is the child's system message"
+        );
+        assert_eq!(
+            child.tool_names,
+            vec!["read".to_string()],
+            "the child gets exactly the frontmatter's tool"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ const PREAMBLE: &str = "You are an expert coding assistant operating inside Arch
 
 const TODO_GUIDANCE: &str = "Use manage_todo_list to track multi-step work — write the plan before starting, mark items completed as you go";
 
-const SUBAGENT_GUIDANCE: &str = "Delegate independent subtasks with subagent — give each a systemPrompt describing its role and constraints (e.g. a read-only researcher, a focused reviewer)";
+const SUBAGENT_GUIDANCE: &str = "Delegate independent subtasks with subagent — give each a systemPrompt describing its role and constraints (e.g. a read-only researcher, a focused reviewer), or a discovered agent (list_agents)";
 
 const CONTEXT_CANDIDATES: &[&str] = &[
     "AGENTS.override.md",
@@ -480,6 +480,27 @@ When a skill file references a relative path, resolve it against the skill direc
                  </rules>"
             )),
             "all 4 lines in the exact order: {prompt}"
+        );
+    }
+
+    // 2b — (ADR 0020) the guidance mentions `list_agents` (the parent
+    // discovers its Agent definitions via the `list_agents` tool).
+    #[test]
+    fn the_subagent_guidance_mentions_list_agents() {
+        let root = scratch();
+        let cwd = root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let tools = vec![spec("subagent", "Launch a subagent.")];
+        let ctx = PromptContext {
+            cwd: &cwd,
+            agent_dir: Path::new(""),
+            tools: &tools,
+            skills: &[],
+        };
+        let prompt = build_main_prompt(&ctx);
+        assert!(
+            prompt.contains("or a discovered agent (list_agents)"),
+            "SUBAGENT_GUIDANCE must mention list_agents: {prompt}"
         );
     }
 
