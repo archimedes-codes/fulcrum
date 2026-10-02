@@ -8,8 +8,8 @@
 //! the `SessionStore` (the `native_messages` table).
 //!
 //! Tools are dispatched IN-PROCESS (the native `ToolRegistry`): the
-//! built-ins (Task 1's `execute_tool`) + the suite tools (the frame-free
-//! cores of the existing bridge handlers — `todo_apply` /
+//! built-ins (Task 1's `execute_tool`) + the suite tools (the in-process
+//! cores of the interactive channel — `todo_apply` /
 //! `sudo_run_flow` / the in-process `ask` waiter) + `subagent` (a native
 //! parent spawns an IN-PROCESS native child — `dispatch_native`: an
 //! in-process `AgentLoop` with the parent's model / tools minus
@@ -31,10 +31,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::bridge::{
-    bridge_key, sudo_run_flow, todo_apply, CachedPassword, PendingBridge, PendingSudo,
-    RealSudoRunner, SudoRunner,
-};
+use crate::agent::events::RpcEvent;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
 use crate::agent::harness::compact::{split_for_compaction, Compactor};
 use crate::agent::harness::provider::{
@@ -43,9 +40,12 @@ use crate::agent::harness::provider::{
 };
 use crate::agent::harness::retry::RetryPolicy;
 use crate::agent::harness::store::SessionStore;
+use crate::agent::interactive::{
+    interactive_key, sudo_run_flow, todo_apply, CachedPassword, PendingInteractive, PendingSudo,
+    RealSudoRunner, SudoRunner,
+};
 use crate::agent::mcp::{mcp_tool, McpManager};
 use crate::agent::permission::{native_permission_gate, PendingPermissions, PermissionOutcome};
-use crate::agent::rpc::RpcEvent;
 use crate::agent::session::{normalize, persist_update, EventSink, ThoughtState, TurnState};
 use crate::agent::subagent::{LaunchConfig, SubagentSessionManager};
 use crate::agent::todo::TodoStore;
@@ -160,11 +160,11 @@ pub struct AgentLoop {
     pub control_tx: mpsc::Sender<ControlCmd>,
     control_queue: mpsc::Receiver<ControlCmd>,
     pub pending_permissions: PendingPermissions,
-    pub pending_bridge: PendingBridge,
+    pub pending_bridge: PendingInteractive,
     /// The trust lookup source (ADR 0010 — the permission gate's
     /// `space_trusted` lookup; `None` = fail-closed: the gate prompts).
     pub trust_db: Option<Arc<Db>>,
-    /// The Tauri event sink (the `permission-request` / `bridge-request`
+    /// The Tauri event sink (the `permission-request` / `interactive-request`
     /// / `session-update` frames).
     pub sink: Arc<dyn EventSink>,
     pub todo_store: Arc<TodoStore>,
@@ -219,7 +219,7 @@ impl AgentLoop {
         prompt_tx: mpsc::Sender<Prompt>,
         prompt_queue: mpsc::Receiver<Prompt>,
         pending_permissions: PendingPermissions,
-        pending_bridge: PendingBridge,
+        pending_bridge: PendingInteractive,
         trust_db: Option<Arc<Db>>,
         sink: Arc<dyn EventSink>,
         todo_store: Arc<TodoStore>,
@@ -940,8 +940,8 @@ impl AgentLoop {
 
     /// The native `ToolRegistry`: a `match` on the tool name — the
     /// built-ins (Task 1's `execute_tool`, in-process, `ToolCtx { cwd,
-    /// cancel }`) + the suite tools (the frame-free cores of the existing
-    /// bridge handlers, called in-process — NOT over the bridge) +
+    /// cancel }`) + the suite tools (the in-process cores of the
+    /// interactive channel, called in-process — NOT over a socket) +
     /// `subagent` (a native parent spawns an IN-PROCESS native child via
     /// `dispatch_native`).
     async fn dispatch_tool(&mut self, tc: &ToolCall, turn: &CancellationToken) -> ToolResult {
@@ -999,7 +999,7 @@ impl AgentLoop {
             "sudo_exec" => {
                 // RACED against the TURN token (finding 8b, round 2 —
                 // the confirm / password sub-prompts `select!` only on
-                // the SESSION teardown token + the 330 s bridge
+                // the SESSION teardown token + the 330 s interactive
                 // timeout: a Stop while a dialog is open would wait out
                 // up to 330 s, and a confirm answered AFTER the Stop
                 // would still EXECUTE the elevated command).
@@ -1040,8 +1040,8 @@ impl AgentLoop {
         }
     }
 
-    /// The in-process `ask` flow (the `ask` bridge method's flow — a
-    /// `pending_bridge` oneshot + `bridge-request` event + the 300 s
+    /// The in-process `ask` flow (the `ask` interactive method's flow — a
+    /// `pending_bridge` oneshot + `interactive-request` event + the 300 s
     /// cap): the user's answer is shaped per the suite's
     /// `shapeAskResult` (a cancel → the cancelled shape; otherwise the
     /// `User answers` content).
@@ -1051,14 +1051,14 @@ impl AgentLoop {
         request_id: &str,
         turn: &CancellationToken,
     ) -> ToolResult {
-        let key = bridge_key(&self.session_id, request_id);
+        let key = interactive_key(&self.session_id, request_id);
         let (tx, rx) = oneshot::channel();
         {
             let mut map = self.pending_bridge.lock().await;
             map.insert(key.clone(), tx);
         }
         self.sink.emit(
-            "bridge-request",
+            "interactive-request",
             json!({
                 "sessionId": self.session_id,
                 "requestId": request_id,
@@ -1092,7 +1092,7 @@ impl AgentLoop {
                 is_error: true,
             };
         };
-        let (task, launch) = match crate::agent::bridge::dispatch_params(params) {
+        let (task, launch) = match crate::agent::interactive::dispatch_params(params) {
             Some(p) => p,
             None => {
                 return ToolResult {
@@ -1209,8 +1209,8 @@ impl AgentLoop {
         // never zeroed out by a stale file). An explicit `tools` param
         // is NEVER filtered here (its semantics — verbatim,
         // `dispatch_native` minus `subagent`/`list_agents` — are
-        // unchanged). `then_some` (NOT `then`) — the codebase precedent
-        // is `bridge.rs:1393`.
+        // unchanged). `then_some` (NOT `then`) — an absent `tools`
+        // stays `None`.
         let specs = tool_specs();
         let tools = launch.tools.clone().or_else(|| {
             def.tools.as_ref().and_then(|t| {
@@ -2124,7 +2124,11 @@ mod tests {
             _password: String,
             _timeout: Duration,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = crate::agent::bridge::SudoRun> + Send + 'static>,
+            Box<
+                dyn std::future::Future<Output = crate::agent::interactive::SudoRun>
+                    + Send
+                    + 'static,
+            >,
         > {
             self.ran.store(true, Ordering::SeqCst);
             Box::pin(async { unreachable!("the recording runner never completes a run") })
@@ -2283,7 +2287,6 @@ mod tests {
         // rewrite) are valid.
         db.record_session(&crate::agent::SessionInfo {
             session_id: "s1".to_string(),
-            agent_id: "native".to_string(),
             cwd: std::path::PathBuf::from("/tmp"),
             capabilities: serde_json::json!({}),
             config_options: None,
@@ -2657,7 +2660,7 @@ mod tests {
     /// (finding 8b, round 2) A `sudo_exec` blocking on its confirm
     /// sub-prompt + a TURN cancel → the flow returns a cancelled result
     /// PROMPTLY (the turn token is raced — pre-fix the flow selected
-    /// only on the SESSION teardown token + the 330 s bridge timeout,
+    /// only on the SESSION teardown token + the 330 s interactive timeout,
     /// so a Stop waited out up to 330 s, and a confirm answered AFTER
     /// the Stop still EXECUTED the elevated command). The command is
     /// NEVER run.
@@ -2694,7 +2697,9 @@ mod tests {
             .cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), task)
             .await
-            .expect("the turn settled promptly (it did not wait out the 330 s bridge timeout)");
+            .expect(
+                "the turn settled promptly (it did not wait out the 330 s interactive timeout)",
+            );
         assert!(
             !ran.load(Ordering::SeqCst),
             "the elevated command was NEVER executed"
@@ -3949,18 +3954,14 @@ mod tests {
     /// Build a `SubagentSessionManager` with `NativeDeps` set (a
     /// `provider_factory` returning a `RequestRecordingProvider`
     /// (sharing `recorded`) for ANY model + the given catalog + settle
-    /// bound) — the `subagent.rs` `make_native_manager` mirror (its
-    /// `.expect("subagent manager should build")` included).
+    /// bound) — the `subagent.rs` `make_native_manager` mirror.
     fn make_native_manager(
         config_dir: &std::path::Path,
         recorded: Arc<StdMutex<Vec<RecordedRequest>>>,
         catalog: ModelCatalog,
         settle_timeout: Duration,
     ) -> Arc<SubagentSessionManager> {
-        let manager = Arc::new(
-            SubagentSessionManager::new(config_dir.to_path_buf(), None)
-                .expect("subagent manager should build"),
-        );
+        let manager = Arc::new(SubagentSessionManager::new(None));
         let factory: crate::agent::session::ProviderFactory = Arc::new(move |_m: &Model| {
             Box::new(RequestRecordingProvider {
                 recorded: recorded.clone(),
@@ -3968,7 +3969,11 @@ mod tests {
         });
         manager.set_native_deps(crate::agent::subagent::NativeDeps {
             provider_factory: factory,
-            catalog,
+            catalog: crate::agent::session::EffectiveCatalog {
+                config_dir: config_dir.to_path_buf(),
+                cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                base: catalog,
+            },
             todo_store: Arc::new(crate::agent::todo::TodoStore::new()),
             sudo: SudoDeps::default(),
             settle_timeout,

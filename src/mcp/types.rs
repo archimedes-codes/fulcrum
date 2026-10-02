@@ -274,7 +274,7 @@ fn string_map(v: &Value) -> BTreeMap<String, String> {
 /// - a `command` (a non-empty string) → `Stdio` (`args` a string array,
 ///   `env` a string map, `cwd` a string → `PathBuf`).
 /// - neither (or a malformed one) → `None` (a bad entry is skipped, never
-///   an error — the best-effort config, ADR 0012 precedent).
+///   an error — the best-effort config, ADR 0018 precedent).
 pub fn classify_server(entry: &Value) -> Option<ServerDef> {
     let map = entry.as_object()?;
     if map.get("disabled").and_then(Value::as_bool) == Some(true) {

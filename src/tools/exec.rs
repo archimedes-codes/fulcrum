@@ -2,11 +2,10 @@
 //! tool, each sandboxed to the session's `cwd` (via the existing
 //! [`FsBackend`]) and returning a pi-shaped [`ToolResult`] — `content` is
 //! what the LLM sees, `details` is what the UI sees (matching pi's
-//! built-in renderers). Both the Phase 1 bridge round-trip (external
-//! sessions) and the Phase 2 native harness (in-process) call
+//! built-in renderers). The native harness (in-process) calls
 //! [`execute_tool`].
 //!
-//! `powershell` is deliberately absent (Windows-only; the bridge is
+//! `powershell` is deliberately absent (Windows-only; the harness is
 //! Linux-only) — it lands with the Windows native sessions (Task 6).
 //!
 //! Security note: `bash` is GATED, not sandboxed — `sh -c` can read/write
@@ -26,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::fs_backend::FsBackend;
 
 /// The default `bash` deadline when no `timeout_ms` is given (300 s —
-/// matching the bridge's `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`: the native
+/// matching the interactive channel's `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`: the native
 /// `dispatch_tool` has no outer timeout of its own, so the executor must
 /// bound the run itself — a no-`timeout_ms` `bash` is NOT unbounded).
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -87,7 +86,7 @@ pub struct ImageRef {
 
 /// A pi-shaped tool result: `content` (the LLM sees this), `details` (the
 /// UI sees it), `is_error` (the Rust field) — serialized as **`isError`**
-/// (camelCase, the wire contract every bridge handler + pi's
+/// (camelCase, the wire contract the native tool results + pi's
 /// `tool_execution_end` use; a snake_case wire name would make pi render
 /// every failure as a success).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -193,7 +192,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     let mut out_buf = [0u8; 8192];
     let mut err_buf = [0u8; 8192];
     // Deadline for the timeout. No `timeout_ms` = the 300 s default
-    // ([`DEFAULT_BASH_TIMEOUT`] — the bridge's
+    // ([`DEFAULT_BASH_TIMEOUT`] — the interactive channel's
     // `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`; the native `dispatch_tool` has no
     // outer timeout, so the executor bounds the run itself). Re-armed
     // each loop iteration (`Sleep` is not `Unpin`, so it cannot be a
@@ -848,8 +847,8 @@ pub async fn exec_ls(ctx: &ToolCtx, params: &Value) -> ToolResult {
     ToolResult::ok_text(names.join("\n"), Some(json!({ "entries": names.len() })))
 }
 
-/// Dispatch a tool call to its executor (the entry point both the Phase 1
-/// bridge round-trip and the Phase 2 native harness call).
+/// Dispatch a tool call to its executor (the entry point the native
+/// harness calls).
 pub async fn execute_tool(ctx: &ToolCtx, tool: &str, params: &Value) -> ToolResult {
     match tool {
         "bash" => exec_bash(ctx, params).await,
@@ -1025,7 +1024,7 @@ mod tests {
     }
 
     /// The native `bash` deadline without a `timeout_ms` is 300 s (matching
-    /// the bridge's `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`) — NOT unbounded.
+    /// the interactive channel's `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`) — NOT unbounded.
     #[test]
     fn bash_default_deadline_is_300s() {
         assert_eq!(DEFAULT_BASH_TIMEOUT, Duration::from_secs(300));

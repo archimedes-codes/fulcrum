@@ -1,28 +1,19 @@
-//! The model catalog (native-agent-harness Task 5, ADR 0012: v1 adds no
-//! new user-facing config surface). The desktop **seeds** its model
-//! catalog + provider auth from the user's existing pi config files
-//! (`~/.pi/agent/settings.json` / `auth.json` / `models-store.json`)
-//! so the user's existing pi setup works with zero reconfiguration.
-//!
-//! Seeding is **best-effort**: a missing/unparseable file degrades to
-//! "no seeded model" (a logged warning), never a crash. The catalog is
-//! the source for the model picker (Task 7) and the [`Provider`]
-//! construction (Task 4: a [`Model`]'s `provider` + `base_url` +
-//! `api_key` → an `OpenAiCompatibleProvider`).
+//! The model catalog. The desktop's model source is the Settings'
+//! providers list (ADR 0014 — user providers shadow the base catalog on
+//! a provider-id clash) merged with live per-provider discovery
+//! (`GET /v1/models`). The catalog is the source for the model picker
+//! and the [`Provider`] construction (a [`Model`]'s `provider` +
+//! `base_url` + `api_key` → an `OpenAiCompatibleProvider`).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// A model with no metadata in `models-store.json` gets this window
-/// (best-effort). Also the `effective_catalog` fallback for a user
-/// provider's discovered model (ADR 0014 — a user model has no static
-/// metadata).
+/// A model with no metadata gets this context window (best-effort).
+/// Also the `effective_catalog` fallback for a user provider's
+/// discovered model (ADR 0014 — a user model has no static metadata).
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 128000;
-/// The `Compactor` (Task 6) thresholds when `settings.json` has no
-/// `compaction` block (pi's own defaults).
+/// The `Compactor`'s (Task 6) thresholds (pi's own defaults).
 const DEFAULT_RESERVE_TOKENS: u32 = 16384;
 const DEFAULT_KEEP_RECENT_TOKENS: u32 = 20000;
 
@@ -39,7 +30,7 @@ pub struct Model {
     /// `OpenAiCompatibleProvider` appends `/chat/completions`).
     pub base_url: String,
     /// The `Authorization: Bearer` key (empty when the provider needs
-    /// none — a local gateway — or is absent from `auth.json`).
+    /// none — a local gateway).
     pub api_key: String,
     pub context_window: u32,
     /// USD per 1M input tokens.
@@ -48,7 +39,7 @@ pub struct Model {
     pub cost_per_mtok_out: f64,
     /// `true` when the model speaks the OpenAI-compatible
     /// chat-completions API (`api == "openai-completions"` — the only
-    /// tool-carrying wire in v1, ADR 0012).
+    /// tool-carrying wire in v1, ADR 0014).
     pub supports_tools: bool,
     /// `reasoning` + a non-empty `thinkingLevelMap` (non-null values).
     pub supports_thinking: bool,
@@ -61,11 +52,10 @@ pub struct Model {
     pub api: Option<String>,
 }
 
-/// The `Compactor`'s (Task 6) thresholds — seeded from `settings.json`'s
-/// `compaction` (`{ enabled, reserveTokens, keepRecentTokens }`),
-/// defaulting `true` / `16384` / `20000` when absent (compaction is ON
-/// by default — pi's own default; an explicit `compaction.enabled:
-/// false` disables it).
+/// The `Compactor`'s (Task 6) thresholds — `{ enabled, reserveTokens,
+/// keepRecentTokens }`, defaulting `true` / `16384` / `20000` (compaction
+/// is ON by default — pi's own default; an explicit `enabled: false`
+/// disables it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionConfig {
     pub enabled: bool,
@@ -83,22 +73,19 @@ impl Default for CompactionConfig {
     }
 }
 
-/// The desktop's model catalog (seeded from the pi config files, ADR
-/// 0012).
+/// The desktop's model catalog (the base of the effective catalog —
+/// the Settings' providers list is merged on top, ADR 0014).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelCatalog {
-    /// The enabled models (one per `settings.json` `enabledModels`
-    /// entry).
+    /// The enabled models.
     pub models: Vec<Model>,
     /// The default model's composed key (e.g.
-    /// `tama/Qwen/Qwen3.8-27B`), or `None` when the settings' default
-    /// (`defaultProvider` + `defaultModel`) matches no `enabledModels`
-    /// entry. Task 7's built-in `harness.default_model` (`None`) is
-    /// resolved from this at session start.
+    /// `tama/Qwen/Qwen3.8-27B`), or `None` when no default is set.
+    /// The resolution chain (settings `default_model` → this → first
+    /// OpenAI-compatible model) is resolved at session start.
     pub default_model: Option<String>,
-    /// The `Compactor` thresholds (Task 6) — seeded from
-    /// `settings.json`'s `compaction` (compaction ON by default, `true`
-    /// / `16384` / `20000` when absent).
+    /// The `Compactor` thresholds (Task 6) — compaction ON by default
+    /// (`true` / `16384` / `20000`).
     pub compaction: CompactionConfig,
 }
 
@@ -113,7 +100,7 @@ impl ModelCatalog {
         &self.models
     }
 
-    /// The v1-selectable set (ADR 0012): the tool-supporting,
+    /// The selectable set (ADR 0014): the tool-supporting,
     /// OpenAI-compatible models (`api == "openai-completions"`).
     pub fn openai_compatible(&self) -> Vec<&Model> {
         self.models
@@ -121,92 +108,36 @@ impl ModelCatalog {
             .filter(|m| m.supports_tools && m.api.as_deref() == Some("openai-completions"))
             .collect()
     }
-
-    /// Seed the catalog from the user's pi config files (read-only —
-    /// ADR 0012: the desktop NEVER writes to pi's config). Best-effort:
-    /// a missing/unparseable file degrades (a logged warning), never a
-    /// crash.
-    ///
-    /// `pi_dir` is `~/.pi/agent` in production ([`seed_from_pi_config`])
-    /// and a temp dir in tests (pointing at a real `HOME` would be
-    /// racy).
-    pub fn seed_from(pi_dir: &Path) -> ModelCatalog {
-        // The production entry point: the `api_key` is resolved from the
-        // process environment (env-first) then `auth.json`.
-        Self::seed_from_env(pi_dir, &|name: &str| std::env::var(name).ok())
-    }
-
-    /// The testable core of [`seed_from`]: seed from the pi config files,
-    /// resolving each provider's `api_key` via `env_lookup` (env-first —
-    /// `<PROVIDER>_API_KEY` → `_TOKEN` → `_KEY` — then `auth.json`). In
-    /// production `env_lookup` is `std::env::var`; in tests a controlled
-    /// table (so the tests never touch the real environment).
-    pub fn seed_from_env(
-        pi_dir: &Path,
-        env_lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> ModelCatalog {
-        // `settings.json` is the spine (the `enabledModels` list): a
-        // missing/unparseable file → an empty catalog (no models, no
-        // default, the compaction defaults).
-        let Some(settings) = read_json::<Settings>(&pi_dir.join("settings.json")) else {
-            return ModelCatalog::default();
-        };
-
-        // `auth.json` / `models-store.json` degrade independently (a
-        // missing file → empty keys / default metadata).
-        let auth: HashMap<String, AuthEntry> =
-            read_json(&pi_dir.join("auth.json")).unwrap_or_default();
-        let store: HashMap<String, ProviderStore> =
-            read_json(&pi_dir.join("models-store.json")).unwrap_or_default();
-
-        let models = settings
-            .enabled_models
-            .iter()
-            .filter_map(|entry| {
-                let (provider, id) = split_enabled_entry(entry)?;
-                let meta = store
-                    .get(provider)
-                    .and_then(|p| p.models.iter().find(|m| m.id.as_deref() == Some(id)));
-                Some(build_model(provider, id, meta, &auth, pi_dir, env_lookup))
-            })
-            .collect();
-
-        ModelCatalog {
-            models,
-            default_model: resolve_default(&settings),
-            compaction: settings.compaction.map(Into::into).unwrap_or_default(),
-        }
-    }
 }
 
-/// Merge the seeded catalog with the user-provider models (ADR 0014).
+/// Merge the base catalog with the user-provider models (ADR 0014).
 /// `user_models` are the discovered models; `shadowed_provider_ids` are
 /// the ids of EVERY user provider configured in `settings.json` (regardless
 /// of whether its discovery succeeded — a provider that discovered 0 models
-/// STILL shadows the seeded models for its id: user-wins-on-clash, even
-/// on failure). For every id in `shadowed_provider_ids` the seeded models
+/// STILL shadows the base models for its id: user-wins-on-clash, even
+/// on failure). For every id in `shadowed_provider_ids` the base models
 /// for that id are REPLACED by the user models with that id (possibly none).
-/// `default_model` is the seeded default unless it belongs to a shadowed
+/// `default_model` is the base default unless it belongs to a shadowed
 /// provider (then `None` — the caller's resolution chain degrades).
 pub fn merge_catalog(
-    seeded: &ModelCatalog,
+    base: &ModelCatalog,
     user_models: &[Model],
     shadowed_provider_ids: &[String],
 ) -> ModelCatalog {
-    let kept_seeded: Vec<Model> = seeded
+    let kept_base: Vec<Model> = base
         .models
         .iter()
         .filter(|m| !shadowed_provider_ids.contains(&m.provider))
         .cloned()
         .collect();
-    let mut models = kept_seeded;
+    let mut models = kept_base;
     models.extend_from_slice(user_models);
-    // The seeded default is kept only when it still EXISTS in the merged
+    // The base default is kept only when it still EXISTS in the merged
     // result: a shadowed provider's default model was replaced (possibly by
     // nothing) → `None` (the caller's resolution chain degrades). A
-    // default pointing at a model absent from `seeded.models` (a stale
+    // default pointing at a model absent from `base.models` (a stale
     // key) also degrades to `None` (it is not in the merged result either).
-    let default_model = seeded.default_model.clone().filter(|key| {
+    let default_model = base.default_model.clone().filter(|key| {
         models
             .iter()
             .any(|m| format!("{}/{}", m.provider, m.id) == key.as_str())
@@ -214,69 +145,8 @@ pub fn merge_catalog(
     ModelCatalog {
         models,
         default_model,
-        compaction: seeded.compaction,
+        compaction: base.compaction,
     }
-}
-
-/// Seed from the user's pi config dir (the production entry point — a
-/// thin wrapper over [`ModelCatalog::seed_from`] so the seeding logic
-/// stays testable on a temp dir).
-pub fn seed_from_pi_config() -> ModelCatalog {
-    let Some(home) = home_dir() else {
-        eprintln!("harness: no $HOME / %USERPROFILE — the model catalog is empty");
-        return ModelCatalog::default();
-    };
-    ModelCatalog::seed_from(&home.join(".pi/agent"))
-}
-
-/// `$HOME` (Unix) / `%USERPROFILE` (Windows) — no `dirs` dependency.
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var("USERPROFILE").ok().map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("HOME").ok().map(PathBuf::from)
-    }
-}
-
-/// Resolve a provider's `api_key` (the `Authorization: Bearer` key).
-///
-/// **Env first** (matching `pi-provider-litellm`'s ambient auth): for
-/// provider `p` (uppercased `P`), try `P_API_KEY` → `P_TOKEN` → `P_KEY`
-/// and use the first that is set and **non-empty** (a `tama` gateway is
-/// keyed by `TAMA_TOKEN`; `eurouter`/`openrouter`/`google` by
-/// `<NAME>_API_KEY`). Env-first means a stored key can be overridden
-/// without editing `auth.json`. Then `auth.json[provider].key`. A provider
-/// with neither (a local gateway needing no key) → empty.
-fn resolve_api_key(
-    provider: &str,
-    auth: &HashMap<String, AuthEntry>,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
-) -> String {
-    let upper = provider.to_ascii_uppercase();
-    for suffix in ["_API_KEY", "_TOKEN", "_KEY"] {
-        if let Some(v) = env_lookup(&format!("{upper}{suffix}")) {
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    auth.get(provider)
-        .and_then(|a| a.key.clone())
-        .unwrap_or_default()
-}
-
-/// Fresh model metadata from a live `GET /v1/models` (the OpenAI endpoint
-/// "supplies everything" — the `pi-provider-litellm` `fetchModels` pattern).
-/// All fields `Option`: a field absent in the response keeps the static
-/// (`models-store.json`) value.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct DiscoveredMeta {
-    pub context_window: Option<u32>,
-    pub thinking_levels: Option<Vec<String>>,
-    pub supports_thinking: Option<bool>,
 }
 
 /// The per-provider discovery cache entry: `attempted` (a failed /
@@ -287,6 +157,17 @@ pub struct DiscoveredMeta {
 pub struct ProviderDiscovery {
     pub attempted: bool,
     pub models: HashMap<String, DiscoveredMeta>,
+}
+
+/// Fresh model metadata from a live `GET /v1/models` (the OpenAI endpoint
+/// "supplies everything" — the `pi-provider-litellm` `fetchModels` pattern).
+/// All fields `Option`: a field absent in the response keeps the static
+/// value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveredMeta {
+    pub context_window: Option<u32>,
+    pub thinking_levels: Option<Vec<String>>,
+    pub supports_thinking: Option<bool>,
 }
 
 /// The `GET /v1/models` response (standard OpenAI discovery — `tama` and
@@ -313,8 +194,8 @@ struct DiscoveredModel {
 /// Query a provider's `GET /v1/models` for fresh model metadata (bounded,
 /// best-effort). `base_url` is `.../v1` (the endpoint is `{base_url}/models`).
 /// A non-2xx / network error → `Err` (the caller degrades to the static
-/// `models-store.json` metadata). The `api_key` is sent as `Authorization:
-/// Bearer` when non-empty (a local gateway needing no key → no header).
+/// metadata). The `api_key` is sent as `Authorization: Bearer` when
+/// non-empty (a local gateway needing no key → no header).
 pub async fn discover_models(
     base_url: &str,
     api_key: &str,
@@ -351,312 +232,9 @@ pub async fn discover_models(
         .collect())
 }
 
-/// Build one `Model` for an `enabledModels` entry: the metadata (from
-/// `models-store.json[provider].models[]` matched by `id` — absent →
-/// the defaults), the `api_key` (env-first via [`resolve_api_key`] —
-/// `auth.json` fallback — absent → empty), and the `base_url` (the model
-/// entry's `baseUrl` → the `pi-provider-<provider>.json` fallback `baseURL`
-/// normalized with a `/v1` suffix → a provider-specific default).
-fn build_model(
-    provider: &str,
-    id: &str,
-    meta: Option<&StoreModel>,
-    auth: &HashMap<String, AuthEntry>,
-    pi_dir: &Path,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
-) -> Model {
-    // `api == "openai-completions"` is the OpenAI-compatible
-    // discriminator (v1 is OpenAI-compatible only, ADR 0012). A
-    // metadata-less model defaults to tool-supporting (best-effort) but
-    // an unknown `api` is NOT OpenAI-compatible (it is excluded from
-    // `openai_compatible()`).
-    let (supports_tools, api) = match meta {
-        Some(m) => {
-            let openai = m.api.as_deref() == Some("openai-completions");
-            (openai, m.api.clone())
-        }
-        None => (true, None),
-    };
-
-    // `reasoning` + the NON-NULL `thinkingLevelMap` keys.
-    let (supports_thinking, thinking_levels) =
-        match meta.and_then(|m| m.thinking_level_map.as_ref()) {
-            Some(map) => {
-                let levels: Vec<String> = map
-                    .iter()
-                    .filter(|(_, v)| v.is_some())
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                let reasoning = meta.and_then(|m| m.reasoning).unwrap_or(false);
-                (reasoning && !levels.is_empty(), levels)
-            }
-            None => (false, Vec::new()),
-        };
-
-    let base_url = meta
-        .and_then(|m| m.base_url.clone())
-        .or_else(|| {
-            let path = pi_dir.join(format!("pi-provider-{provider}.json"));
-            read_json::<PiProviderFile>(&path).and_then(|f| f.base_url)
-        })
-        .map(|b| normalize_base_url(&b))
-        .or_else(|| provider_default_base_url(provider))
-        .unwrap_or_default();
-
-    Model {
-        id: id.to_string(),
-        provider: provider.to_string(),
-        base_url,
-        // Env-first (a `TAMA_TOKEN`-style ambient key), then `auth.json`;
-        // a provider with neither (a local gateway needing no key) → empty.
-        api_key: resolve_api_key(provider, auth, env_lookup),
-        context_window: meta
-            .and_then(|m| m.context_window)
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
-        cost_per_mtok_in: meta
-            .and_then(|m| m.cost.as_ref())
-            .and_then(|c| c.input)
-            .unwrap_or(0.0),
-        cost_per_mtok_out: meta
-            .and_then(|m| m.cost.as_ref())
-            .and_then(|c| c.output)
-            .unwrap_or(0.0),
-        supports_tools,
-        supports_thinking,
-        thinking_levels,
-        api,
-    }
-}
-
-/// The default: the BARE `defaultModel` + `defaultProvider` composed
-/// into the `"<provider>/<id>"` key, `None` when it matches no
-/// `enabledModels` entry.
-fn resolve_default(settings: &Settings) -> Option<String> {
-    let (Some(provider), Some(model)) = (&settings.default_provider, &settings.default_model)
-    else {
-        return None;
-    };
-    let key = format!("{provider}/{model}");
-    settings
-        .enabled_models
-        .iter()
-        .any(|e| e == &key)
-        .then_some(key)
-}
-
-/// Split an `enabledModels` entry on the FIRST `/` (model ids themselves
-/// contain `/` — `tama/Qwen/Qwen3.8-27B` → provider `tama`, id
-/// `Qwen/Qwen3.8-27B`). `None` when the entry has no `/` (or an empty
-/// side).
-fn split_enabled_entry(entry: &str) -> Option<(&str, &str)> {
-    let (provider, id) = entry.split_once('/')?;
-    if provider.is_empty() || id.is_empty() {
-        return None;
-    }
-    Some((provider, id))
-}
-
-/// Normalize a base URL to the OpenAI-compatible form: a trailing
-/// `/v1` (the `OpenAiCompatibleProvider` appends `/chat/completions`).
-/// The model entry's `baseUrl` already carries the suffix
-/// (`https://tama.wizards.town/v1`); the `pi-provider-<provider>.json`
-/// fallback `baseURL` does NOT (`https://tama.wizards.town`) → append it.
-fn normalize_base_url(url: &str) -> String {
-    let url = url.trim_end_matches('/');
-    if url.is_empty() || url.ends_with("/v1") {
-        url.to_string()
-    } else {
-        format!("{url}/v1")
-    }
-}
-
-/// Provider-specific `base_url` defaults (the last fallback in the
-/// chain) — `openrouter` is the only one with a well-known default
-/// (an unknown provider → `None` → an empty `base_url`, best-effort).
-fn provider_default_base_url(provider: &str) -> Option<String> {
-    match provider {
-        "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),
-        _ => None,
-    }
-}
-
-/// Read + parse one JSON file (best-effort: a missing/unparseable file
-/// → `None` + a logged warning, never a crash).
-fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("harness: cannot read {}: {e}", path.display());
-            return None;
-        }
-    };
-    match serde_json::from_str(&text) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!("harness: cannot parse {}: {e}", path.display());
-            None
-        }
-    }
-}
-
-// ── the pi config file shapes (verified against `~/.pi/agent/`) ──────
-//
-// Only the seeded fields are named — serde ignores the rest.
-
-/// `settings.json` (a bare `defaultModel` + `defaultProvider`, the
-/// `enabledModels` list, and the `Compactor` thresholds under
-/// `compaction`).
-#[derive(Debug, Deserialize)]
-struct Settings {
-    #[serde(default, rename = "defaultProvider")]
-    default_provider: Option<String>,
-    #[serde(default, rename = "defaultModel")]
-    default_model: Option<String>,
-    #[serde(default, rename = "enabledModels")]
-    enabled_models: Vec<String>,
-    #[serde(default)]
-    compaction: Option<SettingsCompaction>,
-}
-
-/// `settings.json`'s `compaction` block (`{ enabled, reserveTokens,
-/// keepRecentTokens }` — `enabled` defaults `true` (pi's own default;
-/// a block without the key still compacts), the numeric fields default
-/// when absent).
-#[derive(Debug, Deserialize)]
-struct SettingsCompaction {
-    #[serde(default = "default_true")]
-    enabled: bool,
-    #[serde(default, rename = "reserveTokens")]
-    reserve_tokens: Option<u32>,
-    #[serde(default, rename = "keepRecentTokens")]
-    keep_recent_tokens: Option<u32>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl From<SettingsCompaction> for CompactionConfig {
-    fn from(c: SettingsCompaction) -> Self {
-        Self {
-            enabled: c.enabled,
-            reserve_tokens: c.reserve_tokens.unwrap_or(DEFAULT_RESERVE_TOKENS),
-            keep_recent_tokens: c.keep_recent_tokens.unwrap_or(DEFAULT_KEEP_RECENT_TOKENS),
-        }
-    }
-}
-
-/// `auth.json`: `provider → { key, type }` (read `.key` — NOT
-/// `api_key`).
-#[derive(Debug, Deserialize)]
-struct AuthEntry {
-    #[serde(default)]
-    key: Option<String>,
-}
-
-/// `models-store.json`: `provider → { models, checkedAt, etag?,
-/// lastModified? }` — the provider-level `etag`/`lastModified` are
-/// OPTIONAL (a sparse `tama`-like entry has only `{ models, checkedAt }`
-/// — they are not even named here, so the sparse shape parses).
-#[derive(Debug, Deserialize)]
-struct ProviderStore {
-    #[serde(default)]
-    models: Vec<StoreModel>,
-}
-
-/// A `models-store.json` model entry (`{ id, name, api, baseUrl,
-/// provider, reasoning, thinkingLevelMap, input, cost, contextWindow,
-/// maxTokens, compat?, inputLimits?, type? }`) — only the seeded fields
-/// are named; `compat`/`inputLimits`/`type` are optional and ignored.
-#[derive(Debug, Deserialize)]
-struct StoreModel {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    api: Option<String>,
-    #[serde(default, rename = "baseUrl")]
-    base_url: Option<String>,
-    #[serde(default)]
-    reasoning: Option<bool>,
-    #[serde(default, rename = "thinkingLevelMap")]
-    thinking_level_map: Option<HashMap<String, Option<String>>>,
-    #[serde(default)]
-    cost: Option<ModelCost>,
-    #[serde(default, rename = "contextWindow")]
-    context_window: Option<u32>,
-}
-
-/// A model entry's `cost` (`{ input, output, cacheRead, cacheWrite }` —
-/// USD per 1M tokens; v1 seeds input/output only).
-#[derive(Debug, Deserialize)]
-struct ModelCost {
-    #[serde(default)]
-    input: Option<f64>,
-    #[serde(default)]
-    output: Option<f64>,
-}
-
-/// `pi-provider-<provider>.json` (a FALLBACK only — a *different*
-/// schema: top-level `baseURL` WITHOUT the `/v1` suffix, and
-/// `context_length`/`tool_call`/`modalities` model entries that do not
-/// map cleanly in v1 — only the `baseURL` is used).
-#[derive(Debug, Deserialize)]
-struct PiProviderFile {
-    #[serde(default, rename = "baseURL")]
-    base_url: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── `enabledModels` splitting ─────────────────────────────────────
-
-    #[test]
-    fn split_entry_splits_on_the_first_slash_only() {
-        // Model ids themselves contain `/` — split on the FIRST only.
-        assert_eq!(
-            split_enabled_entry("tama/Qwen/Qwen3.8-27B"),
-            Some(("tama", "Qwen/Qwen3.8-27B"))
-        );
-        assert_eq!(
-            split_enabled_entry("openrouter/openrouter/free"),
-            Some(("openrouter", "openrouter/free"))
-        );
-        // No `/` / empty sides → `None` (skipped, not a crash).
-        assert_eq!(split_enabled_entry("just-a-model"), None);
-        assert_eq!(split_enabled_entry("/no-provider"), None);
-        assert_eq!(split_enabled_entry("no-model/"), None);
-    }
-
-    // ── `base_url` normalization ──────────────────────────────────────
-
-    #[test]
-    fn normalize_base_url_appends_v1_when_absent() {
-        // The `pi-provider-*.json` fallback `baseURL` lacks the suffix.
-        assert_eq!(
-            normalize_base_url("https://tama.wizards.town"),
-            "https://tama.wizards.town/v1"
-        );
-        // The model entry's `baseUrl` already carries it (untouched).
-        assert_eq!(
-            normalize_base_url("https://tama.wizards.town/v1"),
-            "https://tama.wizards.town/v1"
-        );
-        // A trailing `/` is trimmed before the suffix is appended.
-        assert_eq!(normalize_base_url("https://x.io/"), "https://x.io/v1");
-    }
-
-    // ── the provider-default fallback ─────────────────────────────────
-
-    #[test]
-    fn provider_default_base_url_is_openrouter_only() {
-        assert_eq!(
-            provider_default_base_url("openrouter"),
-            Some("https://openrouter.ai/api/v1".to_string())
-        );
-        assert_eq!(provider_default_base_url("tama"), None);
-    }
 
     // ── `ModelCatalog` accessors ──────────────────────────────────────
 
@@ -703,86 +281,12 @@ mod tests {
     #[test]
     fn compaction_config_defaults() {
         let c = CompactionConfig::default();
-        // (finding 13a) Compaction is ON by default (pi's own default —
-        // a settings file without a `compaction` block still compacts;
-        // an explicit `compaction.enabled: false` disables it).
+        // (finding 13a) Compaction is ON by default (a catalog without an
+        // explicit config still compacts; an explicit `enabled: false`
+        // disables it).
         assert!(c.enabled);
         assert_eq!(c.reserve_tokens, 16384);
         assert_eq!(c.keep_recent_tokens, 20000);
-    }
-
-    // ── API-key resolution (env first, then `auth.json`) ────────────────
-
-    /// A fake `env_lookup` table for the `resolve_api_key` tests.
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let m: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |name: &str| m.get(name).cloned()
-    }
-
-    #[test]
-    fn resolve_api_key_env_first_then_auth() {
-        let mut auth: HashMap<String, AuthEntry> = HashMap::new();
-        auth.insert(
-            "p".into(),
-            AuthEntry {
-                key: Some("auth-key".into()),
-            },
-        );
-        auth.insert(
-            "g".into(),
-            AuthEntry {
-                key: Some("g-auth".into()),
-            },
-        );
-        // `tama`: `TAMA_API_KEY` set → wins (first in the order), even
-        // though `TAMA_TOKEN` is also set.
-        let env = env_of(&[("TAMA_API_KEY", "env-api"), ("TAMA_TOKEN", "env-token")]);
-        assert_eq!(resolve_api_key("tama", &auth, &env), "env-api");
-        // `eur`: no `EUR_API_KEY`, `EUR_TOKEN` set → the token wins.
-        let env = env_of(&[("EUR_TOKEN", "eur-env-token")]);
-        assert_eq!(resolve_api_key("eur", &auth, &env), "eur-env-token");
-        // `g`: `G_API_KEY` is EMPTY (skipped) → `G_TOKEN` wins over the
-        // `auth.json` key (env-first precedence).
-        let env = env_of(&[("G_API_KEY", ""), ("G_TOKEN", "g-env-token")]);
-        assert_eq!(resolve_api_key("g", &auth, &env), "g-env-token");
-        // `p`: no env var, `auth.json` has a key → the stored key wins.
-        let env = env_of(&[]);
-        assert_eq!(resolve_api_key("p", &auth, &env), "auth-key");
-        // `x`: no env var, no `auth.json` entry → empty (a local gateway).
-        assert_eq!(resolve_api_key("x", &auth, &env), "");
-        // `k`: `K_KEY` (the last in the order) is the only one set.
-        let env = env_of(&[("K_KEY", "k-key")]);
-        assert_eq!(resolve_api_key("k", &auth, &env), "k-key");
-    }
-
-    // ── end-to-end: `seed_from` resolves the `api_key` from the env ────
-
-    #[test]
-    fn seed_from_resolves_the_api_key_from_the_env_when_absent_from_auth() {
-        let dir = std::env::temp_dir().join(format!("catalog-seed-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("settings.json"),
-            r#"{ "defaultProvider": "tama", "defaultModel": "m/1",
-                 "enabledModels": ["tama/m/1"] }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("models-store.json"),
-            r#"{ "tama": { "models": [ { "id": "m/1",
-                "api": "openai-completions",
-                "baseUrl": "https://tama.wizards.town/v1" } ] } }"#,
-        )
-        .unwrap();
-        // NO `auth.json` entry for `tama` — the key comes from the env.
-        let catalog = ModelCatalog::seed_from_env(&dir, &env_of(&[("TAMA_TOKEN", "tama-env-key")]));
-        assert_eq!(catalog.models.len(), 1);
-        assert_eq!(catalog.models[0].api_key, "tama-env-key");
-        // The base_url is still seeded from the model entry (untouched by the env).
-        assert_eq!(catalog.models[0].base_url, "https://tama.wizards.town/v1");
     }
 
     // ── live `/v1/models` discovery (the endpoint "supplies everything") ──
@@ -865,53 +369,6 @@ mod tests {
         server.abort();
     }
 
-    /// (finding 13a) A settings file WITHOUT a `compaction` block seeds
-    /// the default — compaction `enabled: true` (pi's behavior; a long
-    /// native session compacts instead of hitting a hard context-length
-    /// `Fatal`).
-    #[test]
-    fn a_settings_file_without_a_compaction_block_defaults_to_enabled() {
-        let dir = std::env::temp_dir().join(format!("catalog-seed-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("settings.json"),
-            r#"{ "defaultProvider": "p", "defaultModel": "m", "enabledModels": ["p/m"] }"#,
-        )
-        .unwrap();
-        let catalog = ModelCatalog::seed_from(&dir);
-        assert!(
-            catalog.compaction.enabled,
-            "compaction is ON by default (a missing `compaction` block)"
-        );
-        // An explicit `compaction.enabled: false` still disables it.
-        std::fs::write(
-            dir.join("settings.json"),
-            r#"{ "defaultProvider": "p", "defaultModel": "m", "enabledModels": ["p/m"], "compaction": { "enabled": false } }"#,
-        )
-        .unwrap();
-        let catalog = ModelCatalog::seed_from(&dir);
-        assert!(
-            !catalog.compaction.enabled,
-            "an explicit `compaction.enabled: false` disables it"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn settings_compaction_maps_with_per_field_defaults() {
-        // A partial block (the numeric fields absent) → the per-field
-        // defaults.
-        let c: CompactionConfig = SettingsCompaction {
-            enabled: true,
-            reserve_tokens: None,
-            keep_recent_tokens: Some(5000),
-        }
-        .into();
-        assert!(c.enabled);
-        assert_eq!(c.reserve_tokens, 16384);
-        assert_eq!(c.keep_recent_tokens, 5000);
-    }
-
     // ── `merge_catalog` (ADR 0014: the effective catalog) ─────────────
 
     /// A full `Model` literal (the `model` helper above pins `provider` to
@@ -935,16 +392,16 @@ mod tests {
 
     #[test]
     fn merge_catalog_replaces_shadowed_providers_even_with_zero_models() {
-        let seeded = ModelCatalog {
+        let base = ModelCatalog {
             models: vec![full_model("a", "p"), full_model("b", "q")],
             default_model: Some("p/a".to_string()),
             ..Default::default()
         };
-        // A discovered model under `p` REPLACES the seeded `p/a` (the user
-        // wins on a provider-id clash); the seeded default belongs to the
+        // A discovered model under `p` REPLACES the base `p/a` (the user
+        // wins on a provider-id clash); the base default belongs to the
         // shadowed provider → `None` (the resolution chain degrades).
         let user = vec![full_model("x", "p")];
-        let merged = merge_catalog(&seeded, &user, &["p".to_string()]);
+        let merged = merge_catalog(&base, &user, &["p".to_string()]);
         let mut keys: Vec<String> = merged
             .models
             .iter()
@@ -956,10 +413,10 @@ mod tests {
 
         // ZERO discovered models STILL shadow: the provider's id is in
         // `shadowed_provider_ids` with an empty `user_models` → 0 models
-        // for `p` (the stale seeded `p/a` does NOT resurrect — a
+        // for `p` (the stale base `p/a` does NOT resurrect — a
         // two-argument signature cannot express this, since `p` would be
         // absent from `user_models` entirely).
-        let merged = merge_catalog(&seeded, &[], &["p".to_string()]);
+        let merged = merge_catalog(&base, &[], &["p".to_string()]);
         let keys: Vec<String> = merged
             .models
             .iter()
@@ -967,13 +424,13 @@ mod tests {
             .collect();
         assert_eq!(keys, vec!["q/b".to_string()]);
         assert_eq!(merged.default_model, None);
-        // The `compaction` carries over from the seeded catalog.
-        assert_eq!(merged.compaction, seeded.compaction);
+        // The `compaction` carries over from the base catalog.
+        assert_eq!(merged.compaction, base.compaction);
     }
 
     #[test]
-    fn merge_catalog_with_no_user_providers_is_the_seeded_catalog() {
-        let seeded = ModelCatalog {
+    fn merge_catalog_with_no_user_providers_is_the_base_catalog() {
+        let base = ModelCatalog {
             models: vec![full_model("a", "p")],
             default_model: Some("p/a".to_string()),
             compaction: CompactionConfig {
@@ -982,24 +439,7 @@ mod tests {
                 keep_recent_tokens: 2,
             },
         };
-        let merged = merge_catalog(&seeded, &[], &[]);
-        assert_eq!(merged, seeded);
-    }
-
-    // ── the sparse `models-store.json` shape ──────────────────────────
-
-    #[test]
-    fn sparse_provider_entry_parses() {
-        // The `tama` entry has only `{ models, checkedAt }` (no
-        // `etag`/`lastModified`) and its model entry has no
-        // `inputLimits` — the serde structs must accept the sparse
-        // shape (or the whole source is dropped).
-        let store: HashMap<String, ProviderStore> =
-            serde_json::from_str(r#"{ "tama": { "models": [ { "id": "m" } ], "checkedAt": 1 } }"#)
-                .unwrap();
-        let provider = store.get("tama").expect("the sparse entry parses");
-        assert_eq!(provider.models.len(), 1);
-        assert_eq!(provider.models[0].id.as_deref(), Some("m"));
-        assert_eq!(provider.models[0].api, None);
+        let merged = merge_catalog(&base, &[], &[]);
+        assert_eq!(merged, base);
     }
 }

@@ -2,7 +2,7 @@
 //! MCP reads — `~/.pi/agent/mcp.json` (global) + `<project>/.pi/mcp.json`
 //! (project override, highest precedence) — the `mcpServers` shape.
 //!
-//! Best-effort (the ADR 0012 precedent: the desktop is a read-only
+//! Best-effort (the ADR 0018 precedent: the desktop is a read-only
 //! CONSUMER of the user's existing pi setup): a missing / unparseable
 //! file degrades to "that layer absent" — it never errors, never
 //! crashes the session.

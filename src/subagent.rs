@@ -1,16 +1,11 @@
 //! The subagent session manager: runs delegated subagent sessions on the
-//! dedicated worker runtime (ADR 0004), through the SAME shared
-//! [`SessionDriver`] machinery as [`SessionManager`].
+//! SAME shared [`SessionDriver`] machinery as [`SessionManager`].
 //!
-//! A subagent session is **ephemeral** (not persisted — `db: None`), runs on
-//! the worker runtime (so two concurrent ACP sessions never share one
-//! reactor, ADR 0004), and spawns the SAME registry entry as its parent
-//! (the built-in `pi` entry in production). Subagents cannot dispatch
-//! subagents (the tool is excluded from their spawn — `subagent: None`).
-//!
-//! The whole lifecycle (spawn → establish → prompt → close) runs on the
-//! worker runtime via [`WorkerRuntime::spawn_task`] (channel-based handoff
-//! only — never `block_on` across runtimes).
+//! A subagent session is **ephemeral** (not persisted — `db: None`), runs
+//! on the main runtime (a `tokio::spawn` driver task), and builds an
+//! in-process native `AgentLoop` (the desktop is native-only — there is
+//! no external pi path). Subagents cannot dispatch subagents (the tool is
+//! excluded from their spawn — `subagent: None`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,51 +16,37 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::bridge;
 use crate::agent::harness::{
-    build_child_system_message, tool_specs, AgentLoop, Model, ModelCatalog, Prompt, RetryPolicy,
-    SessionStore, SudoDeps,
+    build_child_system_message, tool_specs, AgentLoop, Model, Prompt, RetryPolicy, SessionStore,
+    SudoDeps,
 };
+use crate::agent::interactive;
 use crate::agent::permission::{self, PermissionOutcome};
-use crate::agent::rpc::{PiRpc, PiRpcHandle};
 use crate::agent::session::{
-    bridge_spawn_setup, resolve_composed_model, CloseKind, CostAccumulator, EventSink,
-    ExternalClose, ProviderFactory, SessionDriver, SessionInfo,
+    resolve_composed_model, CloseKind, EffectiveCatalog, EventSink, ExternalClose, ProviderFactory,
+    SessionDriver, SessionInfo,
 };
 use crate::agent::todo::TodoStore;
-use crate::agent::worker_runtime::WorkerRuntime;
-use crate::config::{ConfigError, Registry};
 use crate::storage::Db;
 
-/// Manages all live SUBAGENT sessions (on the worker runtime).
+/// Manages all live SUBAGENT sessions.
 ///
 /// Owns a shared [`SessionDriver`] (db: `None` — ephemeral, `trust_db`:
 /// threaded via [`Self::new`], subagent: `None`) whose
 /// `sessions` / `pending_*` maps EVERY per-dispatch driver shares (the
 /// manager's `respond_*` and the driver-task cleanup operate on the shared
-/// maps), plus a [`WorkerRuntime`]. Each dispatch builds a FRESH driver on
-/// top of the shared maps (fresh `text_capture` / `last_message_id` /
+/// maps). Each dispatch builds a FRESH driver on top of the shared maps
+/// (fresh `text_capture` / `last_message_id` /
 /// `cost_capture` — a concurrent dispatch must not clobber another's final
 /// output, and a no-text dispatch must not return a PREVIOUS dispatch's
-/// text). The one-live policy does NOT apply to subagents (ADR 0002 —
-/// subagent sessions are excluded by definition).
+/// text). The one-live policy does NOT apply to subagents
+/// (subagent sessions are excluded by definition).
 pub struct SubagentSessionManager {
     /// The shared driver (db: `None` — ephemeral, `trust_db` threaded via
     /// `new` — the ADR 0010 trust lookup, `subagent: None`), behind an `Arc`:
     /// its `sessions` / `pending_*` maps are shared by every per-dispatch
-    /// driver (see `dispatch`), and `respond_*` reads them here.
+    /// driver (see `dispatch_native`), and `respond_*` reads them here.
     driver: Arc<SessionDriver>,
-    /// The dedicated worker runtime (ADR 0004) all subagent sessions run on.
-    worker: WorkerRuntime,
-    registry: Registry,
-    config_dir: PathBuf,
-    /// The installed gate extension's path (`None` when the install
-    /// failed — the dispatch runs ungated rather than broken).
-    gate_path: Option<PathBuf>,
-    /// The installed tools-override extension's path (`None` when the
-    /// install failed — the dispatch runs on the suite's original tools
-    /// rather than broken).
-    tools_path: Option<PathBuf>,
     /// The native-harness deps (`dispatch_native` reads
     /// `self.native_deps.get()`); set ONCE at the `SessionManager`
     /// wiring time (`set_subagent_manager` — the manager is received as
@@ -90,7 +71,7 @@ pub struct LaunchConfig {
 
 /// The deps `dispatch_native` needs to build a native `AgentLoop` (the
 /// pieces `build_native_session` consumes — the `ProviderFactory` /
-/// `ModelCatalog` / `TodoStore` / `SudoDeps` / the child's settle
+/// `EffectiveCatalog` / `TodoStore` / `SudoDeps` / the child's settle
 /// bound). Set ONCE at the `SessionManager` wiring time
 /// (`set_subagent_manager`) via [`Self::set_native_deps`] (a `&self`
 /// `OnceLock` — the manager is received as an `Arc` there). The child's
@@ -99,7 +80,12 @@ pub struct LaunchConfig {
 #[derive(Clone)]
 pub struct NativeDeps {
     pub provider_factory: ProviderFactory,
-    pub catalog: ModelCatalog,
+    /// The EFFECTIVE catalog supplier (the base catalog + the settings'
+    /// providers + live discovery — resolved at dispatch time, NOT a
+    /// startup snapshot: the desktop is native-only, so a named agent's
+    /// `model:` frontmatter resolves against the effective catalog, and
+    /// the base catalog is empty after the pi-config seeding removal).
+    pub catalog: EffectiveCatalog,
     pub todo_store: Arc<TodoStore>,
     pub sudo: SudoDeps,
     /// The child's settle bound (default 30 min — the `SessionDriver`
@@ -242,131 +228,39 @@ impl EventSink for CapturingSink {
     }
 }
 
-/// The `pi` CLI args for a subagent dispatch (the flags the wrapper script
-/// used to `exec`, now passed directly). Each of `--system-prompt` /
-/// `--model` / `--thinking` is emitted only when its field is `Some`;
-/// `--tools <csv>` is emitted when `tools` is `Some`, and
-/// `--exclude-tools subagent` when it is `None`; `--no-session` is always
-/// appended.
-pub fn subagent_pi_args(cfg: &LaunchConfig) -> Vec<String> {
-    let mut args = vec![
-        "--mode".to_string(),
-        "rpc".to_string(),
-        "--no-themes".to_string(),
-    ];
-    if let Some(sp) = &cfg.system_prompt {
-        args.push("--system-prompt".to_string());
-        args.push(sp.clone());
-    }
-    if let Some(model) = &cfg.model {
-        args.push("--model".to_string());
-        args.push(model.clone());
-    }
-    if let Some(thinking) = &cfg.thinking {
-        args.push("--thinking".to_string());
-        args.push(thinking.clone());
-    }
-    match &cfg.tools {
-        Some(tools) => {
-            args.push("--tools".to_string());
-            args.push(tools.join(","));
-        }
-        None => {
-            args.push("--exclude-tools".to_string());
-            args.push("subagent".to_string());
-        }
-    }
-    args.push("--no-session".to_string());
-    args
-}
-
 impl SubagentSessionManager {
     /// Create a manager (a shared driver with the capture hooks enabled per
-    /// dispatch, a dedicated worker runtime, the agent registry from
-    /// `config_dir`). `trust_db` is the TRUST lookup source threaded onto
-    /// the shared driver (ADR 0010 — subagent Sessions inherit Space trust
+    /// dispatch). `trust_db` is the TRUST lookup source threaded onto the
+    /// shared driver (ADR 0010 — subagent Sessions inherit Space trust
     /// through it; `None` = fail-closed, the gate always prompts). It is
     /// SEPARATE from the driver's `db` (transcript persistence — always
     /// `None` for subagents, which are ephemeral): threading the full db
     /// here would make subagent updates attempt transcript inserts (a FK
     /// failure — subagent sessions have no `sessions` row).
-    ///
-    /// The `WorkerRuntime` is built here (two idle threads, negligible);
-    /// a spawn / build failure (EAGAIN under load) is an `io::Error` —
-    /// mapped to the existing `ConfigError::Io` case, NOT a panic (the app
-    /// degrades instead of crashing at startup). Dropping the manager drops
-    /// the runtime (the shutdown `Sender` is dropped, unblocking the
-    /// dedicated thread — the app-exit path).
-    pub fn new(config_dir: PathBuf, trust_db: Option<Arc<Db>>) -> Result<Self, ConfigError> {
-        let registry = Registry::load(&config_dir)?;
+    pub fn new(trust_db: Option<Arc<Db>>) -> Self {
         // The shared driver (db: `None` — ephemeral; `subagent: None` —
         // subagents cannot dispatch subagents): its `sessions` /
         // `pending_*` maps are shared by EVERY per-dispatch driver (the
         // manager's `respond_*` and the driver-task cleanup operate on
         // these maps). The captures are per-dispatch (a fresh `Some`
-        // instance in `dispatch` — a concurrent dispatch must not clobber
-        // another's final output).
+        // instance in `dispatch_native` — a concurrent dispatch must not
+        // clobber another's final output).
         let mut driver = SessionDriver::new();
         // The trust lookup source (ADR 0010 — subagent Sessions inherit
         // Space trust through `trust_db`; the driver's `db` stays `None`
         // — subagents are ephemeral and must not attempt transcript
         // inserts).
         driver.trust_db = trust_db;
-        let worker = WorkerRuntime::new()?;
-        // Install the bundled gate extension (idempotent — the main
-        // manager installs the same file; the write is skipped when it
-        // matches). A failure is NON-fatal: dispatches run ungated.
-        let gate_path = match crate::agent::gate::install_gate_extension(&config_dir) {
-            Ok(path) => Some(path),
-            Err(e) => {
-                eprintln!("gate extension install failed: {e} (dispatches run ungated)");
-                None
-            }
-        };
-        // Install the desktop-provided tools override (idempotent — the main
-        // manager installs the same file; the write is skipped when it
-        // matches). A failure is NON-fatal: dispatches run on the suite's
-        // original tools.
-        let tools_path = match crate::agent::tools::install_tools_extension(&config_dir) {
-            Ok(path) => Some(path),
-            Err(e) => {
-                eprintln!(
-                    "tools extension install failed: {e} (dispatches run on the suite's tools)"
-                );
-                None
-            }
-        };
-        Ok(Self {
+        Self {
             driver: Arc::new(driver),
-            worker,
-            registry,
-            config_dir,
-            gate_path,
-            tools_path,
             native_deps: std::sync::OnceLock::new(),
-        })
+        }
     }
 
     /// The shared driver (exposed for tests — `respond_*` and the
     /// per-dispatch drivers read its shared `sessions` / `pending_*` maps).
     pub fn driver(&self) -> &SessionDriver {
         &self.driver
-    }
-
-    /// The agent registry (consumed by the dispatch lifecycle to look up
-    /// the parent's registry entry).
-    pub fn registry(&self) -> &Registry {
-        &self.registry
-    }
-
-    /// The configured config directory.
-    pub fn config_dir(&self) -> &PathBuf {
-        &self.config_dir
-    }
-
-    /// The dedicated worker runtime (subagent sessions run on it, ADR 0004).
-    pub fn worker(&self) -> &WorkerRuntime {
-        &self.worker
     }
 
     /// Store the native-harness deps (set-once — a second call is a
@@ -390,328 +284,9 @@ impl SubagentSessionManager {
         self.driver.db.clone()
     }
 
-    /// Spawn + establish + prompt one subagent session. `parent_session_id`
-    /// is the parent's ACP id (from the listener's session-id state — after
-    /// the parent's `set_session_id`; a `dispatch_subagent` frame arrives
-    /// mid-turn, so it is always the ACP id); `parent_cwd` is the parent's
-    /// Space folder (the subagent's cwd + fs sandbox root); `parent_agent_id`
-    /// is the parent's registry agent id (the subagent spawns the SAME
-    /// registry entry as the parent — the built-in `pi` entry in production);
-    /// `agent_name` is the dispatch's agent name (the `subagent-session-
-    /// started` payload); `launch` is the per-dispatch pi configuration
-    /// (ADR 0005); `task` is the prompt body (the first `session/prompt`).
-    ///
-    /// The whole lifecycle (spawn → establish → prompt → close) runs on the
-    /// worker runtime via [`WorkerRuntime::spawn_task`] (channel-based
-    /// handoff only — never `block_on` across runtimes). Returns the result
-    /// oneshot + a cancel handle (flips the external close — the driver task
-    /// tears the session down; the agent's process group dies on Unix).
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch(
-        &self,
-        parent_session_id: &str,
-        parent_cwd: &Path,
-        parent_agent_id: &str,
-        agent_name: String,
-        launch: LaunchConfig,
-        task: String,
-        sink: &Arc<dyn EventSink>,
-    ) -> (oneshot::Receiver<SubagentOutcome>, SubagentCancel) {
-        // A per-dispatch driver (the review fix for the shared-capture bug):
-        // the `sessions` / `pending_*` maps are the SAME `Arc`s as the
-        // manager's driver (the manager's `respond_*` and the driver-task
-        // cleanup operate on the shared maps — a per-dispatch entry is
-        // resolvable from the manager, and the driver-task cleanup removes
-        // the session from the shared map), but the captures are FRESH:
-        // two CONCURRENT dispatches must not clobber each other's
-        // `last_message_id` / `text_capture` / `cost_capture` (a
-        // `messageId` collision — per-process ids like `m1` — would garble
-        // the shared entries), and a no-text dispatch must return the empty
-        // string, NOT a PREVIOUS dispatch's final text (stale carry-over).
-        // `drive_session` takes `&SessionDriver`, so the owned per-dispatch
-        // driver moves into the worker task (it borrows NOTHING from
-        // `self` — `spawn_task` requires `Future + Send + 'static`).
-        let base = &self.driver;
-        let driver = SessionDriver {
-            sessions: base.sessions.clone(),
-            pending_permissions: base.pending_permissions.clone(),
-            pending_bridge: base.pending_bridge.clone(),
-            // Phase 2 (Task 1): the shared `todo_update` / `sudo_exec`
-            // handler state — cloned the same way `pending_bridge` is
-            // (the subagent children get the bridge env via
-            // `bridge_spawn_setup` and can resolve their prompts through
-            // the shared maps).
-            todo_store: base.todo_store.clone(),
-            pending_sudo: base.pending_sudo.clone(),
-            sudo_password: base.sudo_password.clone(),
-            runner: base.runner.clone(),
-            establish_timeout: base.establish_timeout,
-            settle_timeout: base.settle_timeout,
-            db: base.db.clone(),
-            trust_db: base.trust_db.clone(),
-            text_capture: Some(Arc::new(StdMutex::new(std::collections::HashMap::new()))),
-            last_message_id: Some(Arc::new(StdMutex::new(None))),
-            cost_capture: Some(Arc::new(StdMutex::new(CostAccumulator::default()))),
-            subagent: base.subagent.clone(),
-            generation_counter: base.generation_counter.clone(),
-        };
-        // Cheap owned clones so the worker task borrows NOTHING from `self`
-        // (`spawn_task` requires `Future + Send + 'static`): the (cheap)
-        // `Registry`, and owned `String` / `PathBuf` copies of the
-        // arguments. `worker` is NOT cloned — `spawn_task` is a `&self`
-        // method call; the closure only captures owned values.
-        let registry = self.registry.clone();
-        let sink = sink.clone();
-        let parent_session_id = parent_session_id.to_string();
-        let parent_cwd = parent_cwd.to_path_buf();
-        let parent_agent_id = parent_agent_id.to_string();
-        // The external close (the driver task's cancel path) + the cancel
-        // handle (the caller's cancel path) from ONE channel + kind (one
-        // kind, first-set-wins across the whole session).
-        let (ec, cancel) = SubagentCancel::new_external_close();
-        let task_cancel = cancel.clone();
-        // A probe receiver (cloned BEFORE `ec` moves into `drive_session`):
-        // read BEFORE the unconditional teardown cancel, a flipped flag
-        // means a USER cancel won the race (the `(Ok(_), Err(e))` arm
-        // reports "cancelled"); a SettleTimeout / agent death has NO
-        // flipped flag yet (the arm reports the `wait_for_settle` error,
-        // not "cancelled").
-        let close_probe = ec.rx.clone();
-
-        // The gate path (an OWNED clone — the task closure is `'static`
-        // and cannot borrow `self`).
-        let gate_path = self.gate_path.clone();
-        // The tools path (an OWNED clone — same `'static` constraint; a
-        // verbatim `self.tools_path` inside the closure is a compile
-        // error).
-        let tools_path = self.tools_path.clone();
-        let handle = self.worker.spawn_task(async move {
-            let start = std::time::Instant::now();
-
-            // 1. The bridge-listener placeholder (exactly like
-            // `start_session`'s `client_session_id`): the ACP
-            // `session_id` is agent-generated and is the identity for
-            // everything else (see step 4).
-            let client_session_id = crate::agent::session::mint_session_id();
-
-            // 2. Bridge setup (4 env vars + per-spawn socket, the parent's
-            // registry entry). `None` when the agent is not a bridge
-            // agent / the bridge is unavailable (the suite's fork path
-            // covers that — no bridge env).
-            let entry = match registry.get(&parent_agent_id) {
-                Some(e) => e,
-                None => {
-                    return SubagentOutcome::Failed {
-                        error: format!("unknown agent: {parent_agent_id}"),
-                    }
-                }
-            };
-            let (mut agent_env, bridge_setup) = match bridge_spawn_setup(entry, &client_session_id)
-            {
-                Some((env, sid, socket_path)) => (env, Some((sid, socket_path))),
-                None => (entry.env.clone(), None),
-            };
-
-            // 2a. The gate injection (Task 4): `-e <gate.ts>` +
-            // `PI_ARCHIMEDES_GATE=1` (the extension is inert without the
-            // env var) — appended to the `pi` CLI args (the per-dispatch
-            // config flags the wrapper script used to `exec` are now
-            // passed DIRECTLY — the wrapper is deleted, Task 5).
-            // The tools override (Phase 1 + Phase 2): a SECOND `-e
-            // <tools.ts>` (the extension is inert without the bridge env
-            // the setup above already set when available) +
-            // `--no-builtin-tools` ONLY when the override will actually
-            // register the built-ins (a Linux bridge spawn — the override
-            // is self-gated on the platform; `tools_path` is `Some` on
-            // EVERY platform, so keying the flag on it would strip pi's
-            // built-ins off-Linux with nothing to replace them → zero
-            // tools).
-            let base = subagent_pi_args(&launch);
-            let args = crate::agent::tools::spawn_args(
-                &base,
-                gate_path.as_deref(),
-                tools_path.as_deref(),
-                bridge_setup.is_some() && cfg!(target_os = "linux"),
-            );
-            if gate_path.is_some() {
-                crate::agent::gate::gate_env(&mut agent_env);
-            }
-            // A dedicated discriminator env (harmless in production; lets
-            // a `fake_pi`-based test distinguish subagent children).
-            agent_env.insert("ARCHIMEDES_SUBAGENT".to_string(), "1".to_string());
-
-            let rpc = match PiRpc::spawn(&entry.command, &args, &agent_env, &parent_cwd) {
-                Ok(r) => r,
-                Err(e) => {
-                    return SubagentOutcome::Failed {
-                        error: e.to_string(),
-                    };
-                }
-            };
-            let handle = rpc.handle();
-            let hint = format!(
-                "could not spawn the subagent agent '{}' (parent session {parent_session_id})",
-                entry.command
-            );
-            eprintln!(
-                "[subagent-dispatch] SPAWNED agent '{agent_name}' (parent {parent_session_id}); task: {}",
-                &task[..task.len().min(60)]
-            );
-
-            // 3. Establish: `get_state` (the pi session's id + capability
-            // envelope) — bounded by the establish timeout, external-close
-            // aware (a cancel during the window is honored, not deferred).
-            // The subagent's `SessionInfo` carries a `Value::Null`
-            // capability envelope: subagents are ephemeral (nothing reads
-            // their capabilities — no Resume button, no config UI).
-            let establish_cwd = parent_cwd.clone();
-            // A separate owned copy for the establisher closure (the
-            // `move` closure captures it; `parent_agent_id` itself is only
-            // BORROWED by the `drive_session` argument below).
-            let establish_agent_id = parent_agent_id.clone();
-            let info = driver
-                .drive_session(
-                    handle.clone(),
-                    &parent_agent_id,
-                    hint,
-                    parent_cwd,
-                    &sink,
-                    bridge_setup,
-                    Some(ec),
-                    move |h: PiRpcHandle| async move {
-                        let state = h.send(json!({ "type": "get_state" })).await?;
-                        let session_id = state
-                            .get("sessionId")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        Ok(SessionInfo {
-                            session_id,
-                            agent_id: establish_agent_id,
-                            cwd: establish_cwd,
-                            capabilities: Value::Null,
-                            config_options: None,
-                            // Ephemeral (subagent) sessions are never archived (ADR 0016).
-                            archived: false,
-                        })
-                    },
-                )
-                .await;
-
-            // On establish failure the session never materialized: NO
-            // `subagent-*` events (the main agent's tool result carries the
-            // error); the driver teardown already unlinked the socket, the
-            // worker task unlinks the wrapper (it owns the path).
-            let info = match info {
-                Ok(i) => i,
-                Err(e) => {
-                    return SubagentOutcome::Failed {
-                        error: e.to_string(),
-                    };
-                }
-            };
-
-            // 4. The pi `session_id` is known NOW — emit
-            // `subagent-session-started`. It carries the pi id (NEVER the
-            // placeholder — every downstream artifact the panel
-            // cross-references is keyed by the pi id) + the parent's ACP id.
-            sink.emit(
-                "subagent-session-started",
-                json!({
-                    "sessionId": info.session_id,
-                    "parentSessionId": parent_session_id,
-                    "agentName": agent_name,
-                    "task": task,
-                    "model": launch.model.as_deref(),
-                    "thinkingLevel": launch.thinking.as_deref(),
-                }),
-            );
-
-            // 5. The task as the first `prompt` (the `prompt` response is
-            // the preflight — the turn's OUTCOME comes from the driver's
-            // `agent_settled` watch, awaited BOUNDED below by the
-            // `settle_timeout`: a hung turn resolves `SettleTimeout` and
-            // the unconditional cancel tears the session down; a user
-            // cancel is the external close, which tears the session down
-            // and resolves the wait via the dropped watch sender).
-            let sid = info.session_id.clone();
-            eprintln!("[subagent-dispatch] established {sid}; sending prompt");
-            let prompt = handle
-                .send(json!({ "type": "prompt", "content": task }))
-                .await;
-            eprintln!("[subagent-dispatch] prompt send returned for {sid}: {prompt:?}");
-            let settle = driver.wait_for_settle(&sid).await;
-            eprintln!("[subagent-dispatch] settled for {sid}: {settle:?}");
-            // Read the cancel probe BEFORE the unconditional teardown
-            // cancel: a flipped flag here means a USER cancel won the
-            // race (the `(Ok(_), Err(e))` arm reports "cancelled"); a
-            // SettleTimeout / agent death has NO flipped flag yet (the
-            // arm reports the `wait_for_settle` error, not "cancelled").
-            let cancelled = *close_probe.borrow();
-            // Ensure teardown on completion or failure.
-            task_cancel.cancel();
-            match (prompt, settle) {
-                (Ok(_), Ok(_)) => {
-                    // `output` = the accumulated text of the
-                    // `last_message_id` (NOT `HashMap` iteration order; no
-                    // text → empty string); `metrics` from `cost_capture`
-                    // (the accumulated `cost_update` usage, defaulting to 0)
-                    // + `duration_ms` (wall clock since step 1).
-                    let (output, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    sink.emit(
-                        "subagent-closed",
-                        json!({
-                            "sessionId": sid,
-                            "status": "completed",
-                            "metrics": metrics_json(&metrics),
-                        }),
-                    );
-                    SubagentOutcome::Completed { output, metrics }
-                }
-                (Err(e), _) => {
-                    // The preflight failed (the turn never started).
-                    let error = e.to_string();
-                    let (_, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    sink.emit(
-                        "subagent-closed",
-                        json!({
-                            "sessionId": sid,
-                            "status": "failed",
-                            "error": error.clone(),
-                            "metrics": metrics_json(&metrics),
-                        }),
-                    );
-                    SubagentOutcome::Failed { error }
-                }
-                (Ok(_), Err(e)) => {
-                    // The turn did not settle (cancellation — a flipped
-                    // flag means the session was closed → "cancelled" — or
-                    // the agent died mid-turn).
-                    let error = if cancelled {
-                        "cancelled".to_string()
-                    } else {
-                        e.to_string()
-                    };
-                    let (_, metrics) = captures(&driver, start.elapsed().as_millis() as u64);
-                    sink.emit(
-                        "subagent-closed",
-                        json!({
-                            "sessionId": sid,
-                            "status": "failed",
-                            "error": error.clone(),
-                            "metrics": metrics_json(&metrics),
-                        }),
-                    );
-                    SubagentOutcome::Failed { error }
-                }
-            }
-        });
-        (handle, cancel)
-    }
-
     /// Spawn an IN-PROCESS native child `AgentLoop` for a subagent
     /// dispatch (the native-native subagent — Task 2): the driver task
-    /// (the MAIN runtime — NOT the `WorkerRuntime`) builds the child
+    /// (the MAIN runtime — in-process, no external process) builds the child
     /// (the parent's model / tools minus `subagent`, `subagent: None`
     /// — the recursion guard, a [`CapturingSink`], a THROWAWAY `Db`),
     /// spawns it, drives it (the task, the settle vs `settle_timeout`
@@ -831,11 +406,17 @@ impl SubagentSessionManager {
         let parent_cwd = parent_cwd.to_path_buf();
         let parent_model = parent_model.clone();
         let sink = sink.clone();
-        // The driver task (the MAIN runtime — NOT the `WorkerRuntime`;
-        // the oneshot is the observation point, so the `JoinHandle` is
-        // detached — the task runs until it resolves the oneshot).
+        // The driver task (the MAIN runtime — in-process; the oneshot is
+        // the observation point, so the `JoinHandle` is detached — the task
+        // runs until it resolves the oneshot).
         tokio::spawn(async move {
             let start = std::time::Instant::now();
+
+            // 0. The EFFECTIVE catalog (the base catalog + the settings'
+            // providers + live discovery — resolved NOW, at dispatch time:
+            // a named agent's `model:` frontmatter must resolve against the
+            // effective catalog, not a startup snapshot).
+            let catalog = deps.catalog.resolve(None).await;
 
             // 1. The child `Model`: a `launch.model` override — a
             // trailing `:<level>` suffix is stripped FIRST (the REAL
@@ -849,7 +430,7 @@ impl SubagentSessionManager {
                         .rsplit_once(':')
                         .map(|(b, s)| (b.to_string(), Some(s.to_string())))
                         .unwrap_or_else(|| (key.clone(), None));
-                    match resolve_composed_model(&deps.catalog, &bare) {
+                    match resolve_composed_model(&catalog, &bare) {
                         Some(m) => (m, suffix),
                         None => {
                             let _ = dispatch_tx.send(SubagentOutcome::Failed {
@@ -912,7 +493,6 @@ impl SubagentSessionManager {
             // the temp file).
             if let Err(e) = child_db.record_session(&SessionInfo {
                 session_id: child_id.clone(),
-                agent_id: "native".to_string(),
                 cwd: parent_cwd.clone(),
                 capabilities: json!({}),
                 config_options: None,
@@ -959,7 +539,7 @@ impl SubagentSessionManager {
                 parent_cwd.clone(),
                 model.clone(),
                 provider,
-                deps.catalog.clone(),
+                catalog.clone(),
                 store,
                 events_tx,
                 child_cancel.clone(),
@@ -1162,21 +742,21 @@ impl SubagentSessionManager {
         (dispatch_rx, sub_cancel)
     }
 
-    /// Resolve a pending request of a SUBAGENT session (its own bridge
-    /// listener's map — the `session_id` is the subagent's ACP id, the
-    /// listener's `set_session_id` ran on the ACP id after establishment).
+    /// Resolve a pending request of a SUBAGENT session (its own
+    /// interactive channel's map — the `session_id` is the subagent's ACP id,
+    /// set on the loop once the ACP id is known).
     ///
     /// Direct map access — callable from ANY runtime (the map is a
     /// `tokio::sync::Mutex`, locked briefly). `false` when the entry is gone
     /// (the session closed, or the request already resolved — the silent
     /// no-op).
-    pub async fn respond_bridge_request(
+    pub async fn respond_interactive_request(
         &self,
         session_id: &str,
         request_id: &str,
         result: Value,
     ) -> bool {
-        let key = bridge::bridge_key(session_id, request_id);
+        let key = interactive::interactive_key(session_id, request_id);
         let sender = self.driver.pending_bridge.lock().await.remove(&key);
         match sender {
             Some(sender) => {
@@ -1187,11 +767,11 @@ impl SubagentSessionManager {
                 // Phase 2: the `pending_bridge` lookup missed — check the
                 // `pending_sudo` sub-prompt oneshots (the `sudo_exec`
                 // `:confirm` / `:password` keys, `"{sid}/{id}:confirm"` /
-                // `"{sid}/{id}:password"`). The legacy `confirm` /
-                // `password` flow still resolves via `pending_bridge` (the
+                // `"{sid}/{id}:password"`). The `confirm` /
+                // `password` flows still resolve via `pending_bridge` (the
                 // lookup above is NOT removed). NOTE the plain-`bool`
                 // return (NOT `Result<bool>` — the command shim computes
-                // `main_hit || subagent_state.respond_bridge_request(…)`
+                // `main_hit || subagent_state.respond_interactive_request(…)`
                 // as a `bool`).
                 let sudo_sender = self.driver.pending_sudo.lock().await.remove(&key);
                 match sudo_sender {
@@ -1206,7 +786,7 @@ impl SubagentSessionManager {
     }
 
     /// Resolve a pending permission prompt of a SUBAGENT session (same
-    /// semantics as [`Self::respond_bridge_request`]: the subagent's ACP id,
+    /// semantics as [`Self::respond_interactive_request`]: the subagent's ACP id,
     /// `false` when the entry is gone).
     pub async fn respond_permission(
         &self,
@@ -1226,7 +806,7 @@ impl SubagentSessionManager {
     }
 }
 
-/// The cancel handle for a subagent dispatch (the bridge waiter holds one so
+/// The cancel handle for a subagent dispatch (the driver task holds one so
 /// a parent close / the agent's EOF cancels the in-flight dispatch).
 ///
 /// Keeps the [`ExternalClose`]'s `tx` + `kind`; `cancel()` sets the kind
@@ -1236,7 +816,7 @@ impl SubagentSessionManager {
 #[derive(Clone)]
 pub struct SubagentCancel {
     /// The close flag sender (flipped by `cancel`; the driver task selects
-    /// on its receiver; the subagent's bridge listener observes it so a
+    /// on its receiver; the subagent's driver task observes it so a
     /// cancel cancels in-flight `ask` waiters via their `close_rx` arm).
     tx: watch::Sender<bool>,
     /// The close kind (first-set-wins): set `User` before the flag flips;
@@ -1245,18 +825,14 @@ pub struct SubagentCancel {
 }
 
 impl SubagentCancel {
-    /// Build the [`ExternalClose`] (the driver task's cancel path — it keeps
-    /// the `rx` + `kind`) + the [`SubagentCancel`] handle (the caller's
+    /// Build the [`ExternalClose`] (the driver task's cancel path — it
+    /// keeps the `rx`) + the [`SubagentCancel`] handle (the caller's
     /// cancel path — it keeps the `tx` + `kind`) from ONE channel + kind
     /// (one kind, first-set-wins across the whole session).
     pub(crate) fn new_external_close() -> (ExternalClose, SubagentCancel) {
         let (tx, rx) = watch::channel(false);
         let kind = Arc::new(StdMutex::new(None));
-        let ec = ExternalClose {
-            tx: tx.clone(),
-            rx,
-            kind: kind.clone(),
-        };
+        let ec = ExternalClose { rx };
         (ec, SubagentCancel { tx, kind })
     }
 
@@ -1273,46 +849,6 @@ impl SubagentCancel {
         // gone (the session already closed).
         let _ = self.tx.send(true);
     }
-}
-
-/// Read the final output + metrics from the driver's capture hooks:
-/// `output` is the accumulated text of the `last_message_id` (NOT `HashMap`
-/// iteration order; no text → empty string); the token/cost fields come from
-/// the accumulated `cost_update` usage (defaulting to 0 — the
-/// `CostAccumulator` default when the session pushed none); `duration_ms` is
-/// the caller's wall clock.
-///
-/// The capture reads are TOLERANT of a poisoned mutex (`into_inner` — a
-/// poisoned capture degrades to its last good state, not a panic): a panic
-/// while a brief capture guard is held must not chain into every subsequent
-/// `captures()` / hook (and, on the worker task, into a dropped oneshot —
-/// a crash silently reported as a "cancelled" dispatch).
-fn captures(driver: &SessionDriver, duration_ms: u64) -> (String, SubagentMetrics) {
-    let mut metrics = SubagentMetrics {
-        duration_ms,
-        ..Default::default()
-    };
-    if let Some(cc) = &driver.cost_capture {
-        let c = cc.lock().unwrap_or_else(|p| p.into_inner());
-        metrics.input_tokens = c.input_tokens;
-        metrics.output_tokens = c.output_tokens;
-        metrics.cost = c.cost;
-    }
-    let output = driver
-        .last_message_id
-        .as_ref()
-        .and_then(|lmi| lmi.lock().unwrap_or_else(|p| p.into_inner()).clone())
-        .and_then(|id| {
-            driver.text_capture.as_ref().and_then(|tc| {
-                tc.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get(&id)
-                    .cloned()
-            })
-        })
-        .unwrap_or_default();
-    metrics.output = output.clone();
-    (output, metrics)
 }
 
 /// The `metrics` object shape (the wire contract: `inputTokens` /
@@ -1474,17 +1010,12 @@ mod tests {
 
     use tokio::sync::oneshot;
 
-    use crate::agent::errors::RpcError;
     use crate::agent::harness::{
         ChatRole, FinishReason, MessageContent, Model, ModelCatalog, ModelRequest, Provider,
         ProviderError, ProviderEvent, SudoDeps,
     };
     use crate::agent::permission::PermissionOutcome;
-    use crate::agent::rpc::{PiRpc, PiRpcHandle};
-    use crate::agent::session::{
-        CloseKind, EventSink, ExternalClose, SessionBackend, SessionDriver, SessionInfo,
-    };
-    use crate::config::Registry;
+    use crate::agent::session::{CloseKind, EffectiveCatalog, EventSink};
     use crate::storage::Db;
     use async_trait::async_trait;
     use futures_util::StreamExt;
@@ -1493,15 +1024,6 @@ mod tests {
         CapturingSink, LaunchConfig, NativeDeps, SubagentCancel, SubagentOutcome,
         SubagentSessionManager,
     };
-
-    /// The `fake_pi` binary path. These tests spawn it DIRECTLY (no copy):
-    /// they never reap processes by binary path (the driver kills via the
-    /// child handle `PiRpc` owns), so a shared path cannot false-positive —
-    /// and a copy races the kernel's ETXTBSY check (the copy's write-fd
-    /// can still be in flight when the forked child execs).
-    fn fake_pi_bin() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/fake_pi"))
-    }
 
     #[derive(Clone)]
     struct TestSink {
@@ -1512,25 +1034,6 @@ mod tests {
         fn emit(&self, event: &str, payload: serde_json::Value) {
             let _ = self.tx.send((event.to_string(), payload));
         }
-    }
-
-    /// Close a live session in a `SessionDriver` (the `SessionManager`
-    /// `close_session` logic, inlined for tests): set the `User` kind
-    /// (first-set-wins) + flip the close flag.
-    async fn close_session_internal(driver: &Arc<SessionDriver>, session_id: &str) {
-        let (close_tx, close_kind) = {
-            let sessions = driver.sessions.lock().await;
-            match sessions.get(session_id) {
-                Some(live) => (live.close_tx.clone(), live.close_kind.clone()),
-                None => return,
-            }
-        };
-        if let Ok(mut kind) = close_kind.lock() {
-            if kind.is_none() {
-                *kind = Some(CloseKind::User);
-            }
-        }
-        let _ = close_tx.send(true);
     }
 
     /// (Lock order) `captured_text` must NOT hold `last_message_id`
@@ -1573,146 +1076,10 @@ mod tests {
         assert_eq!(sink.captured_text(), "hello");
     }
 
-    /// (1) Named agent with tools: every flag present, in order.
-    #[test]
-    fn subagent_pi_args_named_with_tools() {
-        let args = super::subagent_pi_args(&LaunchConfig {
-            system_prompt: Some("You are a careful reviewer.".into()),
-            model: Some("anthropic/claude-sonnet-4-5".into()),
-            thinking: Some("high".into()),
-            tools: Some(vec!["read".into(), "bash".into()]),
-        });
-        assert_eq!(
-            args,
-            vec![
-                "--mode",
-                "rpc",
-                "--no-themes",
-                "--system-prompt",
-                "You are a careful reviewer.",
-                "--model",
-                "anthropic/claude-sonnet-4-5",
-                "--thinking",
-                "high",
-                "--tools",
-                "read,bash",
-                "--no-session",
-            ]
-        );
-    }
-
-    /// (2) Named agent without tools: `--exclude-tools subagent`, no `--tools`.
-    #[test]
-    fn subagent_pi_args_named_without_tools() {
-        let args = super::subagent_pi_args(&LaunchConfig {
-            system_prompt: Some("body".into()),
-            model: None,
-            thinking: None,
-            tools: None,
-        });
-        assert_eq!(
-            args,
-            vec![
-                "--mode",
-                "rpc",
-                "--no-themes",
-                "--system-prompt",
-                "body",
-                "--exclude-tools",
-                "subagent",
-                "--no-session"
-            ]
-        );
-    }
-
-    /// (3) Config-less dispatch (all `None`): only the base + exclude + no-session.
-    #[test]
-    fn subagent_pi_args_config_less_is_minimal() {
-        let args = super::subagent_pi_args(&LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-        });
-        assert_eq!(
-            args,
-            vec![
-                "--mode",
-                "rpc",
-                "--no-themes",
-                "--exclude-tools",
-                "subagent",
-                "--no-session"
-            ]
-        );
-    }
-
-    /// (4) Model + thinking only (a common partial config).
-    #[test]
-    fn subagent_pi_args_model_and_thinking_only() {
-        let args = super::subagent_pi_args(&LaunchConfig {
-            system_prompt: None,
-            model: Some("openai/gpt-5".into()),
-            thinking: Some("medium".into()),
-            tools: Some(vec!["read".into()]),
-        });
-        assert_eq!(
-            args,
-            vec![
-                "--mode",
-                "rpc",
-                "--no-themes",
-                "--model",
-                "openai/gpt-5",
-                "--thinking",
-                "medium",
-                "--tools",
-                "read",
-                "--no-session"
-            ]
-        );
-    }
-
     fn temp_config_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("subagent-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    /// Write an agents.json with ONE `fake` entry pointing at `fake_pi`
-    /// with the given env (e.g. `FAKE_PI_TWO_MSGS=1`).
-    fn write_agents_json_pi(dir: &std::path::Path, env: &[(&str, &str)]) {
-        // `env` is a JSON OBJECT (a `BTreeMap` on the wire) — the slice
-        // form would serialize as an array of pairs and fail to
-        // deserialize.
-        let env_map: serde_json::Map<String, serde_json::Value> = env
-            .iter()
-            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
-            .collect();
-        let json = serde_json::json!({
-            "agents": [
-                {
-                    "id": "fake",
-                    "name": "Fake Pi",
-                    "command": fake_pi_bin(),
-                    "args": [],
-                    "env": env_map,
-                }
-            ]
-        });
-        std::fs::write(
-            dir.join("agents.json"),
-            serde_json::to_string_pretty(&json).unwrap(),
-        )
-        .unwrap();
-    }
-
-    /// Spawn a `PiRpc` from a registry entry (the command + args + env).
-    fn make_rpc(
-        entry: &crate::config::AgentEntry,
-        cwd: &std::path::Path,
-    ) -> Result<PiRpc, crate::agent::RpcError> {
-        PiRpc::spawn(&entry.command, &entry.args, &entry.env, cwd)
     }
 
     /// (1) `SubagentCancel`: first-set-wins `kind` = `User`; the flag flips
@@ -1722,20 +1089,20 @@ mod tests {
     fn subagent_cancel_first_set_wins_user_and_flips_flag() {
         let (ec, cancel) = SubagentCancel::new_external_close();
         // Initially: kind is `None`, the flag is `false`.
-        assert!(ec.kind.lock().unwrap().is_none());
+        assert!(cancel.kind.lock().unwrap().is_none());
         assert!(!*ec.rx.borrow());
         cancel.cancel();
         // After cancel: kind is `User`, the flag is `true`.
-        assert_eq!(*ec.kind.lock().unwrap(), Some(CloseKind::User));
+        assert_eq!(*cancel.kind.lock().unwrap(), Some(CloseKind::User));
         assert!(*ec.rx.borrow());
         // Idempotent: cancel again, kind stays `User`.
         cancel.cancel();
-        assert_eq!(*ec.kind.lock().unwrap(), Some(CloseKind::User));
+        assert_eq!(*cancel.kind.lock().unwrap(), Some(CloseKind::User));
     }
 
     #[tokio::test]
-    async fn respond_bridge_request_resolves_and_misses() {
-        let manager = SubagentSessionManager::new(temp_config_dir(), None).unwrap();
+    async fn respond_interactive_request_resolves_and_misses() {
+        let manager = SubagentSessionManager::new(None);
         let (tx, rx) = oneshot::channel();
         manager
             .driver()
@@ -1746,7 +1113,7 @@ mod tests {
         // Resolves the entry (returns `true`).
         assert!(
             manager
-                .respond_bridge_request("sess", "r1", serde_json::json!({ "x": 1 }))
+                .respond_interactive_request("sess", "r1", serde_json::json!({ "x": 1 }))
                 .await
         );
         let v = rx.await.unwrap();
@@ -1754,14 +1121,14 @@ mod tests {
         // A missing key returns `false`.
         assert!(
             !manager
-                .respond_bridge_request("sess", "r2", serde_json::json!({}))
+                .respond_interactive_request("sess", "r2", serde_json::json!({}))
                 .await
         );
     }
 
     #[tokio::test]
     async fn respond_permission_resolves_and_misses() {
-        let manager = SubagentSessionManager::new(temp_config_dir(), None).unwrap();
+        let manager = SubagentSessionManager::new(None);
         let (tx, rx) = oneshot::channel();
         manager
             .driver()
@@ -1791,7 +1158,7 @@ mod tests {
     /// set wins — the `OnceLock` is set-once at wiring time).
     #[test]
     fn set_native_deps_is_set_once_on_the_manager() {
-        let manager = SubagentSessionManager::new(temp_config_dir(), None).unwrap();
+        let manager = SubagentSessionManager::new(None);
         // Unset in `new` (the native wiring is injected at the
         // `SessionManager` wiring time — `set_subagent_manager`).
         assert!(manager.native_deps().is_none());
@@ -1807,7 +1174,11 @@ mod tests {
             });
         let first = super::NativeDeps {
             provider_factory: mock_factory.clone(),
-            catalog: crate::agent::harness::ModelCatalog::default(),
+            catalog: EffectiveCatalog {
+                config_dir: PathBuf::new(),
+                cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                base: crate::agent::harness::ModelCatalog::default(),
+            },
             todo_store: Arc::new(crate::agent::todo::TodoStore::new()),
             sudo: crate::agent::harness::SudoDeps::default(),
             settle_timeout: Duration::from_secs(30 * 60),
@@ -1829,323 +1200,6 @@ mod tests {
             manager.native_deps().unwrap().settle_timeout,
             Duration::from_secs(30 * 60)
         );
-    }
-
-    /// (3) The `text_capture` / `last_message_id` pair: drive a `fake_pi`
-    /// `FAKE_PI_TWO_MSGS` session through a `SessionDriver` with both
-    /// `Some`; assert the per-`messageId` texts (m1 = "hello", m2 =
-    /// "world") AND that `last_message_id` is `m2` (the final-output
-    /// source, NOT `HashMap` iteration order).
-    // The polling loop holds the (brief) `std::sync::Mutex` guards in scope
-    // across the `sleep` / teardown awaits on purpose (a plain `StdMutex` is
-    // the driver's capture type by design — the guards are dropped before
-    // each await; clippy's liveness analysis is scope-based, not `drop`-aware).
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn text_capture_and_last_message_id_track_distinct_messages() {
-        let config_dir = temp_config_dir();
-        write_agents_json_pi(&config_dir, &[("FAKE_PI_TWO_MSGS", "1")]);
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let registry = Registry::load(&config_dir).unwrap();
-        let entry = registry.get("fake").unwrap();
-        let cwd = config_dir.clone();
-
-        let mut driver = SessionDriver::new();
-        driver.text_capture = Some(Arc::new(StdMutex::new(HashMap::new())));
-        driver.last_message_id = Some(Arc::new(StdMutex::new(None)));
-        let text_capture = driver.text_capture.clone().unwrap();
-        let last_message_id = driver.last_message_id.clone().unwrap();
-        let driver = Arc::new(driver);
-
-        // Drive the session (the fake in `FAKE_PI_TWO_MSGS` mode answers
-        // `get_state`, then streams m1 ("hello") then m2 ("world") on
-        // `prompt`).
-        let info = crate::test_support::run_with_retry(|| {
-            let driver = driver.clone();
-            let sink = sink.clone();
-            let entry = entry.clone();
-            let cwd = cwd.clone();
-            async move {
-                let rpc = make_rpc(&entry, &cwd)?;
-                let handle: PiRpcHandle = rpc.handle();
-                let cwd = cwd.clone();
-                driver
-                    .drive_session(
-                        handle,
-                        "fake",
-                        String::new(),
-                        cwd.clone(),
-                        &sink,
-                        None,
-                        None,
-                        move |h: PiRpcHandle| async move {
-                            let state = h.send(serde_json::json!({ "type": "get_state" })).await?;
-                            let session_id = state
-                                .get("sessionId")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            Ok(SessionInfo {
-                                session_id,
-                                agent_id: "fake".to_string(),
-                                cwd,
-                                capabilities: serde_json::Value::Null,
-                                config_options: None,
-                                // Ephemeral (subagent) sessions are never archived (ADR 0016).
-                                archived: false,
-                            })
-                        },
-                    )
-                    .await
-            }
-        })
-        .await
-        .expect("drive_session should establish");
-
-        // Send the prompt (the preflight response), then await the turn's
-        // settle (the driver's `agent_settled` watch).
-        let sid = info.session_id.clone();
-        let handle = {
-            let sessions = driver.sessions.lock().await;
-            match sessions.get(&sid).unwrap().handle.clone() {
-                // The `SessionBackend` generalization (Task 7): the test
-                // drives an EXTERNAL session — the pi handle.
-                SessionBackend::Pi(handle) => handle,
-                SessionBackend::Native(_) => {
-                    panic!("the test session is external, not native")
-                }
-            }
-        };
-        handle
-            .send(serde_json::json!({ "type": "prompt", "content": "hi" }))
-            .await
-            .expect("prompt should succeed");
-        driver
-            .wait_for_settle(&sid)
-            .await
-            .expect("the turn should settle");
-
-        // Poll the captures until both messages are accumulated.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            let acc = text_capture.lock().unwrap();
-            let done = acc.get("m1").is_some() && acc.get("m2").is_some();
-            drop(acc);
-            if done {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                panic!(
-                    "timeout waiting for the captures; got {:?}",
-                    &*text_capture.lock().unwrap()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let acc = text_capture.lock().unwrap();
-        assert_eq!(acc.get("m1").map(|s| s.as_str()), Some("hello"));
-        assert_eq!(acc.get("m2").map(|s| s.as_str()), Some("world"));
-        // The last-seen messageId is m2 (NOT derived from HashMap order).
-        assert_eq!(last_message_id.lock().unwrap().as_deref(), Some("m2"));
-        drop(acc);
-
-        // Teardown (best effort — the process dies on close).
-        close_session_internal(&driver, &info.session_id).await;
-        let _ = std::fs::remove_dir_all(&config_dir);
-    }
-
-    /// (4) The `external_close` arm: a driver task with `external_close: Some`
-    /// tears down when the external flag flips DURING the establish phase (the
-    /// fake in `FAKE_PI_HANG` mode never answers `get_state` — WITHOUT the
-    /// external close, `drive_session` would wait out the full establish
-    /// timeout).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn external_close_tears_down_during_establish() {
-        let config_dir = temp_config_dir();
-        write_agents_json_pi(&config_dir, &[("FAKE_PI_HANG", "1")]);
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let registry = Registry::load(&config_dir).unwrap();
-        let entry: crate::config::AgentEntry = registry.get("fake").cloned().unwrap();
-        let cwd = config_dir.clone();
-
-        let mut driver = SessionDriver::new();
-        driver.establish_timeout = Duration::from_secs(10);
-        let driver = Arc::new(driver);
-
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let kind = Arc::new(StdMutex::new(None));
-        let external_close = ExternalClose {
-            tx: tx.clone(),
-            rx,
-            kind: kind.clone(),
-        };
-
-        let drive = tokio::spawn(async move {
-            let rpc = make_rpc(&entry, &cwd).expect("fake_pi should spawn");
-            let handle = rpc.handle();
-            driver
-                .drive_session(
-                    handle,
-                    "fake",
-                    String::new(),
-                    cwd,
-                    &sink,
-                    None,
-                    Some(external_close),
-                    move |h: PiRpcHandle| async move {
-                        let state = h.send(serde_json::json!({ "type": "get_state" })).await?;
-                        let session_id = state
-                            .get("sessionId")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        Ok(SessionInfo {
-                            session_id,
-                            agent_id: "fake".to_string(),
-                            cwd: config_dir.clone(),
-                            capabilities: serde_json::Value::Null,
-                            config_options: None,
-                            // Ephemeral (subagent) sessions are never archived (ADR 0016).
-                            archived: false,
-                        })
-                    },
-                )
-                .await
-        });
-
-        // The establish phase is in progress (the hung fake never
-        // answers `get_state`): flip the external close.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        *kind.lock().unwrap() = Some(CloseKind::User);
-        let _ = tx.send(true);
-
-        let result = tokio::time::timeout(Duration::from_secs(8), drive).await;
-
-        let final_res = match result {
-            Ok(inner) => inner,
-            Err(_) => panic!("Test timed out at 8s"),
-        };
-
-        match final_res {
-            Ok(Ok(_)) => panic!("Session established unexpectedly"),
-            Err(e) => panic!("Task panicked: {:?}", e),
-            Ok(Err(e)) => {
-                // The external close won the race: the establisher's
-                // select arm resolved the teardown (a `spawn` /
-                // `io`-class error the `run_with_retry` mapping does
-                // NOT retry — the hang-mode fake spawned fine, so the
-                // error is the teardown's, not a spawn flake).
-                assert!(
-                    !e.to_string().contains("did not answer get_state"),
-                    "Expected a prompt teardown (User), not the establish timeout; got: {e}"
-                );
-            }
-        }
-    }
-
-    /// (5) `wait_for_settle` is BOUNDED (the zombie-subagent fix): a
-    /// hung turn (the `FAKE_PI_HANG_PROMPT` fake acks the prompt but
-    /// never emits `agent_settled`) resolves `Err(SettleTimeout)` after
-    /// `settle_timeout` — the wait does not linger forever.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn wait_for_settle_times_out_on_a_hung_turn() {
-        let config_dir = temp_config_dir();
-        write_agents_json_pi(&config_dir, &[("FAKE_PI_HANG_PROMPT", "1")]);
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink { tx });
-
-        let registry = Registry::load(&config_dir).unwrap();
-        let entry = registry.get("fake").unwrap();
-        let cwd = config_dir.clone();
-
-        let mut driver = SessionDriver::new();
-        driver.settle_timeout = Duration::from_millis(500);
-        let driver = Arc::new(driver);
-
-        // Drive the session (the fake in `FAKE_PI_HANG_PROMPT` mode
-        // answers `get_state`, acks the prompt, but NEVER settles — the
-        // hung-turn condition).
-        let info = crate::test_support::run_with_retry(|| {
-            let driver = driver.clone();
-            let sink = sink.clone();
-            let entry = entry.clone();
-            let cwd = cwd.clone();
-            async move {
-                let rpc = make_rpc(&entry, &cwd)?;
-                let handle: PiRpcHandle = rpc.handle();
-                let cwd = cwd.clone();
-                driver
-                    .drive_session(
-                        handle,
-                        "fake",
-                        String::new(),
-                        cwd.clone(),
-                        &sink,
-                        None,
-                        None,
-                        move |h: PiRpcHandle| async move {
-                            let state = h.send(serde_json::json!({ "type": "get_state" })).await?;
-                            let session_id = state
-                                .get("sessionId")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            Ok(SessionInfo {
-                                session_id,
-                                agent_id: "fake".to_string(),
-                                cwd,
-                                capabilities: serde_json::Value::Null,
-                                config_options: None,
-                                // Ephemeral (subagent) sessions are never archived (ADR 0016).
-                                archived: false,
-                            })
-                        },
-                    )
-                    .await
-            }
-        })
-        .await
-        .expect("drive_session should establish");
-
-        // Ack the prompt (the fake NEVER settles it — the hung turn).
-        let sid = info.session_id.clone();
-        let handle = {
-            let sessions = driver.sessions.lock().await;
-            match sessions.get(&sid).unwrap().handle.clone() {
-                // The `SessionBackend` generalization (Task 7): the test
-                // drives an EXTERNAL session — the pi handle.
-                SessionBackend::Pi(handle) => handle,
-                SessionBackend::Native(_) => {
-                    panic!("the test session is external, not native")
-                }
-            }
-        };
-        handle
-            .send(serde_json::json!({ "type": "prompt", "content": "hi" }))
-            .await
-            .expect("prompt should succeed");
-
-        // The bounded wait resolves `Err(SettleTimeout)` (well inside the
-        // 5 s test deadline — NOT a test hang).
-        let r = tokio::time::timeout(Duration::from_secs(5), driver.wait_for_settle(&sid))
-            .await
-            .expect("wait_for_settle should resolve (the timeout, not a test hang)")
-            .unwrap_err();
-        assert!(
-            matches!(r, RpcError::SettleTimeout { .. }),
-            "expected SettleTimeout, got {r:?}"
-        );
-
-        // Teardown (best effort — the process dies on close).
-        close_session_internal(&driver, &info.session_id).await;
-        let _ = std::fs::remove_dir_all(&config_dir);
     }
 
     // ── The `dispatch_native` throwaway-`Db` tests (the review fix) ──
@@ -2279,10 +1333,7 @@ mod tests {
         provider: Arc<dyn Provider>,
         settle_timeout: Duration,
     ) -> Arc<SubagentSessionManager> {
-        let manager = Arc::new(
-            SubagentSessionManager::new(config_dir.to_path_buf(), None)
-                .expect("subagent manager should build"),
-        );
+        let manager = Arc::new(SubagentSessionManager::new(None));
         let catalog = ModelCatalog {
             models: vec![native_test_model()],
             ..Default::default()
@@ -2291,7 +1342,11 @@ mod tests {
             Arc::new(move |_m: &Model| Box::new(ArcBoxProvider(provider.clone())));
         manager.set_native_deps(NativeDeps {
             provider_factory: factory,
-            catalog,
+            catalog: EffectiveCatalog {
+                config_dir: config_dir.to_path_buf(),
+                cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                base: catalog,
+            },
             todo_store: Arc::new(crate::agent::todo::TodoStore::new()),
             sudo: SudoDeps::default(),
             settle_timeout,

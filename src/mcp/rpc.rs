@@ -30,7 +30,7 @@ impl RpcRequest {
 
 /// A JSON-RPC 2.0 error object (`error: { code, message, data? }`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct RpcError {
+pub struct SessionError {
     pub code: i64,
     pub message: String,
     pub data: Option<Value>,
@@ -42,13 +42,13 @@ pub struct RpcError {
 pub struct RpcResponse {
     pub id: Value,
     pub result: Option<Value>,
-    pub error: Option<RpcError>,
+    pub error: Option<SessionError>,
 }
 
 /// Parse a server line as a RESPONSE (a JSON object carrying an `id`):
 /// - a valid JSON object with an `id` → `Ok(RpcResponse)` (`result` and/or
 ///   `error` extracted; an `error` object `{ code, message, data? }` →
-///   `RpcError` — a non-object `error` is a parse error).
+///   `SessionError` — a non-object `error` is a parse error).
 /// - a non-object / invalid JSON / a missing `id` (a notification) →
 ///   `Err` (the caller routes it to `parse_notification`).
 pub fn parse_response(line: &str) -> Result<RpcResponse, String> {
@@ -74,7 +74,7 @@ pub fn parse_response(line: &str) -> Result<RpcResponse, String> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Some(RpcError {
+            Some(SessionError {
                 code,
                 message,
                 data: em.get("data").cloned(),

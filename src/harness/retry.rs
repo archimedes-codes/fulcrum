@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::events::RpcEvent;
 use crate::agent::harness::provider::ProviderError;
-use crate::agent::rpc::RpcEvent;
 
 /// The default attempt budget (the plan's N=5).
 const DEFAULT_MAX_ATTEMPTS: u64 = 5;

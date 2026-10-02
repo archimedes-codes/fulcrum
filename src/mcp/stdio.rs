@@ -301,7 +301,7 @@ fn err_resp() -> RpcResponse {
     RpcResponse {
         id: Value::Null,
         result: None,
-        error: Some(super::rpc::RpcError {
+        error: Some(super::rpc::SessionError {
             code: -32000,
             message: "the server process exited".to_string(),
             data: None,
