@@ -488,7 +488,7 @@ impl SubagentSessionManager {
             // `start_session`'s `client_session_id`): the ACP
             // `session_id` is agent-generated and is the identity for
             // everything else (see step 4).
-            let client_session_id = uuid::Uuid::new_v4().to_string();
+            let client_session_id = crate::agent::session::mint_session_id();
 
             // 2. Bridge setup (4 env vars + per-spawn socket, the parent's
             // registry entry). `None` when the agent is not a bridge
@@ -882,7 +882,7 @@ impl SubagentSessionManager {
             // temp file) is `Failed` (NOT a panic — a panic would drop
             // the oneshot, surfacing as a bare "cancelled" with zero
             // diagnostics).
-            let child_id = uuid::Uuid::new_v4().to_string();
+            let child_id = crate::agent::session::mint_session_id();
             // `_child_db_guard` is held for the WHOLE driver task (dropped
             // at scope end — the `_` only suppresses the unused-variable
             // warning; the `Drop` still runs, removing the temp file on ANY

@@ -1254,6 +1254,7 @@ impl AgentLoop {
                 reasoning_effort: None,
                 stream: true,
             },
+            session_id: Some(self.session_id.clone()),
         };
         let mut stream = tokio::select! {
             s = self.provider.complete(&req) => s?,
@@ -1325,6 +1326,7 @@ impl AgentLoop {
                 reasoning_effort: self.thinking_level.clone(),
                 stream: true,
             },
+            session_id: Some(self.session_id.clone()),
         }
     }
 
@@ -1988,6 +1990,59 @@ mod tests {
         ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
         {
             Err(self.error.clone())
+        }
+    }
+
+    /// A `Provider` that records `req.session_id.clone()` into an `Arc<StdMutex<Vec<Option<String>>>>`
+    /// and returns canned responses (or `text_then_done` by default).
+    struct SessionRecordingProvider {
+        recorded_session_ids: Arc<StdMutex<Vec<Option<String>>>>,
+        scripts: Vec<Vec<ProviderEvent>>,
+        call_idx: AtomicU32,
+    }
+
+    impl SessionRecordingProvider {
+        fn new(recorded_session_ids: Arc<StdMutex<Vec<Option<String>>>>) -> Self {
+            Self {
+                recorded_session_ids,
+                scripts: Vec::new(),
+                call_idx: AtomicU32::new(0),
+            }
+        }
+
+        fn with_scripts(
+            recorded_session_ids: Arc<StdMutex<Vec<Option<String>>>>,
+            scripts: Vec<Vec<ProviderEvent>>,
+        ) -> Self {
+            Self {
+                recorded_session_ids,
+                scripts,
+                call_idx: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SessionRecordingProvider {
+        async fn complete(
+            &self,
+            req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            self.recorded_session_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(req.session_id.clone());
+            let idx = self.call_idx.fetch_add(1, Ordering::SeqCst) as usize;
+            let events = if let Some(script) = self.scripts.get(idx) {
+                script.clone()
+            } else {
+                vec![
+                    ProviderEvent::TextDelta("ok".to_string()),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ]
+            };
+            Ok(futures_util::stream::iter(events).boxed())
         }
     }
 
@@ -3573,5 +3628,101 @@ mod tests {
             "the context block, got {text}"
         );
         assert!(!r.is_error);
+    }
+
+    #[tokio::test]
+    async fn model_requests_carry_the_session_id_across_turns_and_tool_calls() {
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let provider = SessionRecordingProvider::with_scripts(
+            recorded.clone(),
+            vec![
+                // Turn 1, call 1: tool call
+                vec![
+                    ProviderEvent::ToolCall(ToolCall {
+                        id: "t1".to_string(),
+                        name: "ls".to_string(),
+                        arguments: json!({ "path": "." }),
+                    }),
+                    ProviderEvent::Done(FinishReason::ToolCalls),
+                ],
+                // Turn 1, call 2: finish
+                vec![
+                    ProviderEvent::TextDelta("done with ls".to_string()),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ],
+                // Turn 2, call 3: simple text response
+                vec![
+                    ProviderEvent::TextDelta("turn 2".to_string()),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ],
+            ],
+        );
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+
+        // Turn 1: has a tool call and follow-up completion
+        loop_.handle_prompt(&text_prompt("run ls")).await;
+        wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("turn 1 settled");
+
+        // Turn 2: another conversational prompt
+        loop_.handle_prompt(&text_prompt("second turn")).await;
+        wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("turn 2 settled");
+
+        let sessions = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            sessions.len(),
+            3,
+            "expected 3 model calls across the two turns"
+        );
+        for (i, session_id) in sessions.iter().enumerate() {
+            assert_eq!(
+                session_id,
+                &Some("s1".to_string()),
+                "call {i} should carry Some(\"s1\")",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_model_request_carries_the_session_id() {
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let provider = SessionRecordingProvider::new(recorded.clone());
+        let (mut loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        let older = vec![ChatMessage {
+            role: ChatRole::User,
+            content: MessageContent::Text("history".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let summary = loop_
+            .summarize(&older, &CancellationToken::new())
+            .await
+            .expect("summarize succeeds");
+        assert_eq!(summary, "ok");
+
+        let sessions = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(sessions.len(), 1, "expected 1 model call for summarize");
+        assert_eq!(sessions[0], Some("s1".to_string()));
     }
 }
