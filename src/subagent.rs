@@ -1046,7 +1046,12 @@ impl SubagentSessionManager {
             // child died before the turn started → `Failed`). The
             // system message was already seeded in step 7 (BEFORE the
             // task prompt).
-            let preflight = prompt_tx.send(Prompt { text: task.clone() }).await;
+            let preflight = prompt_tx
+                .send(Prompt {
+                    text: task.clone(),
+                    images: Vec::new(),
+                })
+                .await;
             // 11. Race: the child's settle (a `changed()` `Err` = the
             // child loop task DIED — the `settle_tx` was dropped —
             // `Failed`, NOT `Completed`, mirroring

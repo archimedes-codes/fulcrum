@@ -48,7 +48,7 @@ use crate::agent::rpc::RpcEvent;
 use crate::agent::session::{normalize, persist_update, EventSink, ThoughtState, TurnState};
 use crate::agent::subagent::SubagentSessionManager;
 use crate::agent::todo::TodoStore;
-use crate::agent::tools::{execute_tool, ContentBlock, ToolCtx, ToolResult};
+use crate::agent::tools::{execute_tool, ContentBlock, ImageRef, ToolCtx, ToolResult};
 use crate::storage::Db;
 
 /// The `ask` flow's cap (the suite's `timeoutMs: 300_000` — 5 min; the
@@ -79,10 +79,14 @@ fn is_compaction_summary(m: &ChatMessage) -> bool {
     matches!(&m.content, MessageContent::Text(t) if t.starts_with(SUMMARY_PREFIX))
 }
 
-/// A prompt to the loop (the `prompt_queue` item).
+/// A prompt to the loop (the `prompt_queue` item): the text + the image
+/// attachments (`ImageRef` — the pi `ImageContent` shape; the manager
+/// maps the wire `ImagePayload` onto it). An empty `images` is a
+/// text-only prompt (the common case).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     pub text: String,
+    pub images: Vec<ImageRef>,
 }
 
 /// A control command to the loop (the `control_queue` item — the
@@ -256,9 +260,10 @@ impl AgentLoop {
     }
 
     /// Queue a prompt (best-effort — a full / closed queue is dropped).
-    pub fn send_prompt(&self, text: &str) {
+    pub fn send_prompt(&self, text: &str, images: &[ImageRef]) {
         let _ = self.prompt_tx.try_send(Prompt {
             text: text.to_string(),
+            images: images.to_vec(),
         });
     }
 
@@ -422,7 +427,7 @@ impl AgentLoop {
                     None => break,
                 },
                 p = self.prompt_queue.recv() => match p {
-                    Some(p) => self.handle_prompt(&p.text).await,
+                    Some(p) => self.handle_prompt(&p).await,
                     None => break,
                 },
             }
@@ -430,7 +435,11 @@ impl AgentLoop {
     }
 
     /// Handle one prompt (the model → tool → retry/compaction loop).
-    pub async fn handle_prompt(&mut self, text: &str) {
+    /// `prompt` carries the text + the image attachments (the `user`
+    /// message the turn pushes is `Blocks` — text first, then the image
+    /// blocks — when images are present; a text-only prompt keeps the
+    /// `Text` shape).
+    pub async fn handle_prompt(&mut self, prompt: &Prompt) {
         // A Stop is pending (the turn token is cancelled — `NativeHandle::cancel`
         // cancelled it): a queued prompt must not start a FRESH turn after the
         // user pressed Stop. Drain the queue + skip this prompt (the token is
@@ -459,7 +468,7 @@ impl AgentLoop {
             *self.turn_cancel.lock().unwrap_or_else(|p| p.into_inner()) = fresh.clone();
             fresh
         };
-        self.handle_turn(&turn, text).await;
+        self.handle_turn(&turn, &prompt.text, &prompt.images).await;
     }
 
     /// The turn body (the model → tool → retry/compaction loop) — `turn`
@@ -467,7 +476,7 @@ impl AgentLoop {
     /// stream, the backoff sleeps, the tool batch, the gate, and the
     /// `ask` / `subagent` / `summarize` flows all race it — a cancel
     /// stops the turn, it is never waited out).
-    async fn handle_turn(&mut self, turn: &CancellationToken, text: &str) {
+    async fn handle_turn(&mut self, turn: &CancellationToken, text: &str, images: &[ImageRef]) {
         // The display `user` row is written SOLELY by the manager's
         // `send_prompt_with_images` (`record_message` — the command
         // delegates to it and adds no persistence of its own): the loop
@@ -476,9 +485,33 @@ impl AgentLoop {
         // DISTINCT in `ON CONFLICT`, so a double write would show a
         // duplicate user bubble in restored history). The provider
         // transcript is `native_messages` (the push below).
+        //
+        // The provider-transcript `user` message is `Text` for a
+        // text-only prompt (the common case) and `Blocks` (text FIRST,
+        // then the image blocks — an empty text adds no text block)
+        // when images are present: the provider's `to_wire` sends the
+        // blocks as OpenAI `text` / `image_url` parts (the model sees
+        // the image), while the `ContentBlock`'s own pi-shaped
+        // serialization is the transcript / DB shape.
+        let content = if images.is_empty() {
+            MessageContent::Text(text.to_string())
+        } else {
+            let mut blocks: Vec<ContentBlock> = Vec::new();
+            if !text.is_empty() {
+                blocks.push(ContentBlock::Text {
+                    text: text.to_string(),
+                });
+            }
+            for image in images {
+                blocks.push(ContentBlock::Image {
+                    image: image.clone(),
+                });
+            }
+            MessageContent::Blocks(blocks)
+        };
         self.messages.push(ChatMessage {
             role: ChatRole::User,
-            content: MessageContent::Text(text.to_string()),
+            content,
             tool_call_id: None,
             tool_calls: None,
         });
@@ -781,7 +814,12 @@ impl AgentLoop {
                 });
                 self.messages.push(ChatMessage {
                     role: ChatRole::Tool,
-                    content: MessageContent::Text(result_text(&result)),
+                    // The result's FULL `Blocks` (a `read` on an image
+                    // file is an image-only result — flattening to the
+                    // first text block would drop the image the model is
+                    // meant to see; the provider's `to_wire` sends the
+                    // blocks as OpenAI `text` / `image_url` parts).
+                    content: MessageContent::Blocks(result.content.clone()),
                     tool_call_id: Some(tc.id.clone()),
                     tool_calls: None,
                 });
@@ -1474,8 +1512,11 @@ fn role_str(role: ChatRole) -> &'static str {
     }
 }
 
-/// The tool result's text (the first text block — the provider
-/// transcript's `tool` message content).
+/// The tool result's text (the first text block). TEST-ONLY (the
+/// production `tool` message keeps the result's FULL `Blocks` — the
+/// provider's `to_wire` is the wire shape; this is the assertion
+/// helper for the `dispatch_tool` results).
+#[cfg(test)]
 fn result_text(result: &ToolResult) -> String {
     result
         .content
@@ -2055,6 +2096,15 @@ mod tests {
         build_loop_with_db(provider, events, turn_cancel, settle_tx, retry).0
     }
 
+    /// A text-only `Prompt` (the test's common case — no image
+    /// attachments).
+    fn text_prompt(text: &str) -> Prompt {
+        Prompt {
+            text: text.to_string(),
+            images: Vec::new(),
+        }
+    }
+
     /// Await the first event matching `pred` (bounded — the tests must
     /// not hang).
     async fn wait_for_event(
@@ -2102,7 +2152,7 @@ mod tests {
             settle_tx,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
-        loop_.handle_prompt("hello").await;
+        loop_.handle_prompt(&text_prompt("hello")).await;
         // The raw `agent_settled` was DROPPED (the channel is still full —
         // the first event is still the pre-filled `turn_start`).
         assert_eq!(
@@ -2153,7 +2203,7 @@ mod tests {
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
-        let task = tokio::spawn(async move { loop_.handle_prompt("hello").await });
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("hello")).await });
         // The first tool starts (the `ask` blocks until the cancel).
         wait_for_event(
             &mut events_rx,
@@ -2210,7 +2260,7 @@ mod tests {
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
-        let task = tokio::spawn(async move { loop_.handle_prompt("hello").await });
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("hello")).await });
         tokio::time::sleep(Duration::from_millis(200)).await; // the call is in flight
         turn_cancel
             .lock()
@@ -2257,7 +2307,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .cancel();
-        loop_.handle_prompt("hello").await;
+        loop_.handle_prompt(&text_prompt("hello")).await;
         // The skipped prompt's settle (pre-fix this was missing → the
         // `send_prompt` caller hung).
         wait_for_event(&mut events_rx, 5000, |e| {
@@ -2296,7 +2346,7 @@ mod tests {
         );
         // Queue a prompt (its `pending_turn` resolver is conceptually held by
         // the caller — here the loop just has to settle it).
-        loop_.send_prompt("hello");
+        loop_.send_prompt("hello", &[]);
         // A Stop (the turn token) arrives — the queued prompt is drained (or
         // dequeued + skipped; either way the loop must settle it). Pre-fix the
         // drain arm dropped the item and `agent_settled` never fired.
@@ -2335,7 +2385,7 @@ mod tests {
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
-        loop_.handle_prompt("hello").await;
+        loop_.handle_prompt(&text_prompt("hello")).await;
         // The failed turn settles with `turn_end` (the timeline closes) +
         // `agent_settled` (the reliable settle signal) — `turn_end` FIRST.
         wait_for_event(&mut events_rx, 5000, |e| {
@@ -2380,7 +2430,7 @@ mod tests {
         // test fails.
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop_.sudo.runner = Arc::new(RecordingSudoRunner { ran: ran.clone() });
-        let task = tokio::spawn(async move { loop_.handle_prompt("hello").await });
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("hello")).await });
         // The `sudo_exec` is now blocking on its confirm sub-prompt
         // (never answered in the test).
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2452,7 +2502,7 @@ mod tests {
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
-        loop_.handle_prompt("hello").await;
+        loop_.handle_prompt(&text_prompt("hello")).await;
         let mut events = Vec::new();
         while let Ok(ev) = events_rx.try_recv() {
             events.push(ev);
@@ -2494,7 +2544,7 @@ mod tests {
             watch::channel(0u64).0,
             RetryPolicy::new_with(3, Duration::from_secs(30)),
         );
-        let task = tokio::spawn(async move { loop_.handle_prompt("hello").await });
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("hello")).await });
         wait_for_event(&mut events_rx, 5000, |e| {
             matches!(e, RpcEvent::auto_retry_start { .. })
         })
@@ -3165,7 +3215,7 @@ mod tests {
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
         loop_.set_enabled_tools(Some(vec!["read".to_string()]));
-        loop_.handle_prompt("hello").await;
+        loop_.handle_prompt(&text_prompt("hello")).await;
         let end = wait_for_event(&mut events_rx, 5000, |e| {
             matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1")
         })
@@ -3313,6 +3363,165 @@ mod tests {
             is_error: false,
         };
         assert_eq!(result_text(&r), "the text");
+    }
+
+    /// A tool result's IMAGE blocks reach the model: the `tool` message
+    /// the turn pushes is the result's FULL `Blocks` (a `read` on an
+    /// image file returns an image-only result — flattening it to the
+    /// first text block would drop the image the model is meant to see;
+    /// the provider's `to_wire` then sends it as an `image_url`
+    /// data-URI on the request wire).
+    #[tokio::test]
+    async fn a_tool_result_image_reaches_the_model_transcript() {
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "img.png" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        // A 1x1 transparent PNG (the `read` keys on the extension —
+        // the bytes are base64-encoded, not decoded).
+        std::fs::write(
+            loop_.space_cwd.join("img.png"),
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xD4, 0x00,
+                0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
+        )
+        .expect("the test png writes");
+        // The turn completes on its own (the scripted provider ends it —
+        // no cancel), so a plain await (the `loop_` stays in scope for
+        // the `messages` assertion below).
+        loop_.handle_prompt(&text_prompt("read the image")).await;
+        wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the turn settled");
+        // The `tool` message is the result's FULL `Blocks` (the image
+        // survived — NOT flattened to the first text block, which would
+        // be empty for an image-only result).
+        let tool_msg = loop_
+            .messages
+            .iter()
+            .find(|m| m.role == ChatRole::Tool)
+            .expect("a tool message was pushed");
+        match &tool_msg.content {
+            MessageContent::Blocks(blocks) => assert!(
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. })),
+                "the image block survived into the model transcript (got {blocks:?})"
+            ),
+            MessageContent::Text(t) => {
+                panic!("the tool message was flattened to text ({t:?}) — the image is lost")
+            }
+        }
+    }
+
+    /// A prompt WITH images pushes a `Blocks` user message (text FIRST,
+    /// then the image blocks — the model sees the image on the request
+    /// wire via the provider's `to_wire`; an empty text + images is an
+    /// image-only `Blocks`, NO empty text block).
+    #[tokio::test]
+    async fn a_prompt_with_images_pushes_a_blocks_user_message() {
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::TextDelta("ok".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("ok2".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        // A prompt with text + an image → `Blocks` (text first, image
+        // after).
+        loop_
+            .handle_prompt(&Prompt {
+                text: "describe".to_string(),
+                images: vec![crate::agent::tools::ImageRef {
+                    data: "BASE64DATA".to_string(),
+                    mime_type: "image/png".to_string(),
+                }],
+            })
+            .await;
+        wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the turn settled");
+        let first = loop_.messages.first().expect("a user message was pushed");
+        match &first.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2, "a text block + an image block");
+                assert!(
+                    matches!(&blocks[0], ContentBlock::Text { text } if text == "describe"),
+                    "the text block is FIRST (got {blocks:?})"
+                );
+                assert!(
+                    matches!(&blocks[1], ContentBlock::Image { image } if image.mime_type == "image/png" && image.data == "BASE64DATA"),
+                    "the image block follows (got {blocks:?})"
+                );
+            }
+            other => panic!("a prompt with images is a Blocks user message, got {other:?}"),
+        }
+        // An EMPTY text + an image → an image-only `Blocks` (no empty
+        // text block).
+        loop_
+            .handle_prompt(&Prompt {
+                text: String::new(),
+                images: vec![crate::agent::tools::ImageRef {
+                    data: "D".to_string(),
+                    mime_type: "image/gif".to_string(),
+                }],
+            })
+            .await;
+        wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the turn settled");
+        let second = loop_
+            .messages
+            .get(2)
+            .expect("the second user message was pushed");
+        match &second.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1, "an empty text adds no text block");
+                assert!(matches!(&blocks[0], ContentBlock::Image { .. }));
+            }
+            other => panic!("an image-only prompt is a Blocks user message, got {other:?}"),
+        }
     }
 
     #[test]

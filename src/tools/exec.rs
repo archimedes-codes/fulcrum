@@ -76,7 +76,7 @@ pub enum ContentBlock {
 }
 
 /// A base64 image reference (pi's `ImageContent` payload).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageRef {
     /// base64 (WITHOUT a `data:` prefix).
     pub data: String,
