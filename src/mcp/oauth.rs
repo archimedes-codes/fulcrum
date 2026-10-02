@@ -353,6 +353,47 @@ pub async fn refresh(stored: &StoredAuth, client: &reqwest::Client) -> Option<St
     parse_token_response(&v, &creds, &stored.auth_server_url, stored.scope.as_deref()).ok()
 }
 
+async fn resolve_auth_server_url(
+    def: &HttpDef,
+    auth_server_url: Option<&str>,
+    client: &reqwest::Client,
+) -> Result<String, String> {
+    if let Some(u) = auth_server_url {
+        if !u.is_empty() {
+            return Ok(u.to_string());
+        }
+    }
+    // Probe def.url to discover the auth server from WWW-Authenticate (RFC 9728).
+    let resp = client
+        .post(&def.url)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"archimedes","version":"0.1.0"}}}"#)
+        .send()
+        .await
+        .map_err(|e| format!("probing server for auth metadata failed: {e}"))?;
+
+    let www_auth = resp
+        .headers()
+        .get("WWW-Authenticate")
+        .or_else(|| resp.headers().get("www-authenticate"))
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(header) = www_auth {
+        if let Some(meta_url) = from_www_authenticate(header) {
+            let servers = resource_metadata(&meta_url, client).await?;
+            if let Some(first) = servers.into_iter().next() {
+                return Ok(first);
+            }
+        }
+    }
+
+    Err(
+        "no authorization server URL (set `authorizationServerUrl` in the config, \
+         or the server's 401 must carry a `WWW-Authenticate` `resource_metadata`)"
+            .to_string(),
+    )
+}
+
 /// The `authenticate` orchestrator:
 /// - `client_credentials` grant → a straight `token_endpoint` request.
 /// - `authorization_code` (the default) → DCR (unless a pre-registered
@@ -363,7 +404,7 @@ pub async fn refresh(stored: &StoredAuth, client: &reqwest::Client) -> Option<St
 /// `auth_server_url`: the auth server's base URL (the config's
 /// `authorizationServerUrl`, OR a 401's `WWW-Authenticate`
 /// `resource_metadata` → RFC 9728 → `authorization_servers[0]` — the caller
-/// resolves it and passes it; `None` → an error).
+/// resolves it and passes it; `None` → auto-discovered or error).
 /// `open_browser`: a seam (production = the platform opener, fire-and-forget;
 /// a test = a reqwest request to the authorization URL — the mock server
 /// 302-redirects it to the callback). `Send + Sync` (the `authenticate`
@@ -374,18 +415,12 @@ pub async fn authenticate(
     cancel: &CancellationToken,
     open_browser: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<StoredAuth, String> {
-    let Some(auth_server_url) = auth_server_url else {
-        return Err(
-            "no authorization server URL (set `authorizationServerUrl` in the config, \
-             or the server's 401 must carry a `WWW-Authenticate` `resource_metadata`)"
-                .to_string(),
-        );
-    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("the reqwest client builds");
-    let metadata = discover(auth_server_url, &client).await?;
+    let auth_server_url = resolve_auth_server_url(def, auth_server_url, &client).await?;
+    let metadata = discover(&auth_server_url, &client).await?;
     let AuthFields {
         grant_type,
         client_id,
@@ -409,7 +444,7 @@ pub async fn authenticate(
                 &metadata,
                 &creds,
                 scope.as_deref(),
-                auth_server_url,
+                &auth_server_url,
                 &client,
             )
             .await?;
@@ -470,7 +505,7 @@ pub async fn authenticate(
                 &verifier,
                 &redirect_uri,
                 scope.as_deref(),
-                auth_server_url,
+                &auth_server_url,
             )
             .await?;
             Ok(stored)

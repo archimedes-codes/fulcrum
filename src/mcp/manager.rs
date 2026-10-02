@@ -304,6 +304,7 @@ fn stored_token_provider(server_name: &str) -> Option<TokenProvider> {
 /// `kill_on_drop`). `Ok` = the tool count; `Err` = the error text (a
 /// `needs-auth` / a network failure) surfaced verbatim.
 pub async fn test_server(
+    server_name: Option<&str>,
     def: &ServerDef,
     project_cwd: &Path,
     timeout: Duration,
@@ -317,11 +318,9 @@ pub async fn test_server(
             tools
         }
         ServerDef::Http(def) => {
-            // An OAuth server: the stored token, if any (a `settings-test`
-            // name has no credentials entry → `None` → a 401 →
-            // `needs-auth`).
+            // An OAuth server: the stored token for this server, if any.
             let get_token = if matches!(def.auth, AuthSpec::OAuth { .. }) {
-                stored_token_provider("settings-test")
+                server_name.and_then(stored_token_provider)
             } else {
                 None
             };
@@ -332,6 +331,33 @@ pub async fn test_server(
         }
     };
     Ok(tools.len())
+}
+
+/// Run the interactive OAuth flow for a server from outside an agent session
+/// (e.g. from the Settings UI). Stores the resulting token in `mcp-auth.json`.
+pub async fn authenticate_server(server_name: &str, def: &ServerDef) -> Result<String, String> {
+    let ServerDef::Http(http_def) = def else {
+        return Err(format!("{server_name} is not an HTTP server (no OAuth)"));
+    };
+    if !matches!(http_def.auth, AuthSpec::OAuth { .. }) {
+        return Err(format!("{server_name} is not an OAuth server"));
+    }
+    let auth_server_url = match &http_def.auth {
+        AuthSpec::OAuth {
+            authorization_server_url,
+            ..
+        } => authorization_server_url.clone(),
+        _ => None,
+    };
+    let cancel = CancellationToken::new();
+    let open_browser: Box<dyn Fn(&str) + Send + Sync> = Box::new(production_open_browser);
+    let stored = oauth::authenticate(http_def, auth_server_url.as_deref(), &cancel, &open_browser)
+        .await
+        .map_err(|e| format!("{server_name}: {e}"))?;
+    let mut map = oauth::load_credentials(&oauth::auth_file_path());
+    map.insert(server_name.to_string(), stored);
+    oauth::save_credentials(&oauth::auth_file_path(), &map)?;
+    Ok(format!("{server_name}: authenticated"))
 }
 
 /// The production `open_browser` (the platform default browser,
@@ -478,9 +504,14 @@ mod tests {
             env: std::collections::BTreeMap::new(),
             cwd: None,
         });
-        let count = test_server(&def, std::path::Path::new("."), Duration::from_secs(5))
-            .await
-            .expect("the fake server answers");
+        let count = test_server(
+            None,
+            &def,
+            std::path::Path::new("."),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the fake server answers");
         assert_eq!(count, 3);
     }
 
@@ -491,7 +522,13 @@ mod tests {
             headers: std::collections::BTreeMap::new(),
             auth: AuthSpec::None,
         });
-        let result = test_server(&def, std::path::Path::new("."), Duration::from_secs(2)).await;
+        let result = test_server(
+            None,
+            &def,
+            std::path::Path::new("."),
+            Duration::from_secs(2),
+        )
+        .await;
         assert!(result.is_err(), "a dead port is an error");
     }
 
