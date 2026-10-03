@@ -57,14 +57,21 @@ pub struct SubagentSessionManager {
 /// Per-dispatch pi configuration for a subagent session (moved verbatim
 /// from `launch_wrapper.rs` — the wrapper script is deleted in this task;
 /// the flags are now passed directly to the `pi` spawn).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchConfig {
     /// The agent file body (named agents); `None` for config-less dispatch.
     pub system_prompt: Option<String>,
     /// Resolved model ("provider/id" or "provider/id:<thinking>"); `None` = pi default.
     pub model: Option<String>,
-    /// Explicit thinking level from the agent file; `None` = pi's own resolution.
+    /// Explicit thinking level from the tool call ONLY (the frontmatter's
+    /// `thinking` moved to `frontmatter_thinking` — the dispatch layers it
+    /// LAST).
     pub thinking: Option<String>,
+    /// The frontmatter's `thinking` (the dispatch resolves the thinking in
+    /// the doc-correct order: explicit > model-key `:<level>` suffix >
+    /// this — the frontmatter's `thinking` is the LAST rung). `None` for
+    /// a config-less dispatch.
+    pub frontmatter_thinking: Option<String>,
     /// Tool allowlist (named agents with `tools`); `None` → `--exclude-tools subagent`.
     pub tools: Option<Vec<String>>,
 }
@@ -442,12 +449,17 @@ impl SubagentSessionManager {
                 }
                 None => (parent_model, None),
             };
-            // 2. The child thinking level: `launch.thinking` (else the
-            // `:<level>` suffix); validate against `model.thinking_
-            // levels` (when non-empty — an empty set soft-passes) — a
-            // mismatch is DROPPED (never sent upstream as a bogus
-            // `reasoning_effort`).
-            let mut thinking = launch.thinking.clone().or(level_suffix);
+            // 2. The child thinking level: explicit > the `:<level>` suffix of
+            // the resolved model key > the frontmatter's `thinking` (the
+            // doc-correct order — the frontmatter's `thinking` is the LAST rung).
+            // Validate against `model.thinking_levels` (when non-empty — an empty
+            // set soft-passes) — a mismatch is DROPPED (never sent upstream as a
+            // bogus `reasoning_effort`).
+            let mut thinking = launch
+                .thinking
+                .clone()
+                .or(level_suffix)
+                .or(launch.frontmatter_thinking.clone());
             if let Some(level) = &thinking {
                 if !model.thinking_levels.is_empty()
                     && !model.thinking_levels.iter().any(|l| l == level)
@@ -1321,6 +1333,7 @@ mod tests {
             system_prompt: None,
             model: None,
             thinking: None,
+            frontmatter_thinking: None,
             tools: None,
         }
     }

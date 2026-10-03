@@ -131,6 +131,10 @@ pub struct AgentLoop {
     pub model: Model,
     pub provider: Box<dyn Provider>,
     pub catalog: ModelCatalog,
+    /// The settings dir (the `settings.json` home — ADR 0023:
+    /// `resolve_launch` reads the `subagentModels` override from here at
+    /// dispatch time; `None` = no override layer).
+    config_dir: Option<PathBuf>,
     pub store: SessionStore,
     /// The `RpcEvent`-shaped values (the SAME vocabulary an external
     /// session emits — the driver / tests consume it).
@@ -246,6 +250,7 @@ impl AgentLoop {
             model,
             provider,
             catalog,
+            config_dir,
             store,
             events,
             cancel,
@@ -1189,17 +1194,48 @@ impl AgentLoop {
         // handled downstream). An explicit `model` param is NEVER
         // degraded here (it is the model's current intent —
         // `dispatch_native` still fails it when unknown, unchanged).
-        let model = launch.model.clone().or_else(|| {
-            def.model.as_ref().and_then(|m| {
-                let bare = m
-                    .rsplit_once(':')
-                    .map(|(b, _)| b.to_string())
-                    .unwrap_or_else(|| m.clone());
-                crate::agent::session::resolve_composed_model(&self.catalog, &bare)
-                    .is_some()
-                    .then_some(m.clone())
-            })
+        // (ADR 0023) The per-agent model override (the settings'
+        // `subagentModels` — read at dispatch time: a settings edit takes
+        // effect on the NEXT dispatch, no restart; a missing/corrupt file
+        // yields the defaults → no override). SOFT, like the frontmatter:
+        // a value whose bare key resolves to NOTHING degrades to the next
+        // layer (a stale override must not fail the dispatch). CASE-
+        // INSENSITIVE by name (a case-insensitive SCAN — the stored key is
+        // NOT rewritten: the UI saves `def.name` verbatim, and a hand-edited
+        // mixed-case key must still match the case-insensitive `agentName`
+        // resolution).
+        let override_model = self.config_dir.as_deref().and_then(|dir| {
+            crate::commands::settings::load_settings(dir)
+                .subagent_models
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
         });
+        let model = launch
+            .model
+            .clone()
+            .or_else(|| {
+                override_model.as_ref().and_then(|m| {
+                    let bare = m
+                        .rsplit_once(':')
+                        .map(|(b, _)| b.to_string())
+                        .unwrap_or_else(|| m.clone());
+                    crate::agent::session::resolve_composed_model(&self.catalog, &bare)
+                        .is_some()
+                        .then_some(m.clone())
+                })
+            })
+            .or_else(|| {
+                def.model.as_ref().and_then(|m| {
+                    let bare = m
+                        .rsplit_once(':')
+                        .map(|(b, _)| b.to_string())
+                        .unwrap_or_else(|| m.clone());
+                    crate::agent::session::resolve_composed_model(&self.catalog, &bare)
+                        .is_some()
+                        .then_some(m.clone())
+                })
+            });
         // Unknown tool names in the frontmatter are DROPPED (a file
         // hint, not precise intent), as are the parent-guarded
         // `subagent` / `list_agents` (they can never reach the child —
@@ -1233,11 +1269,16 @@ impl AgentLoop {
             .system_prompt
             .clone()
             .or_else(|| (!def.system_prompt.is_empty()).then(|| def.system_prompt.clone()));
-        let thinking = launch.thinking.clone().or_else(|| def.thinking.clone());
+        // The thinking split (the doc-correct order — the dispatch resolves
+        // explicit > model-key suffix > frontmatter `thinking`): `thinking`
+        // holds the EXPLICIT param only; the frontmatter's `thinking` moves
+        // to its own field.
+        let frontmatter_thinking = def.thinking.clone();
         LaunchConfig {
             system_prompt,
             model,
-            thinking,
+            thinking: launch.thinking.clone(),
+            frontmatter_thinking,
             tools,
         }
     }
@@ -2278,6 +2319,8 @@ mod tests {
         turn_cancel: Arc<StdMutex<CancellationToken>>,
         settle_tx: watch::Sender<u64>,
         retry: RetryPolicy,
+        models: Vec<Model>,
+        config_dir: Option<&std::path::Path>,
     ) -> (AgentLoop, Arc<Db>) {
         let dir = std::env::temp_dir().join(format!("harness-loop-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2293,21 +2336,9 @@ mod tests {
             archived: false,
         })
         .expect("record_session");
-        let model = Model {
-            id: "m1".to_string(),
-            provider: "fake".to_string(),
-            base_url: "http://fake".to_string(),
-            api_key: "k".to_string(),
-            context_window: 128000,
-            cost_per_mtok_in: 0.0,
-            cost_per_mtok_out: 0.0,
-            supports_tools: true,
-            supports_thinking: false,
-            thinking_levels: Vec::new(),
-            api: Some("openai-completions".to_string()),
-        };
+        let model = models.first().cloned().expect("at least one model");
         let catalog = ModelCatalog {
-            models: vec![model.clone()],
+            models,
             default_model: None,
             compaction: CompactionConfig::default(),
         };
@@ -2336,7 +2367,7 @@ mod tests {
             None,
             SudoDeps::default(),
             retry,
-            None,
+            config_dir.map(|p| p.to_path_buf()),
         );
         (loop_, db)
     }
@@ -2350,7 +2381,16 @@ mod tests {
         settle_tx: watch::Sender<u64>,
         retry: RetryPolicy,
     ) -> AgentLoop {
-        build_loop_with_db(provider, events, turn_cancel, settle_tx, retry).0
+        build_loop_with_db(
+            provider,
+            events,
+            turn_cancel,
+            settle_tx,
+            retry,
+            vec![fake_model("m1")],
+            None,
+        )
+        .0
     }
 
     /// A text-only `Prompt` (the test's common case — no image
@@ -2991,6 +3031,8 @@ mod tests {
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
         );
         loop_.prepend_system("the prompt".to_string());
         let loaded = loop_.store.load_messages("s1").unwrap();
@@ -3031,6 +3073,8 @@ mod tests {
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
         );
         loop_.catalog.compaction.keep_recent_tokens = 1;
         loop_.load_transcript(vec![
@@ -3123,6 +3167,8 @@ mod tests {
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
         );
         loop_.catalog.compaction.keep_recent_tokens = 1;
         loop_.load_transcript(vec![
@@ -3195,6 +3241,8 @@ mod tests {
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
         );
         loop_.catalog.compaction.keep_recent_tokens = 1;
         loop_.load_transcript(vec![
@@ -3277,6 +3325,8 @@ mod tests {
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
         );
         loop_.catalog.compaction.keep_recent_tokens = 1;
         loop_.load_transcript(vec![
@@ -3349,6 +3399,8 @@ mod tests {
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
         );
         loop_.prepend_system("the prompt".to_string());
         let loaded = loop_.store.load_messages("s1").unwrap();
@@ -3866,6 +3918,7 @@ mod tests {
         sink: Arc<dyn EventSink>,
         subagent_manager: Option<Arc<SubagentSessionManager>>,
         models: Vec<Model>,
+        config_dir: Option<&std::path::Path>,
     ) -> AgentLoop {
         let dir = std::env::temp_dir().join(format!("harness-loop-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3897,7 +3950,7 @@ mod tests {
             subagent_manager,
             SudoDeps::default(),
             retry,
-            None,
+            config_dir.map(|p| p.to_path_buf()),
         )
     }
 
@@ -4016,6 +4069,7 @@ mod tests {
             model: Some("fake/m1".to_string()),
             thinking: Some("high".to_string()),
             tools: Some(vec!["bash".to_string()]),
+            ..Default::default()
         };
         assert_eq!(
             loop_.resolve_launch(&launch, ""),
@@ -4062,6 +4116,7 @@ mod tests {
             model: Some("fake/m1".to_string()),
             thinking: Some("high".to_string()),
             tools: Some(vec!["bash".to_string()]),
+            ..Default::default()
         };
         assert_eq!(
             loop_.resolve_launch(&launch, "nope"),
@@ -4096,10 +4151,11 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "Scout");
         assert_eq!(resolved.model, Some("fake/m1".to_string()));
-        assert_eq!(resolved.thinking, Some("low".to_string()));
+        assert_eq!(resolved.frontmatter_thinking, Some("low".to_string()));
         assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
         assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
     }
@@ -4131,11 +4187,12 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
         assert_eq!(resolved.model, Some("fake/m1".to_string()));
-        assert_eq!(resolved.thinking, Some("low".to_string()));
+        assert_eq!(resolved.frontmatter_thinking, Some("low".to_string()));
         assert_eq!(
             resolved.tools,
             Some(vec!["read".to_string(), "bash".to_string()])
@@ -4172,6 +4229,7 @@ mod tests {
             model: Some("fake/m1".to_string()),
             thinking: None,
             tools: Some(vec!["bash".to_string()]),
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         // The explicit params win (the file's `model: fake/m2` is stale
@@ -4180,7 +4238,7 @@ mod tests {
         assert_eq!(resolved.model, Some("fake/m1".to_string()));
         assert_eq!(resolved.tools, Some(vec!["bash".to_string()]));
         // The `None` field is filled from the file:
-        assert_eq!(resolved.thinking, Some("low".to_string()));
+        assert_eq!(resolved.frontmatter_thinking, Some("low".to_string()));
     }
 
     /// (ADR 0020) a frontmatter `model` that resolves to NOTHING (not in
@@ -4213,6 +4271,7 @@ mod tests {
             model: Some("fake/m1".to_string()),
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(
@@ -4221,7 +4280,7 @@ mod tests {
             "the stale frontmatter model degrades to the explicit param"
         );
         assert_eq!(
-            resolved.thinking,
+            resolved.frontmatter_thinking,
             Some("low".to_string()),
             "the thinking is still filled from the file"
         );
@@ -4255,6 +4314,7 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(
@@ -4297,6 +4357,7 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(
@@ -4336,6 +4397,7 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(
@@ -4374,6 +4436,7 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(
@@ -4426,6 +4489,7 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(
@@ -4468,6 +4532,7 @@ mod tests {
             model: None,
             thinking: None,
             tools: None,
+            ..Default::default()
         };
         let resolved = loop_.resolve_launch(&launch, "scout");
         assert_eq!(
@@ -4475,9 +4540,528 @@ mod tests {
             "an empty body means `None` (NOT `Some(\"\")` )"
         );
         assert_eq!(
-            resolved.thinking,
+            resolved.frontmatter_thinking,
             Some("low".to_string()),
             "the thinking is still filled from the file"
+        );
+    }
+
+    /// (ADR 0023) a settings `subagentModels` override (RESOLVABLE —
+    /// in the catalog) beats the frontmatter `model`.
+    #[test]
+    fn resolve_launch_settings_override_beats_frontmatter_model() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-settings-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{ "subagentModels": { "scout": "fake/m2" } }"#,
+        )
+        .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(
+            home.join(".agents/agents/scout.md"),
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let (loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1"), fake_model("m2")],
+            Some(&config_dir),
+        );
+        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
+        assert_eq!(
+            resolved.model,
+            Some("fake/m2".to_string()),
+            "the settings override beats the frontmatter model"
+        );
+    }
+
+    /// (ADR 0023) the EXPLICIT launch param beats the settings override.
+    #[test]
+    fn resolve_launch_explicit_param_beats_settings_override() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-settings-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{ "subagentModels": { "scout": "fake/m2" } }"#,
+        )
+        .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(
+            home.join(".agents/agents/scout.md"),
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let (loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1"), fake_model("m2")],
+            Some(&config_dir),
+        );
+        let launch = LaunchConfig {
+            model: Some("fake/m1".to_string()),
+            ..Default::default()
+        };
+        let resolved = loop_.resolve_launch(&launch, "scout");
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "the explicit param beats the settings override"
+        );
+    }
+
+    /// (ADR 0023) a settings override that resolves to NOTHING (NOT in
+    /// the catalog — a stale override) degrades SOFT to the frontmatter
+    /// `model` (never an error, never `None`).
+    #[test]
+    fn resolve_launch_stale_override_degrades_to_frontmatter() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-settings-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{ "subagentModels": { "scout": "fake/nope" } }"#,
+        )
+        .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(
+            home.join(".agents/agents/scout.md"),
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let (loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1"), fake_model("m2")],
+            Some(&config_dir),
+        );
+        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "a stale override degrades to the frontmatter model (soft)"
+        );
+    }
+
+    /// (ADR 0023) the override key matches CASE-INSENSITIVELY (a capital
+    /// settings key `"Scout"` matches the file's `name: scout` + the
+    /// case-insensitive `agentName` `"Scout"`).
+    #[test]
+    fn resolve_launch_case_insensitive_override_key() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-settings-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{ "subagentModels": { "Scout": "fake/m2" } }"#,
+        )
+        .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(
+            home.join(".agents/agents/scout.md"),
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let (loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1"), fake_model("m2")],
+            Some(&config_dir),
+        );
+        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "Scout");
+        assert_eq!(
+            resolved.model,
+            Some("fake/m2".to_string()),
+            "the capital settings key matches the lowercase agentName"
+        );
+    }
+
+    /// (ADR 0023) a `settings.json` with an EMPTY `subagentModels` map →
+    /// no override layer → the frontmatter `model` applies (today's
+    /// behavior).
+    #[test]
+    fn resolve_launch_no_override_keeps_the_frontmatter() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-settings-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{ "subagentModels": {} }"#,
+        )
+        .unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(
+            home.join(".agents/agents/scout.md"),
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let (loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1"), fake_model("m2")],
+            Some(&config_dir),
+        );
+        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "no override → the frontmatter model applies"
+        );
+    }
+
+    /// (ADR 0023 thinking split) the frontmatter's `thinking` moves to
+    /// its OWN field (`frontmatter_thinking`): `thinking` holds the
+    /// EXPLICIT param only (`None` here) — the dispatch layers the
+    /// frontmatter's `thinking` LAST.
+    #[test]
+    fn resolve_launch_frontmatter_thinking_migrates_to_its_own_field() {
+        let (provider, _calls) = ScriptedProvider::new(vec![]);
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(
+            home.join(".agents/agents/scout.md"),
+            "---\nname: scout\ndescription: Fast recon.\nthinking: low\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let (loop_, _db) = build_loop_with_db(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
+        );
+        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
+        assert_eq!(
+            resolved.thinking, None,
+            "`thinking` holds the EXPLICIT param only"
+        );
+        assert_eq!(
+            resolved.frontmatter_thinking,
+            Some("low".to_string()),
+            "the frontmatter's `thinking` moves to its own field"
+        );
+    }
+
+    /// (ADR 0023 thinking-order regression) the `:<level>` suffix of the
+    /// resolved model key beats the frontmatter's `thinking` (the
+    /// doc-correct order — explicit > suffix > frontmatter; the OLD code
+    /// produced the frontmatter's `"low"` here).
+    #[tokio::test]
+    async fn a_native_subagent_with_a_suffix_model_key_uses_the_suffix_thinking() {
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "recon the auth code", "agentName": "scout" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        // A TWO-model catalog: `fake/m1` (the parent) + `fake/m2` (the
+        // frontmatter target — IN the catalog, so it is NOT stale).
+        let models = vec![fake_model("m1"), fake_model("m2")];
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-agent-def-e2e-cfg-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let recorded = Arc::new(StdMutex::new(Vec::<RecordedRequest>::new()));
+        let manager = make_native_manager(
+            &config_dir,
+            recorded.clone(),
+            ModelCatalog {
+                models: models.clone(),
+                default_model: None,
+                compaction: CompactionConfig::default(),
+            },
+            Duration::from_secs(30),
+        );
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        });
+        let mut loop_ = build_loop_with_subagent(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            Some(manager),
+            models,
+            None,
+        );
+        // The Agent definition: `model: fake/m2:high` (IN the catalog —
+        // the `:<level>` suffix is stripped for the resolvability check)
+        // + `thinking: low` (the LAST rung — the suffix beats it).
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2:high\nthinking: low\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        loop_.handle_prompt(&text_prompt("go")).await;
+        // The parent turn settled (bounded — the `ScriptedProvider`
+        // settles it; the child ran to completion inside the dispatch).
+        wait_for_event(&mut events_rx, 20000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the parent turn settled");
+        // The `subagent-session-started` frame: the suffix's `high`
+        // beats the frontmatter's `low` (the doc-correct order), and
+        // the model is the suffix-STRIPPED key.
+        let events = sink_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let started = events
+            .iter()
+            .find(|(name, _)| name == "subagent-session-started")
+            .expect("the `subagent-session-started` frame was emitted");
+        assert_eq!(
+            started.1["model"], "fake/m2",
+            "the suffix is stripped for the model resolution"
+        );
+        assert_eq!(
+            started.1["thinkingLevel"], "high",
+            "the suffix beats the frontmatter's `thinking` (the order fix)"
+        );
+    }
+
+    /// (ADR 0023) end-to-end: a settings `subagentModels` override beats
+    /// the frontmatter `model` (the child runs the override), and the
+    /// frontmatter's `thinking` STILL applies (the override only
+    /// replaces the model).
+    #[tokio::test]
+    async fn a_native_subagent_with_a_settings_override_runs_the_override_model() {
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "recon the auth code", "agentName": "scout" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        // A THREE-model catalog: `fake/m1` (the parent) + `fake/m2` (the
+        // frontmatter target) + `fake/m3` (the override target — IN the
+        // catalog, so it is NOT stale).
+        let models = vec![fake_model("m1"), fake_model("m2"), fake_model("m3")];
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-agent-def-e2e-cfg-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{ "subagentModels": { "scout": "fake/m3" } }"#,
+        )
+        .unwrap();
+        let recorded = Arc::new(StdMutex::new(Vec::<RecordedRequest>::new()));
+        let manager = make_native_manager(
+            &config_dir,
+            recorded.clone(),
+            ModelCatalog {
+                models: models.clone(),
+                default_model: None,
+                compaction: CompactionConfig::default(),
+            },
+            Duration::from_secs(30),
+        );
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        });
+        let mut loop_ = build_loop_with_subagent(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            Some(manager),
+            models,
+            Some(&config_dir),
+        );
+        // The Agent definition: `model: fake/m2` (IN the catalog — NOT
+        // stale) + `thinking: low` (the override replaces ONLY the
+        // model — the thinking still comes from the file).
+        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        loop_.handle_prompt(&text_prompt("go")).await;
+        // The parent turn settled (bounded — the `ScriptedProvider`
+        // settles it; the child ran to completion inside the dispatch).
+        wait_for_event(&mut events_rx, 20000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the parent turn settled");
+        // The `subagent-session-started` frame: the override beats the
+        // frontmatter's model, and the frontmatter's `thinking` still
+        // applies.
+        let events = sink_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let started = events
+            .iter()
+            .find(|(name, _)| name == "subagent-session-started")
+            .expect("the `subagent-session-started` frame was emitted");
+        assert_eq!(
+            started.1["model"], "fake/m3",
+            "the settings override beats the frontmatter model"
+        );
+        assert_eq!(
+            started.1["thinkingLevel"], "low",
+            "the frontmatter's `thinking` still applies (the override only replaces the model)"
+        );
+        // The child's model request went to the override model (the
+        // `RequestRecordingProvider` records every request — the parent's
+        // are `m1`, the child's is `m3`).
+        let recorded = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let child = recorded
+            .iter()
+            .find(|r| r.model == "m3")
+            .expect("the child requested `fake/m3` (the override)");
+        assert_eq!(
+            child.system,
+            Some("You are a scout.".to_string()),
+            "the frontmatter body is the child's system message"
         );
     }
 
@@ -4546,6 +5130,7 @@ mod tests {
             sink,
             Some(manager),
             models,
+            None,
         );
         // The Agent definition (the loop's `space_cwd` is the Space root
         // — the frontmatter's `model` is IN the catalog, so it is NOT
@@ -4928,6 +5513,8 @@ mod tests {
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
         );
         let older = vec![ChatMessage {
             role: ChatRole::User,
