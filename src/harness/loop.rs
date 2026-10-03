@@ -205,6 +205,17 @@ pub struct AgentLoop {
     /// Set by `compact()` (a forced compaction before the next model
     /// call).
     force_compact: bool,
+    /// The session's current context size in tokens (the `context_usage_
+    /// update` frame source — the frontend's context-percentage display).
+    ///
+    /// Unlike the `Compactor`'s `context_tokens` (an ACCUMULATION of every
+    /// response's input + output — a deliberately conservative over-estimate
+    /// for the compaction threshold), this is the context as the PROVIDER
+    /// sees it: the last response's `input_tokens` (the prompt size — the
+    /// full context sent to the model) or the compactor's re-estimate (the
+    /// post-compaction / resume anchor, when the provider hasn't reported
+    /// yet).
+    last_context_tokens: u64,
 }
 
 impl AgentLoop {
@@ -279,6 +290,43 @@ impl AgentLoop {
             messages: Vec::new(),
             compactor,
             force_compact: false,
+            last_context_tokens: 0,
+        }
+    }
+
+    /// Emit the `context_usage_update` frame (the frontend's
+    /// context-percentage display — the session's current context size vs
+    /// the model's window). NOT part of the FROZEN ACP `session-update`
+    /// vocabulary: it bypasses the `normalize` / `persist_update` pipeline
+    /// on purpose (a bookkeeping frame, like the client-synthesized
+    /// `config_option_update` — the desktop, not the agent, owns it).
+    ///
+    /// ALSO persists the usage on the `sessions` row (the
+    /// `context_usage_json` column — the same db as the trust lookup,
+    /// `None` for subagent sessions, which are ephemeral and unresumable):
+    /// the frontend's store drops the entry on close, so the row is the
+    /// source of truth for a CLOSED session's context bar (the stored
+    /// session's `context_usage` over IPC). A write failure is a silent
+    /// no-op (the frame is the primary path — a db hiccup must not break
+    /// the display).
+    fn emit_context_usage(&self) {
+        self.sink.emit(
+            "session-update",
+            json!({
+                "sessionId": self.session_id,
+                "update": {
+                    "sessionUpdate": "context_usage_update",
+                    "usedTokens": self.last_context_tokens,
+                    "windowTokens": self.model.context_window,
+                },
+            }),
+        );
+        if let Some(db) = &self.trust_db {
+            let _ = db.record_session_context_usage(
+                &self.session_id,
+                self.last_context_tokens,
+                u64::from(self.model.context_window),
+            );
         }
     }
 
@@ -291,10 +339,13 @@ impl AgentLoop {
     }
 
     /// Switch the model (the `Compactor` is rebuilt — the context window
-    /// is per-model).
+    /// is per-model). The context (the `messages`) is UNCHANGED: the last
+    /// known context size is kept, the frame is re-emitted with the new
+    /// model's window.
     pub fn set_model(&mut self, model: Model) {
         self.compactor = Compactor::new(self.catalog.compaction, model.context_window);
         self.model = model;
+        self.emit_context_usage();
     }
 
     /// Set the thinking level (the `reasoning_effort` of the model
@@ -346,6 +397,8 @@ impl AgentLoop {
             },
         );
         self.compactor.reestimate(&self.messages);
+        self.last_context_tokens = self.compactor.context_tokens();
+        self.emit_context_usage();
         self.persist_system_message();
     }
 
@@ -355,6 +408,8 @@ impl AgentLoop {
     pub fn load_transcript(&mut self, messages: Vec<ChatMessage>) {
         self.messages = messages;
         self.compactor.reestimate(&self.messages);
+        self.last_context_tokens = self.compactor.context_tokens();
+        self.emit_context_usage();
     }
 
     /// Stop the in-flight TURN (the `cancel_session` Stop — finding 8c:
@@ -692,6 +747,13 @@ impl AgentLoop {
                             ProviderEvent::Usage(u) => {
                                 acc.usage = Some(u);
                                 self.compactor.add_usage(&u);
+                                // The response's `input_tokens` is the prompt size —
+                                // the context as the provider sees it (the
+                                // `context_usage_update` frame source; the
+                                // `Compactor`'s accumulation is a separate,
+                                // conservative threshold metric).
+                                self.last_context_tokens = u64::from(u.input_tokens);
+                                self.emit_context_usage();
                                 self.emit(RpcEvent::message_update {
                                     usage: acc.usage_value(),
                                     assistant_message_event: Value::Object(Default::default()),
@@ -1378,6 +1440,12 @@ impl AgentLoop {
                     compacted.extend(recent);
                     self.messages = compacted;
                     self.compactor.reestimate(&self.messages);
+                    // The re-estimate is the post-compaction anchor (the
+                    // `context_usage_update` frame — the percentage drops
+                    // after the compaction instead of staying at the
+                    // pre-compaction value).
+                    self.last_context_tokens = self.compactor.context_tokens();
+                    self.emit_context_usage();
                     // Rewrite the transcript (the old rows are replaced —
                     // a fresh `seq` run) ATOMICALLY: a single `Db`
                     // transaction (clear + reinsert), so a crash
@@ -2334,6 +2402,7 @@ mod tests {
             capabilities: serde_json::json!({}),
             config_options: None,
             archived: false,
+            context_usage: None,
         })
         .expect("record_session");
         let model = models.first().cloned().expect("at least one model");
@@ -3382,6 +3451,219 @@ mod tests {
             ),
             other => panic!("expected a text summary at index 1, got {other:?}"),
         }
+    }
+
+    // ── `context_usage_update` frames (the frontend's context-percentage
+    // display: the session's current context size vs the model's window —
+    // emitted via the sink, NOT the `normalize`/`persist_update` pipeline
+    // (a bookkeeping frame, like the client-synthesized
+    // `config_option_update`)). ──
+
+    /// The `updates` of the LAST `context_usage_update` frame (the tests
+    /// assert on the most recent frame — the frames are cumulative).
+    fn last_context_usage_frame(updates: &StdMutex<Vec<Value>>) -> Option<Value> {
+        updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .rev()
+            .find(|u| u["sessionUpdate"] == "context_usage_update")
+            .cloned()
+    }
+
+    /// A provider `Usage` event updates the session's tracked context size
+    /// (the response's `input_tokens` — the prompt size, i.e. the context
+    /// as the provider sees it) and emits a `context_usage_update` frame
+    /// (the window is the session model's `context_window`).
+    #[tokio::test]
+    async fn a_usage_event_emits_a_context_usage_update_frame() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Usage(Usage {
+                input_tokens: 4321,
+                output_tokens: 100,
+            }),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let mut loop_ = build_loop_with_subagent(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let frame =
+            last_context_usage_frame(&updates).expect("a context_usage_update frame was emitted");
+        assert_eq!(
+            frame["usedTokens"], 4321,
+            "the context size is the response's input tokens"
+        );
+        assert_eq!(frame["windowTokens"], 128000, "the window is the model's");
+    }
+
+    /// `load_transcript` (a resume) re-estimates the context from the
+    /// loaded messages and emits the frame — a resumed session shows its
+    /// context percentage BEFORE the first turn.
+    #[tokio::test]
+    async fn load_transcript_emits_a_context_usage_update_from_the_reestimate() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+        let mut loop_ = build_loop_with_subagent(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.load_transcript(vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ]);
+        let frame =
+            last_context_usage_frame(&updates).expect("a context_usage_update frame was emitted");
+        // "u1" / "a1": 2 chars / 4 = 0 each +1 (the role overhead) = 2.
+        assert_eq!(frame["usedTokens"], 2, "the re-estimated context size");
+        assert_eq!(frame["windowTokens"], 128000);
+    }
+
+    /// A compaction rewrites the transcript (the older messages replaced
+    /// by the summary) — the re-estimated (post-compaction) context size
+    /// is emitted, so the percentage drops after the compaction instead
+    /// of staying at the pre-compaction value.
+    #[tokio::test]
+    async fn a_compaction_emits_a_context_usage_update_from_the_reestimate() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("the summary".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let mut loop_ = build_loop_with_subagent(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.catalog.compaction.keep_recent_tokens = 1;
+        loop_.load_transcript(vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a2".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ]);
+        loop_.run_compaction(&CancellationToken::new()).await;
+        let frame = last_context_usage_frame(&updates)
+            .expect("a context_usage_update frame was emitted after the compaction");
+        // The emitted value is the compactor's re-estimated (post-compaction)
+        // context size — the same source the compaction threshold reads.
+        assert_eq!(frame["usedTokens"], loop_.compactor.context_tokens());
+        assert_eq!(frame["windowTokens"], 128000);
+    }
+
+    /// A model switch changes the WINDOW (the context — the messages — is
+    /// unchanged): the last known context size is kept, the frame is
+    /// re-emitted with the new model's window.
+    #[tokio::test]
+    async fn a_model_switch_emits_a_context_usage_update_with_the_new_window() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+        let mut loop_ = build_loop_with_subagent(
+            Box::new(provider),
+            mpsc::channel(8).0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.load_transcript(vec![ChatMessage {
+            role: ChatRole::User,
+            content: MessageContent::Text("u1".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        }]);
+        let switched = Model {
+            id: "m2".to_string(),
+            provider: "fake".to_string(),
+            base_url: "http://fake".to_string(),
+            api_key: "k".to_string(),
+            context_window: 64000,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        };
+        loop_.set_model(switched);
+        let frame = last_context_usage_frame(&updates)
+            .expect("a context_usage_update frame was emitted on the model switch");
+        assert_eq!(
+            frame["usedTokens"], 1,
+            "the context size is kept (the messages are unchanged)"
+        );
+        assert_eq!(
+            frame["windowTokens"], 64000,
+            "the window is the new model's"
+        );
     }
 
     /// (ADR 0017) a resume REPLAYS the stored system message verbatim

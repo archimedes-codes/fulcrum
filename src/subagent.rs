@@ -510,6 +510,7 @@ impl SubagentSessionManager {
                 config_options: None,
                 // Ephemeral (subagent) sessions are never archived (ADR 0016).
                 archived: false,
+                context_usage: None,
             }) {
                 let _ = dispatch_tx.send(SubagentOutcome::Failed {
                     error: format!("record the throwaway child session: {e}"),
