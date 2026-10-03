@@ -2,8 +2,8 @@
 //! providers list (ADR 0014 — user providers shadow the base catalog on
 //! a provider-id clash) merged with live per-provider discovery
 //! (`GET /v1/models`). The catalog is the source for the model picker
-//! and the [`Provider`] construction (a [`Model`]'s `provider` +
-//! `base_url` + `api_key` → an `OpenAiCompatibleProvider`).
+//! and the [`Provider`] construction (a [`Model`]'s `api` discriminator
+//! → `build_provider` (ADR 0024)).
 
 use std::collections::HashMap;
 
@@ -37,9 +37,9 @@ pub struct Model {
     pub cost_per_mtok_in: f64,
     /// USD per 1M output tokens.
     pub cost_per_mtok_out: f64,
-    /// `true` when the model speaks the OpenAI-compatible
-    /// chat-completions API (`api == "openai-completions"` — the only
-    /// tool-carrying wire in v1, ADR 0014).
+    /// `true` when the model can carry tool calls on its wire (the
+    /// selectable set, ADR 0024 — the three wires the harness speaks
+    /// all carry tools).
     pub supports_tools: bool,
     /// `reasoning` + a non-empty `thinkingLevelMap` (non-null values).
     pub supports_thinking: bool,
@@ -47,8 +47,9 @@ pub struct Model {
     /// `["low", "medium", "xhigh"]`).
     pub thinking_levels: Vec<String>,
     /// The wire API discriminator (`"openai-completions"` /
-    /// `"google-generative-ai"` / …; `None` for a metadata-less model —
-    /// an unknown API is not OpenAI-compatible).
+    /// `"anthropic-messages"` / `"openai-responses"` / other; `None` for a
+    /// metadata-less model — an unknown API is not one of the three the
+    /// harness speaks).
     pub api: Option<String>,
 }
 
@@ -100,12 +101,23 @@ impl ModelCatalog {
         &self.models
     }
 
-    /// The selectable set (ADR 0014): the tool-supporting,
-    /// OpenAI-compatible models (`api == "openai-completions"`).
-    pub fn openai_compatible(&self) -> Vec<&Model> {
+    /// The selectable set (ADR 0024): the tool-supporting models on a wire
+    /// the harness speaks (`"openai-completions"` / `"anthropic-messages"`
+    /// / `"openai-responses"` — a `None` / unknown `api` stays
+    /// unselectable: an unknown API is not one of the three the harness
+    /// speaks).
+    pub fn selectable(&self) -> Vec<&Model> {
         self.models
             .iter()
-            .filter(|m| m.supports_tools && m.api.as_deref() == Some("openai-completions"))
+            .filter(|m| {
+                m.supports_tools
+                    && matches!(
+                        m.api.as_deref(),
+                        Some("openai-completions")
+                            | Some("anthropic-messages")
+                            | Some("openai-responses")
+                    )
+            })
             .collect()
     }
 }
@@ -191,15 +203,32 @@ struct DiscoveredModel {
     supports_reasoning_effort: Option<bool>,
 }
 
-/// Query a provider's `GET /v1/models` for fresh model metadata (bounded,
-/// best-effort). `base_url` is `.../v1` (the endpoint is `{base_url}/models`).
+/// Query a provider's `GET {base_url}/models` for fresh model metadata
+/// (bounded, best-effort). `base_url` is `.../v1` (the endpoint is
+/// `{base_url}/models`). The `api` decides the wire (ADR 0024):
+/// - `"anthropic-messages"`: the ANTHROPIC shape (the `x-api-key` +
+///   `anthropic-version` headers; the response carries `id` ONLY — a
+///   discovered Anthropic model gets the `DEFAULT_CONTEXT_WINDOW`
+///   fallback + no advertised thinking levels, the documented v1
+///   degradation);
+/// - any other `api` (`openai-completions` / `openai-responses` /
+///   anything else): the OpenAI shape (`Authorization: Bearer` when the
+///   key is non-empty — a local gateway needing no key → no header —
+///   the `max_model_len` / `reasoningLevels` /
+///   `supportsReasoningEffort` parsing).
+///
 /// A non-2xx / network error → `Err` (the caller degrades to the static
-/// metadata). The `api_key` is sent as `Authorization: Bearer` when
-/// non-empty (a local gateway needing no key → no header).
+/// metadata).
 pub async fn discover_models(
     base_url: &str,
     api_key: &str,
+    api: &str,
 ) -> Result<HashMap<String, DiscoveredMeta>, String> {
+    if api == "anthropic-messages" {
+        return discover_anthropic_models(base_url, api_key).await;
+    }
+    // The OpenAI shape (`openai-completions` / `openai-responses` /
+    // anything else — the existing behavior verbatim).
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -232,6 +261,79 @@ pub async fn discover_models(
         .collect())
 }
 
+/// The Anthropic `GET {base_url}/models` (ADR 0024 — the SAME endpoint
+/// path, since Anthropic's model list lives at `{base}/models`, e.g.
+/// `https://api.anthropic.com/v1/models`). Headers (BOTH required):
+/// `x-api-key` (NOT `Authorization: Bearer` — the Anthropic API's auth
+/// header; a keyless call → NO `x-api-key` header, the existing
+/// empty-key rule) + `anthropic-version` (Anthropic requires it on
+/// EVERY endpoint — the same value as `AnthropicProvider::complete`'s
+/// header; WITHOUT it, real `api.anthropic.com/v1/models` returns 400 →
+/// discovery fails → 0 models → every Anthropic provider row shows
+/// `unreachable`). The response carries NO `max_model_len` /
+/// `reasoningLevels` / `supportsReasoningEffort` — a discovered
+/// Anthropic model gets the `DEFAULT_CONTEXT_WINDOW` fallback + no
+/// advertised thinking levels (the documented v1 degradation).
+async fn discover_anthropic_models(
+    base_url: &str,
+    api_key: &str,
+) -> Result<HashMap<String, DiscoveredMeta>, String> {
+    // Normalize the base to include the `/v1` API prefix (ADR 0024 —
+    // mirroring ZCode's adapter-boundary normalization; WITHOUT it a
+    // gateway root like `https://openrouter.ai/api` would 404 on
+    // `…/api/models` → 0 discovered models → the row shows `unreachable`).
+    let url = format!(
+        "{}/models",
+        super::provider::normalize_anthropic_base_url(base_url)
+    );
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client
+        .get(&url)
+        // `anthropic-version` is REQUIRED on every Anthropic endpoint
+        // (the same value as `AnthropicProvider::complete`'s header).
+        .header("anthropic-version", "2023-06-01");
+    // `x-api-key` (NOT `Authorization: Bearer` — the Anthropic API's
+    // auth header); a keyless call → NO `x-api-key` header (the
+    // existing empty-key rule).
+    if !api_key.is_empty() {
+        req = req.header("x-api-key", api_key);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("status {status}"));
+    }
+    let body: AnthropicModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
+    // `id` ONLY (the Anthropic list carries NO metadata fields) → an
+    // all-`None` meta entry (the caller's `DEFAULT_CONTEXT_WINDOW`
+    // fallback + no advertised thinking levels — the documented v1
+    // degradation).
+    Ok(body
+        .data
+        .into_iter()
+        .map(|m| (m.id, DiscoveredMeta::default()))
+        .collect())
+}
+
+/// The Anthropic `GET /v1/models` response (ADR 0024 — the entries
+/// carry `id` + `display_name`; NO `max_model_len` /
+/// `reasoningLevels` / `supportsReasoningEffort` — only `id` is
+/// parsed, the rest is the documented v1 degradation).
+#[derive(Debug, Deserialize)]
+struct AnthropicModelsResponse {
+    #[serde(default)]
+    data: Vec<AnthropicDiscoveredModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicDiscoveredModel {
+    id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,25 +357,52 @@ mod tests {
     }
 
     #[test]
-    fn get_all_and_openai_compatible_filter() {
+    fn selectable_includes_the_three_wires() {
         let catalog = ModelCatalog {
             models: vec![
                 model("a", true, Some("openai-completions")),
-                model("b", false, Some("google-generative-ai")),
-                model("c", true, None), // metadata-less: tools OK, api unknown
+                model("b", true, Some("anthropic-messages")),
+                model("c", true, Some("openai-responses")),
             ],
             ..Default::default()
         };
         assert_eq!(catalog.all().len(), 3);
         assert!(catalog.get("a").is_some());
         assert!(catalog.get("zzz").is_none());
-        // The v1-selectable set: `supports_tools` AND OpenAI-compatible.
-        let openai: Vec<&str> = catalog
-            .openai_compatible()
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
-        assert_eq!(openai, vec!["a"]);
+        // The selectable set (ADR 0024): one model per wire, all
+        // `supports_tools` → all three selectable.
+        let ids: Vec<&str> = catalog.selectable().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn selectable_excludes_none_and_unknown_api() {
+        // A `None` / unknown `api` stays unselectable (an unknown API is
+        // not one of the three the harness speaks).
+        let catalog = ModelCatalog {
+            models: vec![
+                model("a", true, Some("openai-completions")),
+                model("b", true, Some("google-generative-ai")),
+                model("c", true, None), // metadata-less: api unknown
+            ],
+            ..Default::default()
+        };
+        let ids: Vec<&str> = catalog.selectable().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"]);
+    }
+
+    #[test]
+    fn selectable_requires_supports_tools() {
+        // A known wire that does NOT support tools stays unselectable.
+        let catalog = ModelCatalog {
+            models: vec![
+                model("a", true, Some("openai-completions")),
+                model("b", false, Some("anthropic-messages")),
+            ],
+            ..Default::default()
+        };
+        let ids: Vec<&str> = catalog.selectable().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"]);
     }
 
     // ── the `CompactionConfig` defaults ───────────────────────────────
@@ -327,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_models_maps_the_live_metadata() {
+    async fn discover_models_openai_shape_unchanged() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body = r#"{"data":[{"id":"m/1","max_model_len":99999,
@@ -335,9 +464,13 @@ mod tests {
             "supportsReasoningEffort":true},
             {"id":"m/2"}]}"#;
         let server = raw_json_server(listener, 200, body).await;
-        let models = discover_models(&format!("http://{addr}/v1"), "test-key")
-            .await
-            .unwrap();
+        let models = discover_models(
+            &format!("http://{addr}/v1"),
+            "test-key",
+            "openai-completions",
+        )
+        .await
+        .unwrap();
         // `m/1`: the live metadata is mapped (context window, thinking
         // levels, supports_thinking).
         let m1 = &models["m/1"];
@@ -357,15 +490,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_models_responses_uses_the_openai_shape() {
+        // `openai-responses` routes through the SAME OpenAI parsing path
+        // (the endpoint + the `max_model_len` / `reasoningLevels` /
+        // `supportsReasoningEffort` parsing — ADR 0024).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"data":[{"id":"r/1","max_model_len":42424,
+            "reasoningLevels":["low"],
+            "supportsReasoningEffort":true}]}"#;
+        let server = raw_json_server(listener, 200, body).await;
+        let models = discover_models(&format!("http://{addr}/v1"), "test-key", "openai-responses")
+            .await
+            .unwrap();
+        // The OpenAI parsing path mapped the metadata (not the Anthropic
+        // all-`None` shape).
+        assert_eq!(models["r/1"].context_window, Some(42424));
+        assert_eq!(models["r/1"].thinking_levels, Some(vec!["low".into()]));
+        assert_eq!(models["r/1"].supports_thinking, Some(true));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discover_models_anthropic_shape() {
+        // (ADR 0024) The Anthropic model list carries `id` +
+        // `display_name` ONLY (NO `max_model_len` / `reasoningLevels` /
+        // `supportsReasoningEffort`) — a discovered Anthropic model gets
+        // the `DEFAULT_CONTEXT_WINDOW` fallback + no advertised thinking
+        // levels (the documented v1 degradation): an id-keyed all-`None`
+        // meta map.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"data":[{"id":"claude-sonnet-4","display_name":"Claude Sonnet 4"},
+            {"id":"claude-opus-4"}]}"#;
+        let server = raw_json_server(listener, 200, body).await;
+        let models = discover_models(
+            &format!("http://{addr}/v1"),
+            "test-key",
+            "anthropic-messages",
+        )
+        .await
+        .unwrap();
+        assert_eq!(models.len(), 2);
+        // Both entries parse (the `display_name` is ignored) and carry
+        // all-`None` metadata.
+        for meta in models.values() {
+            assert_eq!(meta, &DiscoveredMeta::default());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn discover_models_errors_on_a_non_2xx() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = raw_json_server(listener, 401, r#"{"error":"auth"}"#).await;
         // A 401 (a bad/missing key) → `Err` (the caller degrades to the
         // static metadata).
-        assert!(discover_models(&format!("http://{addr}/v1"), "bad-key")
-            .await
-            .is_err());
+        assert!(discover_models(
+            &format!("http://{addr}/v1"),
+            "bad-key",
+            "openai-completions"
+        )
+        .await
+        .is_err());
         server.abort();
     }
 
