@@ -3,18 +3,19 @@
 //! owns the conversation's control flow: it receives prompts, runs the
 //! model → tool → retry/compaction loop, emits the normalized events
 //! (the SAME `RpcEvent` shapes an external session emits — the loop runs
-//! them through the existing `normalize` + `persist_update` pipeline, so
-//! the frontend is unchanged), and persists the provider transcript to
-//! the `SessionStore` (the `native_messages` table).
+//! them through the existing `normalize` + `compute_display_rows` +
+//! `Store::persist_display` pipeline, so the frontend is unchanged), and
+//! persists the provider transcript through the `Store` seam (the
+//! `native_messages` table).
 //!
 //! Tools are dispatched IN-PROCESS (the native `ToolRegistry`): the
 //! built-ins (Task 1's `execute_tool`) + the suite tools (the in-process
 //! cores of the interactive channel — `todo_apply` /
-//! `sudo_run_flow` / the in-process `ask` waiter) + `subagent` (a native
-//! parent spawns an IN-PROCESS native child — `dispatch_native`: an
-//! in-process `AgentLoop` with the parent's model / tools minus
-//! `subagent` (the recursion guard), a `CapturingSink`, a throwaway
-//! `Db` — NO external `pi` process). A permission gate (the handle-free waiter —
+//! `sudo_run_flow` / the in-process `ask` waiter) + `subagent` (the
+//! parent's `SubagentDispatcher` — the `WorkerManager`'s `dispatch_subagent`
+//! flow spawns a WORKER child process (the ADR 0025 re-plumb: the
+//! in-process `AgentLoop` child is GONE — the child's transcript persists
+//! as an ephemeral `is_subagent` `sessions` row). A permission gate (the handle-free waiter —
 //! `permission::native_permission_gate`) precedes every MUTATING tool
 //! (`bash` / `edit` / `write`): a trusted Space is auto-approved
 //! (ADR 0010), a deny is a tool-result error `"permission denied"`.
@@ -34,23 +35,24 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
 use crate::agent::harness::compact::{split_for_compaction, Compactor};
+use crate::agent::harness::dispatch::SubagentDispatcher;
 use crate::agent::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest, Provider,
     ProviderError, ProviderEvent, ToolCall, ToolSpec, Usage,
 };
 use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::harness::store::SessionStore;
+use crate::agent::harness::store::Store;
+use crate::agent::harness::trust::TrustSource;
 use crate::agent::interactive::{
     interactive_key, sudo_run_flow, todo_apply, CachedPassword, PendingInteractive, PendingSudo,
     RealSudoRunner, SudoRunner,
 };
 use crate::agent::mcp::{mcp_tool, McpManager};
 use crate::agent::permission::{native_permission_gate, PendingPermissions, PermissionOutcome};
-use crate::agent::session::{normalize, persist_update, EventSink, ThoughtState, TurnState};
-use crate::agent::subagent::{LaunchConfig, SubagentSessionManager};
+use crate::agent::session::{compute_display_rows, normalize, EventSink, ThoughtState, TurnState};
+use crate::agent::subagent::LaunchConfig;
 use crate::agent::todo::TodoStore;
 use crate::agent::tools::{execute_tool, ContentBlock, ImageRef, ToolCtx, ToolResult};
-use crate::storage::Db;
 
 /// The `ask` flow's cap (the suite's `timeoutMs: 300_000` — 5 min; the
 /// agent's 300 s cancel deterministically wins the desktop's 330 s
@@ -135,10 +137,15 @@ pub struct AgentLoop {
     /// `resolve_launch` reads the `subagentModels` override from here at
     /// dispatch time; `None` = no override layer).
     config_dir: Option<PathBuf>,
-    pub store: SessionStore,
+    pub store: Arc<dyn Store>,
     /// The `RpcEvent`-shaped values (the SAME vocabulary an external
-    /// session emits — the driver / tests consume it).
-    pub events: mpsc::Sender<RpcEvent>,
+    /// session emits — the driver / tests consume it). UNBOUNDED (ADR
+    /// 0025: the event stream drives the Supervisor's internal
+    /// bookkeeping — settle detection, the `SubagentCapture`'s
+    /// `agent_settled`-adjacent signals, the debug log — a full bounded
+    /// channel dropping those frames is unacceptable; the unbounded
+    /// `send` never fails, so nothing is dropped).
+    pub events: mpsc::UnboundedSender<RpcEvent>,
     /// The SESSION teardown token (`close_session` — `run()` exits on it;
     /// the driver tears the session down when the loop task ends).
     pub cancel: CancellationToken,
@@ -146,16 +153,21 @@ pub struct AgentLoop {
     /// 8c): SHARED with the `NativeHandle` (the handle cancels the
     /// CURRENT turn; the loop arms a fresh token per prompt — a stale
     /// cancel does not settle the next turn, and a Stop keeps the
-    /// session ALIVE, matching the external `abort`).
-    turn_cancel: Arc<StdMutex<CancellationToken>>,
+    /// session ALIVE, matching the external `abort`). `pub` (the Worker's
+    /// `build_loop` seam keeps the handle — ADR 0025 Task 2).
+    pub turn_cancel: Arc<StdMutex<CancellationToken>>,
     /// The RELIABLE settle signal (finding 3): `emit` writes it on every
-    /// `agent_settled` (a watch send is NEVER dropped — a full / slow
-    /// `events` mpsc can drop the raw event, but the driver's settle
-    /// watch fires regardless). The counter forces `changed()` to fire on
-    /// every settle (a watch coalesces equal values).
-    settle_tx: watch::Sender<u64>,
+    /// `agent_settled` (a watch send is NEVER dropped — the settle watch
+    /// fires regardless of the `events` delivery). The counter forces
+    /// `changed()` to fire on every settle (a watch coalesces equal
+    /// values). `pub` (the Worker's `build_loop` seam — ADR 0025 Task 2).
+    pub settle_tx: watch::Sender<u64>,
     settle_count: AtomicU64,
-    prompt_tx: mpsc::Sender<Prompt>,
+    /// The prompt queue (the `pub` sender — `pub` so the Worker's
+    /// `build_loop` seam can clone it before `tokio::spawn` (ADR 0025
+    /// Task 2); the bounded channel's backpressure is the intended
+    /// `send().await` stall).
+    pub prompt_tx: mpsc::Sender<Prompt>,
     prompt_queue: mpsc::Receiver<Prompt>,
     /// The control channel (the `set_config_option` native branch — the
     /// sender is `pub` so the session's `NativeHandle` can clone it; the
@@ -167,7 +179,7 @@ pub struct AgentLoop {
     pub pending_bridge: PendingInteractive,
     /// The trust lookup source (ADR 0010 — the permission gate's
     /// `space_trusted` lookup; `None` = fail-closed: the gate prompts).
-    pub trust_db: Option<Arc<Db>>,
+    pub trust: Option<Arc<dyn TrustSource>>,
     /// The Tauri event sink (the `permission-request` / `interactive-request`
     /// / `session-update` frames).
     pub sink: Arc<dyn EventSink>,
@@ -177,10 +189,10 @@ pub struct AgentLoop {
     /// `new` with `home_dir` = `dirs::home_dir` + `project_cwd` =
     /// `space_cwd`).
     pub mcp: McpManager,
-    /// The subagent dispatch handle (a native parent spawns an IN-PROCESS
-    /// native child — `dispatch_native`; `None` when the manager is
+    /// The subagent dispatch handle (a native parent spawns a native
+    /// child — `SubagentDispatcher::dispatch`; `None` when the manager is
     /// absent).
-    pub subagent: Option<Arc<SubagentSessionManager>>,
+    pub subagent: Option<Arc<dyn SubagentDispatcher>>,
     pub sudo: SudoDeps,
     retry: RetryPolicy,
     /// The enabled tools (`None` = ALL tools; `Some(v)` = exactly `v`
@@ -226,8 +238,8 @@ impl AgentLoop {
         model: Model,
         provider: Box<dyn Provider>,
         catalog: ModelCatalog,
-        store: SessionStore,
-        events: mpsc::Sender<RpcEvent>,
+        store: Arc<dyn Store>,
+        events: mpsc::UnboundedSender<RpcEvent>,
         cancel: CancellationToken,
         turn_cancel: Arc<StdMutex<CancellationToken>>,
         settle_tx: watch::Sender<u64>,
@@ -235,10 +247,10 @@ impl AgentLoop {
         prompt_queue: mpsc::Receiver<Prompt>,
         pending_permissions: PendingPermissions,
         pending_bridge: PendingInteractive,
-        trust_db: Option<Arc<Db>>,
+        trust: Option<Arc<dyn TrustSource>>,
         sink: Arc<dyn EventSink>,
         todo_store: Arc<TodoStore>,
-        subagent: Option<Arc<SubagentSessionManager>>,
+        subagent: Option<Arc<dyn SubagentDispatcher>>,
         sudo: SudoDeps,
         retry: RetryPolicy,
         // The settings dir (the `settings.json` home — ADR 0019: the MCP
@@ -274,7 +286,7 @@ impl AgentLoop {
             control_queue,
             pending_permissions,
             pending_bridge,
-            trust_db,
+            trust,
             sink,
             todo_store,
             mcp,
@@ -302,13 +314,16 @@ impl AgentLoop {
     /// `config_option_update` — the desktop, not the agent, owns it).
     ///
     /// ALSO persists the usage on the `sessions` row (the
-    /// `context_usage_json` column — the same db as the trust lookup,
-    /// `None` for subagent sessions, which are ephemeral and unresumable):
-    /// the frontend's store drops the entry on close, so the row is the
-    /// source of truth for a CLOSED session's context bar (the stored
-    /// session's `context_usage` over IPC). A write failure is a silent
-    /// no-op (the frame is the primary path — a db hiccup must not break
-    /// the display).
+    /// `context_usage_json` column — via the `Store` seam, ADR 0025:
+    /// `SqliteStore` writes, `IpcStore` frames, `NoopStore` ignores —
+    /// the old `trust_db`-gating is gone: an ephemeral subagent row now
+    /// also gets a `context_usage_json` write, which is harmless — the
+    /// persister's `ensure_session_row` creates the row; the display is
+    /// per-session): the frontend's store drops the entry on close, so
+    /// the row is the source of truth for a CLOSED session's context bar
+    /// (the stored session's `context_usage` over IPC). A write failure
+    /// is a silent no-op (the frame is the primary path — a db hiccup
+    /// must not break the display).
     fn emit_context_usage(&self) {
         self.sink.emit(
             "session-update",
@@ -321,13 +336,11 @@ impl AgentLoop {
                 },
             }),
         );
-        if let Some(db) = &self.trust_db {
-            let _ = db.record_session_context_usage(
-                &self.session_id,
-                self.last_context_tokens,
-                u64::from(self.model.context_window),
-            );
-        }
+        let _ = self.store.record_context_usage(
+            &self.session_id,
+            self.last_context_tokens,
+            u64::from(self.model.context_window),
+        );
     }
 
     /// Queue a prompt (best-effort — a full / closed queue is dropped).
@@ -964,7 +977,7 @@ impl AgentLoop {
             &format!("{} {}", tc.name, tc.arguments),
             &self.sink,
             &self.pending_permissions,
-            self.trust_db.as_ref(),
+            self.trust.as_deref(),
             &self.space_cwd,
             turn,
         )
@@ -1144,13 +1157,12 @@ impl AgentLoop {
         shape_ask_result(response, params)
     }
 
-    /// `subagent` dispatch: a native parent session spawns an IN-PROCESS
-    /// NATIVE child (the native-native subagent — `dispatch_native`: an
-    /// in-process `AgentLoop` with the parent's model / tools minus
-    /// `subagent` (the recursion guard), a `CapturingSink`, a throwaway
-    /// `Db` — NO external `pi` process).
+    /// `subagent` dispatch: the parent's `SubagentDispatcher` (the
+    /// `WorkerManager`'s `dispatch_subagent` flow — the child is a WORKER
+    /// process; the ADR 0025 re-plumb — the in-process `AgentLoop` child
+    /// is GONE).
     async fn dispatch_subagent(&mut self, params: &Value, turn: &CancellationToken) -> ToolResult {
-        let Some(manager) = &self.subagent else {
+        let Some(dispatcher) = &self.subagent else {
             return ToolResult {
                 content: vec![ContentBlock::Text {
                     text: "subagent dispatch is not available in this session".to_string(),
@@ -1180,7 +1192,7 @@ impl AgentLoop {
         // definitions (layered — explicit params win; no match / empty =
         // config-less, never an error).
         let launch = self.resolve_launch(&launch, &agent_name);
-        let (dispatch_rx, cancel) = manager.dispatch_native(
+        let (dispatch_rx, cancel) = dispatcher.dispatch(
             &self.session_id,
             &self.space_cwd,
             &self.model,
@@ -1701,17 +1713,15 @@ impl AgentLoop {
     }
 
     /// Emit one `RpcEvent`: through the EXISTING `normalize` +
-    /// `persist_update` pipeline (the FROZEN `session-update` frames via
-    /// the sink + the display `record_message` persistence) AND onto the
-    /// `events` channel (the raw `RpcEvent` values — `try_send`: a full /
-    /// closed channel drops the event, mirroring `send_prompt`;
-    /// `Sender::send` is ASYNC in tokio and `emit` is sync — the
-    /// `RetryPolicy`'s emitter closure is a `FnMut`, so the send cannot
-    /// be awaited here). The settle is NOT taken from the (lossy)
-    /// `events` channel: an `agent_settled` is ALSO written to the settle
-    /// watch (a watch send is NEVER dropped — finding 3: a full / slow
-    /// `events` mpsc can drop the raw event, but the driver's settle
-    /// watch fires regardless, so the turn settle is never lost).
+    /// `compute_display_rows` + `Store::persist_display` pipeline (the
+    /// FROZEN `session-update` frames via the sink + the display
+    /// persistence) AND onto the `events` channel (the raw `RpcEvent`
+    /// values — the UNBOUNDED `send` never fails — ADR 0025: nothing is
+    /// dropped; a closed channel (the driver gone) is a silent no-op).
+    /// The settle is NOT taken from the (lossy) `events` channel: an
+    /// `agent_settled` is ALSO written to the settle watch (a watch send
+    /// is NEVER dropped — the driver's settle watch fires regardless, so
+    /// the turn settle is never lost).
     fn emit(&self, ev: RpcEvent) {
         let updates = normalize(
             &ev,
@@ -1722,23 +1732,15 @@ impl AgentLoop {
                 "session-update",
                 json!({ "sessionId": self.session_id, "update": u }),
             );
-            let db = self.store.db();
-            persist_update(
-                db,
-                &self.session_id,
-                u,
-                &self.text_acc,
-                &self.tool_state,
-                &self.thought_state,
-            );
+            let rows =
+                compute_display_rows(u, &self.text_acc, &self.tool_state, &self.thought_state);
+            let _ = self.store.persist_display(&self.session_id, &rows);
         }
         if matches!(ev, RpcEvent::agent_settled) {
             let n = self.settle_count.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = self.settle_tx.send(n);
         }
-        if let Err(e) = self.events.try_send(ev) {
-            eprintln!("harness: events channel full / closed, dropped an event: {e}");
-        }
+        let _ = self.events.send(ev);
     }
 }
 
@@ -2217,6 +2219,12 @@ mod tests {
 
     use super::*;
     use crate::agent::harness::catalog::CompactionConfig;
+    use crate::agent::harness::dispatch::InProcessDispatcher;
+    use crate::agent::harness::store::SessionStore;
+    use crate::agent::subagent::{SubagentOutcome, SubagentSessionManager};
+    use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
+    use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
+    use crate::agent::worker::protocol::{StartEnv, StartMode};
     use crate::storage::Db;
 
     /// A `SudoRunner` that records a call (the tests assert the
@@ -2383,7 +2391,7 @@ mod tests {
     /// the STORE via `loop_.store` against the same `Db`).
     fn build_loop_with_db(
         provider: Box<dyn Provider>,
-        events: mpsc::Sender<RpcEvent>,
+        events: mpsc::UnboundedSender<RpcEvent>,
         turn_cancel: Arc<StdMutex<CancellationToken>>,
         settle_tx: watch::Sender<u64>,
         retry: RetryPolicy,
@@ -2403,6 +2411,7 @@ mod tests {
             config_options: None,
             archived: false,
             context_usage: None,
+            is_subagent: false,
         })
         .expect("record_session");
         let model = models.first().cloned().expect("at least one model");
@@ -2421,7 +2430,7 @@ mod tests {
             model,
             provider,
             catalog,
-            SessionStore::new(db.clone()),
+            Arc::new(SessionStore::new(db.clone())),
             events,
             CancellationToken::new(),
             turn_cancel,
@@ -2445,7 +2454,7 @@ mod tests {
     /// `Db` use `build_loop_with_db`).
     fn build_loop(
         provider: Box<dyn Provider>,
-        events: mpsc::Sender<RpcEvent>,
+        events: mpsc::UnboundedSender<RpcEvent>,
         turn_cancel: Arc<StdMutex<CancellationToken>>,
         settle_tx: watch::Sender<u64>,
         retry: RetryPolicy,
@@ -2474,7 +2483,7 @@ mod tests {
     /// Await the first event matching `pred` (bounded — the tests must
     /// not hang).
     async fn wait_for_event(
-        rx: &mut mpsc::Receiver<RpcEvent>,
+        rx: &mut mpsc::UnboundedReceiver<RpcEvent>,
         timeout_ms: u64,
         pred: impl Fn(&RpcEvent) -> bool,
     ) -> Result<RpcEvent, ()> {
@@ -2495,16 +2504,16 @@ mod tests {
         }
     }
 
-    /// (finding 3) The `events` mpsc is FULL (the consumer is slow /
-    /// blocked): the `agent_settled` delivery is DROPPED, but the settle
-    /// watch fires regardless — the driver's settle (and the `send_prompt`
-    /// / `wait_for_settle` waits it drives) is never lost to a lossy
-    /// `events` delivery.
+    /// (finding 3 — ADR 0025's UNBOUNDED `events` channel): a slow /
+    /// blocked consumer NEVER drops an event (the pre-fix bounded channel
+    /// dropped the `agent_settled` delivery); the settle watch fires
+    /// regardless — the driver's settle (and the `send_prompt` /
+    /// `wait_for_settle` waits it drives) is never lost.
     #[tokio::test]
-    async fn a_full_events_channel_does_not_lose_the_settle() {
-        let (events_tx, mut events_rx) = mpsc::channel(4);
+    async fn a_slow_events_consumer_never_drops_the_settle() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         for _ in 0..4 {
-            events_tx.try_send(RpcEvent::turn_start).unwrap();
+            events_tx.send(RpcEvent::turn_start).unwrap();
         }
         let (settle_tx, settle_rx) = watch::channel(0u64);
         let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
@@ -2519,19 +2528,25 @@ mod tests {
             RetryPolicy::new_with(5, Duration::from_millis(1)),
         );
         loop_.handle_prompt(&text_prompt("hello")).await;
-        // The raw `agent_settled` was DROPPED (the channel is still full —
-        // the first event is still the pre-filled `turn_start`).
+        // The raw `agent_settled` was NOT dropped (unbounded — the
+        // pre-filled events are still ahead of it in the queue; EVERY
+        // event is delivered, in order).
+        let mut seen = Vec::new();
+        while let Ok(ev) = events_rx.try_recv() {
+            seen.push(ev);
+        }
         assert_eq!(
-            events_rx.try_recv().unwrap().kind(),
-            "turn_start",
-            "the settled event was dropped (the channel was full)"
+            seen.first().map(|e| e.kind()),
+            Some("turn_start".into()),
+            "the pre-filled events are still at the head (nothing was dropped)"
         );
-        // ...but the settle watch fired (the reliable signal).
         assert_eq!(
-            *settle_rx.borrow(),
-            1,
-            "the settle watch fired despite the dropped events delivery"
+            seen.last().map(|e| e.kind()),
+            Some("agent_settled".into()),
+            "the settled event was delivered (unbounded — no drop)"
         );
+        // ...and the settle watch fired (the reliable signal).
+        assert_eq!(*settle_rx.borrow(), 1, "the settle watch fired");
     }
 
     /// (finding 8a) A turn with 2 tool calls: a cancel after the first
@@ -2539,7 +2554,7 @@ mod tests {
     /// executed (a cancelled tool result; the turn settles).
     #[tokio::test]
     async fn a_cancel_stops_the_remaining_tool_calls_in_a_batch() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
@@ -2616,7 +2631,7 @@ mod tests {
     /// stalled `complete` / `stream.next()` blocks indefinitely).
     #[tokio::test]
     async fn a_cancel_stops_an_in_flight_model_call() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, calls) = ScriptedProvider::new(vec![None]); // a HANGING `complete`
         let mut loop_ = build_loop(
@@ -2655,7 +2670,7 @@ mod tests {
     /// caller hung until a `close_session`.
     #[tokio::test]
     async fn a_skipped_prompt_settles_the_pending_turn() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (settle_tx, settle_rx) = watch::channel(0u64);
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, _calls) = ScriptedProvider::new(vec![None]); // a HANGING `complete`
@@ -2699,7 +2714,7 @@ mod tests {
     /// the items, so the queued prompt's `send_prompt` caller hung.
     #[tokio::test]
     async fn a_drained_queued_prompt_settles_the_pending_turn() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (settle_tx, settle_rx) = watch::channel(0u64);
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, _calls) = ScriptedProvider::new(vec![None]); // a HANGING `complete`
@@ -2739,7 +2754,7 @@ mod tests {
     /// no `turn_end`, so a failed turn's timeline did not close cleanly).
     #[tokio::test]
     async fn a_failed_model_call_settles_with_turn_end_and_agent_settled() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let provider = FailingProvider {
             error: ProviderError::Fatal("the model call failed".to_string()),
@@ -2775,7 +2790,7 @@ mod tests {
     /// NEVER run.
     #[tokio::test]
     async fn a_cancel_stops_a_sudo_flow_blocking_on_its_confirm_prompt() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
             ProviderEvent::ToolCall(ToolCall {
@@ -2852,7 +2867,7 @@ mod tests {
     /// one message).
     #[tokio::test]
     async fn a_retried_model_call_emits_one_message_start() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
                 ProviderEvent::TextDelta("part".to_string()),
@@ -2900,7 +2915,7 @@ mod tests {
     /// cancelled turn waited out up to 8 s of backoff).
     #[tokio::test]
     async fn a_cancel_during_the_retry_backoff_settles_fast() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![ProviderEvent::Error(
             ProviderError::Retryable("transient".to_string()),
@@ -2948,7 +2963,7 @@ mod tests {
         ])]);
         let mut loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -2980,7 +2995,7 @@ mod tests {
         ])]);
         let mut loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3008,7 +3023,7 @@ mod tests {
         )])]);
         let mut loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3035,7 +3050,7 @@ mod tests {
             ProviderEvent::TextDelta("partial".to_string()),
             ProviderEvent::Done(FinishReason::Error),
         ])]);
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let mut loop_ = build_loop(
             Box::new(provider),
             events_tx,
@@ -3096,7 +3111,7 @@ mod tests {
         ])]);
         let (mut loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3138,7 +3153,7 @@ mod tests {
         ]);
         let (mut loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3232,7 +3247,7 @@ mod tests {
         ]);
         let (mut loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3306,7 +3321,7 @@ mod tests {
         ]);
         let (mut loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3390,7 +3405,7 @@ mod tests {
         ]);
         let (mut loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3489,9 +3504,9 @@ mod tests {
             }),
             ProviderEvent::Done(FinishReason::Stop),
         ])]);
-        let mut loop_ = build_loop_with_subagent(
+        let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3520,9 +3535,9 @@ mod tests {
             updates: updates.clone(),
         });
         let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
-        let mut loop_ = build_loop_with_subagent(
+        let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3566,9 +3581,9 @@ mod tests {
             ProviderEvent::TextDelta("the summary".to_string()),
             ProviderEvent::Done(FinishReason::Stop),
         ])]);
-        let mut loop_ = build_loop_with_subagent(
+        let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3623,9 +3638,9 @@ mod tests {
             updates: updates.clone(),
         });
         let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
-        let mut loop_ = build_loop_with_subagent(
+        let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3677,7 +3692,7 @@ mod tests {
         ])]);
         let (mut loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3718,7 +3733,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
         let mut loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -3785,7 +3800,7 @@ mod tests {
     /// tool-result error and the turn settles.
     #[tokio::test]
     async fn a_native_session_with_enabled_tools_cannot_dispatch_a_disabled_tool() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
                 ProviderEvent::ToolCall(ToolCall {
@@ -3845,7 +3860,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
         let mut loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4019,7 +4034,7 @@ mod tests {
     #[tokio::test]
     async fn list_agents_tool_lists_discovered_agents() {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let (events_tx, _events_rx) = mpsc::channel(8);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (settle_tx, _settle_rx) = watch::channel(0u64);
         let loop_ = build_loop(
@@ -4069,7 +4084,7 @@ mod tests {
     #[tokio::test]
     async fn list_agents_tool_returns_none_when_empty() {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let (events_tx, _events_rx) = mpsc::channel(8);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (settle_tx, _settle_rx) = watch::channel(0u64);
         let loop_ = build_loop(
@@ -4111,7 +4126,7 @@ mod tests {
     #[tokio::test]
     async fn list_agents_tool_flattens_block_scalar_descriptions() {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let (events_tx, _events_rx) = mpsc::channel(8);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (settle_tx, _settle_rx) = watch::channel(0u64);
         let loop_ = build_loop(
@@ -4183,22 +4198,22 @@ mod tests {
         }
     }
 
-    /// Build an `AgentLoop` with a `subagent` manager + a MULTI-model
+    /// Build an `AgentLoop` with a `subagent` dispatcher + a MULTI-model
     /// catalog (a copy of `build_loop_with_db`'s body with the `Db`
     /// assertion seam dropped — the `models` vec in the `ModelCatalog`,
-    /// the `subagent` `AgentLoop::new` arg set to `subagent_manager`,
+    /// the `subagent` `AgentLoop::new` arg set to the given dispatcher,
     /// the `sink` passed through instead of the fixed `TestSink`). The
     /// PARENT's `model` arg is `models[0]`; the parent's `ModelCatalog`
     /// gets the full `models` vec.
     #[allow(clippy::too_many_arguments)]
-    fn build_loop_with_subagent(
+    fn build_loop_with_dispatcher(
         provider: Box<dyn Provider>,
-        events: mpsc::Sender<RpcEvent>,
+        events: mpsc::UnboundedSender<RpcEvent>,
         turn_cancel: Arc<StdMutex<CancellationToken>>,
         settle_tx: watch::Sender<u64>,
         retry: RetryPolicy,
         sink: Arc<dyn EventSink>,
-        subagent_manager: Option<Arc<SubagentSessionManager>>,
+        subagent: Option<Arc<dyn SubagentDispatcher>>,
         models: Vec<Model>,
         config_dir: Option<&std::path::Path>,
     ) -> AgentLoop {
@@ -4217,7 +4232,7 @@ mod tests {
             models[0].clone(),
             provider,
             catalog,
-            SessionStore::new(db),
+            Arc::new(SessionStore::new(db)),
             events,
             CancellationToken::new(),
             turn_cancel,
@@ -4229,92 +4244,104 @@ mod tests {
             None,
             sink,
             Arc::new(crate::agent::todo::TodoStore::new()),
-            subagent_manager,
+            subagent,
             SudoDeps::default(),
             retry,
             config_dir.map(|p| p.to_path_buf()),
         )
     }
 
-    /// A recorded child-model request (the `complete` argument's
-    /// `model` / the first `System` message's text / the tool names).
-    #[derive(Clone)]
-    struct RecordedRequest {
-        model: String,
-        system: Option<String>,
-        tool_names: Vec<String>,
-    }
+    /// The `fake_worker` fixture factory (the `WorkerFactory` seam — the
+    /// `CARGO_MANIFEST_DIR`/`target/debug` convention; `cargo test` builds
+    /// the bin targets).
+    struct FakeWorkerFactory;
 
-    /// A `Provider` that RECORDS each `complete` request's `model` +
-    /// the first `System` message's text + the tool names into a shared
-    /// `Arc<StdMutex<Vec<RecordedRequest>>>` and returns a fixed
-    /// single-response stream (the test-12 child — every model call
-    /// settles the child's turn).
-    struct RequestRecordingProvider {
-        recorded: Arc<StdMutex<Vec<RecordedRequest>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for RequestRecordingProvider {
-        async fn complete(
-            &self,
-            req: &ModelRequest,
-        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
-        {
-            let system = req
-                .messages
-                .iter()
-                .find(|m| m.role == ChatRole::System)
-                .and_then(|m| match &m.content {
-                    MessageContent::Text(t) => Some(t.clone()),
-                    _ => None,
-                });
-            let tool_names = req.tools.iter().map(|t| t.name.clone()).collect();
-            self.recorded
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(RecordedRequest {
-                    model: req.model.clone(),
-                    system,
-                    tool_names,
-                });
-            Ok(futures_util::stream::iter(vec![
-                ProviderEvent::TextDelta("scout done".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ])
-            .boxed())
+    impl WorkerFactory for FakeWorkerFactory {
+        fn spawn(&self) -> Result<WorkerHandle, WorkerError> {
+            WorkerHandle::spawn(&std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/target/debug/fake_worker"
+            )))
         }
     }
 
-    /// Build a `SubagentSessionManager` with `NativeDeps` set (a
-    /// `provider_factory` returning a `RequestRecordingProvider`
-    /// (sharing `recorded`) for ANY model + the given catalog + settle
-    /// bound) — the `subagent.rs` `make_native_manager` mirror.
-    fn make_native_manager(
-        config_dir: &std::path::Path,
-        recorded: Arc<StdMutex<Vec<RecordedRequest>>>,
-        catalog: ModelCatalog,
+    /// A `WorkerManager` with the loop's parent session (`"s1"` — the
+    /// `AgentLoop`'s `session_id`) `attach`ed (the ADR 0025 Task 5
+    /// re-plumb — the subagent runs in a `fake_worker` process): the
+    /// parent's `StartEnv` carries the given `models` catalog (the
+    /// `dispatch_subagent` flow resolves the child's `model` against it)
+    /// and the given `config_dir` (the settings' `subagentModels`
+    /// override is resolved loop-side; the `config_dir` is the
+    /// parent's). The `sink_for` lookup returns the given sink for the
+    /// parent (the `subagent-session-started` / `subagent-closed` UI
+    /// lifecycle events are delivered on the PARENT's sink).
+    async fn make_worker_manager(
         settle_timeout: Duration,
-    ) -> Arc<SubagentSessionManager> {
-        let manager = Arc::new(SubagentSessionManager::new(None));
-        let factory: crate::agent::session::ProviderFactory = Arc::new(move |_m: &Model| {
-            Box::new(RequestRecordingProvider {
-                recorded: recorded.clone(),
-            })
-        });
-        manager.set_native_deps(crate::agent::subagent::NativeDeps {
-            provider_factory: factory,
-            catalog: crate::agent::session::EffectiveCatalog {
-                config_dir: config_dir.to_path_buf(),
-                cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-                base: catalog,
+        models: Vec<Model>,
+        config_dir: Option<&std::path::Path>,
+        sink: Arc<dyn EventSink>,
+    ) -> Arc<WorkerManager> {
+        let factory: Arc<dyn WorkerFactory> = Arc::new(FakeWorkerFactory);
+        // The `on_event` closure mirrors the router's `SinkFrame` re-emit
+        // (the child's `SinkFrame`s — the `session_info` Start echo with
+        // the `systemPrompt` / `trusted` envelope fields — land on the
+        // test's sink; the `RpcEvent` stream is a no-op here).
+        let on_event_sink = sink.clone();
+        let wm = WorkerManager::new(
+            factory,
+            Arc::new(|_id: String, _code: Option<i32>| {}),
+            Arc::new(
+                move |_id: String, is_subagent: bool, evt: WorkerInboundEvent| {
+                    if is_subagent {
+                        if let WorkerInboundEvent::SinkFrame { event, payload } = &evt {
+                            on_event_sink.emit(event, payload.clone());
+                        }
+                    }
+                },
+            ),
+            Arc::new(move |id: &str| (id == "s1").then(|| sink.clone())),
+        )
+        .with_settle_timeout(settle_timeout);
+        let wm = Arc::new(wm);
+        let env = StartEnv::from_parts(
+            "s1".to_string(),
+            "/tmp/space".to_string(),
+            StartMode::Fresh,
+            None,
+            models[0].clone(),
+            ModelCatalog {
+                models,
+                default_model: None,
+                compaction: CompactionConfig::default(),
             },
-            todo_store: Arc::new(crate::agent::todo::TodoStore::new()),
-            sudo: SudoDeps::default(),
-            settle_timeout,
-            trust_db: None,
-            config_dir: None,
-        });
+            None,
+            true,
+            None,
+            config_dir
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/tmp".to_string()),
+            true,
+            None,
+        );
+        wm.attach("s1", &env)
+            .await
+            .expect("the parent attach completes");
+        wm
+    }
+
+    /// A `SubagentSessionManager` on a `WorkerManager` (the ADR 0025
+    /// Task 5 re-plumb — the `InProcessDispatcher`'s manager): the parent
+    /// `"s1"` is `attach`ed with the given `models` catalog (the
+    /// `dispatch_subagent` flow resolves the child's `model` against it).
+    async fn make_subagent_manager(
+        settle_timeout: Duration,
+        models: Vec<Model>,
+        config_dir: Option<&std::path::Path>,
+        sink: Arc<dyn EventSink>,
+    ) -> Arc<SubagentSessionManager> {
+        let wm = make_worker_manager(settle_timeout, models, config_dir, sink).await;
+        let manager = Arc::new(SubagentSessionManager::new());
+        manager.set_worker_manager(wm);
         manager
     }
 
@@ -4341,7 +4368,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4371,7 +4398,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4414,7 +4441,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4450,7 +4477,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4492,7 +4519,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4534,7 +4561,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4577,7 +4604,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4620,7 +4647,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4660,7 +4687,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4699,7 +4726,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4752,7 +4779,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4795,7 +4822,7 @@ mod tests {
         let (provider, _calls) = ScriptedProvider::new(vec![]);
         let loop_ = build_loop(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4864,7 +4891,7 @@ mod tests {
         }
         let (loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4914,7 +4941,7 @@ mod tests {
         }
         let (loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -4970,7 +4997,7 @@ mod tests {
         }
         let (loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -5022,7 +5049,7 @@ mod tests {
         }
         let (loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -5074,7 +5101,7 @@ mod tests {
         }
         let (loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -5117,7 +5144,7 @@ mod tests {
         }
         let (loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -5139,10 +5166,15 @@ mod tests {
     /// (ADR 0023 thinking-order regression) the `:<level>` suffix of the
     /// resolved model key beats the frontmatter's `thinking` (the
     /// doc-correct order — explicit > suffix > frontmatter; the OLD code
-    /// produced the frontmatter's `"low"` here).
+    /// produced the frontmatter's `"low"` here). The ADR 0025 Task 5
+    /// re-plumb: the subagent runs in a `fake_worker` process (the
+    /// `WorkerManager`'s `dispatch_subagent` flow) — the
+    /// `subagent-session-started` frame carries the RESOLVED model +
+    /// thinking, and the `subagent` tool result is the child's captured
+    /// final text (the `fake_worker`'s canned `"canned answer"`).
     #[tokio::test]
     async fn a_native_subagent_with_a_suffix_model_key_uses_the_suffix_thinking() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
                 ProviderEvent::ToolCall(ToolCall {
@@ -5160,34 +5192,21 @@ mod tests {
         // A TWO-model catalog: `fake/m1` (the parent) + `fake/m2` (the
         // frontmatter target — IN the catalog, so it is NOT stale).
         let models = vec![fake_model("m1"), fake_model("m2")];
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-agent-def-e2e-cfg-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let recorded = Arc::new(StdMutex::new(Vec::<RecordedRequest>::new()));
-        let manager = make_native_manager(
-            &config_dir,
-            recorded.clone(),
-            ModelCatalog {
-                models: models.clone(),
-                default_model: None,
-                compaction: CompactionConfig::default(),
-            },
-            Duration::from_secs(30),
-        );
         let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
         let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
             events: sink_events.clone(),
         });
-        let mut loop_ = build_loop_with_subagent(
+        let manager =
+            make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone())
+                .await;
+        let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
             events_tx,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
             sink,
-            Some(manager),
+            Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
             models,
             None,
         );
@@ -5204,6 +5223,26 @@ mod tests {
         )
         .unwrap();
         loop_.handle_prompt(&text_prompt("go")).await;
+        // The `subagent` tool result: the child's captured final text
+        // (the `fake_worker`'s canned `"canned answer"` — the
+        // `SubagentCapture` over the child's `SinkFrame`
+        // `agent_message_chunk` stream).
+        let end = wait_for_event(&mut events_rx, 20000, |e| {
+            matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1")
+        })
+        .await
+        .expect("the `subagent`'s tool_execution_end");
+        let RpcEvent::tool_execution_end {
+            result, is_error, ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert!(!is_error, "the child completed");
+        assert_eq!(
+            result["content"][0]["text"], "canned answer",
+            "the tool result is the child's captured final text"
+        );
         // The parent turn settled (bounded — the `ScriptedProvider`
         // settles it; the child ran to completion inside the dispatch).
         wait_for_event(&mut events_rx, 20000, |e| {
@@ -5235,10 +5274,14 @@ mod tests {
     /// (ADR 0023) end-to-end: a settings `subagentModels` override beats
     /// the frontmatter `model` (the child runs the override), and the
     /// frontmatter's `thinking` STILL applies (the override only
-    /// replaces the model).
+    /// replaces the model). The ADR 0025 Task 5 re-plumb: the subagent
+    /// runs in a `fake_worker` process — the `subagent-session-started`
+    /// frame carries the RESOLVED model + thinking + tools, and the
+    /// `subagent` tool result is the child's captured final text (the
+    /// `fake_worker`'s canned `"canned answer"`).
     #[tokio::test]
     async fn a_native_subagent_with_a_settings_override_runs_the_override_model() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
                 ProviderEvent::ToolCall(ToolCall {
@@ -5267,29 +5310,25 @@ mod tests {
             r#"{ "subagentModels": { "scout": "fake/m3" } }"#,
         )
         .unwrap();
-        let recorded = Arc::new(StdMutex::new(Vec::<RecordedRequest>::new()));
-        let manager = make_native_manager(
-            &config_dir,
-            recorded.clone(),
-            ModelCatalog {
-                models: models.clone(),
-                default_model: None,
-                compaction: CompactionConfig::default(),
-            },
-            Duration::from_secs(30),
-        );
         let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
         let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
             events: sink_events.clone(),
         });
-        let mut loop_ = build_loop_with_subagent(
+        let manager = make_subagent_manager(
+            Duration::from_secs(30),
+            models.clone(),
+            Some(&config_dir),
+            sink.clone(),
+        )
+        .await;
+        let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
             events_tx,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
             sink,
-            Some(manager),
+            Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
             models,
             Some(&config_dir),
         );
@@ -5306,6 +5345,24 @@ mod tests {
         )
         .unwrap();
         loop_.handle_prompt(&text_prompt("go")).await;
+        // The `subagent` tool result: the child's captured final text
+        // (the `fake_worker`'s canned `"canned answer"`).
+        let end = wait_for_event(&mut events_rx, 20000, |e| {
+            matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1")
+        })
+        .await
+        .expect("the `subagent`'s tool_execution_end");
+        let RpcEvent::tool_execution_end {
+            result, is_error, ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert!(!is_error, "the child completed");
+        assert_eq!(
+            result["content"][0]["text"], "canned answer",
+            "the tool result is the child's captured final text"
+        );
         // The parent turn settled (bounded — the `ScriptedProvider`
         // settles it; the child ran to completion inside the dispatch).
         wait_for_event(&mut events_rx, 20000, |e| {
@@ -5314,8 +5371,8 @@ mod tests {
         .await
         .expect("the parent turn settled");
         // The `subagent-session-started` frame: the override beats the
-        // frontmatter's model, and the frontmatter's `thinking` still
-        // applies.
+        // frontmatter's model, the frontmatter's `thinking` still
+        // applies, and the tools are the frontmatter's allowlist.
         let events = sink_events
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -5332,18 +5389,10 @@ mod tests {
             started.1["thinkingLevel"], "low",
             "the frontmatter's `thinking` still applies (the override only replaces the model)"
         );
-        // The child's model request went to the override model (the
-        // `RequestRecordingProvider` records every request — the parent's
-        // are `m1`, the child's is `m3`).
-        let recorded = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let child = recorded
-            .iter()
-            .find(|r| r.model == "m3")
-            .expect("the child requested `fake/m3` (the override)");
         assert_eq!(
-            child.system,
-            Some("You are a scout.".to_string()),
-            "the frontmatter body is the child's system message"
+            started.1["enabledTools"],
+            json!(["read"]),
+            "the child's tools are the frontmatter's allowlist"
         );
     }
 
@@ -5351,9 +5400,12 @@ mod tests {
     /// `agentName` matching a discovered definition runs the FRONTMATTER
     /// config (the `dispatch_subagent` → `resolve_launch` layering — the
     /// child's `subagent-session-started` payload carries the
-    /// frontmatter's `model` + `tools`, and the child's first model
-    /// request carries the frontmatter body as its system message with
-    /// exactly the frontmatter's tool).
+    /// frontmatter's `model` + `tools`, and the child's `Start` envelope
+    /// (the `fake_worker`'s `session_info` echo) carries the frontmatter
+    /// body as the `systemPrompt` + exactly the frontmatter's tools).
+    /// The ADR 0025 Task 5 re-plumb: the subagent runs in a `fake_worker`
+    /// process — the `subagent` tool result is the child's captured
+    /// final text (the `fake_worker`'s canned `"canned answer"`).
     ///
     /// No `env_lock()` here (intentional): `resolve_launch` reads `HOME`
     /// (via `discover_agents` → `user_roots`), concurrently with the
@@ -5365,7 +5417,7 @@ mod tests {
     /// it must take `env_lock()` (and set `HOME`) first.
     #[tokio::test]
     async fn a_native_subagent_with_a_matching_agent_name_runs_the_frontmatter_config() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
                 ProviderEvent::ToolCall(ToolCall {
@@ -5383,34 +5435,21 @@ mod tests {
         // A TWO-model catalog: `fake/m1` (the parent) + `fake/m2` (the
         // frontmatter target — IN the catalog, so it is NOT stale).
         let models = vec![fake_model("m1"), fake_model("m2")];
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-agent-def-e2e-cfg-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let recorded = Arc::new(StdMutex::new(Vec::<RecordedRequest>::new()));
-        let manager = make_native_manager(
-            &config_dir,
-            recorded.clone(),
-            ModelCatalog {
-                models: models.clone(),
-                default_model: None,
-                compaction: CompactionConfig::default(),
-            },
-            Duration::from_secs(30),
-        );
         let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
         let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
             events: sink_events.clone(),
         });
-        let mut loop_ = build_loop_with_subagent(
+        let manager =
+            make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone())
+                .await;
+        let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
             events_tx,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
             sink,
-            Some(manager),
+            Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
             models,
             None,
         );
@@ -5458,25 +5497,247 @@ mod tests {
             started.1["thinkingLevel"], "low",
             "the child's thinking level is the frontmatter's"
         );
-        // The child's FIRST model request (the `RequestRecordingProvider`
-        // records every request — the parent's are `m1`, the child's is
-        // `m2`): the frontmatter body is the system message, and the
-        // tool list is exactly the frontmatter's.
-        let recorded = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let child = recorded
+        // The child's `Start` envelope (the `fake_worker`'s `session_info`
+        // echo — re-emitted on the parent's scope by the `on_event`
+        // router): the frontmatter body is the `systemPrompt` (the
+        // `build_child_system_message` output — the body + the todo
+        // instructions), and the `enabledTools` is exactly the
+        // frontmatter's.
+        let child_info = events
             .iter()
-            .find(|r| r.model == "m2")
-            .expect("the child requested `fake/m2` (NOT the parent's `fake/m1`)");
-        assert_eq!(
-            child.system,
-            Some("You are a scout.".to_string()),
-            "the frontmatter body is the child's system message"
+            .find(|(name, payload)| {
+                name == "session-update"
+                    && payload["update"]["sessionUpdate"] == "session_info"
+                    && payload["update"]["systemPrompt"].is_string()
+            })
+            .expect("the child's `session_info` Start echo was re-emitted");
+        assert!(
+            child_info.1["update"]["systemPrompt"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are a scout."),
+            "the frontmatter body is the child's system message (the `build_child_system_message` output)"
         );
         assert_eq!(
-            child.tool_names,
-            vec!["read".to_string()],
+            child_info.1["update"]["enabledTools"],
+            json!(["read"]),
             "the child gets exactly the frontmatter's tool"
         );
+    }
+
+    /// `SubagentWait` mechanics (the `MockDispatcher` seam — a QUEUED
+    /// oneshot): a resolving `Completed` outcome completes the `subagent`
+    /// tool with the captured output (the `select!`'s outcome arm fires
+    /// before the turn-cancel arm).
+    #[tokio::test]
+    async fn subagent_wait_a_resolving_completed_outcome_completes_the_tool() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "the task" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+        // The test resolves the QUEUED oneshot BEFORE the turn starts (the
+        // oneshot's value is buffered — the loop's `select!` sees it
+        // resolved immediately when it pops it at `dispatch`).
+        tx.send(SubagentOutcome::Completed {
+            output: "the answer".to_string(),
+            metrics: crate::agent::subagent::SubagentMetrics {
+                output: "the answer".to_string(),
+                input_tokens: 10,
+                output_tokens: 5,
+                cost: 0.0,
+                duration_ms: 1,
+            },
+        })
+        .unwrap();
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+        // The `subagent` tool result: the `Completed` output verbatim.
+        let end = wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1")
+        })
+        .await
+        .expect("the `subagent`'s tool_execution_end");
+        let RpcEvent::tool_execution_end {
+            result, is_error, ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert!(!is_error, "a `Completed` outcome is a success result");
+        assert_eq!(
+            result["content"][0]["text"], "the answer",
+            "the tool result is the `Completed` output verbatim"
+        );
+        wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the turn settled");
+    }
+
+    /// `SubagentWait` mechanics: a `Failed` outcome is an ERROR tool
+    /// result (the `subagent failed: {error}` text — the parent can
+    /// retry / reword the task).
+    #[tokio::test]
+    async fn subagent_wait_a_failed_outcome_is_an_error_result() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "the task" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+        // The test resolves the QUEUED oneshot BEFORE the turn starts
+        // (the oneshot's value is buffered — the loop's `select!` sees
+        // it resolved immediately when it pops it at `dispatch`).
+        tx.send(SubagentOutcome::Failed {
+            error: "boom".to_string(),
+        })
+        .unwrap();
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+        // The `subagent` tool result: the `Failed` error, verbatim.
+        let end = wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1")
+        })
+        .await
+        .expect("the `subagent`'s tool_execution_end");
+        let RpcEvent::tool_execution_end {
+            result, is_error, ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert!(is_error, "a `Failed` outcome is an error result");
+        assert_eq!(
+            result["content"][0]["text"], "subagent failed: boom",
+            "the tool result carries the `Failed` error verbatim"
+        );
+        wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the turn settled");
+    }
+
+    /// `SubagentWait` mechanics: an UNRESOLVED outcome (the `MockDispatcher`
+    /// empty queue — a never-resolving oneshot) + a turn cancel → the
+    /// `select!`'s turn-cancel arm wins (the `SubagentCancel` is flipped
+    /// — a no-op here — and the tool result is `cancelled`).
+    #[tokio::test]
+    async fn subagent_wait_a_turn_cancel_cancels_the_dispatch() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "subagent".to_string(),
+                arguments: json!({ "task": "the task" }),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ])]);
+        // The EMPTY queue — the `dispatch` returns a never-resolving
+        // oneshot (the outcome arm never fires).
+        let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let turn_cancel_c = turn_cancel.clone();
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            turn_cancel,
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        // The turn runs in a task (`handle_prompt` awaits the WHOLE turn
+        // — the `SubagentWait` select blocks on the never-resolving
+        // oneshot until the turn-cancel arm fires).
+        let turn = tokio::spawn(async move {
+            loop_.handle_prompt(&text_prompt("go")).await;
+        });
+        // Give the turn time to reach the `SubagentWait` select, then
+        // cancel (the `select!`'s turn-cancel arm fires — the
+        // `SubagentCancel` is flipped + the `Cancelled` tool result).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        turn_cancel_c
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel();
+        turn.await.expect("the turn task completed");
+        let end = wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1")
+        })
+        .await
+        .expect("the `subagent`'s tool_execution_end");
+        let RpcEvent::tool_execution_end {
+            result, is_error, ..
+        } = end
+        else {
+            unreachable!()
+        };
+        assert!(is_error, "a cancelled dispatch is an error result");
+        assert_eq!(
+            result["content"][0]["text"], "cancelled",
+            "the `Cancelled` tool result"
+        );
+        wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the turn settled after the cancel");
     }
 
     #[test]
@@ -5515,7 +5776,7 @@ mod tests {
     /// data-URI on the request wire).
     #[tokio::test]
     async fn a_tool_result_image_reaches_the_model_transcript() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
@@ -5587,7 +5848,7 @@ mod tests {
     /// image-only `Blocks`, NO empty text block).
     #[tokio::test]
     async fn a_prompt_with_images_pushes_a_blocks_user_message() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (provider, _calls) = ScriptedProvider::new(vec![
             Some(vec![
@@ -5719,7 +5980,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_requests_carry_the_session_id_across_turns_and_tool_calls() {
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let provider = SessionRecordingProvider::with_scripts(
@@ -5791,7 +6052,7 @@ mod tests {
         let provider = SessionRecordingProvider::new(recorded.clone());
         let (mut loop_, _db) = build_loop_with_db(
             Box::new(provider),
-            mpsc::channel(8).0,
+            mpsc::unbounded_channel().0,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -5852,7 +6113,7 @@ mod tests {
                 ProviderEvent::Done(FinishReason::Stop),
             ]),
         ]);
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let mut loop_ = build_loop(
             Box::new(provider),
             events_tx,
@@ -5915,7 +6176,7 @@ mod tests {
                 ProviderEvent::Done(FinishReason::Stop),
             ]),
         ]);
-        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let mut loop_ = build_loop(
             Box::new(provider),

@@ -25,7 +25,7 @@
 use serde_json::Value;
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum RpcEvent {
     agent_start,

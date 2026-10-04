@@ -15,12 +15,15 @@
 //!
 //! The trusted-Space auto-approve (ADR 0010): a TRUSTED Space's mutating
 //! tool is answered `Selected { "allow" }` IMMEDIATELY — no prompt, no
-//! event, no oneshot. Fail-closed: no db / db error / no space row /
-//! canonicalize failure is untrusted (the prompt flow), with the options
+//! event, no oneshot. Fail-closed: no trust source / lookup failure / no
+//! space row / canonicalize failure is untrusted (the prompt flow), with
+//! the options
 //! `[allow/Allow, reject/Block, trust-space/Don't ask again for this
 //! Space]`; the user's choice maps to allow / deny / allow
-//! (`trust-space` answers `Selected { "trust-space" }` and sets the flag
-//! best-effort — a failed write is logged and the Space stays untrusted);
+//! (`trust-space` answers `Selected { "trust-space" }`; the flag WRITE is
+//! NOT in the gate — ADR 0025: the Supervisor's `respond_permission`
+//! relay applies it (Task 4) + the Worker's `StaticTrustSource` is
+//! flipped (Task 2));
 //! any other outcome, a timeout, a cancel, or a session close maps to
 //! `Cancelled` (a deny).
 //!
@@ -38,8 +41,8 @@ use serde_json::json;
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::harness::trust::TrustSource;
 use crate::agent::session::EventSink;
-use crate::storage::Db;
 
 /// The user's decision on a permission prompt, as chosen via the
 /// `respond_permission` Tauri command.
@@ -64,14 +67,6 @@ pub fn permission_key(session_id: &str, request_id: &str) -> String {
     format!("{session_id}/{request_id}")
 }
 
-/// The key prefix of all pending-permission keys that belong to
-/// `session_id`. Keys are `"{session_id}/{request_id}"`, so the prefix
-/// carries the trailing slash: a session id that is a plain prefix of
-/// another ("s1" vs "s10") must not drain the other session's prompts.
-pub fn session_key_prefix(session_id: &str) -> String {
-    format!("{session_id}/")
-}
-
 /// How long a permission prompt stays open before it auto-cancels.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -83,8 +78,15 @@ const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 ///
 /// The trusted-Space auto-approve is here (ADR 0010): a TRUSTED Space's
 /// mutating tool is answered `Selected { "allow" }` IMMEDIATELY — no
-/// prompt, no event, no oneshot. Fail-closed: no db / db error / no
-/// space row / canonicalize failure is untrusted (the prompt flow).
+/// prompt, no event, no oneshot. Fail-closed: no trust source / lookup
+/// failure / no space row / canonicalize failure is untrusted (the
+/// prompt flow).
+///
+/// The `trust-space` ("Don't ask again") flag WRITE is NOT here (ADR
+/// 0025 — the Worker has no `Db`): the Supervisor's `respond_permission`
+/// relay applies it (Task 4: `db.set_space_trusted(cwd, true)` + the
+/// Worker's `StaticTrustSource` flip — the very next tool call
+/// auto-approves, matching the live-lookup behavior).
 #[allow(clippy::too_many_arguments)]
 pub async fn native_permission_gate(
     session_id: &str,
@@ -92,7 +94,7 @@ pub async fn native_permission_gate(
     title: &str,
     sink: &Arc<dyn EventSink>,
     pending_permissions: &PendingPermissions,
-    db: Option<&Arc<Db>>,
+    trust: Option<&dyn TrustSource>,
     cwd: &std::path::Path,
     cancel: &CancellationToken,
 ) -> PermissionOutcome {
@@ -105,11 +107,9 @@ pub async fn native_permission_gate(
         return PermissionOutcome::Cancelled;
     }
     // Trusted Space (ADR 0010): auto-approve — no prompt, no event, no
-    // oneshot. Fail-closed.
-    let trusted = match db {
-        Some(d) => d.space_trusted(cwd).unwrap_or(false),
-        None => false,
-    };
+    // oneshot. Fail-closed (`None` = always prompt; a lookup that cannot
+    // resolve is `false`).
+    let trusted = trust.map(|t| t.is_trusted(cwd)).unwrap_or(false);
     if trusted {
         return PermissionOutcome::Selected {
             option_id: "allow".to_string(),
@@ -161,33 +161,13 @@ pub async fn native_permission_gate(
         _ = cancel.cancelled() => PermissionOutcome::Cancelled,
     };
 
-    // (d) `trust-space`: the flag write is best-effort and happens BEFORE
-    // the outcome is returned (a failed write is logged and the Space
-    // stays untrusted — the next call prompts again; the outcome is
-    // still the user's `trust-space` selection, which the caller maps to
-    // an allow).
-    if let PermissionOutcome::Selected { option_id } = &outcome {
-        if option_id == "trust-space" {
-            if let Some(d) = db {
-                match d.set_space_trusted(&cwd.display().to_string(), true) {
-                    Ok(true) => {}
-                    Ok(false) => eprintln!(
-                        "trust-space: no space row for {}; trust not persisted",
-                        cwd.display()
-                    ),
-                    Err(e) => {
-                        eprintln!(
-                            "trust-space: failed to set trusted for {}: {e}",
-                            cwd.display()
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    // (e) Remove the entry (best-effort — a session close may have
-    // drained the prefix already).
+    // (d) Remove the entry (best-effort — a session close may have
+    // drained the prefix already). The `trust-space` flag WRITE is NOT
+    // here (ADR 0025 — the Worker has no `Db`): the Supervisor's
+    // `respond_permission` relay applies it (Task 4) + the Worker's
+    // `StaticTrustSource` is flipped (Task 2) — the very next tool call
+    // auto-approves. The OUTCOME is still the user's `trust-space`
+    // selection, which the caller maps to an allow.
     pending_permissions.lock().await.remove(&key);
     outcome
 }
@@ -195,6 +175,8 @@ pub async fn native_permission_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::harness::trust::SqliteTrustSource;
+    use crate::storage::Db;
     use serde_json::Value;
     use std::collections::HashMap;
     use tokio::sync::mpsc;
@@ -241,7 +223,7 @@ mod tests {
             "Allow bash?",
             &sink,
             &pending,
-            Some(&db),
+            Some(&SqliteTrustSource::new(db)),
             &cwd,
             &cancel,
         )
@@ -286,7 +268,7 @@ mod tests {
                 "Allow bash?",
                 &sink,
                 &task_pending,
-                Some(&task_db),
+                Some(&SqliteTrustSource::new(task_db)),
                 &task_cwd,
                 &task_cancel,
             )
@@ -330,7 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_gate_trust_space_allows_and_sets_the_flag() {
+    async fn native_gate_trust_space_allows_without_writing_the_flag() {
         let (db, cwd) = temp_db_cwd();
         db.upsert_space(&cwd.display().to_string(), false).unwrap();
         assert!(!db.space_trusted(&cwd).unwrap(), "untrusted by default");
@@ -351,7 +333,7 @@ mod tests {
                 "Allow write?",
                 &sink,
                 &task_pending,
-                Some(&task_db),
+                Some(&SqliteTrustSource::new(task_db)),
                 &task_cwd,
                 &task_cancel,
             )
@@ -383,9 +365,13 @@ mod tests {
             },
             "the outcome is the user's selection (the caller maps it to allow)"
         );
+        // (ADR 0025) The flag write is NOT in the gate anymore (the
+        // Worker has no `Db`): the Supervisor's `respond_permission`
+        // relay applies it (Task 4) + the Worker's `StaticTrustSource`
+        // is flipped (Task 2).
         assert!(
-            db.space_trusted(&cwd).unwrap(),
-            "trust-space sets the flag best-effort"
+            !db.space_trusted(&cwd).unwrap(),
+            "the gate no longer writes the trust flag (the Supervisor does — ADR 0025)"
         );
     }
 
@@ -404,7 +390,7 @@ mod tests {
             "Allow bash?",
             &sink,
             &pending,
-            Some(&db),
+            Some(&SqliteTrustSource::new(db)),
             &cwd,
             &cancel,
         )
@@ -413,33 +399,6 @@ mod tests {
             outcome,
             PermissionOutcome::Cancelled,
             "a cancel is a denial (never an auto-allow)"
-        );
-    }
-
-    #[test]
-    fn key_prefix_carries_the_trailing_slash() {
-        assert_eq!(session_key_prefix("s1"), "s1/");
-    }
-
-    #[test]
-    fn closing_s1_does_not_drain_s10_pending_entries() {
-        // Simulate the driver-task cleanup `retain` for closing session
-        // "s1" while a prompt from the longer session "s10" is pending.
-        let mut map: HashMap<String, oneshot::Sender<PermissionOutcome>> = HashMap::new();
-        let (tx_s1, _rx_s1) = oneshot::channel();
-        let (tx_s10, _rx_s10) = oneshot::channel();
-        map.insert(permission_key("s1", "r1"), tx_s1);
-        map.insert(permission_key("s10", "r1"), tx_s10);
-
-        map.retain(|key, _| !key.starts_with(&session_key_prefix("s1")));
-
-        assert!(
-            map.contains_key(&permission_key("s10", "r1")),
-            "closing s1 must not drain s10's pending entry"
-        );
-        assert!(
-            !map.contains_key(&permission_key("s1", "r1")),
-            "s1's own pending entry must be drained"
         );
     }
 }
