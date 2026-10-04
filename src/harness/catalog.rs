@@ -38,8 +38,9 @@ pub struct Model {
     /// USD per 1M output tokens.
     pub cost_per_mtok_out: f64,
     /// `true` when the model can carry tool calls on its wire (the
-    /// selectable set, ADR 0024 — the three wires the harness speaks
-    /// all carry tools).
+    /// selectable set, ADR 0024 — the three wires the harness speaks +
+    /// the `litellm` discovery mode (ADR 0026, its wire is
+    /// `openai-completions`) all carry tools).
     pub supports_tools: bool,
     /// `reasoning` + a non-empty `thinkingLevelMap` (non-null values).
     pub supports_thinking: bool,
@@ -47,9 +48,10 @@ pub struct Model {
     /// `["low", "medium", "xhigh"]`).
     pub thinking_levels: Vec<String>,
     /// The wire API discriminator (`"openai-completions"` /
-    /// `"anthropic-messages"` / `"openai-responses"` / other; `None` for a
-    /// metadata-less model — an unknown API is not one of the three the
-    /// harness speaks).
+    /// `"anthropic-messages"` / `"openai-responses"` / `"litellm"` /
+    /// other; `None` for a metadata-less model — an unknown API is not
+    /// one of the three wires the harness speaks nor the `litellm`
+    /// discovery mode (ADR 0026)).
     pub api: Option<String>,
 }
 
@@ -103,9 +105,11 @@ impl ModelCatalog {
 
     /// The selectable set (ADR 0024): the tool-supporting models on a wire
     /// the harness speaks (`"openai-completions"` / `"anthropic-messages"`
-    /// / `"openai-responses"` — a `None` / unknown `api` stays
-    /// unselectable: an unknown API is not one of the three the harness
-    /// speaks).
+    /// / `"openai-responses"`) PLUS the `litellm` discovery mode (ADR 0026
+    /// — a discovery mode, not a fourth wire: its wire is
+    /// `openai-completions`). A `None` / unknown `api` stays
+    /// unselectable: an unknown API is not one of the three wires the
+    /// harness speaks nor the `litellm` discovery mode.
     pub fn selectable(&self) -> Vec<&Model> {
         self.models
             .iter()
@@ -116,6 +120,7 @@ impl ModelCatalog {
                         Some("openai-completions")
                             | Some("anthropic-messages")
                             | Some("openai-responses")
+                            | Some("litellm")
                     )
             })
             .collect()
@@ -205,12 +210,16 @@ struct DiscoveredModel {
 
 /// Query a provider's `GET {base_url}/models` for fresh model metadata
 /// (bounded, best-effort). `base_url` is `.../v1` (the endpoint is
-/// `{base_url}/models`). The `api` decides the wire (ADR 0024):
+/// `{base_url}/models`). The `api` decides the wire (ADR 0024 / 0026):
 /// - `"anthropic-messages"`: the ANTHROPIC shape (the `x-api-key` +
 ///   `anthropic-version` headers; the response carries `id` ONLY — a
 ///   discovered Anthropic model gets the `DEFAULT_CONTEXT_WINDOW`
 ///   fallback + no advertised thinking levels, the documented v1
 ///   degradation);
+/// - `"litellm"`: the LITELLM shape (ADR 0026 — the LiteLLM proxy's
+///   `GET {base}/model/info`; the response carries `model_name` +
+///   `model_info.{max_input_tokens,reasoning_effort_levels,
+///   supports_reasoning}`);
 /// - any other `api` (`openai-completions` / `openai-responses` /
 ///   anything else): the OpenAI shape (`Authorization: Bearer` when the
 ///   key is non-empty — a local gateway needing no key → no header —
@@ -226,6 +235,9 @@ pub async fn discover_models(
 ) -> Result<HashMap<String, DiscoveredMeta>, String> {
     if api == "anthropic-messages" {
         return discover_anthropic_models(base_url, api_key).await;
+    }
+    if api == "litellm" {
+        return discover_litellm_models(base_url, api_key).await;
     }
     // The OpenAI shape (`openai-completions` / `openai-responses` /
     // anything else — the existing behavior verbatim).
@@ -334,6 +346,92 @@ struct AnthropicDiscoveredModel {
     id: String,
 }
 
+/// The LiteLLM `GET {base_url}/model/info` (ADR 0026): `model_name` → the
+/// map key; `model_info.max_input_tokens` (fallback `max_output_tokens`) →
+/// `context_window`; `reasoning_effort_levels` → `thinking_levels`
+/// (VERBATIM); `supports_reasoning` → `supports_thinking`.
+/// `default_reasoning_effort` / `supports_function_calling` / the cost
+/// fields are parsed-by-omission (ignored for v1 — see the ADR's
+/// Considered Options). Bearer auth when the key is non-empty (empty key →
+/// no header); same 5s/10s bounded client; non-2xx / network error →
+/// `Err`. NO base-URL normalization (LiteLLM serves both `/v1/model/info`
+/// and `/model/info` — the caller passes the base as configured).
+async fn discover_litellm_models(
+    base_url: &str,
+    api_key: &str,
+) -> Result<HashMap<String, DiscoveredMeta>, String> {
+    let url = format!("{}/model/info", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(&url);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("status {status}"));
+    }
+    let body: LiteLLMModelInfoResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body
+        .data
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.model_name,
+                entry
+                    .model_info
+                    .map(|mi| DiscoveredMeta {
+                        // `max_input_tokens` → the context window (the
+                        // `max_output_tokens` fallback keeps a
+                        // `max_output_tokens`-only entry from losing its
+                        // window entirely). An OUTPUT cap, not a total window
+                        // — so it UNDER-sizes the budget (safe; over-sizing
+                        // risks provider 400s), for the rare absent shape.
+                        context_window: mi.max_input_tokens.or(mi.max_output_tokens),
+                        thinking_levels: mi.reasoning_effort_levels,
+                        supports_thinking: mi.supports_reasoning,
+                    })
+                    .unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// The LiteLLM `GET /model/info` response (ADR 0026 — `data` entries carry
+/// `model_name` + a `model_info` metadata block; the rest of the block is
+/// ignored for v1).
+#[derive(Debug, Deserialize)]
+struct LiteLLMModelInfoResponse {
+    #[serde(default)]
+    data: Vec<LiteLLMModelInfoEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiteLLMModelInfoEntry {
+    model_name: String,
+    // `Option`: an absent OR an explicit `"model_info": null` (both
+    // observed shapes on LiteLLM deployments) must map to an all-`None`
+    // meta entry (the documented degradation, same as a bare OpenAI
+    // entry) — NOT fail the whole response (the `Option` handles both).
+    model_info: Option<LiteLLMModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiteLLMModelInfo {
+    #[serde(rename = "max_input_tokens")]
+    max_input_tokens: Option<u32>,
+    #[serde(rename = "max_output_tokens")]
+    max_output_tokens: Option<u32>,
+    #[serde(rename = "reasoning_effort_levels")]
+    reasoning_effort_levels: Option<Vec<String>>,
+    #[serde(rename = "supports_reasoning")]
+    supports_reasoning: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,16 +461,19 @@ mod tests {
                 model("a", true, Some("openai-completions")),
                 model("b", true, Some("anthropic-messages")),
                 model("c", true, Some("openai-responses")),
+                model("lit/1", true, Some("litellm")),
             ],
             ..Default::default()
         };
-        assert_eq!(catalog.all().len(), 3);
+        assert_eq!(catalog.all().len(), 4);
         assert!(catalog.get("a").is_some());
         assert!(catalog.get("zzz").is_none());
-        // The selectable set (ADR 0024): one model per wire, all
-        // `supports_tools` → all three selectable.
+        // The selectable set (ADR 0024): one model per wire + the
+        // `litellm` discovery mode (ADR 0026 — its wire is
+        // `openai-completions`), all `supports_tools` → all four
+        // selectable.
         let ids: Vec<&str> = catalog.selectable().iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(ids, vec!["a", "b", "c", "lit/1"]);
     }
 
     #[test]
@@ -398,6 +499,7 @@ mod tests {
             models: vec![
                 model("a", true, Some("openai-completions")),
                 model("b", false, Some("anthropic-messages")),
+                model("d", false, Some("litellm")),
             ],
             ..Default::default()
         };
@@ -537,6 +639,93 @@ mod tests {
         for meta in models.values() {
             assert_eq!(meta, &DiscoveredMeta::default());
         }
+        server.abort();
+    }
+
+    // ── the LiteLLM `GET {base}/model/info` discovery shape (ADR 0026) ──
+
+    /// The `raw_json_server` above ignores the request PATH + HEADERS (it
+    /// serves its fixed body to any GET) — these tests pin the `litellm`
+    /// DISPATCH ARM + the response parsing. The `{base}/model/info` path
+    /// + the Bearer header are verified by the live smoke (Task 5).
+
+    #[tokio::test]
+    async fn discover_models_litellm_maps_the_model_info_shape() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A full entry (`lit/1`) + a bare entry (`lit/2` — an absent
+        // `model_info` → an all-`None` meta entry, the documented
+        // degradation, the same as a bare OpenAI entry).
+        let body = r#"{"data":[
+            {"model_name":"lit/1","model_info":{
+                "max_input_tokens":262144,
+                "max_output_tokens":32768,
+                "reasoning_effort_levels":["none","low","medium","xhigh"],
+                "supports_reasoning":true}},
+            {"model_name":"lit/2"}]}"#;
+        let server = raw_json_server(listener, 200, body).await;
+        let models = discover_models(&format!("http://{addr}/v1"), "test-key", "litellm")
+            .await
+            .unwrap();
+        // `model_name` is the map key (NOT an `id` field — the OpenAI
+        // shape would fail to parse this body). The keys are sorted —
+        // `HashMap` iteration order is nondeterministic.
+        let mut keys: Vec<&str> = models.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["lit/1", "lit/2"]);
+        // `lit/1`: `max_input_tokens` → `context_window` (the
+        // `max_output_tokens` is NOT used when `max_input_tokens` is
+        // present); `reasoning_effort_levels` → `thinking_levels`
+        // VERBATIM; `supports_reasoning` → `supports_thinking`.
+        let lit1 = &models["lit/1"];
+        assert_eq!(lit1.context_window, Some(262144));
+        assert_eq!(
+            lit1.thinking_levels,
+            Some(vec![
+                "none".into(),
+                "low".into(),
+                "medium".into(),
+                "xhigh".into()
+            ])
+        );
+        assert_eq!(lit1.supports_thinking, Some(true));
+        // `lit/2`: absent `model_info` → all-`None` meta.
+        let lit2 = &models["lit/2"];
+        assert_eq!(lit2, &DiscoveredMeta::default());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discover_models_litellm_falls_back_to_max_output_tokens() {
+        // `max_input_tokens` absent → the `max_output_tokens` fallback
+        // (a `max_output_tokens`-only entry still gets a window).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"data":[{"model_name":"lit/o","model_info":
+            {"max_output_tokens":999}}]}"#;
+        let server = raw_json_server(listener, 200, body).await;
+        let models = discover_models(&format!("http://{addr}/v1"), "test-key", "litellm")
+            .await
+            .unwrap();
+        assert_eq!(models["lit/o"].context_window, Some(999));
+        // No reasoning fields advertised → all `None`.
+        assert_eq!(models["lit/o"].thinking_levels, None);
+        assert_eq!(models["lit/o"].supports_thinking, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discover_models_litellm_errors_on_a_non_2xx() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = raw_json_server(listener, 404, r#"{"detail":"Not Found"}"#).await;
+        // A non-2xx → `Err` (the caller degrades to the static metadata —
+        // the row shows `unreachable`, 0 models, still shadows the base id).
+        assert!(
+            discover_models(&format!("http://{addr}/v1"), "test-key", "litellm")
+                .await
+                .is_err()
+        );
         server.abort();
     }
 
