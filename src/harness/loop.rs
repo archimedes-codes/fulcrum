@@ -880,14 +880,59 @@ impl AgentLoop {
             // tool-result error `"permission denied"`), EXECUTE (the
             // native `ToolRegistry` — in-process), append the `ToolResult`
             // as a `tool` message + `tool_execution_end`.
-            for tc in &tool_calls {
-                // A CANCELLED turn must not execute the remaining calls
-                // (finding 8a — a Stop is honored BETWEEN calls: each
-                // skipped call gets a cancelled tool result and is NOT
-                // executed; the turn settles at the top of the loop).
-                let result = if turn.is_cancelled() {
+            // (4a) Dispatch the enabled `subagent` calls CONCURRENTLY (the
+            // long-running fan-out — `dispatch_subagent` is `&self`, so a
+            // shared reborrow lets N run at once via `join_all`). The results
+            // are keyed by tool-call INDEX (unique by construction — a
+            // duplicate tool-call `id` would collide on a `HashMap` keyed by
+            // id); (4b) appends them in the ORIGINAL `tool_calls` order. (A
+            // CANCELLED turn skips the batch — the `turn.is_cancelled()`
+            // checks below handle it.)
+            let mut subagent_results: HashMap<usize, ToolResult> = if turn.is_cancelled() {
+                HashMap::new()
+            } else {
+                let me: &Self = self;
+                let futures: Vec<_> = tool_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tc)| me.is_enabled_subagent_call(tc))
+                    .map(|(idx, tc)| {
+                        let args = tc.arguments.clone();
+                        async move { (idx, me.dispatch_subagent(&args, turn).await) }
+                    })
+                    .collect();
+                futures_util::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .collect()
+            };
+
+            // (4b) Append the tool results in the ORIGINAL `tool_calls` order
+            // (the `subagent` calls use the pre-computed concurrent result;
+            // the other tools run sequentially — a `subagent` call that is NOT
+            // enabled falls through to `dispatch_tool`'s "tool not enabled"
+            // error). A `subagent` call's CACHED result wins even on a
+            // cancelled turn — it already reflects the actual outcome (a
+            // subagent cancelled mid-batch is `Cancelled` from the `select!`;
+            // one that finished is `Completed`), so a completed subagent's
+            // result is preserved rather than silently replaced by
+            // `"cancelled"`. A non-`subagent` call that is skipped by a Stop
+            // gets a cancelled tool result (finding 8a — a Stop is honored
+            // BETWEEN calls; the turn settles at the top of the loop).
+            for (idx, tc) in tool_calls.iter().enumerate() {
+                let result = if Self::is_subagent_call(&tc.name) {
+                    match subagent_results.remove(&idx) {
+                        Some(r) => r,
+                        None if turn.is_cancelled() => Self::cancelled_tool_result(),
+                        None => self.dispatch_tool(tc, turn).await,
+                    }
+                } else if turn.is_cancelled() {
                     Self::cancelled_tool_result()
                 } else {
+                    // Mutating tools (the `bash` / `edit` / `write` triple)
+                    // require a `permission_request` round-trip — `gate_tool`
+                    // blocks until the user responds (or the turn is
+                    // cancelled); the other tools run ungated.
                     let allowed = if MUTATING_TOOLS.contains(&tc.name.as_str()) {
                         self.gate_tool(tc, turn).await
                     } else {
@@ -1031,21 +1076,20 @@ impl AgentLoop {
         // below routes both to it): the gate must know the alias — a
         // parent with `enabled_tools: Some(["subagent"])` must not get
         // `tool not enabled: dispatch_subagent` when the model emits it.
-        if let Some(tools) = &self.enabled_tools {
-            let effective = if tc.name == "dispatch_subagent" {
-                "subagent"
-            } else {
-                tc.name.as_str()
+        if !self.is_tool_enabled(&tc.name) {
+            return ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!("tool not enabled: {}", tc.name),
+                }],
+                details: None,
+                is_error: true,
             };
-            if !tools.iter().any(|t| t == effective) {
-                return ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: format!("tool not enabled: {}", tc.name),
-                    }],
-                    details: None,
-                    is_error: true,
-                };
-            }
+        }
+        // The `subagent` / `dispatch_subagent` alias (the single source of
+        // truth is `is_subagent_call` — the parallel batch + this dispatch
+        // share it; a future third alias updates only that one place).
+        if Self::is_subagent_call(&tc.name) {
+            return self.dispatch_subagent(&tc.arguments, turn).await;
         }
         match tc.name.as_str() {
             "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" => {
@@ -1099,7 +1143,6 @@ impl AgentLoop {
                 }
             }
             "ask" => self.ask_flow(&tc.arguments, &tc.id, turn).await,
-            "subagent" | "dispatch_subagent" => self.dispatch_subagent(&tc.arguments, turn).await,
             "list_agents" => self.list_agents_tool().await,
             "mcp" => {
                 // RACED against the TURN token (finding 8b, round 2 — a Stop
@@ -1157,11 +1200,44 @@ impl AgentLoop {
         shape_ask_result(response, params)
     }
 
+    /// The `enabled_tools`-filter name for `name` (the `dispatch_subagent` →
+    /// `subagent` alias — the model may emit either name for the same tool).
+    fn effective_tool_name(name: &str) -> &str {
+        if name == "dispatch_subagent" {
+            "subagent"
+        } else {
+            name
+        }
+    }
+
+    /// Whether `name` passes the `enabled_tools` filter (`None` = all enabled).
+    fn is_tool_enabled(&self, name: &str) -> bool {
+        match &self.enabled_tools {
+            Some(tools) => tools.iter().any(|t| t == Self::effective_tool_name(name)),
+            None => true,
+        }
+    }
+
+    /// Whether `name` is a `subagent` / `dispatch_subagent` tool call (the
+    /// parallel-batch detection — the `dispatch_tool` `match` routes both to
+    /// `dispatch_subagent`).
+    fn is_subagent_call(name: &str) -> bool {
+        name == "subagent" || name == "dispatch_subagent"
+    }
+
+    /// Whether `tc` is a `subagent` call that PASSES the `enabled_tools`
+    /// filter (the `dispatch_tool` check, replicated — so the parallel batch
+    /// only dispatches ENABLED subagents; a disabled one falls through to
+    /// `dispatch_tool`'s "tool not enabled" error in the sequential pass).
+    fn is_enabled_subagent_call(&self, tc: &ToolCall) -> bool {
+        Self::is_subagent_call(&tc.name) && self.is_tool_enabled(&tc.name)
+    }
+
     /// `subagent` dispatch: the parent's `SubagentDispatcher` (the
     /// `WorkerManager`'s `dispatch_subagent` flow — the child is a WORKER
     /// process; the ADR 0025 re-plumb — the in-process `AgentLoop` child
     /// is GONE).
-    async fn dispatch_subagent(&mut self, params: &Value, turn: &CancellationToken) -> ToolResult {
+    async fn dispatch_subagent(&self, params: &Value, turn: &CancellationToken) -> ToolResult {
         let Some(dispatcher) = &self.subagent else {
             return ToolResult {
                 content: vec![ContentBlock::Text {
@@ -5599,6 +5675,608 @@ mod tests {
         })
         .await
         .expect("the turn settled");
+    }
+
+    /// A test `SubagentDispatcher` that simulates a SLOW subagent (each
+    /// `dispatch` resolves after `delay`) while counting how many subagents
+    /// are in-flight CONCURRENTLY (the parallel-dispatch assertion — the max
+    /// in-flight count is N for a concurrent batch, 1 for sequential).
+    struct ConcurrentCountingDispatcher {
+        delay: Duration,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ConcurrentCountingDispatcher {
+        fn new(delay: Duration) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    delay,
+                    in_flight: in_flight.clone(),
+                    max_in_flight: max_in_flight.clone(),
+                },
+                max_in_flight,
+            )
+        }
+    }
+
+    impl SubagentDispatcher for ConcurrentCountingDispatcher {
+        fn dispatch(
+            &self,
+            _parent_session_id: &str,
+            _parent_cwd: &std::path::Path,
+            _parent_model: &Model,
+            _parent_enabled_tools: Vec<String>,
+            _agent_name: String,
+            _launch: LaunchConfig,
+            _task: String,
+            _sink: &Arc<dyn EventSink>,
+        ) -> (
+            tokio::sync::oneshot::Receiver<SubagentOutcome>,
+            crate::agent::subagent::SubagentCancel,
+        ) {
+            let in_flight = self.in_flight.clone();
+            let max_in_flight = self.max_in_flight.clone();
+            let c = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            loop {
+                let m = max_in_flight.load(Ordering::SeqCst);
+                if c <= m {
+                    break;
+                }
+                if max_in_flight
+                    .compare_exchange(m, c, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let delay = self.delay;
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = tx.send(SubagentOutcome::Completed {
+                    output: "done".to_string(),
+                    metrics: crate::agent::subagent::SubagentMetrics {
+                        output: "done".to_string(),
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cost: 0.0,
+                        duration_ms: 1,
+                    },
+                });
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            });
+            (rx, crate::agent::subagent::SubagentCancel::none())
+        }
+    }
+
+    /// ADR 0025 follow-up: the `subagent` tool calls in ONE assistant
+    /// message run CONCURRENTLY (the model-loop tool execution batches them
+    /// via `join_all` — N subagents take ~1× the individual duration, not
+    /// N×). The assertion: the max CONCURRENT in-flight subagent count is
+    /// ≥ 2 (a sequential loop would peak at 1).
+    #[tokio::test]
+    async fn subagent_calls_in_one_message_run_in_parallel() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "a" }),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t2".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "b" }),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t3".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "c" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (dispatcher, max_in_flight) =
+            ConcurrentCountingDispatcher::new(Duration::from_millis(50));
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+        wait_for_event(&mut events_rx, 10000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("the turn settled");
+        // CONCURRENT dispatch: ≥ 2 subagents were in-flight at the same
+        // time (a sequential loop would peak at 1).
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) >= 2,
+            "the subagent tool calls ran concurrently (max in-flight = {}), \n\
+             not sequentially (which would peak at 1)",
+            max_in_flight.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A test `SubagentDispatcher` for the CANCEL-during-batch test: each
+    /// `dispatch` returns a NEVER-resolving oneshot (the subagent stays
+    /// in-flight) + a `SubagentCancel::Flag` whose flip records the cancel.
+    /// The test stores the watch receivers so it can assert `cancel.cancel()`
+    /// fired for every in-flight subagent when the turn is cancelled.
+    struct CancellingDispatcher {
+        cancels: Arc<StdMutex<Vec<watch::Receiver<bool>>>>,
+    }
+
+    impl CancellingDispatcher {
+        fn new() -> (Self, Arc<StdMutex<Vec<watch::Receiver<bool>>>>) {
+            let cancels = Arc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    cancels: cancels.clone(),
+                },
+                cancels,
+            )
+        }
+    }
+
+    impl SubagentDispatcher for CancellingDispatcher {
+        fn dispatch(
+            &self,
+            _parent_session_id: &str,
+            _parent_cwd: &std::path::Path,
+            _parent_model: &Model,
+            _parent_enabled_tools: Vec<String>,
+            _agent_name: String,
+            _launch: LaunchConfig,
+            _task: String,
+            _sink: &Arc<dyn EventSink>,
+        ) -> (
+            tokio::sync::oneshot::Receiver<SubagentOutcome>,
+            crate::agent::subagent::SubagentCancel,
+        ) {
+            let (flag_tx, flag_rx) = watch::channel(false);
+            self.cancels.lock().unwrap().push(flag_rx);
+            // The oneshot sender is FORGOTTEN (never sent, never dropped) so
+            // the receiver stays PENDING — the subagent remains in-flight
+            // until the turn's `select!` `turn.cancelled()` arm fires.
+            let (os_tx, os_rx) = tokio::sync::oneshot::channel();
+            std::mem::forget(os_tx);
+            (
+                os_rx,
+                crate::agent::subagent::SubagentCancel::new_flag(flag_tx),
+            )
+        }
+    }
+
+    /// A test `SubagentDispatcher` for the ORDERING test: a subagent whose
+    /// `task` contains `"a"` (tool call `t1`) resolves SLOW (300 ms); one
+    /// whose `task` contains `"b"` (tool call `t2`) resolves FAST (20 ms) —
+    /// so `t2` completes FIRST. It records the COMPLETION order so the test
+    /// can prove the append-order reordering is real (not vacuous).
+    struct OutOfOrderDispatcher {
+        completion_order: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl OutOfOrderDispatcher {
+        fn new() -> (Self, Arc<StdMutex<Vec<String>>>) {
+            let completion_order = Arc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    completion_order: completion_order.clone(),
+                },
+                completion_order,
+            )
+        }
+    }
+
+    impl SubagentDispatcher for OutOfOrderDispatcher {
+        fn dispatch(
+            &self,
+            _parent_session_id: &str,
+            _parent_cwd: &std::path::Path,
+            _parent_model: &Model,
+            _parent_enabled_tools: Vec<String>,
+            _agent_name: String,
+            _launch: LaunchConfig,
+            task: String,
+            _sink: &Arc<dyn EventSink>,
+        ) -> (
+            tokio::sync::oneshot::Receiver<SubagentOutcome>,
+            crate::agent::subagent::SubagentCancel,
+        ) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let delay = if task.contains('a') {
+                Duration::from_millis(300)
+            } else {
+                Duration::from_millis(20)
+            };
+            let completion_order = self.completion_order.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                completion_order.lock().unwrap().push(task.clone());
+                let _ = tx.send(SubagentOutcome::Completed {
+                    output: task.clone(),
+                    metrics: crate::agent::subagent::SubagentMetrics {
+                        output: task.clone(),
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cost: 0.0,
+                        duration_ms: 1,
+                    },
+                });
+            });
+            (rx, crate::agent::subagent::SubagentCancel::none())
+        }
+    }
+
+    /// Parallel-batch CANCEL safety: when the turn is cancelled while N
+    /// subagents are in-flight, EVERY in-flight subagent's `cancel.cancel()`
+    /// fires (the `select!`'s `turn.cancelled()` arm) and the turn settles
+    /// (the `join_all` unwinds through all N cancel arms — no hang on a slow
+    /// / never-resolving worker).
+    #[tokio::test]
+    async fn subagent_batch_a_turn_cancel_cancels_all_in_flight_subagents() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "a" }),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t2".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "b" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (dispatcher, cancels) = CancellingDispatcher::new();
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        // The `join_all` batch blocks (the oneshots never resolve) until the
+        // turn is cancelled — so drive it in a task.
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("go")).await });
+        // Wait (up to 5 s) for BOTH subagents to be dispatched (in-flight).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while cancels.lock().unwrap().len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            cancels.lock().unwrap().len(),
+            2,
+            "both subagents were dispatched (in-flight) before the cancel"
+        );
+        // Cancel the turn — the in-flight `select!`s must fire.
+        turn_cancel.lock().unwrap().cancel();
+        // The turn must SETTLE (the `join_all` unwinds through both cancel
+        // arms — it does NOT hang on the never-resolving oneshots).
+        let _ = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the turn settled after the cancel (no hang)");
+        wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::agent_settled)
+        })
+        .await
+        .expect("agent_settled");
+        // BOTH in-flight subagents were cancelled (`cancel.cancel()` fired for
+        // each — the watch flag flipped to `true`).
+        let flipped = cancels
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| *r.borrow())
+            .count();
+        assert_eq!(
+            flipped, 2,
+            "every in-flight subagent's `cancel.cancel()` fired on a turn cancel"
+        );
+    }
+
+    /// Parallel-batch ORDERING: a subagent that completes FIRST (t2, fast)
+    /// must still be appended AFTER a slower one (t1) — the results are
+    /// appended in the ORIGINAL `tool_calls` order, not completion order.
+    #[tokio::test]
+    async fn subagent_batch_results_are_appended_in_original_order_regardless_of_completion_order()
+    {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "a" }),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t2".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "b" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (dispatcher, completion_order) = OutOfOrderDispatcher::new();
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+        // Collect the `tool_execution_end` order (drain until `agent_settled`).
+        let mut order = Vec::new();
+        while let Ok(e) = events_rx.try_recv() {
+            if let RpcEvent::tool_execution_end {
+                ref tool_call_id, ..
+            } = e
+            {
+                order.push(tool_call_id.clone());
+            }
+            if matches!(e, RpcEvent::agent_settled) {
+                break;
+            }
+        }
+        // PROVE the reordering is real: the fast one (t2 / "b") completed
+        // FIRST (so appending t1-then-t2 is a genuine reordering, not a
+        // vacuous pass where t1 happened to finish first).
+        assert_eq!(
+            *completion_order.lock().unwrap(),
+            vec!["b".to_string(), "a".to_string()],
+            "t2 (the fast one) completed before t1 — the append-order test is not vacuous"
+        );
+        assert_eq!(
+            order,
+            vec!["t1".to_string(), "t2".to_string()],
+            "results appended in the ORIGINAL `tool_calls` order (t1 before t2), even though t2 (the fast one) completed first"
+        );
+    }
+
+    /// Parallel-batch MIXED message: a `subagent` call + a non-`subagent`
+    /// tool (`ls`, ungated) in ONE assistant message — the `subagent` is
+    /// batched (Phase 1), the `ls` runs sequentially (Phase 2); BOTH results
+    /// are appended in the original order and the turn settles.
+    #[tokio::test]
+    async fn subagent_batch_mixed_with_a_non_subagent_tool_runs_both_in_order() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "a" }),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t2".to_string(),
+                    name: "ls".to_string(),
+                    arguments: json!({ "path": "." }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (dispatcher, _max) = ConcurrentCountingDispatcher::new(Duration::from_millis(20));
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+        let mut order = Vec::new();
+        while let Ok(e) = events_rx.try_recv() {
+            if let RpcEvent::tool_execution_end {
+                ref tool_call_id, ..
+            } = e
+            {
+                order.push(tool_call_id.clone());
+            }
+            if matches!(e, RpcEvent::agent_settled) {
+                break;
+            }
+        }
+        assert_eq!(
+            order,
+            vec!["t1".to_string(), "t2".to_string()],
+            "both the `subagent` (batched) and the `ls` (sequential) ran, in the original `tool_calls` order"
+        );
+    }
+
+    /// A test `SubagentDispatcher` for the COMPLETED-result-survives-Stop
+    /// test: a subagent whose `task` contains `"a"` (t1) resolves FAST (20 ms,
+    /// `Completed`); one whose `task` contains `"b"` (t2) NEVER resolves
+    /// (stays in-flight until the turn is cancelled).
+    struct PartialResolveDispatcher;
+
+    impl SubagentDispatcher for PartialResolveDispatcher {
+        fn dispatch(
+            &self,
+            _parent_session_id: &str,
+            _parent_cwd: &std::path::Path,
+            _parent_model: &Model,
+            _parent_enabled_tools: Vec<String>,
+            _agent_name: String,
+            _launch: LaunchConfig,
+            task: String,
+            _sink: &Arc<dyn EventSink>,
+        ) -> (
+            tokio::sync::oneshot::Receiver<SubagentOutcome>,
+            crate::agent::subagent::SubagentCancel,
+        ) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if task.contains('a') {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _ = tx.send(SubagentOutcome::Completed {
+                        output: "t1-done".to_string(),
+                        metrics: crate::agent::subagent::SubagentMetrics {
+                            output: "t1-done".to_string(),
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            cost: 0.0,
+                            duration_ms: 1,
+                        },
+                    });
+                });
+            } else {
+                // t2: the oneshot sender is FORGOTTEN (never sent) so the
+                // receiver stays PENDING — t2 stays in-flight until cancelled.
+                std::mem::forget(tx);
+            }
+            (rx, crate::agent::subagent::SubagentCancel::none())
+        }
+    }
+
+    /// Parallel-batch CANCEL: a subagent that COMPLETED before a mid-batch
+    /// Stop keeps its real (`Completed`) result — it is NOT replaced by
+    /// `"cancelled"` (the fix-#1 core behavior). A still-in-flight subagent
+    /// IS `"cancelled"`.
+    #[tokio::test]
+    async fn subagent_batch_a_completed_result_survives_a_mid_batch_stop() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "a" }),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t2".to_string(),
+                    name: "subagent".to_string(),
+                    arguments: json!({ "task": "b" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            Arc::new(TestSink {
+                updates: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            Some(Arc::new(PartialResolveDispatcher) as Arc<dyn SubagentDispatcher>),
+            vec![fake_model("m1")],
+            None,
+        );
+        // The `join_all` batch blocks (t2 never resolves) until the turn is
+        // cancelled — so drive it in a task.
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("go")).await });
+        // Let t1 complete (its `Completed` result is cached in the batch);
+        // t2 stays in-flight.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Cancel the turn — t2 (in-flight) is cancelled; t1's result is cached.
+        turn_cancel.lock().unwrap().cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the turn settled after the cancel");
+        // Collect the tool results (drain until `agent_settled` — the
+        // `tool_execution_end` events are emitted BEFORE the settle, so a
+        // `wait_for_event` first would have consumed them and the drain
+        // below would see nothing).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut results: HashMap<String, Value> = HashMap::new();
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("agent_settled not seen within 5 s");
+            }
+            match tokio::time::timeout(Duration::from_millis(100), events_rx.recv()).await {
+                Ok(Some(e)) => {
+                    if let RpcEvent::tool_execution_end {
+                        ref tool_call_id,
+                        ref result,
+                        ..
+                    } = e
+                    {
+                        results.insert(tool_call_id.clone(), result.clone());
+                    }
+                    if matches!(e, RpcEvent::agent_settled) {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    panic!("the event channel closed / timed out before agent_settled");
+                }
+            }
+        }
+        // t1 (completed before the Stop) keeps its REAL result, not "cancelled".
+        assert_eq!(
+            results
+                .get("t1")
+                .and_then(|v| v["content"][0]["text"].as_str()),
+            Some("t1-done"),
+            "a completed subagent's result survives a mid-batch Stop (fix #1)"
+        );
+        // t2 (in-flight at the Stop) is "cancelled".
+        assert_eq!(
+            results
+                .get("t2")
+                .and_then(|v| v["content"][0]["text"].as_str()),
+            Some("cancelled"),
+            "an in-flight subagent is 'cancelled' on a mid-batch Stop"
+        );
     }
 
     /// `SubagentWait` mechanics: a `Failed` outcome is an ERROR tool
