@@ -8,11 +8,16 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::agent::harness::catalog::Model;
-use crate::agent::session::EventSink;
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::events::EventSink;
+use crate::agent::harness::catalog::{Model, ModelCatalog};
+use crate::agent::harness::provider::ToolCall;
 use crate::agent::subagent::{
     LaunchConfig, SubagentCancel, SubagentOutcome, SubagentSessionManager,
 };
+use crate::agent::tools::{ContentBlock, ToolResult};
 
 /// The subagent dispatch seam (ADR 0025): `InProcessDispatcher`
 /// (delegates to `SubagentSessionManager::dispatch_native` — the current
@@ -159,11 +164,162 @@ impl SubagentDispatcher for MockDispatcher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The subagent tool-call gate + dispatch flow (moved from `loop.rs` — these
+// are free functions of the values they need, so this module never depends
+// on `AgentLoop`; `loop.rs` keeps a thin wrapper that supplies its fields).
+// ---------------------------------------------------------------------------
+
+/// The `enabled_tools`-filter name for `name` (the `dispatch_subagent` →
+/// `subagent` alias — the model may emit either name for the same tool).
+pub(crate) fn effective_tool_name(name: &str) -> &str {
+    if name == "dispatch_subagent" {
+        "subagent"
+    } else {
+        name
+    }
+}
+
+/// Whether `name` is a `subagent` / `dispatch_subagent` tool call (the
+/// parallel-batch detection — the `dispatch_tool` `match` routes both to
+/// `dispatch_subagent`).
+pub(crate) fn is_subagent_call(name: &str) -> bool {
+    name == "subagent" || name == "dispatch_subagent"
+}
+
+/// Whether `name` passes the `enabled_tools` filter (`None` = all enabled).
+pub(crate) fn is_tool_enabled(enabled_tools: Option<&[String]>, name: &str) -> bool {
+    match enabled_tools {
+        Some(tools) => tools.iter().any(|t| t == effective_tool_name(name)),
+        None => true,
+    }
+}
+
+/// Whether `tc` is a `subagent` call that PASSES the `enabled_tools`
+/// filter (the `dispatch_tool` check, replicated — so the parallel batch
+/// only dispatches ENABLED subagents; a disabled one falls through to
+/// `dispatch_tool`'s "tool not enabled" error in the sequential pass).
+pub(crate) fn is_enabled_subagent_call(enabled_tools: Option<&[String]>, tc: &ToolCall) -> bool {
+    is_subagent_call(&tc.name) && is_tool_enabled(enabled_tools, &tc.name)
+}
+
+/// The parent-session values a subagent dispatch needs (the `AgentLoop`
+/// fields the flow reads, passed explicitly so `dispatch.rs` stays free of
+/// `AgentLoop`).
+pub(crate) struct SubagentParent<'a> {
+    pub session_id: &'a str,
+    pub space_cwd: &'a std::path::Path,
+    pub model: &'a Model,
+    pub enabled_tools: Option<&'a [String]>,
+    pub sink: &'a Arc<dyn EventSink>,
+    pub catalog: &'a ModelCatalog,
+    pub config_dir: Option<&'a std::path::Path>,
+}
+
+/// The `subagent` dispatch's outcome (the `SubagentOutcome` mapping).
+enum SubagentWait {
+    Completed { output: String },
+    Failed { error: String },
+    Cancelled,
+}
+
+/// `subagent` dispatch: the parent's `SubagentDispatcher` (the
+/// `WorkerManager`'s `dispatch_subagent` flow — the child is a WORKER
+/// process; the ADR 0025 re-plumb — the in-process `AgentLoop` child
+/// is GONE).
+pub(crate) async fn dispatch_subagent(
+    dispatcher: Option<&Arc<dyn SubagentDispatcher>>,
+    parent: &SubagentParent<'_>,
+    params: &Value,
+    turn: &CancellationToken,
+) -> ToolResult {
+    let Some(dispatcher) = dispatcher else {
+        return ToolResult {
+            content: vec![ContentBlock::Text {
+                text: "subagent dispatch is not available in this session".to_string(),
+            }],
+            details: None,
+            is_error: true,
+        };
+    };
+    let (task, launch) = match crate::agent::interactive::dispatch_params(params) {
+        Some(p) => p,
+        None => {
+            return ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "invalid params: `task` is required".to_string(),
+                }],
+                details: None,
+                is_error: true,
+            };
+        }
+    };
+    let agent_name = params
+        .get("agentName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // ADR 0020: resolve `agentName` against the discovered Agent
+    // definitions (layered — explicit params win; no match / empty =
+    // config-less, never an error).
+    let launch = crate::agent::harness::launch::resolve_launch(
+        &launch,
+        &agent_name,
+        parent.catalog,
+        parent.config_dir,
+        parent.space_cwd,
+    );
+    let (dispatch_rx, cancel) = dispatcher.dispatch(
+        parent.session_id,
+        parent.space_cwd,
+        parent.model,
+        parent.enabled_tools.map(|v| v.to_vec()).unwrap_or_default(),
+        agent_name,
+        launch,
+        task,
+        parent.sink,
+    );
+    let outcome = tokio::select! {
+        r = dispatch_rx => match r {
+            Ok(SubagentOutcome::Completed { output, .. }) => SubagentWait::Completed { output },
+            Ok(SubagentOutcome::Failed { error }) => SubagentWait::Failed { error },
+            // The worker task vanished without resolving (app exit) —
+            // the dispatch is gone: cancel.
+            Err(_) => SubagentWait::Cancelled,
+        },
+        _ = turn.cancelled() => {
+            cancel.cancel();
+            SubagentWait::Cancelled
+        }
+    };
+    match outcome {
+        SubagentWait::Completed { output } => ToolResult {
+            content: vec![ContentBlock::Text { text: output }],
+            details: None,
+            is_error: false,
+        },
+        SubagentWait::Failed { error } => ToolResult {
+            content: vec![ContentBlock::Text {
+                text: format!("subagent failed: {error}"),
+            }],
+            details: None,
+            is_error: true,
+        },
+        SubagentWait::Cancelled => ToolResult {
+            content: vec![ContentBlock::Text {
+                text: "cancelled".to_string(),
+            }],
+            details: None,
+            is_error: true,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::events::EventSink;
     use crate::agent::harness::ModelCatalog;
-    use crate::agent::session::EventSink;
     use crate::agent::subagent::SubagentOutcome;
     use crate::agent::worker::client::{WorkerError, WorkerHandle};
     use crate::agent::worker::manager::{WorkerFactory, WorkerManager};

@@ -41,8 +41,8 @@ use serde_json::json;
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::events::EventSink;
 use crate::agent::harness::trust::TrustSource;
-use crate::agent::session::EventSink;
 
 /// The user's decision on a permission prompt, as chosen via the
 /// `respond_permission` Tauri command.

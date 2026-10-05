@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::model_key::ModelKey;
+use super::WireApi;
+
 /// A model with no metadata gets this context window (best-effort).
 /// Also the `effective_catalog` fallback for a user provider's
 /// discovered model (ADR 0014 — a user model has no static metadata).
@@ -53,6 +56,22 @@ pub struct Model {
     /// one of the three wires the harness speaks nor the `litellm`
     /// discovery mode (ADR 0026)).
     pub api: Option<String>,
+}
+
+impl Model {
+    /// The thinking-level membership predicate: `true` when the model
+    /// advertises NO levels (the empty set soft-passes — the status quo
+    /// is never a mismatch) or the level is in `thinking_levels`.
+    pub fn supports_thinking_level(&self, level: &str) -> bool {
+        self.thinking_levels.is_empty() || self.thinking_levels.iter().any(|l| l == level)
+    }
+}
+
+/// The composed key of a catalog model (its `provider` / `id` halves).
+impl From<&Model> for ModelKey {
+    fn from(m: &Model) -> Self {
+        ModelKey::new(m.provider.clone(), m.id.clone())
+    }
 }
 
 /// The `Compactor`'s (Task 6) thresholds — `{ enabled, reserveTokens,
@@ -115,13 +134,10 @@ impl ModelCatalog {
             .iter()
             .filter(|m| {
                 m.supports_tools
-                    && matches!(
-                        m.api.as_deref(),
-                        Some("openai-completions")
-                            | Some("anthropic-messages")
-                            | Some("openai-responses")
-                            | Some("litellm")
-                    )
+                    && m.api
+                        .as_deref()
+                        .and_then(WireApi::parse)
+                        .is_some_and(WireApi::is_supported)
             })
             .collect()
     }
@@ -154,11 +170,10 @@ pub fn merge_catalog(
     // nothing) → `None` (the caller's resolution chain degrades). A
     // default pointing at a model absent from `base.models` (a stale
     // key) also degrades to `None` (it is not in the merged result either).
-    let default_model = base.default_model.clone().filter(|key| {
-        models
-            .iter()
-            .any(|m| format!("{}/{}", m.provider, m.id) == key.as_str())
-    });
+    let default_model = base
+        .default_model
+        .clone()
+        .filter(|key| models.iter().any(|m| ModelKey::from(m).to_string() == *key));
     ModelCatalog {
         models,
         default_model,
@@ -233,44 +248,45 @@ pub async fn discover_models(
     api_key: &str,
     api: &str,
 ) -> Result<HashMap<String, DiscoveredMeta>, String> {
-    if api == "anthropic-messages" {
-        return discover_anthropic_models(base_url, api_key).await;
+    let api = WireApi::parse(api).unwrap_or(WireApi::OpenAiCompletions);
+    match api {
+        WireApi::AnthropicMessages => discover_anthropic_models(base_url, api_key).await,
+        WireApi::LiteLLM => discover_litellm_models(base_url, api_key).await,
+        // The OpenAI shape (`OpenAiCompletions` / `OpenAiResponses` /
+        // unknown — the current behavior verbatim).
+        _ => {
+            let url = format!("{}/models", base_url.trim_end_matches('/'));
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .read_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let mut req = client.get(&url);
+            if !api_key.is_empty() {
+                req = req.bearer_auth(api_key);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("status {status}"));
+            }
+            let body: ModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
+            Ok(body
+                .data
+                .into_iter()
+                .map(|m| {
+                    (
+                        m.id,
+                        DiscoveredMeta {
+                            context_window: m.max_model_len,
+                            thinking_levels: m.reasoning_levels,
+                            supports_thinking: m.supports_reasoning_effort,
+                        },
+                    )
+                })
+                .collect())
+        }
     }
-    if api == "litellm" {
-        return discover_litellm_models(base_url, api_key).await;
-    }
-    // The OpenAI shape (`openai-completions` / `openai-responses` /
-    // anything else — the existing behavior verbatim).
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .read_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.get(&url);
-    if !api_key.is_empty() {
-        req = req.bearer_auth(api_key);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("status {status}"));
-    }
-    let body: ModelsResponse = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(body
-        .data
-        .into_iter()
-        .map(|m| {
-            (
-                m.id,
-                DiscoveredMeta {
-                    context_window: m.max_model_len,
-                    thinking_levels: m.reasoning_levels,
-                    supports_thinking: m.supports_reasoning_effort,
-                },
-            )
-        })
-        .collect())
 }
 
 /// The Anthropic `GET {base_url}/models` (ADR 0024 — the SAME endpoint
@@ -307,7 +323,10 @@ async fn discover_anthropic_models(
         .get(&url)
         // `anthropic-version` is REQUIRED on every Anthropic endpoint
         // (the same value as `AnthropicProvider::complete`'s header).
-        .header("anthropic-version", "2023-06-01");
+        .header(
+            "anthropic-version",
+            super::provider::transport::ANTHROPIC_API_VERSION,
+        );
     // `x-api-key` (NOT `Authorization: Bearer` — the Anthropic API's
     // auth header); a keyless call → NO `x-api-key` header (the
     // existing empty-key rule).
@@ -435,6 +454,23 @@ struct LiteLLMModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── `Model` ───────────────────────────────────────────────────────
+
+    #[test]
+    fn supports_thinking_level_empty_set_soft_passes() {
+        let m = model("a", true, Some("openai-completions"));
+        assert!(m.supports_thinking_level("high"));
+        assert!(m.supports_thinking_level("anything"));
+    }
+
+    #[test]
+    fn supports_thinking_level_membership() {
+        let mut m = model("a", true, Some("openai-completions"));
+        m.thinking_levels = vec!["low".to_string(), "high".to_string()];
+        assert!(m.supports_thinking_level("high"));
+        assert!(!m.supports_thinking_level("bogus"));
+    }
 
     // ── `ModelCatalog` accessors ──────────────────────────────────────
 
@@ -782,7 +818,7 @@ mod tests {
         let mut keys: Vec<String> = merged
             .models
             .iter()
-            .map(|m| format!("{}/{}", m.provider, m.id))
+            .map(|m| ModelKey::from(m).to_string())
             .collect();
         keys.sort();
         assert_eq!(keys, vec!["p/x".to_string(), "q/b".to_string()]);
@@ -797,7 +833,7 @@ mod tests {
         let keys: Vec<String> = merged
             .models
             .iter()
-            .map(|m| format!("{}/{}", m.provider, m.id))
+            .map(|m| ModelKey::from(m).to_string())
             .collect();
         assert_eq!(keys, vec!["q/b".to_string()]);
         assert_eq!(merged.default_model, None);

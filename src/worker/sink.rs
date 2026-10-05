@@ -16,7 +16,7 @@
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::agent::session::EventSink;
+use crate::agent::events::EventSink;
 use crate::agent::worker::protocol::Outbound;
 
 /// The Worker's `EventSink` (ADR 0025 Task 2): maps the Tauri event
@@ -78,7 +78,7 @@ impl EventSink for IpcEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::session::EventSink;
+    use crate::agent::events::EventSink;
     use serde_json::json;
     use tokio::sync::mpsc;
 

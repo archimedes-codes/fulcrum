@@ -17,6 +17,7 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::prompt::{build_main_prompt, PromptContext};
 use crate::agent::harness::provider::build_provider;
@@ -26,7 +27,6 @@ use crate::agent::harness::store::Store;
 use crate::agent::harness::trust::{StaticTrustSource, TrustSource};
 use crate::agent::interactive::{interactive_key, PendingInteractive, PendingSudo};
 use crate::agent::permission::{permission_key, PendingPermissions, PermissionOutcome};
-use crate::agent::session::EventSink;
 use crate::agent::todo::TodoStore;
 use crate::agent::worker::dispatch::{IpcDispatcher, SubagentWaiters};
 use crate::agent::worker::protocol::{Inbound, Outbound, StartEnv, StartMode};
@@ -596,7 +596,7 @@ mod tests {
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (settle_tx, _settle_rx) = watch::channel(0u64);
         let store: Arc<dyn Store> = Arc::new(IpcStore::new(outbound.clone()));
-        let sink: Arc<dyn crate::agent::session::EventSink> =
+        let sink: Arc<dyn crate::agent::events::EventSink> =
             Arc::new(IpcEventSink::new(outbound.clone()));
         let mut loop_ = AgentLoop::new(
             env.session_id.clone(),

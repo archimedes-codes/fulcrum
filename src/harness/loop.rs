@@ -24,63 +24,38 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
+use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
-use crate::agent::harness::compact::{split_for_compaction, Compactor};
+use crate::agent::harness::compact::{self, Compactor};
 use crate::agent::harness::dispatch::SubagentDispatcher;
 use crate::agent::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest, Provider,
     ProviderError, ProviderEvent, ToolCall, ToolSpec, Usage,
 };
 use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::harness::store::Store;
+use crate::agent::harness::store::{role_str, Store};
 use crate::agent::harness::trust::TrustSource;
 use crate::agent::interactive::{
-    interactive_key, sudo_run_flow, todo_apply, CachedPassword, PendingInteractive, PendingSudo,
-    RealSudoRunner, SudoRunner,
+    sudo_run_flow, todo_apply, CachedPassword, PendingInteractive, PendingSudo, RealSudoRunner,
+    SudoRunner,
 };
 use crate::agent::mcp::{mcp_tool, McpManager};
+use crate::agent::normalize::{compute_display_rows, normalize, ThoughtState, TurnState};
 use crate::agent::permission::{native_permission_gate, PendingPermissions, PermissionOutcome};
-use crate::agent::session::{compute_display_rows, normalize, EventSink, ThoughtState, TurnState};
-use crate::agent::subagent::LaunchConfig;
 use crate::agent::todo::TodoStore;
 use crate::agent::tools::{execute_tool, ContentBlock, ImageRef, ToolCtx, ToolResult};
-
-/// The `ask` flow's cap (the suite's `timeoutMs: 300_000` — 5 min; the
-/// agent's 300 s cancel deterministically wins the desktop's 330 s
-/// waiter, so a 330 s client timeout would RACE the desktop's own
-/// waiter).
-const ASK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The built-ins the `ToolRegistry` gates before execution
 /// (`bash` / `edit` / `write` — the mutating built-ins; `read` /
 /// `find` / `grep` / `ls` are read-only and skip the gate).
 const MUTATING_TOOLS: &[&str] = &["bash", "edit", "write"];
-
-/// The compaction SUMMARY's prefix (harness-generated — `run_compaction`
-/// prepends it to the summarized text): the ONE place the prefix lives
-/// (the summary construction + `is_compaction_summary` share it). A
-/// summary is a `System` message carrying this prefix — the only
-/// reliable way to tell it from a REAL system prompt (a summary is
-/// CONVERSATION state, not prompt state: it must be foldable by the
-/// next compaction; only a non-summary leading `System` message is
-/// prompt state).
-const SUMMARY_PREFIX: &str = "Summary of previous conversation:";
-
-/// A message is a compaction SUMMARY (a `System` message with the
-/// harness-generated `SUMMARY_PREFIX` text) — conversation state, never
-/// prompt state.
-fn is_compaction_summary(m: &ChatMessage) -> bool {
-    matches!(&m.content, MessageContent::Text(t) if t.starts_with(SUMMARY_PREFIX))
-}
 
 /// A prompt to the loop (the `prompt_queue` item): the text + the image
 /// attachments (`ImageRef` — the pi `ImageContent` shape; the manager
@@ -895,7 +870,12 @@ impl AgentLoop {
                 let futures: Vec<_> = tool_calls
                     .iter()
                     .enumerate()
-                    .filter(|(_, tc)| me.is_enabled_subagent_call(tc))
+                    .filter(|(_, tc)| {
+                        crate::agent::harness::dispatch::is_enabled_subagent_call(
+                            me.enabled_tools(),
+                            tc,
+                        )
+                    })
                     .map(|(idx, tc)| {
                         let args = tc.arguments.clone();
                         async move { (idx, me.dispatch_subagent(&args, turn).await) }
@@ -920,7 +900,7 @@ impl AgentLoop {
             // gets a cancelled tool result (finding 8a — a Stop is honored
             // BETWEEN calls; the turn settles at the top of the loop).
             for (idx, tc) in tool_calls.iter().enumerate() {
-                let result = if Self::is_subagent_call(&tc.name) {
+                let result = if crate::agent::harness::dispatch::is_subagent_call(&tc.name) {
                     match subagent_results.remove(&idx) {
                         Some(r) => r,
                         None if turn.is_cancelled() => Self::cancelled_tool_result(),
@@ -1088,7 +1068,7 @@ impl AgentLoop {
         // The `subagent` / `dispatch_subagent` alias (the single source of
         // truth is `is_subagent_call` — the parallel batch + this dispatch
         // share it; a future third alias updates only that one place).
-        if Self::is_subagent_call(&tc.name) {
+        if crate::agent::harness::dispatch::is_subagent_call(&tc.name) {
             return self.dispatch_subagent(&tc.arguments, turn).await;
         }
         match tc.name.as_str() {
@@ -1142,7 +1122,17 @@ impl AgentLoop {
                     _ = turn.cancelled() => Self::sudo_cancelled_result(),
                 }
             }
-            "ask" => self.ask_flow(&tc.arguments, &tc.id, turn).await,
+            "ask" => {
+                crate::agent::harness::ask::ask_flow(
+                    &self.pending_bridge,
+                    &self.sink,
+                    &self.session_id,
+                    &tc.arguments,
+                    &tc.id,
+                    turn,
+                )
+                .await
+            }
             "list_agents" => self.list_agents_tool().await,
             "mcp" => {
                 // RACED against the TURN token (finding 8b, round 2 — a Stop
@@ -1163,159 +1153,30 @@ impl AgentLoop {
         }
     }
 
-    /// The in-process `ask` flow (the `ask` interactive method's flow — a
-    /// `pending_bridge` oneshot + `interactive-request` event + the 300 s
-    /// cap): the user's answer is shaped per the suite's
-    /// `shapeAskResult` (a cancel → the cancelled shape; otherwise the
-    /// `User answers` content).
-    async fn ask_flow(
-        &mut self,
-        params: &Value,
-        request_id: &str,
-        turn: &CancellationToken,
-    ) -> ToolResult {
-        let key = interactive_key(&self.session_id, request_id);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut map = self.pending_bridge.lock().await;
-            map.insert(key.clone(), tx);
-        }
-        self.sink.emit(
-            "interactive-request",
-            json!({
-                "sessionId": self.session_id,
-                "requestId": request_id,
-                "method": "ask",
-                "source": "native",
-                "toolCallId": Value::Null,
-                "params": params,
-            }),
-        );
-        let response = tokio::select! {
-            r = rx => r.ok(),
-            _ = tokio::time::sleep(ASK_TIMEOUT) => None,
-            _ = turn.cancelled() => None,
-        };
-        self.pending_bridge.lock().await.remove(&key);
-        shape_ask_result(response, params)
-    }
-
-    /// The `enabled_tools`-filter name for `name` (the `dispatch_subagent` →
-    /// `subagent` alias — the model may emit either name for the same tool).
-    fn effective_tool_name(name: &str) -> &str {
-        if name == "dispatch_subagent" {
-            "subagent"
-        } else {
-            name
-        }
-    }
-
-    /// Whether `name` passes the `enabled_tools` filter (`None` = all enabled).
+    /// Whether `name` passes the `enabled_tools` filter (`None` = all
+    /// enabled). The logic lives in `harness::dispatch` (no loop state).
     fn is_tool_enabled(&self, name: &str) -> bool {
-        match &self.enabled_tools {
-            Some(tools) => tools.iter().any(|t| t == Self::effective_tool_name(name)),
-            None => true,
-        }
+        crate::agent::harness::dispatch::is_tool_enabled(self.enabled_tools(), name)
     }
 
-    /// Whether `name` is a `subagent` / `dispatch_subagent` tool call (the
-    /// parallel-batch detection — the `dispatch_tool` `match` routes both to
-    /// `dispatch_subagent`).
-    fn is_subagent_call(name: &str) -> bool {
-        name == "subagent" || name == "dispatch_subagent"
-    }
-
-    /// Whether `tc` is a `subagent` call that PASSES the `enabled_tools`
-    /// filter (the `dispatch_tool` check, replicated — so the parallel batch
-    /// only dispatches ENABLED subagents; a disabled one falls through to
-    /// `dispatch_tool`'s "tool not enabled" error in the sequential pass).
-    fn is_enabled_subagent_call(&self, tc: &ToolCall) -> bool {
-        Self::is_subagent_call(&tc.name) && self.is_tool_enabled(&tc.name)
-    }
-
-    /// `subagent` dispatch: the parent's `SubagentDispatcher` (the
-    /// `WorkerManager`'s `dispatch_subagent` flow — the child is a WORKER
-    /// process; the ADR 0025 re-plumb — the in-process `AgentLoop` child
-    /// is GONE).
+    /// `subagent` dispatch — the thin wrapper that supplies the loop's
+    /// fields; the dispatch flow itself lives in `harness::dispatch`.
     async fn dispatch_subagent(&self, params: &Value, turn: &CancellationToken) -> ToolResult {
-        let Some(dispatcher) = &self.subagent else {
-            return ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: "subagent dispatch is not available in this session".to_string(),
-                }],
-                details: None,
-                is_error: true,
-            };
-        };
-        let (task, launch) = match crate::agent::interactive::dispatch_params(params) {
-            Some(p) => p,
-            None => {
-                return ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: "invalid params: `task` is required".to_string(),
-                    }],
-                    details: None,
-                    is_error: true,
-                };
-            }
-        };
-        let agent_name = params
-            .get("agentName")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        // ADR 0020: resolve `agentName` against the discovered Agent
-        // definitions (layered — explicit params win; no match / empty =
-        // config-less, never an error).
-        let launch = self.resolve_launch(&launch, &agent_name);
-        let (dispatch_rx, cancel) = dispatcher.dispatch(
-            &self.session_id,
-            &self.space_cwd,
-            &self.model,
-            self.enabled_tools().map(|v| v.to_vec()).unwrap_or_default(),
-            agent_name,
-            launch,
-            task,
-            &self.sink,
-        );
-        let outcome = tokio::select! {
-            r = dispatch_rx => match r {
-                Ok(crate::agent::subagent::SubagentOutcome::Completed { output, .. }) => {
-                    SubagentWait::Completed { output }
-                }
-                Ok(crate::agent::subagent::SubagentOutcome::Failed { error }) => {
-                    SubagentWait::Failed { error }
-                }
-                // The worker task vanished without resolving (app exit) —
-                // the dispatch is gone: cancel.
-                Err(_) => SubagentWait::Cancelled,
+        crate::agent::harness::dispatch::dispatch_subagent(
+            self.subagent.as_ref(),
+            &crate::agent::harness::dispatch::SubagentParent {
+                session_id: &self.session_id,
+                space_cwd: &self.space_cwd,
+                model: &self.model,
+                enabled_tools: self.enabled_tools(),
+                sink: &self.sink,
+                catalog: &self.catalog,
+                config_dir: self.config_dir.as_deref(),
             },
-            _ = turn.cancelled() => {
-                cancel.cancel();
-                SubagentWait::Cancelled
-            }
-        };
-        match outcome {
-            SubagentWait::Completed { output } => ToolResult {
-                content: vec![ContentBlock::Text { text: output }],
-                details: None,
-                is_error: false,
-            },
-            SubagentWait::Failed { error } => ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("subagent failed: {error}"),
-                }],
-                details: None,
-                is_error: true,
-            },
-            SubagentWait::Cancelled => ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: "cancelled".to_string(),
-                }],
-                details: None,
-                is_error: true,
-            },
-        }
+            params,
+            turn,
+        )
+        .await
     }
 
     /// Resolve `agentName` against the discovered Agent definitions and
@@ -1323,116 +1184,11 @@ impl AgentLoop {
     /// — explicit > frontmatter > parent defaults). `agentName` empty /
     /// no match → the `launch` is returned VERBATIM (the label-only,
     /// config-less behavior — never an error).
-    fn resolve_launch(&self, launch: &LaunchConfig, agent_name: &str) -> LaunchConfig {
-        let name = agent_name.trim();
-        if name.is_empty() {
-            return launch.clone();
-        }
-        let Some(def) = crate::agents::discover_agents(Some(&self.space_cwd))
-            .into_iter()
-            .find(|d| d.name.eq_ignore_ascii_case(name))
-        else {
-            return launch.clone();
-        };
-        // A frontmatter `model` that resolves to NOTHING (not in the
-        // catalog — a stale file) degrades to the next layer (the
-        // explicit param, else the parent model) — a stale file must not
-        // fail the dispatch. The `:<level>` suffix is stripped ONLY for
-        // the resolvability check (mirroring `dispatch_native_inner`'s
-        // `rsplit_once(':')`); the stored value is the VERBATIM
-        // frontmatter string (the suffix is a thinking-level candidate
-        // handled downstream). An explicit `model` param is NEVER
-        // degraded here (it is the model's current intent —
-        // `dispatch_native` still fails it when unknown, unchanged).
-        // (ADR 0023) The per-agent model override (the settings'
-        // `subagentModels` — read at dispatch time: a settings edit takes
-        // effect on the NEXT dispatch, no restart; a missing/corrupt file
-        // yields the defaults → no override). SOFT, like the frontmatter:
-        // a value whose bare key resolves to NOTHING degrades to the next
-        // layer (a stale override must not fail the dispatch). CASE-
-        // INSENSITIVE by name (a case-insensitive SCAN — the stored key is
-        // NOT rewritten: the UI saves `def.name` verbatim, and a hand-edited
-        // mixed-case key must still match the case-insensitive `agentName`
-        // resolution).
-        let override_model = self.config_dir.as_deref().and_then(|dir| {
-            crate::commands::settings::load_settings(dir)
-                .subagent_models
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.clone())
-        });
-        let model = launch
-            .model
-            .clone()
-            .or_else(|| {
-                override_model.as_ref().and_then(|m| {
-                    let bare = m
-                        .rsplit_once(':')
-                        .map(|(b, _)| b.to_string())
-                        .unwrap_or_else(|| m.clone());
-                    crate::agent::session::resolve_composed_model(&self.catalog, &bare)
-                        .is_some()
-                        .then_some(m.clone())
-                })
-            })
-            .or_else(|| {
-                def.model.as_ref().and_then(|m| {
-                    let bare = m
-                        .rsplit_once(':')
-                        .map(|(b, _)| b.to_string())
-                        .unwrap_or_else(|| m.clone());
-                    crate::agent::session::resolve_composed_model(&self.catalog, &bare)
-                        .is_some()
-                        .then_some(m.clone())
-                })
-            });
-        // Unknown tool names in the frontmatter are DROPPED (a file
-        // hint, not precise intent), as are the parent-guarded
-        // `subagent` / `list_agents` (they can never reach the child —
-        // `dispatch_native_inner` strips them — so a file `tools:
-        // [subagent]` must degrade to ABSENT, not zero the child out).
-        // A list that empties out is treated as ABSENT (the child is
-        // never zeroed out by a stale file). An explicit `tools` param
-        // is NEVER filtered here (its semantics — verbatim,
-        // `dispatch_native` minus `subagent`/`list_agents` — are
-        // unchanged). `then_some` (NOT `then`) — an absent `tools`
-        // stays `None`.
-        let specs = tool_specs();
-        let tools = launch.tools.clone().or_else(|| {
-            def.tools.as_ref().and_then(|t| {
-                let known: Vec<String> = t
-                    .iter()
-                    .filter(|name| {
-                        name.as_str() != "subagent"
-                            && name.as_str() != "list_agents"
-                            && specs.iter().any(|s| s.name == **name)
-                    })
-                    .cloned()
-                    .collect();
-                (!known.is_empty()).then_some(known)
-            })
-        });
-        // An EMPTY frontmatter body means "no system prompt" (the
-        // `or_else` must not turn it into `Some("")` — `dispatch_native`
-        // would prepend an empty message).
-        let system_prompt = launch
-            .system_prompt
-            .clone()
-            .or_else(|| (!def.system_prompt.is_empty()).then(|| def.system_prompt.clone()));
-        // The thinking split (the doc-correct order — the dispatch resolves
-        // explicit > model-key suffix > frontmatter `thinking`): `thinking`
-        // holds the EXPLICIT param only; the frontmatter's `thinking` moves
-        // to its own field.
-        let frontmatter_thinking = def.thinking.clone();
-        LaunchConfig {
-            system_prompt,
-            model,
-            thinking: launch.thinking.clone(),
-            frontmatter_thinking,
-            tools,
-        }
-    }
-
+    ///
+    /// The implementation lives in `harness::launch` (a pure function of
+    /// the catalog / settings dir / space cwd — no loop state); the
+    /// `subagent` dispatch flow calls it directly in `harness::dispatch`.
+    ///
     /// The `list_agents` tool result: one line per discovered Agent
     /// definition (ADR 0020), or `"none"`.
     async fn list_agents_tool(&self) -> ToolResult {
@@ -1478,90 +1234,38 @@ impl AgentLoop {
         }
     }
 
-    /// The compaction (a "summarize these messages" system prompt over
-    /// the OLDER messages — the most recent `keepRecentTokens` kept; the
-    /// older messages replaced by the summary, the transcript REWRITTEN
-    /// (the old rows are replaced), `compaction_start` /
-    /// `compaction_end` emitted).
+    /// The compaction (the `compact.rs` orchestration — the OLDER messages
+    /// summarized and replaced by the summary, the transcript REWRITTEN) +
+    /// the `compaction_start` / `compaction_end` `RpcEvent` emission (which
+    /// needs the loop's `normalize` / display-persistence pipeline) and the
+    /// post-compaction `context_usage_update` frame.
     async fn run_compaction(&mut self, turn: &CancellationToken) {
         self.emit(RpcEvent::compaction_start {
             reason: "context_limit".to_string(),
         });
-        let keep = self.catalog.compaction.keep_recent_tokens;
-        // The leading system message (if any) is prompt state, not
-        // conversation (pi's compaction: "System messages are prompt
-        // state, not conversation; the compaction entry carries their
-        // replay"): EXCLUDE it from the compaction target and RE-PREPEND
-        // it to the compacted transcript. A compaction SUMMARY is NOT
-        // prompt state — it is CONVERSATION state (harness-generated,
-        // the `SUMMARY_PREFIX` text): it must be foldable, so the next
-        // compaction compacts it into the new summary (a summary at
-        // index 0 — a legacy pre-ADR-0017 resume / a child with no
-        // system message — is NOT a leading system message).
-        let system_head = self
-            .messages
-            .first()
-            .filter(|m| matches!(m.role, ChatRole::System) && !is_compaction_summary(m))
-            .cloned();
-        let compactable: &[ChatMessage] = match &system_head {
-            Some(_) => &self.messages[1..],
-            None => &self.messages[..],
-        };
-        let (older, recent) = split_for_compaction(compactable, keep);
         let mut aborted = false;
         let mut error_message: Option<String> = None;
-        if !older.is_empty() {
-            match self.summarize(&older, turn).await {
-                Ok(summary) => {
-                    let summary_msg = ChatMessage {
-                        role: ChatRole::System,
-                        content: MessageContent::Text(format!("{SUMMARY_PREFIX}\n{summary}")),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    };
-                    let mut compacted =
-                        Vec::with_capacity(1 + usize::from(system_head.is_some()) + recent.len());
-                    if let Some(s) = system_head.clone() {
-                        compacted.push(s);
-                    }
-                    compacted.push(summary_msg);
-                    compacted.extend(recent);
-                    self.messages = compacted;
-                    self.compactor.reestimate(&self.messages);
-                    // The re-estimate is the post-compaction anchor (the
-                    // `context_usage_update` frame — the percentage drops
-                    // after the compaction instead of staying at the
-                    // pre-compaction value).
-                    self.last_context_tokens = self.compactor.context_tokens();
-                    self.emit_context_usage();
-                    // Rewrite the transcript (the old rows are replaced —
-                    // a fresh `seq` run) ATOMICALLY: a single `Db`
-                    // transaction (clear + reinsert), so a crash
-                    // mid-rewrite never loses the transcript.
-                    let rows: Vec<(u64, String, String)> = self
-                        .messages
-                        .iter()
-                        .enumerate()
-                        .map(|(seq, m)| {
-                            (
-                                seq as u64,
-                                role_str(m.role).to_string(),
-                                serde_json::to_string(m).unwrap_or_default(),
-                            )
-                        })
-                        .collect();
-                    if let Err(e) = self.store.replace_messages(&self.session_id, &rows) {
-                        eprintln!("harness: transcript rewrite failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    // The summary failed: the transcript is UNCHANGED (the
-                    // next model call runs on the full context — a failed
-                    // compaction is never a lost context).
-                    aborted = true;
-                    error_message = Some(e.to_string());
-                    eprintln!("harness: compaction failed: {e}");
-                }
+        let mut ctx = compact::CompactionCtx {
+            session_id: &self.session_id,
+            model: &self.model,
+            provider: &*self.provider,
+            store: &self.store,
+            keep_recent_tokens: self.catalog.compaction.keep_recent_tokens,
+            compactor: &mut self.compactor,
+        };
+        match compact::run_compaction(&mut ctx, &mut self.messages, turn).await {
+            compact::CompactionOutcome::Skipped => {}
+            compact::CompactionOutcome::Compacted { context_tokens } => {
+                // The re-estimate is the post-compaction anchor (the
+                // `context_usage_update` frame — the percentage drops
+                // after the compaction instead of staying at the
+                // pre-compaction value).
+                self.last_context_tokens = context_tokens;
+                self.emit_context_usage();
+            }
+            compact::CompactionOutcome::Failed { error } => {
+                aborted = true;
+                error_message = Some(error);
             }
         }
         self.emit(RpcEvent::compaction_end {
@@ -1571,98 +1275,6 @@ impl AgentLoop {
             will_retry: false,
             error_message,
         });
-    }
-
-    /// The summary model call (a "summarize these messages" system prompt
-    /// over the older messages — NO tools; the stream is consumed
-    /// silently — the summary is internal, like pi's). The call + stream
-    /// race the turn's cancel (a cancelled turn must not wait out the
-    /// summary — the compaction is aborted; the turn settles at the top
-    /// of the loop). A stream that ends with `Done(Error)` (the provider
-    /// synthesizes it when the stream ends without a `finish_reason`) or
-    /// without a `Done` at all is a retryable `Err` — a truncated summary
-    /// must NEVER rewrite the transcript (finding 4: the `run_compaction`
-    /// error path keeps the transcript intact).
-    async fn summarize(
-        &mut self,
-        older: &[ChatMessage],
-        turn: &CancellationToken,
-    ) -> Result<String, ProviderError> {
-        let system = ChatMessage {
-            role: ChatRole::System,
-            content: MessageContent::Text(
-                "Summarize these messages concisely, preserving decisions, \
-                 file paths, and open tasks. Respond with the summary only."
-                    .to_string(),
-            ),
-            tool_call_id: None,
-            tool_calls: None,
-        };
-        let mut messages = vec![system];
-        messages.extend(older.iter().cloned());
-        let req = ModelRequest {
-            model: self.model.id.clone(),
-            messages,
-            tools: Vec::new(),
-            options: ModelOptions {
-                temperature: Some(0.0),
-                max_tokens: None,
-                reasoning_effort: None,
-                stream: true,
-            },
-            session_id: Some(self.session_id.clone()),
-        };
-        let mut stream = tokio::select! {
-            s = self.provider.complete(&req) => s?,
-            _ = turn.cancelled() => {
-                return Err(ProviderError::Fatal(
-                    "the turn was cancelled during compaction".to_string(),
-                ));
-            }
-        };
-        let mut summary = String::new();
-        let mut finished: Option<FinishReason> = None;
-        loop {
-            tokio::select! {
-                ev = stream.next() => {
-                    let Some(ev) = ev else { break };
-                    match ev {
-                        ProviderEvent::TextDelta(d) => summary.push_str(&d),
-                        ProviderEvent::Done(f) => {
-                            finished = Some(f);
-                            break;
-                        }
-                        ProviderEvent::Error(e) => return Err(e),
-                        _ => {}
-                    }
-                }
-                _ = turn.cancelled() => {
-                    return Err(ProviderError::Fatal(
-                        "the turn was cancelled during compaction".to_string(),
-                    ));
-                }
-            }
-        }
-        // A `Done(Error)` (the provider synthesizes it when the stream
-        // ends without a `finish_reason`), a `Done(Length)` (the summary
-        // hit the OUTPUT TOKEN LIMIT — the wire `finish_reason`
-        // `"length"`: the summary is literally TRUNCATED), or a stream
-        // that ended WITHOUT a `Done` at all is a truncated summary — a
-        // retryable `Err`, NOT a partial `Ok` (a partial summary would
-        // rewrite the transcript and permanently lose the tail of the
-        // summarized history from a mere transport hiccup).
-        match finished {
-            Some(FinishReason::Error) => Err(ProviderError::Retryable(
-                "the summary stream ended without a finish_reason".to_string(),
-            )),
-            Some(FinishReason::Length) => Err(ProviderError::Retryable(
-                "the summary hit the output token limit".to_string(),
-            )),
-            Some(_) => Ok(summary),
-            None => Err(ProviderError::Retryable(
-                "the summary stream ended without a finish_reason".to_string(),
-            )),
-        }
     }
 
     /// The model request (the `messages` vec + the tool specs + the
@@ -1845,29 +1457,12 @@ impl TurnAccumulator {
     }
 }
 
-/// The `subagent` dispatch's outcome (the `SubagentOutcome` mapping).
-enum SubagentWait {
-    Completed { output: String },
-    Failed { error: String },
-    Cancelled,
-}
-
-/// The denormalized `role` index (the `native_messages.role` column).
-fn role_str(role: ChatRole) -> &'static str {
-    match role {
-        ChatRole::System => "system",
-        ChatRole::User => "user",
-        ChatRole::Assistant => "assistant",
-        ChatRole::Tool => "tool",
-    }
-}
-
 /// The tool result's text (the first text block). TEST-ONLY (the
 /// production `tool` message keeps the result's FULL `Blocks` — the
 /// provider's `to_wire` is the wire shape; this is the assertion
 /// helper for the `dispatch_tool` results).
 #[cfg(test)]
-fn result_text(result: &ToolResult) -> String {
+pub(crate) fn result_text(result: &ToolResult) -> String {
     result
         .content
         .iter()
@@ -2081,223 +1676,17 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// One question's answer (the suite's `QuestionResult` shape —
-/// `packages/ask/src/tool.ts`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct AskQuestionResult {
-    id: String,
-    question: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    options: Vec<String>,
-    multi: bool,
-    selected: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    custom: Option<String>,
-}
-
-/// The suite's `responseToResults` (`packages/ask/src/tool.ts:192`): the
-/// `AskResponsePayload` (`{ cancelled, results: [{ id, selectedOptions,
-/// customInput? }] }`) → one `QuestionResult` per question (a missing
-/// `results[i]` is an empty answer).
-fn response_to_results(response: Option<&Value>, questions: &[Value]) -> Vec<AskQuestionResult> {
-    questions
-        .iter()
-        .enumerate()
-        .map(|(i, q)| {
-            let r = response
-                .and_then(|r| r.get("results"))
-                .and_then(Value::as_array)
-                .and_then(|a| a.get(i));
-            let options = q
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|opts| {
-                    opts.iter()
-                        .map(|o| {
-                            o.get("label")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string()
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            AskQuestionResult {
-                id: q
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                question: q
-                    .get("question")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                description: q
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .filter(|s| !s.trim().is_empty()),
-                options,
-                multi: q.get("multi").and_then(Value::as_bool).unwrap_or(false),
-                selected: r
-                    .and_then(|r| r.get("selectedOptions"))
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                custom: r
-                    .and_then(|r| r.get("customInput"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty()),
-            }
-        })
-        .collect()
-}
-
-/// The suite's `shapeAskResult` (a cancel — `cancelled: true` with no
-/// selected options — → the cancelled shape; otherwise the `User
-/// answers` content).
-fn shape_ask_result(response: Option<Value>, params: &Value) -> ToolResult {
-    let questions = params
-        .get("questions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let results = response_to_results(response.as_ref(), &questions);
-    let all_empty = results.iter().all(|r| r.selected.is_empty());
-    let cancelled = response
-        .as_ref()
-        .and_then(|r| r.get("cancelled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let details = json!({
-        "results": serde_json::to_value(&results).unwrap_or(Value::Array(Vec::new())),
-        "customInput": Value::Null,
-        "description": Value::Null,
-    });
-    if cancelled && all_empty {
-        return ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "User cancelled the question.".to_string(),
-            }],
-            details: Some(details),
-            is_error: false,
-        };
-    }
-    ToolResult {
-        content: vec![ContentBlock::Text {
-            text: build_ask_session_content(&results),
-        }],
-        details: Some(details),
-        is_error: false,
-    }
-}
-
-/// The suite's `buildAskSessionContent` (the summary + the per-question
-/// context).
-fn build_ask_session_content(results: &[AskQuestionResult]) -> String {
-    let summary: Vec<String> = results
-        .iter()
-        .map(|r| format!("{}: {}", r.id, selection_summary(r)))
-        .collect();
-    let context: Vec<String> = results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| question_context(r, i))
-        .collect();
-    format!(
-        "User answers:\n{}\n\nAnswer context:\n{}",
-        summary.join("\n"),
-        context.join("\n\n")
-    )
-}
-
-/// The suite's `formatSelectionForSummary`.
-fn selection_summary(r: &AskQuestionResult) -> String {
-    let has_selected = !r.selected.is_empty();
-    let has_custom = r.custom.is_some();
-    if !has_selected && !has_custom {
-        return "(cancelled)".to_string();
-    }
-    if has_selected && has_custom {
-        let selected_part = if r.multi {
-            format!("[{}]", r.selected.join(", "))
-        } else {
-            r.selected.first().cloned().unwrap_or_default()
-        };
-        return format!(
-            "{selected_part} + Other: \"{}\"",
-            r.custom.as_deref().unwrap_or("")
-        );
-    }
-    if has_custom {
-        return format!("\"{}\"", r.custom.as_deref().unwrap_or(""));
-    }
-    if r.multi {
-        return format!("[{}]", r.selected.join(", "));
-    }
-    r.selected.first().cloned().unwrap_or_default()
-}
-
-/// The suite's `formatQuestionContext`.
-fn question_context(r: &AskQuestionResult, index: usize) -> String {
-    let mut lines = vec![
-        format!("Question {} ({})", index + 1, r.id),
-        format!("Prompt: {}", r.question),
-    ];
-    if let Some(d) = &r.description {
-        lines.push("Context:".to_string());
-        for line in d.split('\n') {
-            lines.push(format!("  {line}"));
-        }
-    }
-    lines.push("Options:".to_string());
-    for (i, option) in r.options.iter().enumerate() {
-        lines.push(format!("  {}. {option}", i + 1));
-    }
-    lines.push("Response:".to_string());
-    let has_selected = !r.selected.is_empty();
-    let has_custom = r.custom.is_some();
-    if !has_selected && !has_custom {
-        lines.push("  Selected: (cancelled)".to_string());
-    } else {
-        if has_selected {
-            let selected_text = if r.multi {
-                format!("[{}]", r.selected.join(", "))
-            } else {
-                r.selected.first().cloned().unwrap_or_default()
-            };
-            lines.push(format!("  Selected: {selected_text}"));
-        }
-        if has_custom {
-            if !has_selected {
-                lines.push("  Selected: Other (type your own)".to_string());
-            }
-            lines.push(format!(
-                "  Custom input: {}",
-                r.custom.as_deref().unwrap_or("")
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use crate::agent::harness::catalog::CompactionConfig;
     use crate::agent::harness::dispatch::InProcessDispatcher;
     use crate::agent::harness::store::SessionStore;
-    use crate::agent::subagent::{SubagentOutcome, SubagentSessionManager};
+    use crate::agent::subagent::{LaunchConfig, SubagentOutcome, SubagentSessionManager};
     use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
     use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
     use crate::agent::worker::protocol::{StartEnv, StartMode};
@@ -2397,14 +1786,6 @@ mod tests {
     }
 
     impl SessionRecordingProvider {
-        fn new(recorded_session_ids: Arc<StdMutex<Vec<Option<String>>>>) -> Self {
-            Self {
-                recorded_session_ids,
-                scripts: Vec::new(),
-                call_idx: AtomicU32::new(0),
-            }
-        }
-
         fn with_scripts(
             recorded_session_ids: Arc<StdMutex<Vec<Option<String>>>>,
             scripts: Vec<Vec<ProviderEvent>>,
@@ -3024,99 +2405,6 @@ mod tests {
         .expect("agent_settled after the cancel");
     }
 
-    // ── (finding 4) a truncated summary stream is NOT a good summary ──
-
-    /// (finding 4) The provider synthesizes `Done(FinishReason::Error)`
-    /// when a stream ends without a `finish_reason` — `summarize` must
-    /// treat it as a retryable `Err`, NOT return a partial `Ok` (a
-    /// partial summary would rewrite the transcript and lose history
-    /// from a mere transport hiccup).
-    #[tokio::test]
-    async fn a_summary_stream_ending_in_an_error_is_not_a_good_summary() {
-        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
-            ProviderEvent::TextDelta("partial".to_string()),
-            ProviderEvent::Done(FinishReason::Error),
-        ])]);
-        let mut loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let older = vec![ChatMessage {
-            role: ChatRole::User,
-            content: MessageContent::Text("the old messages".to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        let r = loop_.summarize(&older, &CancellationToken::new()).await;
-        assert!(
-            matches!(r, Err(ProviderError::Retryable(_))),
-            "a `Done(Error)` stream is a retryable error, got {r:?}"
-        );
-    }
-
-    /// (finding 4, round 2) A summary that hits the OUTPUT TOKEN LIMIT
-    /// (`Done(FinishReason::Length)` — the wire `finish_reason`
-    /// `"length"`) is TRUNCATED: it must be a retryable `Err`, NOT an
-    /// `Ok` (an accepted truncated summary would rewrite the
-    /// transcript and permanently lose the tail of the summarized
-    /// history — the same invariant as the `Done(Error)` case above).
-    #[tokio::test]
-    async fn a_summary_stream_ending_in_length_is_not_a_good_summary() {
-        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
-            ProviderEvent::TextDelta("partial".to_string()),
-            ProviderEvent::Done(FinishReason::Length),
-        ])]);
-        let mut loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let older = vec![ChatMessage {
-            role: ChatRole::User,
-            content: MessageContent::Text("the old messages".to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        let r = loop_.summarize(&older, &CancellationToken::new()).await;
-        assert!(
-            matches!(r, Err(ProviderError::Retryable(_))),
-            "a `Done(Length)` stream is a retryable error, got {r:?}"
-        );
-    }
-
-    /// (finding 4) A summary stream that ends WITHOUT a `Done` at all
-    /// (the transport just dropped) is a retryable `Err` too — no
-    /// partial summary is returned.
-    #[tokio::test]
-    async fn a_summary_stream_without_a_done_is_not_a_good_summary() {
-        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![ProviderEvent::TextDelta(
-            "partial".to_string(),
-        )])]);
-        let mut loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let older = vec![ChatMessage {
-            role: ChatRole::User,
-            content: MessageContent::Text("the old messages".to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        let r = loop_.summarize(&older, &CancellationToken::new()).await;
-        assert!(
-            matches!(r, Err(ProviderError::Retryable(_))),
-            "a stream that ends without a `Done` is a retryable error, got {r:?}"
-        );
-    }
-
     /// (finding 4) `run_compaction` over a failing summary: the
     /// transcript is UNCHANGED (a failed compaction is never a lost
     /// context — the `compaction_end` is `aborted` with the error).
@@ -3208,340 +2496,6 @@ mod tests {
             MessageContent::Text("the prompt".to_string()),
             "the persisted content is the prompt text"
         );
-    }
-
-    /// (ADR 0017) `run_compaction` PRESERVES the leading system message
-    /// (the system message is prompt state, not conversation — it is
-    /// excluded from the compaction target and re-prepended to the
-    /// compacted transcript; the `replace_messages` rewrite keeps it at
-    /// seq 0, the summary following it).
-    #[tokio::test]
-    async fn compaction_preserves_leading_system_message() {
-        let (provider, _calls) = ScriptedProvider::new(vec![
-            Some(vec![
-                ProviderEvent::TextDelta("the summary".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-            Some(vec![
-                ProviderEvent::TextDelta("hi".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-        ]);
-        let (mut loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1")],
-            None,
-        );
-        loop_.catalog.compaction.keep_recent_tokens = 1;
-        loop_.load_transcript(vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: MessageContent::Text("the prompt".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-        ]);
-        loop_.run_compaction(&CancellationToken::new()).await;
-        // The leading system message SURVIVES at index 0 (the ORIGINAL
-        // message — NOT replaced by the summary).
-        assert!(
-            matches!(loop_.messages[0].role, ChatRole::System),
-            "the system message survives compaction"
-        );
-        assert_eq!(
-            loop_.messages[0].content,
-            MessageContent::Text("the prompt".to_string()),
-            "the system message is the original, verbatim"
-        );
-        // The summary follows it.
-        assert!(
-            matches!(loop_.messages[1].role, ChatRole::System),
-            "the summary is a system message at index 1"
-        );
-        match &loop_.messages[1].content {
-            MessageContent::Text(t) => assert!(
-                t.starts_with("Summary of previous conversation:"),
-                "the summary message, got {t:?}"
-            ),
-            other => panic!("expected a text summary, got {other:?}"),
-        }
-        // The `replace_messages` rewrite kept the system message at seq 0.
-        let loaded = loop_.store.load_messages("s1").unwrap();
-        assert!(
-            matches!(loaded[0].role, ChatRole::System),
-            "the system message is the seq-0 row after the rewrite"
-        );
-        assert_eq!(
-            loaded[0].content,
-            MessageContent::Text("the prompt".to_string()),
-            "the seq-0 row is the original prompt, verbatim"
-        );
-    }
-
-    /// (ADR 0017) a transcript WITHOUT a leading system message compacts
-    /// EXACTLY as today (the summary leads the compacted transcript —
-    /// today's behavior preserved).
-    #[tokio::test]
-    async fn compaction_without_system_message_unchanged() {
-        let (provider, _calls) = ScriptedProvider::new(vec![
-            Some(vec![
-                ProviderEvent::TextDelta("the summary".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-            Some(vec![
-                ProviderEvent::TextDelta("hi".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-        ]);
-        let (mut loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1")],
-            None,
-        );
-        loop_.catalog.compaction.keep_recent_tokens = 1;
-        loop_.load_transcript(vec![
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-        ]);
-        loop_.run_compaction(&CancellationToken::new()).await;
-        // No system message was seeded: the summary leads (today's
-        // behavior).
-        assert!(
-            matches!(loop_.messages[0].role, ChatRole::System),
-            "the summary leads the compacted transcript"
-        );
-        match &loop_.messages[0].content {
-            MessageContent::Text(t) => assert!(
-                t.starts_with("Summary of previous conversation:"),
-                "the summary message, got {t:?}"
-            ),
-            other => panic!("expected a text summary, got {other:?}"),
-        }
-    }
-
-    /// (review finding 1) TWO compactions on a transcript WITHOUT a real
-    /// system prompt FOLD the old summary into the new one: the summary
-    /// is CONVERSATION state (harness-generated — the `Summary of
-    /// previous conversation:` prefix), not prompt state, so the second
-    /// compaction compacts it too. (A legacy pre-ADR-0017 resume / a
-    /// child with no system message: the first compaction puts the
-    /// summary at index 0; the second must NOT freeze it there.)
-    #[tokio::test]
-    async fn compaction_twice_without_system_message_folds_the_old_summary() {
-        // Distinct canned response per `summarize` call: the FIRST
-        // compaction gets "the summary one", the SECOND gets "the
-        // summary two" (the old summary folded into it).
-        let (provider, _calls) = ScriptedProvider::new(vec![
-            Some(vec![
-                ProviderEvent::TextDelta("the summary one".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-            Some(vec![
-                ProviderEvent::TextDelta("the summary two".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-        ]);
-        let (mut loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1")],
-            None,
-        );
-        loop_.catalog.compaction.keep_recent_tokens = 1;
-        loop_.load_transcript(vec![
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u3".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-        ]);
-        loop_.run_compaction(&CancellationToken::new()).await;
-        loop_.run_compaction(&CancellationToken::new()).await;
-        // The NEW summary leads (the old summary was FOLDED into it —
-        // not preserved verbatim at index 0).
-        assert!(
-            matches!(loop_.messages[0].role, ChatRole::System),
-            "the new summary leads the compacted transcript"
-        );
-        match &loop_.messages[0].content {
-            MessageContent::Text(t) => assert!(
-                t.contains("the summary two"),
-                "the leading summary is the NEW one (the old summary was folded into it), got {t:?}"
-            ),
-            other => panic!("expected a text summary, got {other:?}"),
-        }
-        assert_eq!(
-            loop_.messages.len(),
-            2,
-            "the compacted transcript is the new summary + the kept recent message"
-        );
-    }
-
-    /// (review finding 1) a transcript WITH a real leading system prompt
-    /// keeps it verbatim across TWO compactions (a non-summary leading
-    /// System message is prompt state — excluded from the compaction
-    /// target and re-prepended), and the second compaction folds the
-    /// old summary into the new one behind it.
-    #[tokio::test]
-    async fn compaction_twice_with_system_message() {
-        // Distinct canned response per `summarize` call: the FIRST
-        // compaction gets "the summary one", the SECOND gets "the
-        // summary two" (the old summary folded into it).
-        let (provider, _calls) = ScriptedProvider::new(vec![
-            Some(vec![
-                ProviderEvent::TextDelta("the summary one".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-            Some(vec![
-                ProviderEvent::TextDelta("the summary two".to_string()),
-                ProviderEvent::Done(FinishReason::Stop),
-            ]),
-        ]);
-        let (mut loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1")],
-            None,
-        );
-        loop_.catalog.compaction.keep_recent_tokens = 1;
-        loop_.load_transcript(vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: MessageContent::Text("the prompt".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a1".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: MessageContent::Text("u2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: MessageContent::Text("a2".to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-        ]);
-        loop_.run_compaction(&CancellationToken::new()).await;
-        loop_.run_compaction(&CancellationToken::new()).await;
-        // The ORIGINAL system message survives verbatim at index 0.
-        assert!(
-            matches!(loop_.messages[0].role, ChatRole::System),
-            "the system message survives the second compaction"
-        );
-        assert_eq!(
-            loop_.messages[0].content,
-            MessageContent::Text("the prompt".to_string()),
-            "the system message is the original, verbatim"
-        );
-        // The NEW summary follows it (the old summary was folded into
-        // it — the second compaction compacted the first's summary).
-        match &loop_.messages[1].content {
-            MessageContent::Text(t) => assert!(
-                t.contains("the summary two"),
-                "the summary at index 1 is the NEW one, got {t:?}"
-            ),
-            other => panic!("expected a text summary at index 1, got {other:?}"),
-        }
     }
 
     // ── `context_usage_update` frames (the frontend's context-percentage
@@ -4435,808 +3389,6 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .push((event.to_string(), payload));
         }
-    }
-
-    /// (ADR 0020) `agent_name: ""` → the launch is returned VERBATIM
-    /// (the label-only, config-less behavior — never an error).
-    #[test]
-    fn resolve_launch_no_agent_name_returns_the_launch_verbatim() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let launch = LaunchConfig {
-            system_prompt: Some("explicit prompt".to_string()),
-            model: Some("fake/m1".to_string()),
-            thinking: Some("high".to_string()),
-            tools: Some(vec!["bash".to_string()]),
-            ..Default::default()
-        };
-        assert_eq!(
-            loop_.resolve_launch(&launch, ""),
-            launch,
-            "an empty agentName returns the launch verbatim"
-        );
-    }
-
-    /// (ADR 0020) an `agent_name` matching NO discovered definition →
-    /// the launch is returned VERBATIM. The user-level roots are
-    /// ISOLATED first (a developer's real `~/.pi/agent/agents/nope.md`
-    /// would match and break the "no match" case — the same
-    /// `ENV_LOCK` / `HOME`-to-empty-scratch drop-guard pattern as the
-    /// `list_agents_tool` tests).
-    #[test]
-    fn resolve_launch_unknown_agent_name_returns_the_launch_verbatim() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let empty_home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&empty_home).unwrap();
-        // The `env_lock` helper is poison-tolerant (a sibling test
-        // panicking while holding the lock must not turn this test's
-        // failure into an opaque `PoisonError` panic — see its docs).
-        let _lock = crate::test_support::env_lock();
-        let original = std::env::var_os("HOME");
-        let _restore = RestoreHome(original.clone());
-        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
-        // span (the `env_lock` guard); no other thread mutates HOME
-        // concurrently.
-        unsafe {
-            std::env::set_var("HOME", &empty_home);
-        }
-        let launch = LaunchConfig {
-            system_prompt: Some("explicit prompt".to_string()),
-            model: Some("fake/m1".to_string()),
-            thinking: Some("high".to_string()),
-            tools: Some(vec!["bash".to_string()]),
-            ..Default::default()
-        };
-        assert_eq!(
-            loop_.resolve_launch(&launch, "nope"),
-            launch,
-            "an unknown agentName returns the launch verbatim"
-        );
-    }
-
-    /// (ADR 0020) a CASE-INSENSITIVE exact match applies the frontmatter
-    /// (the file's `name: scout` matches `agentName: "Scout"`).
-    #[test]
-    fn resolve_launch_case_insensitive_match() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "Scout");
-        assert_eq!(resolved.model, Some("fake/m1".to_string()));
-        assert_eq!(resolved.frontmatter_thinking, Some("low".to_string()));
-        assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
-        assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
-    }
-
-    /// (ADR 0020) an all-`None` launch + a file with `model` (IN the
-    /// catalog), `thinking`, `tools` + a body → ALL FOUR fields are
-    /// populated from the file (the frontmatter fills the gaps).
-    #[test]
-    fn resolve_launch_frontmatter_fills_gaps() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [read, bash]\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
-        assert_eq!(resolved.model, Some("fake/m1".to_string()));
-        assert_eq!(resolved.frontmatter_thinking, Some("low".to_string()));
-        assert_eq!(
-            resolved.tools,
-            Some(vec!["read".to_string(), "bash".to_string()])
-        );
-    }
-
-    /// (ADR 0020) a launch with ALL FOUR fields set to values X + a file
-    /// with DIFFERENT values Y, EXCEPT `launch.thinking` is `None` →
-    /// the three set fields keep X (the explicit params win) AND
-    /// `thinking` becomes Y (the `None` field is filled from the file —
-    /// the second assertion fails under the verbatim stub, which would
-    /// leave `thinking` `None`).
-    #[test]
-    fn resolve_launch_explicit_params_win_over_frontmatter() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: Some("X prompt".to_string()),
-            model: Some("fake/m1".to_string()),
-            thinking: None,
-            tools: Some(vec!["bash".to_string()]),
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        // The explicit params win (the file's `model: fake/m2` is stale
-        // anyway — the explicit `fake/m1` is the next layer):
-        assert_eq!(resolved.system_prompt, Some("X prompt".to_string()));
-        assert_eq!(resolved.model, Some("fake/m1".to_string()));
-        assert_eq!(resolved.tools, Some(vec!["bash".to_string()]));
-        // The `None` field is filled from the file:
-        assert_eq!(resolved.frontmatter_thinking, Some("low".to_string()));
-    }
-
-    /// (ADR 0020) a frontmatter `model` that resolves to NOTHING (not in
-    /// the catalog — a stale file) degrades to the next layer (the
-    /// explicit param, else the parent model) — a stale file must not
-    /// fail the dispatch. `thinking` (unaffected by the model degrade)
-    /// is still filled from the file — the second assertion fails under
-    /// the verbatim stub.
-    #[test]
-    fn resolve_launch_stale_frontmatter_model_degrades_to_explicit_param() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\n---\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: Some("fake/m1".to_string()),
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.model,
-            Some("fake/m1".to_string()),
-            "the stale frontmatter model degrades to the explicit param"
-        );
-        assert_eq!(
-            resolved.frontmatter_thinking,
-            Some("low".to_string()),
-            "the thinking is still filled from the file"
-        );
-    }
-
-    /// (ADR 0020) a stale frontmatter `model` + an all-`None` launch →
-    /// `model` degrades to `None` (the parent model applies downstream)
-    /// AND `tools` is still filled from the file (the second assertion
-    /// fails under the verbatim stub).
-    #[test]
-    fn resolve_launch_stale_frontmatter_model_degrades_to_none() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\ntools: [read]\n---\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.model, None,
-            "the stale frontmatter model degrades to `None` (the parent model applies downstream)"
-        );
-        assert_eq!(
-            resolved.tools,
-            Some(vec!["read".to_string()]),
-            "the tools are still filled from the file"
-        );
-    }
-
-    /// (ADR 0020) a stale frontmatter `model` WITH a `:<level>` suffix:
-    /// the suffix is stripped ONLY for the resolvability check (the bare
-    /// `fake/m2` is not in the catalog — the suffix does not save it)
-    /// AND `system_prompt` is still filled from the body (the second
-    /// assertion fails under the verbatim stub).
-    #[test]
-    fn resolve_launch_stale_model_with_level_suffix_degrades() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2:high\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.model, None,
-            "the bare `fake/m2` is not in the catalog — the suffix does not save it"
-        );
-        assert_eq!(
-            resolved.system_prompt,
-            Some("You are a scout.".to_string()),
-            "the body is still filled from the file"
-        );
-    }
-
-    /// (ADR 0020) unknown tool names in the frontmatter are DROPPED (a
-    /// file hint, not precise intent) — known names are kept.
-    #[test]
-    fn resolve_launch_unknown_tool_names_are_dropped() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\ntools: [read, bogus_tool]\n---\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.tools,
-            Some(vec!["read".to_string()]),
-            "known names are kept, unknown names are dropped"
-        );
-    }
-
-    /// (ADR 0020) a frontmatter `tools` list that empties out after the
-    /// unknown-name drop is treated as ABSENT (the child is never
-    /// zeroed out by a stale file) AND `model` (IN the catalog) is
-    /// still filled from the file (the second assertion fails under the
-    /// verbatim stub).
-    #[test]
-    fn resolve_launch_tools_emptied_out_degrades_to_none() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [bogus_tool]\n---\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.tools, None,
-            "an emptied-out list degrades to `None` (never an empty allowlist)"
-        );
-        assert_eq!(
-            resolved.model,
-            Some("fake/m1".to_string()),
-            "the model (in the catalog) is still filled from the file"
-        );
-    }
-
-    /// (ADR 0020) a frontmatter `tools` list that holds ONLY the
-    /// parent-guarded names (`subagent` / `list_agents` — they can never
-    /// reach the child) is treated as ABSENT (the child is never
-    /// zeroed out by a stale file) AND `model` (IN the catalog) is
-    /// still filled from the file (the second assertion fails under a
-    /// no-op change).
-    ///
-    /// No `env_lock()` here (intentional): `resolve_launch` reads `HOME`
-    /// (via `discover_agents` → `user_roots`) concurrently with the
-    /// `HOME`-mutating tests, but the isolation is safe by construction:
-    /// (1) the space-level roots are scanned FIRST (first-wins dedupe),
-    /// so a user-level same-name file can never shadow the space-level
-    /// definition written below; (2) the mutators' scratch homes contain
-    /// no agent files. Asserting on a USER-level definition would
-    /// require `env_lock()` first.
-    #[test]
-    fn resolve_launch_guarded_tool_names_in_frontmatter_degrade_to_none() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [subagent, list_agents]\n---\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.tools, None,
-            "a guarded-only list degrades to `None` (never an empty allowlist)"
-        );
-        assert_eq!(
-            resolved.model,
-            Some("fake/m1".to_string()),
-            "the model (in the catalog) is still filled from the file"
-        );
-    }
-
-    /// (ADR 0020) an EMPTY frontmatter body means "no system prompt" (an
-    /// `or_else` must not turn it into `Some("")` — `dispatch_native`
-    /// would prepend an empty message) AND `thinking` is still filled
-    /// from the file (the second assertion fails under the verbatim
-    /// stub).
-    #[test]
-    fn resolve_launch_empty_body_means_no_system_prompt() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let loop_ = build_loop(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-        );
-        let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-        if let Some(parent) = agent_file.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(
-            &agent_file,
-            "---\nname: scout\ndescription: Fast recon.\nthinking: low\n---\n",
-        )
-        .unwrap();
-        let launch = LaunchConfig {
-            system_prompt: None,
-            model: None,
-            thinking: None,
-            tools: None,
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.system_prompt, None,
-            "an empty body means `None` (NOT `Some(\"\")` )"
-        );
-        assert_eq!(
-            resolved.frontmatter_thinking,
-            Some("low".to_string()),
-            "the thinking is still filled from the file"
-        );
-    }
-
-    /// (ADR 0023) a settings `subagentModels` override (RESOLVABLE —
-    /// in the catalog) beats the frontmatter `model`.
-    #[test]
-    fn resolve_launch_settings_override_beats_frontmatter_model() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("settings.json"),
-            r#"{ "subagentModels": { "scout": "fake/m2" } }"#,
-        )
-        .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
-        std::fs::write(
-            home.join(".agents/agents/scout.md"),
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let _lock = crate::test_support::env_lock();
-        let original = std::env::var_os("HOME");
-        let _restore = RestoreHome(original.clone());
-        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
-        // span (the `env_lock` guard); no other thread mutates HOME
-        // concurrently.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let (loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1"), fake_model("m2")],
-            Some(&config_dir),
-        );
-        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
-        assert_eq!(
-            resolved.model,
-            Some("fake/m2".to_string()),
-            "the settings override beats the frontmatter model"
-        );
-    }
-
-    /// (ADR 0023) the EXPLICIT launch param beats the settings override.
-    #[test]
-    fn resolve_launch_explicit_param_beats_settings_override() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("settings.json"),
-            r#"{ "subagentModels": { "scout": "fake/m2" } }"#,
-        )
-        .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
-        std::fs::write(
-            home.join(".agents/agents/scout.md"),
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let _lock = crate::test_support::env_lock();
-        let original = std::env::var_os("HOME");
-        let _restore = RestoreHome(original.clone());
-        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
-        // span (the `env_lock` guard); no other thread mutates HOME
-        // concurrently.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let (loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1"), fake_model("m2")],
-            Some(&config_dir),
-        );
-        let launch = LaunchConfig {
-            model: Some("fake/m1".to_string()),
-            ..Default::default()
-        };
-        let resolved = loop_.resolve_launch(&launch, "scout");
-        assert_eq!(
-            resolved.model,
-            Some("fake/m1".to_string()),
-            "the explicit param beats the settings override"
-        );
-    }
-
-    /// (ADR 0023) a settings override that resolves to NOTHING (NOT in
-    /// the catalog — a stale override) degrades SOFT to the frontmatter
-    /// `model` (never an error, never `None`).
-    #[test]
-    fn resolve_launch_stale_override_degrades_to_frontmatter() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("settings.json"),
-            r#"{ "subagentModels": { "scout": "fake/nope" } }"#,
-        )
-        .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
-        std::fs::write(
-            home.join(".agents/agents/scout.md"),
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let _lock = crate::test_support::env_lock();
-        let original = std::env::var_os("HOME");
-        let _restore = RestoreHome(original.clone());
-        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
-        // span (the `env_lock` guard); no other thread mutates HOME
-        // concurrently.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let (loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1"), fake_model("m2")],
-            Some(&config_dir),
-        );
-        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
-        assert_eq!(
-            resolved.model,
-            Some("fake/m1".to_string()),
-            "a stale override degrades to the frontmatter model (soft)"
-        );
-    }
-
-    /// (ADR 0023) the override key matches CASE-INSENSITIVELY (a capital
-    /// settings key `"Scout"` matches the file's `name: scout` + the
-    /// case-insensitive `agentName` `"Scout"`).
-    #[test]
-    fn resolve_launch_case_insensitive_override_key() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("settings.json"),
-            r#"{ "subagentModels": { "Scout": "fake/m2" } }"#,
-        )
-        .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
-        std::fs::write(
-            home.join(".agents/agents/scout.md"),
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let _lock = crate::test_support::env_lock();
-        let original = std::env::var_os("HOME");
-        let _restore = RestoreHome(original.clone());
-        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
-        // span (the `env_lock` guard); no other thread mutates HOME
-        // concurrently.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let (loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1"), fake_model("m2")],
-            Some(&config_dir),
-        );
-        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "Scout");
-        assert_eq!(
-            resolved.model,
-            Some("fake/m2".to_string()),
-            "the capital settings key matches the lowercase agentName"
-        );
-    }
-
-    /// (ADR 0023) a `settings.json` with an EMPTY `subagentModels` map →
-    /// no override layer → the frontmatter `model` applies (today's
-    /// behavior).
-    #[test]
-    fn resolve_launch_no_override_keeps_the_frontmatter() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("settings.json"),
-            r#"{ "subagentModels": {} }"#,
-        )
-        .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
-        std::fs::write(
-            home.join(".agents/agents/scout.md"),
-            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let _lock = crate::test_support::env_lock();
-        let original = std::env::var_os("HOME");
-        let _restore = RestoreHome(original.clone());
-        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
-        // span (the `env_lock` guard); no other thread mutates HOME
-        // concurrently.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let (loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1"), fake_model("m2")],
-            Some(&config_dir),
-        );
-        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
-        assert_eq!(
-            resolved.model,
-            Some("fake/m1".to_string()),
-            "no override → the frontmatter model applies"
-        );
-    }
-
-    /// (ADR 0023 thinking split) the frontmatter's `thinking` moves to
-    /// its OWN field (`frontmatter_thinking`): `thinking` holds the
-    /// EXPLICIT param only (`None` here) — the dispatch layers the
-    /// frontmatter's `thinking` LAST.
-    #[test]
-    fn resolve_launch_frontmatter_thinking_migrates_to_its_own_field() {
-        let (provider, _calls) = ScriptedProvider::new(vec![]);
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
-        std::fs::write(
-            home.join(".agents/agents/scout.md"),
-            "---\nname: scout\ndescription: Fast recon.\nthinking: low\n---\nYou are a scout.\n",
-        )
-        .unwrap();
-        let _lock = crate::test_support::env_lock();
-        let original = std::env::var_os("HOME");
-        let _restore = RestoreHome(original.clone());
-        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
-        // span (the `env_lock` guard); no other thread mutates HOME
-        // concurrently.
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let (loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1")],
-            None,
-        );
-        let resolved = loop_.resolve_launch(&LaunchConfig::default(), "scout");
-        assert_eq!(
-            resolved.thinking, None,
-            "`thinking` holds the EXPLICIT param only"
-        );
-        assert_eq!(
-            resolved.frontmatter_thinking,
-            Some("low".to_string()),
-            "the frontmatter's `thinking` moves to its own field"
-        );
     }
 
     /// (ADR 0023 thinking-order regression) the `:<level>` suffix of the
@@ -6419,14 +4571,6 @@ mod tests {
     }
 
     #[test]
-    fn role_str_maps_the_roles() {
-        assert_eq!(role_str(ChatRole::System), "system");
-        assert_eq!(role_str(ChatRole::User), "user");
-        assert_eq!(role_str(ChatRole::Assistant), "assistant");
-        assert_eq!(role_str(ChatRole::Tool), "tool");
-    }
-
-    #[test]
     fn result_text_takes_the_first_text_block() {
         let r = ToolResult {
             content: vec![
@@ -6605,57 +4749,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shape_ask_result_cancelled() {
-        let params = json!({
-            "questions": [{ "id": "q1", "question": "Which?", "options": [{ "label": "A" }] }]
-        });
-        // A `cancelled: true` with no selections (or a missing response —
-        // a timeout) → the cancelled shape.
-        let r = shape_ask_result(
-            Some(json!({ "cancelled": true, "results": [{ "id": "q1", "selectedOptions": [] }] })),
-            &params,
-        );
-        assert_eq!(
-            result_text(&r),
-            "User cancelled the question.",
-            "a cancel is the cancelled shape"
-        );
-        assert!(!r.is_error);
-        let r = shape_ask_result(None, &params);
-        assert_eq!(result_text(&r), "User cancelled the question.");
-    }
-
-    #[test]
-    fn shape_ask_result_answered() {
-        let params = json!({
-            "questions": [{
-                "id": "q1",
-                "question": "Which framework?",
-                "options": [{ "label": "Tauri" }, { "label": "Electron" }],
-                "multi": false
-            }]
-        });
-        let r = shape_ask_result(
-            Some(json!({
-                "cancelled": false,
-                "results": [{ "id": "q1", "selectedOptions": ["Tauri"] }]
-            })),
-            &params,
-        );
-        let text = result_text(&r);
-        assert!(
-            text.starts_with("User answers:"),
-            "the answered shape, got {text}"
-        );
-        assert!(text.contains("q1: Tauri"), "the summary line, got {text}");
-        assert!(
-            text.contains("Prompt: Which framework?"),
-            "the context block, got {text}"
-        );
-        assert!(!r.is_error);
-    }
-
     #[tokio::test]
     async fn model_requests_carry_the_session_id_across_turns_and_tool_calls() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -6722,36 +4815,6 @@ mod tests {
                 "call {i} should carry Some(\"s1\")",
             );
         }
-    }
-
-    #[tokio::test]
-    async fn summarize_model_request_carries_the_session_id() {
-        let recorded = Arc::new(StdMutex::new(Vec::new()));
-        let provider = SessionRecordingProvider::new(recorded.clone());
-        let (mut loop_, _db) = build_loop_with_db(
-            Box::new(provider),
-            mpsc::unbounded_channel().0,
-            Arc::new(StdMutex::new(CancellationToken::new())),
-            watch::channel(0u64).0,
-            RetryPolicy::new_with(5, Duration::from_millis(1)),
-            vec![fake_model("m1")],
-            None,
-        );
-        let older = vec![ChatMessage {
-            role: ChatRole::User,
-            content: MessageContent::Text("history".to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        let summary = loop_
-            .summarize(&older, &CancellationToken::new())
-            .await
-            .expect("summarize succeeds");
-        assert_eq!(summary, "ok");
-
-        let sessions = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert_eq!(sessions.len(), 1, "expected 1 model call for summarize");
-        assert_eq!(sessions[0], Some("s1".to_string()));
     }
 
     /// (ADR 0018) A session with a temp `mcp.json` (the fake stdio server)

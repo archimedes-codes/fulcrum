@@ -24,6 +24,14 @@
 
 use serde_json::Value;
 
+/// Sink for outbound events (session updates, session-closed, …).
+///
+/// The Tauri wiring implements this with `AppHandle::emit`; tests implement
+/// it with a channel so events are assertable.
+pub trait EventSink: Send + Sync {
+    fn emit(&self, event: &str, payload: Value);
+}
+
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]

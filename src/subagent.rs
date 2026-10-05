@@ -21,8 +21,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
 
+use crate::agent::events::EventSink;
 use crate::agent::harness::Model;
-use crate::agent::session::{mint_session_id, EventSink};
+use crate::agent::harness::ModelKey;
+use crate::agent::types::mint_session_id;
 use crate::agent::worker::manager::WorkerManager;
 use crate::agent::worker::protocol::SubagentDispatchWire;
 
@@ -156,7 +158,7 @@ impl SubagentSessionManager {
             // The RESOLVED model key (the `provider/id` composition —
             // the flow resolves it against the parent's effective
             // catalog; a `launch.model` override wins over it).
-            model_key: format!("{}/{}", parent_model.provider, parent_model.id),
+            model_key: ModelKey::from(parent_model).to_string(),
         };
         wm.dispatch_subagent_to(parent_session_id.as_ref(), wire, child_id.clone(), tx);
         (rx, SubagentCancel::new_worker(wm, child_id))
@@ -267,8 +269,8 @@ mod tests {
 
     use tokio::sync::oneshot;
 
+    use crate::agent::events::EventSink;
     use crate::agent::harness::catalog::{Model, ModelCatalog};
-    use crate::agent::session::EventSink;
     use crate::agent::subagent::{
         LaunchConfig, SubagentCancel, SubagentOutcome, SubagentSessionManager,
     };

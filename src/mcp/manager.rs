@@ -16,7 +16,7 @@ use super::http::{HttpClient, TokenProvider};
 use super::oauth;
 use super::stdio::StdioClient;
 use super::types::{AuthSpec, McpState, ServerDef, ToolCallResult, ToolInfo};
-use crate::commands::settings::load_settings;
+use crate::config::load_settings;
 
 /// A connected MCP server (a stdio or HTTP client — the unified interface
 /// the manager routes `list_tools` / `call_tool` through).

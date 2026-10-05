@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::agent::events::EventSink;
 use crate::agent::harness::catalog::Model;
 use crate::agent::harness::dispatch::SubagentDispatcher;
-use crate::agent::session::EventSink;
+use crate::agent::harness::ModelKey;
 use crate::agent::subagent::{LaunchConfig, SubagentCancel, SubagentOutcome};
 use crate::agent::worker::protocol::Outbound;
 
@@ -63,7 +64,7 @@ impl SubagentDispatcher for IpcDispatcher {
         // loop's pre-flight resolved against the Worker's catalog
         // (the Supervisor resolves the key → provider config (it owns
         // the catalog + settings) → the child's `Start`).
-        let model_key = format!("{}/{}", parent_model.provider, parent_model.id);
+        let model_key = ModelKey::from(parent_model).to_string();
         // Unbounded — send never fails (nothing is dropped).
         let _ = self.outbound.send(Outbound::SubagentDispatch {
             id: id.clone(),
@@ -107,8 +108,8 @@ impl SubagentDispatcher for IpcDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::events::EventSink;
     use crate::agent::harness::catalog::Model;
-    use crate::agent::session::EventSink;
     use crate::agent::subagent::{LaunchConfig, SubagentOutcome};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex as StdMutex};
