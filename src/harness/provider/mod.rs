@@ -45,10 +45,10 @@ pub fn build_provider(m: &crate::agent::harness::catalog::Model) -> Box<dyn Prov
         // but a hand-built `Model` with a weird `api` still gets a
         // working client). `litellm` is a DISCOVERY mode, not a wire —
         // its completion wire IS `openai-completions` (ADR 0026).
-        _ => Box::new(OpenAiCompatibleProvider {
-            base_url: m.base_url.clone(),
-            api_key: m.api_key.clone(),
-        }),
+        _ => Box::new(OpenAiCompatibleProvider::new(
+            m.base_url.clone(),
+            m.api_key.clone(),
+        )),
     }
 }
 

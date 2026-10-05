@@ -319,10 +319,10 @@ mod tests {
                 )
                 .await;
         });
-        let provider = super::super::openai::OpenAiCompatibleProvider {
-            base_url: format!("http://{addr}/v1"),
-            api_key: "k".to_string(),
-        };
+        let provider = super::super::openai::OpenAiCompatibleProvider::new(
+            format!("http://{addr}/v1"),
+            "k".to_string(),
+        );
         let req = ModelRequest {
             model: "m/1".to_string(),
             messages: Vec::new(),

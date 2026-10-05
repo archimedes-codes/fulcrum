@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -24,13 +25,90 @@ use super::types::{
 };
 /// A client for the OpenAI-compatible chat-completions API (OpenAI,
 /// OpenRouter, `tama`, …).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OpenAiCompatibleProvider {
     /// The API base (e.g. `https://openrouter.ai/api/v1` — the client
     /// appends `/chat/completions`).
     pub base_url: String,
     /// The `Authorization: Bearer` key.
     pub api_key: String,
+    /// The `stream_options.include_usage` LATCH (the `stream_options`
+    /// retry-and-latch): `true` until a request carrying the field is
+    /// REJECTED for mentioning it — from then on every request omits it.
+    /// Internal per-instance state (NOT a knob), hence not `pub`.
+    accepts_stream_options: AtomicBool,
+}
+
+impl OpenAiCompatibleProvider {
+    /// The production constructor (a fresh client — usage reporting ON
+    /// until this instance learns otherwise; the latch is PER INSTANCE, so
+    /// one hostile proxy does not disable usage for the whole process).
+    pub fn new(base_url: String, api_key: String) -> Self {
+        Self {
+            base_url,
+            api_key,
+            accepts_stream_options: AtomicBool::new(true),
+        }
+    }
+
+    /// The `stream_options` retry-and-latch (the `complete()`'s status
+    /// gate): the FIRST streaming call asks for `stream_options.include_usage`
+    /// (an OpenAI-compatible stream carries NO `usage` chunk unless asked —
+    /// and a usage-less session freezes the context bar and can never trip
+    /// compaction). A FEW strict proxies reject the unknown field with a
+    /// 400, which would otherwise be a `Fatal` on EVERY model call — so on
+    /// a rejection that MENTIONS the field, re-issue once WITHOUT it and
+    /// latch the omission for this instance's lifetime.
+    ///
+    /// The gate is the error's MESSAGE as well as its tier (the body, which
+    /// `map_response` embeds verbatim): an unrelated 400 (a bad model, a
+    /// malformed body) stays the `Fatal` it always was and is NOT re-tried.
+    /// A false positive — a 400 whose text happens to name the field for
+    /// another reason — costs one extra request and then loses usage
+    /// reporting for this session, where the loop's local estimate takes over.
+    async fn send_model_request(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        req: &ModelRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let builder = |body: &Value| {
+            let mut b = client.post(url).bearer_auth(&self.api_key);
+            for (name, value) in litellm_headers(req.session_id.as_deref()) {
+                b = b.header(name, value);
+            }
+            b.json(body)
+        };
+        let stream_options =
+            req.options.stream && self.accepts_stream_options.load(Ordering::Relaxed);
+        let resp = builder(&request_body(req, stream_options))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Retryable(format!("request failed: {e}")))?;
+        let err = match map_response(resp).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => e,
+        };
+        // The retry is gated on BOTH halves: a client error (a 4xx →
+        // `Fatal` — a 429/5xx is the `Retryable` the `RetryPolicy` already
+        // handles, and re-issuing here would skip its backoff) that NAMES
+        // the field.
+        if !stream_options
+            || !matches!(err, ProviderError::Fatal(_))
+            || !is_stream_options_rejection(&err)
+        {
+            return Err(err);
+        }
+        // A usage-request rejection is permanent for this endpoint — latch
+        // it BEFORE the retry (the retry itself carries no field, so a
+        // SECOND rejection cannot re-latch from here).
+        self.accepts_stream_options.store(false, Ordering::Relaxed);
+        let resp = builder(&request_body(req, false))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Retryable(format!("request failed: {e}")))?;
+        map_response(resp).await
+    }
 }
 
 /// The accumulated per-`index` tool-call state (fragments arrive as
@@ -84,7 +162,10 @@ impl LineAssembler {
         if self.buf.is_empty() {
             return None;
         }
-        let line: Vec<u8> = self.buf.drain(..).collect();
+        // `mem::take`, not `drain(..).collect()` — same result (the whole
+        // buffer handed over, `buf` left empty) without the extra
+        // allocation (`clippy::drain_collect`, rustc 1.99).
+        let line = std::mem::take(&mut self.buf);
         Some(String::from_utf8_lossy(&line).into_owned())
     }
 }
@@ -366,22 +447,9 @@ impl Provider for OpenAiCompatibleProvider {
             Duration::from_secs(30),     // a generous CONNECT bound
             Duration::from_secs(5 * 60), // 5 min of SILENCE = a stalled provider
         );
-        let mut builder = client.post(&url).bearer_auth(&self.api_key);
-        for (name, value) in litellm_headers(req.session_id.as_deref()) {
-            builder = builder.header(name, value);
-        }
-        let resp = builder
-            .json(&request_body(req))
-            .send()
-            .await
-            .map_err(|e| ProviderError::Retryable(format!("request failed: {e}")))?;
-
-        // Map the HTTP status to a `ProviderError` BEFORE the SSE body is
-        // consumed (`transport::map_response`: the error payload is read ONLY
-        // for a 4xx/5xx — 401/403 → `Auth`, 429/5xx → `Retryable`, other
-        // 4xx → `Fatal`; any other non-success (1xx/3xx) → the terminal
-        // `Fatal` with NO body suffix).
-        let resp = map_response(resp).await?;
+        // The request + status gate (the `stream_options` retry-and-latch
+        // lives in `send_model_request`).
+        let resp = self.send_model_request(&client, &url, req).await?;
 
         // `bytes_stream` yields `bytes::Bytes`; map to `Vec<u8>` so the
         // stream type does not name the `bytes` crate.
@@ -389,6 +457,19 @@ impl Provider for OpenAiCompatibleProvider {
             resp.bytes_stream().map(|r| r.map(|b| b.to_vec())).boxed();
         Ok(Box::pin(SseStream::new(raw)))
     }
+}
+
+/// Does a `ProviderError` say the endpoint REJECTED the request for its
+/// `stream_options` field? The `map_status` message embeds the error body
+/// verbatim (`status {status}: {body}`), so a strict proxy's complaint —
+/// "Unrecognized field: stream_options", "Unsupported parameter:
+/// stream_options", … — is in there. Matched on the lowercased `usage`-
+/// request marker: any wording that names the field, on any tier. A
+/// genuine `Auth` error never names it, so the tiers stay intact.
+fn is_stream_options_rejection(err: &ProviderError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("stream_options")
 }
 
 /// Build the OpenAI-compatible request body from a [`ModelRequest`]
@@ -399,7 +480,11 @@ impl Provider for OpenAiCompatibleProvider {
 /// `Blocks` — and an assistant `tool_calls` is serialized in the
 /// OpenAI shape (`{ id, type: "function", function: { name, arguments:
 /// <string> } }`).
-fn request_body(req: &ModelRequest) -> Value {
+///
+/// `stream_options.include_usage` is sent when `ask_usage` is set (the
+/// provider's latch — see `send_model_request`), on TOP of the request's
+/// own `stream` flag.
+fn request_body(req: &ModelRequest, ask_usage: bool) -> Value {
     let messages: Vec<Value> = req
         .messages
         .iter()
@@ -444,6 +529,17 @@ fn request_body(req: &ModelRequest) -> Value {
         "messages": Value::Array(messages),
         "stream": req.options.stream,
     });
+    // An OpenAI-compatible stream carries NO `usage` chunk unless the
+    // request asks for it — and a usage-less session is worse than a
+    // cosmetic problem: the `AgentLoop`'s `last_context_tokens` and the
+    // `Compactor`'s accumulation are BOTH fed by the `Usage` event, so
+    // without it the context bar freezes at its first estimate and
+    // auto-compaction can NEVER trip (an unbounded transcript until the
+    // provider 400s). Streaming-only: OpenAI rejects `stream_options`
+    // with `stream: false`.
+    if req.options.stream && ask_usage {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     if !req.tools.is_empty() {
         body["tools"] = req
             .tools
@@ -503,10 +599,10 @@ mod tests {
     /// so a second provider (Anthropic) can be added later.
     #[test]
     fn provider_trait_is_object_safe() {
-        let provider: Box<dyn Provider> = Box::new(OpenAiCompatibleProvider {
-            base_url: "https://example.com/v1".to_string(),
-            api_key: "k".to_string(),
-        });
+        let provider: Box<dyn Provider> = Box::new(OpenAiCompatibleProvider::new(
+            "https://example.com/v1".to_string(),
+            "k".to_string(),
+        ));
         let _ = provider;
     }
 
@@ -641,6 +737,32 @@ mod tests {
                 ProviderEvent::Done(FinishReason::Error),
             ]
         );
+    }
+
+    /// `LineAssembler::finish` is shared by all three SSE parsers, so its
+    /// contract is pinned directly: a non-empty tail is returned ONCE as
+    /// lossy text and the buffer is left empty (a second call yields `None`),
+    /// and a never-written assembler reports `None`.
+    #[test]
+    fn line_assembler_finish_returns_tail_once_then_none() {
+        let mut a = LineAssembler::new();
+        assert_eq!(a.finish(), None, "empty assembler has no tail");
+
+        // An unterminated tail (no trailing '\n') is flushed as-is.
+        assert!(a.push(b"data: partial").is_empty(), "no newline, no line");
+        assert_eq!(a.finish(), Some("data: partial".to_string()));
+        assert_eq!(a.finish(), None, "the tail is consumed, not replayed");
+
+        // A complete line is returned by push (terminator included —
+        // `handle_line` strips it), leaving nothing to flush.
+        assert_eq!(a.push(b"data: whole\n"), vec!["data: whole\n".to_string()]);
+        assert_eq!(a.finish(), None, "complete lines leave no tail");
+
+        // A tail that ends mid-codepoint is truncated lossily (the only
+        // option once the wire is done).
+        assert!(a.push("你好".as_bytes()[..4].as_ref()).is_empty());
+        let tail = a.finish().expect("split codepoint still flushes a tail");
+        assert!(tail.contains('\u{FFFD}'), "got {tail:?}");
     }
 
     #[tokio::test]
@@ -811,7 +933,7 @@ mod tests {
             },
             session_id: None,
         };
-        let body = request_body(&req);
+        let body = request_body(&req, true);
         assert_eq!(body["model"], "m");
         assert_eq!(body["stream"], true);
         let temperature = body["temperature"]
@@ -832,6 +954,42 @@ mod tests {
         // `Blocks` content serializes as an array of OpenAI parts (the
         // `to_wire` shape — `ContentBlock::Text` verbatim).
         assert_eq!(body["messages"][2]["content"][0]["type"], "text");
+        // `stream_options.include_usage` — an OpenAI-compatible stream
+        // carries NO `usage` chunk unless the request asks for it, and a
+        // usage-less session freezes the context bar and NEVER trips the
+        // compaction threshold.
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    /// A NON-streaming request carries no `stream_options` (the field is
+    /// streaming-only — OpenAI 400s on it with `stream: false`).
+    #[test]
+    fn request_body_omits_stream_options_when_not_streaming() {
+        // The `sample_request` fields, restated (that fn inlines its
+        // `messages`); only `stream` differs.
+        let req = ModelRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("hi".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: false,
+            },
+            session_id: None,
+        };
+        let body = request_body(&req, true);
+        assert_eq!(body["stream"], false);
+        assert!(
+            body.get("stream_options").is_none(),
+            "stream_options is streaming-only"
+        );
     }
 
     /// The model-request wire form is the OpenAI shape: `Text` → a plain
@@ -914,7 +1072,7 @@ mod tests {
             },
             session_id: None,
         };
-        let body = request_body(&req);
+        let body = request_body(&req, true);
         let calls = body["messages"][0]["tool_calls"]
             .as_array()
             .expect("assistant tool_calls are present");
@@ -973,7 +1131,7 @@ mod tests {
             },
             session_id: None,
         };
-        let body = request_body(&req);
+        let body = request_body(&req, true);
         assert!(body.get("tools").is_none());
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_tokens").is_none());

@@ -54,14 +54,38 @@ impl Compactor {
         self.context_tokens > threshold
     }
 
-    /// Re-estimate the context from the (post-compaction) messages.
+    /// Re-estimate the context from the (post-compaction) messages — the
+    /// RESET path (after a compaction the transcript genuinely shrank, and
+    /// a resume has no accumulated usage to keep, so the estimate
+    /// REPLACES the accumulation, even downward).
     pub fn reestimate(&mut self, messages: &[ChatMessage]) {
-        self.context_tokens = messages
-            .iter()
-            .map(estimate_message_tokens)
-            .map(u64::from)
-            .sum();
+        self.context_tokens = estimate_context(messages);
     }
+
+    /// The usage-less fallback: re-estimate from the transcript as a
+    /// FLOOR-RAISER — adopt the estimate only when it exceeds what is
+    /// already known. A session on an endpoint that reports usage on SOME
+    /// calls only would otherwise have its authoritative (larger)
+    /// usage-based count replaced by the smaller `chars / 4` estimate on
+    /// every gapped call — the context bar would move backwards and the
+    /// compaction threshold metric would drop (compaction delayed while
+    /// the session grows). Returns the tracked count.
+    pub fn raise_context_from_estimate(&mut self, messages: &[ChatMessage]) -> u64 {
+        self.context_tokens = self.context_tokens.max(estimate_context(messages));
+        self.context_tokens
+    }
+}
+
+/// The transcript's local token estimate (the sum over the messages).
+///
+/// `pub(crate)` so the `AgentLoop` can raise its DISPLAY metric with the
+/// same number the threshold uses (one source for both).
+pub(crate) fn estimate_context(messages: &[ChatMessage]) -> u64 {
+    messages
+        .iter()
+        .map(estimate_message_tokens)
+        .map(u64::from)
+        .sum()
 }
 
 /// A local estimate: the text's `chars / 4` + a flat cost per tool call
@@ -560,6 +584,36 @@ mod tests {
             output_tokens: 10,
         });
         assert!(c.should_compact(), "20 > 0 (the saturated threshold)");
+    }
+
+    #[test]
+    fn raise_context_from_estimate_never_lowers_the_accumulated_usage() {
+        let mut c = Compactor::new(
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 100,
+                keep_recent_tokens: 10,
+            },
+            1000,
+        );
+        c.add_usage(&Usage {
+            input_tokens: 900,
+            output_tokens: 900,
+        });
+        // A tiny transcript: the estimate is far below the accumulation.
+        assert_eq!(
+            c.raise_context_from_estimate(&[text_msg("short")]),
+            1800,
+            "the estimate is a floor-raiser, not a replacement"
+        );
+        assert_eq!(c.context_tokens(), 1800, "the accumulation survives");
+        // And it DOES move when the transcript outgrows the count.
+        let big = text_msg(&"y".repeat(40_000));
+        let raised = c.raise_context_from_estimate(&[big]);
+        assert!(
+            raised > 1800,
+            "a transcript larger than the count is adopted, got {raised}"
+        );
     }
 
     #[test]

@@ -836,6 +836,9 @@ impl AgentLoop {
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls.clone()),
             });
             self.persist_transcript_message();
+            // The usage-less fallback (the assistant message is now in the
+            // transcript, so the estimate covers it).
+            self.note_context_without_usage(acc.usage.is_none());
 
             if tool_calls.is_empty() {
                 // (5) The turn is done.
@@ -955,6 +958,42 @@ impl AgentLoop {
             // assistant message — `message_start` is re-armed).
             message_started = false;
         }
+    }
+
+    /// The usage-less fallback (the context bar + the compaction
+    /// threshold): a model call that reported NO `Usage` leaves both the
+    /// `Compactor`'s accumulation and `last_context_tokens` untouched,
+    /// so a session on a usage-stripping endpoint would show a FROZEN
+    /// percentage and could never trip compaction (an unbounded transcript
+    /// until the provider 400s). Re-estimate from the transcript instead
+    /// — the same local estimate the resume / compaction anchors use, so
+    /// the display and the threshold read ONE source.
+    ///
+    /// Only on a usage-less call, and only ever UPWARDS. The estimate is a
+    /// FLOOR-RAISER, never a replacement: an endpoint that reports usage on
+    /// SOME calls only (a proxy that emits the usage chunk intermittently)
+    /// would otherwise have its authoritative usage-based accounting
+    /// overwritten by the smaller `chars / 4` estimate on every gapped
+    /// call — the context bar would visibly move BACKWARDS, and the
+    /// compaction threshold metric would drop, delaying compaction while
+    /// the session grew. A genuine downward reset stays the job of
+    /// `reestimate` (post-compaction) and the resume anchor, where the
+    /// transcript really did shrink.
+    fn note_context_without_usage(&mut self, no_usage: bool) {
+        if !no_usage {
+            return;
+        }
+        // The threshold metric: the accumulation raised to the estimate if
+        // the transcript outgrew it.
+        self.compactor.raise_context_from_estimate(&self.messages);
+        // The display: the last known context size raised to the estimate.
+        // NOT the accumulation — that sums every call's input + output, so
+        // it far exceeds what the provider currently holds, and the bar
+        // would read over 100%.
+        self.last_context_tokens = self
+            .last_context_tokens
+            .max(compact::estimate_context(&self.messages));
+        self.emit_context_usage();
     }
 
     /// Settle a CANCELLED turn: `turn_end` (the open `messageId`'s
@@ -2553,6 +2592,113 @@ mod tests {
             "the context size is the response's input tokens"
         );
         assert_eq!(frame["windowTokens"], 128000, "the window is the model's");
+    }
+
+    /// A model call that reports NO `Usage` (a proxy that strips the
+    /// usage chunk — the pre-`stream_options` openai-completions wire,
+    /// or a non-conformant endpoint) must still move the context bar:
+    /// the turn falls back to the LOCAL estimate of the transcript, so
+    /// the display — and, through the same `Compactor`, the compaction
+    /// threshold — track the growing context instead of freezing at the
+    /// value the session started with.
+    #[tokio::test]
+    async fn a_model_call_without_usage_falls_back_to_the_local_estimate() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        // A BIG prompt, and a stream that never reports usage.
+        let prompt = "x".repeat(4000);
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            mpsc::unbounded_channel().0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt(&prompt)).await;
+        let frame =
+            last_context_usage_frame(&updates).expect("a context_usage_update frame was emitted");
+        assert!(
+            frame["usedTokens"].as_u64().unwrap_or(0) > 900,
+            "a usage-less turn re-estimates from the transcript (the prompt is \
+             ~1000 tokens), got {}",
+            frame["usedTokens"]
+        );
+        assert_eq!(
+            frame["usedTokens"],
+            loop_.compactor.context_tokens(),
+            "the fallback estimate is the SAME source the compaction threshold reads"
+        );
+    }
+
+    /// The P1 review fix: a usage-less turn must never move the context
+    /// accounting BACKWARDS. A session that mixes reporting and
+    /// non-reporting calls (a proxy that emits the usage chunk on SOME
+    /// responses) would otherwise replace the authoritative usage-based
+    /// count with the smaller `chars / 4` transcript estimate on the
+    /// gapped calls — the bar visibly shrinks and the compaction
+    /// threshold metric drops (compaction delayed while the session
+    /// grows). The estimate is a FLOOR-RAISER: it is adopted only when it
+    /// exceeds what is already known.
+    #[tokio::test]
+    async fn a_usage_less_turn_never_lowers_the_context_accounting() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        // Turn 1 reports usage (the authoritative, LARGE count); turn 2
+        // reports NONE and its transcript estimate is far smaller.
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::TextDelta("one".to_string()),
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 40_000,
+                    output_tokens: 100,
+                }),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("two".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            mpsc::unbounded_channel().0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("first")).await;
+        let after_usage = last_context_usage_frame(&updates).expect("frame after turn 1");
+        let authoritative = after_usage["usedTokens"].as_u64().unwrap();
+        assert_eq!(authoritative, 40_000, "turn 1 reports the provider's count");
+        loop_.handle_prompt(&text_prompt("second")).await;
+        let after_gap = last_context_usage_frame(&updates).expect("frame after turn 2");
+        assert_eq!(
+            after_gap["usedTokens"].as_u64(),
+            Some(authoritative),
+            "the usage-less turn must not shrink the bar to the transcript estimate"
+        );
+        assert!(
+            loop_.compactor.context_tokens() >= authoritative,
+            "the compaction threshold metric must not drop on a usage-less turn \
+             (it would delay compaction), got {}",
+            loop_.compactor.context_tokens()
+        );
     }
 
     /// `load_transcript` (a resume) re-estimates the context from the
