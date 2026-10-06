@@ -1,10 +1,18 @@
 //! The context compactor (native-agent-harness Task 6): track
-//! `context_tokens` (accumulate `Usage` from responses + a local
-//! estimate of the `messages` vec) and signal when the context exceeds
-//! `context_window - reserve_tokens` (the `reserveTokens` /
-//! `keepRecentTokens` thresholds seeded from `settings.json`'s
-//! `compaction` config via the `ModelCatalog` — default
-//! `16384` / `20000` when absent). The summary model call itself is
+//! `context_tokens` — the context as a SNAPSHOT: the last `Usage` the
+//! provider reported (a response's `input + output` IS the whole context
+//! the model was shown, plus its own reply) plus a local estimate of the
+//! `messages` appended since — and signal when the context exceeds
+//! `context_window - reserve_tokens`. The `reserveTokens` /
+//! `keepRecentTokens` thresholds come from the `ModelCatalog`'s
+//! `CompactionConfig`, which is currently ALWAYS the defaults (`16384` /
+//! `20000`): `Settings` has no `compaction` field, so `merge_catalog`
+//! carries the base catalog's own config and there is no settings surface
+//! to override it from (yet). The snapshot is RE-ANCHORED by
+//! `AgentLoop::note_context` wherever the transcript grows, and RETRACTED
+//! by [`Compactor::turn_abandoned`] when a turn — or a retried model call
+//! within one — ends without the assistant reply `record_usage` had
+//! assumed. The summary model call itself is
 //! orchestrated by the `AgentLoop` (it owns the `Provider`); this type
 //! owns the thresholds + the message split.
 
@@ -18,6 +26,17 @@ pub struct Compactor {
     config: CompactionConfig,
     context_window: u32,
     context_tokens: u64,
+    /// The context as the provider last reported it (`input + output`).
+    usage_base: u64,
+    /// How many messages that report already accounts for.
+    usage_watermark: usize,
+    /// The `output_tokens` of the reply the last `record_usage` assumed the
+    /// caller would append. Kept so a turn that ENDS without appending it (a
+    /// cancel / failure never persists a partial reply) can take it back out
+    /// of the anchor — see [`Compactor::turn_abandoned`], which zeroes it in
+    /// the same breath so a retracted reply never lingers as if it were still
+    /// owed.
+    pending_output: u32,
 }
 
 impl Compactor {
@@ -26,6 +45,9 @@ impl Compactor {
             config,
             context_window,
             context_tokens: 0,
+            usage_base: 0,
+            usage_watermark: 0,
+            pending_output: 0,
         }
     }
 
@@ -38,9 +60,60 @@ impl Compactor {
         self.context_tokens
     }
 
-    /// Accumulate a response's usage (input + output).
-    pub fn add_usage(&mut self, u: &Usage) {
-        self.context_tokens += u64::from(u.input_tokens) + u64::from(u.output_tokens);
+    /// Record the provider's usage for the model call that produced the
+    /// assistant message the caller is about to append. `input + output`
+    /// already IS the whole context — the prompt (every message currently in
+    /// the transcript) plus that assistant message's own output — so it
+    /// REPLACES the count, it is never added to it (the accumulation was the
+    /// bug: a re-sent prompt charged once per call). The watermark sits past
+    /// that assistant message, so the trailing estimate starts after it.
+    pub fn record_usage(&mut self, u: &Usage, messages: &[ChatMessage]) {
+        self.usage_base = u64::from(u.input_tokens) + u64::from(u.output_tokens);
+        self.usage_watermark = messages.len() + 1;
+        self.pending_output = u.output_tokens;
+        self.context_tokens = self.usage_base;
+    }
+
+    /// The turn ended WITHOUT appending the assistant message the last
+    /// `record_usage` assumed: pull the watermark back to what the transcript
+    /// actually holds, and drop the discarded reply's output from the anchor
+    /// (the provider never produced it, so it is not part of the context).
+    /// A no-op when the append DID happen — the transcript reached the
+    /// watermark — so it is safe to call on EVERY turn exit AND on the retry
+    /// loop-back.
+    ///
+    /// Why it is needed: the watermark `record_usage` writes is
+    /// `messages.len() + 1`, i.e. "the reply lands at index `len`" — an
+    /// assumption about the FUTURE. Every cancelled or failed turn-exit path
+    /// breaks it (a partial reply is deliberately not persisted), and so does
+    /// the INTRA-TURN mid-stream retry, which discards the partial reply and
+    /// loops back to `should_compact()` without ever exiting the turn — the one
+    /// path the exits cannot cover. Without this reconcile the next turn's
+    /// prompt (or, for the retry, this turn's very next threshold check) lands
+    /// INSIDE the watermark window and is never estimated: the snapshot swallows
+    /// a whole prompt — the exact lag `a846abb` was added to prevent — while the
+    /// anchor still carries output the model never generated.
+    ///
+    /// The guard is what makes it unconditional-callable: `watermark >
+    /// len` is precisely "the assumed index is past the end of the
+    /// transcript". Reconciling when the reply IS in the transcript would
+    /// discount a real message and (worse) reset the count to the bare anchor,
+    /// dropping the tool batch the last `refresh` had already measured.
+    pub fn turn_abandoned(&mut self, messages: &[ChatMessage]) {
+        if self.usage_watermark <= messages.len() {
+            return;
+        }
+        self.usage_base = self
+            .usage_base
+            .saturating_sub(u64::from(self.pending_output));
+        self.usage_watermark = messages.len();
+        // The reply this remembered is now definitively discarded, so it is
+        // pending for NOBODY: zeroing it here makes the field's invariant local
+        // to this method (after a retraction there is nothing left to retract)
+        // rather than something a reader has to prove unreachable across
+        // `record_usage`, `reestimate` and the guard above.
+        self.pending_output = 0;
+        self.context_tokens = self.usage_base;
     }
 
     /// Compaction is due: `context_tokens > context_window -
@@ -56,30 +129,35 @@ impl Compactor {
 
     /// Re-estimate the context from the (post-compaction) messages — the
     /// RESET path (after a compaction the transcript genuinely shrank, and
-    /// a resume has no accumulated usage to keep, so the estimate
-    /// REPLACES the accumulation, even downward).
+    /// a resume has no provider anchor to keep, so the estimate
+    /// REPLACES the count, even downward — and the usage anchor is
+    /// cleared too: a compacted / resumed transcript is a new baseline).
     pub fn reestimate(&mut self, messages: &[ChatMessage]) {
+        self.usage_base = 0;
+        self.usage_watermark = 0;
+        self.pending_output = 0;
         self.context_tokens = estimate_context(messages);
     }
 
-    /// The usage-less fallback: re-estimate from the transcript as a
-    /// FLOOR-RAISER — adopt the estimate only when it exceeds what is
-    /// already known. A session on an endpoint that reports usage on SOME
-    /// calls only would otherwise have its authoritative (larger)
-    /// usage-based count replaced by the smaller `chars / 4` estimate on
-    /// every gapped call — the context bar would move backwards and the
-    /// compaction threshold metric would drop (compaction delayed while
-    /// the session grows). Returns the tracked count.
-    pub fn raise_context_from_estimate(&mut self, messages: &[ChatMessage]) -> u64 {
-        self.context_tokens = self.context_tokens.max(estimate_context(messages));
+    /// The context NOW: the last reported usage plus the local estimate of
+    /// every message appended since (pi's `estimateContextTokens`: a usage
+    /// anchor + its trailing tail). Called after each message is appended, so
+    /// the threshold and the display read ONE number. A usage-less session has
+    /// a `0` anchor and the whole transcript is trailing, so this degrades to
+    /// the plain estimate — which is why the old floor-raiser is gone: the
+    /// anchor only moves when the provider really reports, so the metric can
+    /// no longer be overwritten downward by an estimate.
+    pub fn refresh(&mut self, messages: &[ChatMessage]) -> u64 {
+        let trailing = self.usage_watermark.min(messages.len());
+        self.context_tokens = self.usage_base + estimate_context(&messages[trailing..]);
         self.context_tokens
     }
 }
 
 /// The transcript's local token estimate (the sum over the messages).
 ///
-/// `pub(crate)` so the `AgentLoop` can raise its DISPLAY metric with the
-/// same number the threshold uses (one source for both).
+/// `pub(crate)` so the `AgentLoop`'s tests can reason about the same number
+/// the threshold uses (one source for both the trigger and the frame).
 pub(crate) fn estimate_context(messages: &[ChatMessage]) -> u64 {
     messages
         .iter()
@@ -195,8 +273,10 @@ pub(crate) struct CompactionCtx<'a> {
     /// The keep-recent budget (the caller's `catalog.compaction`).
     pub keep_recent_tokens: u32,
     /// The session's compactor — RE-ESTIMATED on the compacted transcript
-    /// (the post-compaction anchor: the accumulated usage is replaced by
-    /// the estimate of what the context now is).
+    /// (the post-compaction BASELINE: the re-estimated count of what the
+    /// context now is REPLACES the tracked total, and the usage ANCHOR is
+    /// CLEARED — the provider's last report covers a transcript that no
+    /// longer exists).
     pub compactor: &'a mut Compactor,
 }
 
@@ -527,8 +607,45 @@ mod tests {
         }
     }
 
+    /// The regression: an agentic loop re-sends the whole context on every
+    /// call, so summing per-call usage charges the same tokens N times and
+    /// compaction trips at ~window/N. Six calls whose prompts sum to far more
+    /// than the threshold, but whose LARGEST prompt is still under it, are a
+    /// session that has not filled its window — they must not be due.
     #[test]
-    fn usage_accumulates_and_trips_the_threshold() {
+    fn repeated_calls_do_not_charge_the_prompt_once_per_iteration() {
+        let mut c = Compactor::new(
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 100,
+                keep_recent_tokens: 10,
+            },
+            1000,
+        );
+        let msgs: Vec<ChatMessage> = (0..6).map(|i| text_msg(&format!("m{i}"))).collect();
+        for i in 0..6 {
+            c.record_usage(
+                &Usage {
+                    input_tokens: 300,
+                    output_tokens: 10,
+                },
+                &msgs[..=i],
+            );
+            assert!(
+                !c.should_compact(),
+                "a 310-token context is not due on a 1000-window with a 100 reserve, \
+                 whatever the calls summed to (call {i}: {})",
+                c.context_tokens()
+            );
+        }
+    }
+
+    /// A usage report is a SNAPSHOT of the context, not an increment: the
+    /// prompt is the ENTIRE transcript, re-sent on every call, so a second
+    /// call that reports the same numbers must leave the count where it was
+    /// (adding it was the bug that tripped compaction at ~window/N).
+    #[test]
+    fn a_usage_report_is_the_context_not_an_increment() {
         let mut c = Compactor::new(
             CompactionConfig {
                 enabled: true,
@@ -541,12 +658,36 @@ mod tests {
             !c.should_compact(),
             "a fresh context is under the threshold"
         );
-        c.add_usage(&Usage {
-            input_tokens: 500,
-            output_tokens: 500,
-        });
-        assert_eq!(c.context_tokens(), 1000);
-        assert!(c.should_compact(), "1000 > 1000 - 100");
+        c.record_usage(
+            &Usage {
+                input_tokens: 500,
+                output_tokens: 100,
+            },
+            &[],
+        );
+        assert_eq!(c.context_tokens(), 600, "the report IS the context");
+        assert!(!c.should_compact(), "600 < 1000 - 100");
+        c.record_usage(
+            &Usage {
+                input_tokens: 500,
+                output_tokens: 100,
+            },
+            &[],
+        );
+        assert_eq!(
+            c.context_tokens(),
+            600,
+            "a second call reporting the same context does not add to it"
+        );
+        assert!(!c.should_compact(), "still 600 — not due");
+        c.record_usage(
+            &Usage {
+                input_tokens: 950,
+                output_tokens: 0,
+            },
+            &[],
+        );
+        assert!(c.should_compact(), "950 > 1000 - 100");
     }
 
     #[test]
@@ -559,10 +700,13 @@ mod tests {
             },
             1000,
         );
-        c.add_usage(&Usage {
-            input_tokens: 99999,
-            output_tokens: 99999,
-        });
+        c.record_usage(
+            &Usage {
+                input_tokens: 99999,
+                output_tokens: 99999,
+            },
+            &[],
+        );
         assert!(!c.should_compact());
     }
 
@@ -579,15 +723,29 @@ mod tests {
             },
             50,
         );
-        c.add_usage(&Usage {
-            input_tokens: 10,
-            output_tokens: 10,
-        });
+        c.record_usage(
+            &Usage {
+                input_tokens: 10,
+                output_tokens: 10,
+            },
+            &[],
+        );
         assert!(c.should_compact(), "20 > 0 (the saturated threshold)");
     }
 
+    /// pi's `estimateContextTokens`: the anchor (the last reported usage)
+    /// plus the estimate of the messages AFTER it. A call that reports NO
+    /// usage must never drop the metric below the anchor — the anchor only
+    /// moves when the provider really reports, so the trailing estimate can
+    /// only ever ADD to it.
+    ///
+    /// The transcript is built the way the loop builds it: the two prompt
+    /// messages the call was made over, then — AFTER the report — the assistant
+    /// reply that report's `output_tokens` already includes. That reply is the
+    /// watermark slot (index 2): the snapshot already counts it, so only what
+    /// comes after it is estimated.
     #[test]
-    fn raise_context_from_estimate_never_lowers_the_accumulated_usage() {
+    fn refresh_keeps_the_anchor_and_adds_the_trailing_messages() {
         let mut c = Compactor::new(
             CompactionConfig {
                 enabled: true,
@@ -596,28 +754,201 @@ mod tests {
             },
             1000,
         );
-        c.add_usage(&Usage {
-            input_tokens: 900,
-            output_tokens: 900,
-        });
-        // A tiny transcript: the estimate is far below the accumulation.
-        assert_eq!(
-            c.raise_context_from_estimate(&[text_msg("short")]),
-            1800,
-            "the estimate is a floor-raiser, not a replacement"
+        // The transcript the provider call was made over (its `input_tokens`
+        // IS these two messages).
+        let prompt = vec![text_msg("first message"), text_msg("second message")];
+        c.record_usage(
+            &Usage {
+                input_tokens: 900,
+                output_tokens: 100,
+            },
+            &prompt,
         );
-        assert_eq!(c.context_tokens(), 1800, "the accumulation survives");
-        // And it DOES move when the transcript outgrows the count.
-        let big = text_msg(&"y".repeat(40_000));
-        let raised = c.raise_context_from_estimate(&[big]);
-        assert!(
-            raised > 1800,
-            "a transcript larger than the count is adopted, got {raised}"
+        assert_eq!(
+            c.context_tokens(),
+            1000,
+            "the anchor is the whole context the provider holds"
+        );
+        // The loop appends the reply the report already accounts for (index 2,
+        // the watermark slot), and then a tool result — the ONLY message a
+        // usage-less call can still measure.
+        let reply = assistant("the reply the anchor already counts");
+        let tool_result = text_msg("a tool result appended after the reply");
+        let with_reply = vec![
+            text_msg("first message"),
+            text_msg("second message"),
+            reply.clone(),
+        ];
+        let grown = vec![
+            text_msg("first message"),
+            text_msg("second message"),
+            reply.clone(),
+            tool_result.clone(),
+        ];
+        // The trailing estimate is the tool result ALONE: 38 chars / 4 = 9,
+        // +1 for the role overhead = 10. So the snapshot is
+        // `anchor 1000 + trailing 10 = 1010`.
+        assert_eq!(estimate_context(&[tool_result]), 10, "the trailing term");
+        assert_eq!(
+            c.refresh(&grown),
+            1000 + 10,
+            "the anchor survives and the message AFTER the watermark slot is estimated"
+        );
+        assert_eq!(c.context_tokens(), 1010, "the tracked count is the sum");
+        // And a smaller transcript estimate can never pull it down — the
+        // reply's own estimate is NOT re-added (it is inside the watermark) and
+        // the anchor is not replaced by what the local estimate thinks.
+        assert_eq!(
+            c.refresh(&with_reply),
+            1000,
+            "the anchor is never overwritten by an estimate"
+        );
+    }
+
+    /// The watermark `record_usage` set ASSUMES the assistant reply lands at
+    /// `messages.len()` — but a cancelled / failed turn deliberately does NOT
+    /// persist its partial reply, so the watermark points one past reality and
+    /// the NEXT turn's prompt lands INSIDE the watermark window (unmeasured
+    /// until the next report). `turn_abandoned` reconciles: the watermark
+    /// pulls back to what the transcript actually holds and the discarded
+    /// reply's output leaves the anchor (the provider never produced it, so it
+    /// is not part of the context).
+    #[test]
+    fn turn_abandoned_retracts_the_reply_that_never_landed() {
+        let mut c = Compactor::new(
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 100,
+                keep_recent_tokens: 10,
+            },
+            1000,
+        );
+        let two = vec![text_msg("first message"), text_msg("second message")];
+        c.record_usage(
+            &Usage {
+                input_tokens: 900,
+                output_tokens: 100,
+            },
+            &two,
+        );
+        assert_eq!(c.context_tokens(), 1000, "the anchor is input + output");
+        // The turn died before the reply was pushed: the transcript is still
+        // the two messages the report was made over.
+        c.turn_abandoned(&two);
+        assert_eq!(
+            c.context_tokens(),
+            900,
+            "the discarded reply's output leaves the anchor — the provider never \
+             produced it, so it is not part of the context"
+        );
+        // The watermark is 2 (what the transcript holds), so the message the
+        // NEXT turn appends at index 2 is trailing, not covered: 5 chars / 4 +
+        // 1 (the role overhead) = 2 tokens on top of the 900 anchor.
+        let three = vec![
+            text_msg("first message"),
+            text_msg("second message"),
+            text_msg("short"),
+        ];
+        assert_eq!(
+            c.refresh(&three),
+            902,
+            "the message at the index the abandoned reply never took is estimated"
+        );
+        // And the retraction LEAVES NOTHING BEHIND: the reply it retracted is
+        // no longer owed to anyone, so the field that remembered it is zero
+        // too. Today the stale value is unreachable (`turn_abandoned`'s guard
+        // holds until the next `record_usage` overwrites it, and `reestimate`
+        // zeroes it), but a LOCAL invariant costs a reader nothing to check,
+        // while the global one needs all three methods in their heads.
+        assert_eq!(
+            c.pending_output, 0,
+            "a retracted reply is not pending any more"
+        );
+    }
+
+    /// The reconcile must be safe to call on EVERY turn exit: when the reply
+    /// DID land (the transcript is at least as long as the watermark), the
+    /// anchor is exactly right and nothing is retracted — an unconditional
+    /// subtraction would discount a reply that IS in the context (a
+    /// cancelled tool batch, whose assistant message was persisted, is this
+    /// case).
+    #[test]
+    fn turn_abandoned_is_a_no_op_when_the_reply_landed() {
+        let mut c = Compactor::new(
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 100,
+                keep_recent_tokens: 10,
+            },
+            1000,
+        );
+        let two = vec![text_msg("first message"), text_msg("second message")];
+        c.record_usage(
+            &Usage {
+                input_tokens: 900,
+                output_tokens: 100,
+            },
+            &two,
+        );
+        // The reply landed at index 2 — the watermark (3) is what the
+        // transcript now holds.
+        let three = vec![
+            text_msg("first message"),
+            text_msg("second message"),
+            assistant("the reply"),
+        ];
+        assert_eq!(c.refresh(&three), 1000, "the anchor covers the reply");
+        c.turn_abandoned(&three);
+        assert_eq!(
+            c.context_tokens(),
+            1000,
+            "a reply that is in the transcript is never discounted"
+        );
+        // …and a later message is still estimated on top of it.
+        let four = vec![
+            text_msg("first message"),
+            text_msg("second message"),
+            assistant("the reply"),
+            text_msg("short"),
+        ];
+        assert_eq!(c.refresh(&four), 1002, "the trailing message is estimated");
+    }
+
+    /// `reestimate` clears the anchor WHOLESALE (a compaction / resume is a
+    /// new baseline) — and so does `turn_abandoned`'s own guard: a post-reset
+    /// watermark is `0`, which can never exceed the transcript's length, so an
+    /// abandoned turn that predates the compaction cannot discount the new
+    /// baseline.
+    #[test]
+    fn turn_abandoned_after_a_reestimate_does_not_discount_the_new_baseline() {
+        let mut c = Compactor::new(
+            CompactionConfig {
+                enabled: true,
+                reserve_tokens: 100,
+                keep_recent_tokens: 10,
+            },
+            1000,
+        );
+        c.record_usage(
+            &Usage {
+                input_tokens: 900,
+                output_tokens: 100,
+            },
+            &[],
+        );
+        c.reestimate(&[text_msg("short")]);
+        let baseline = c.context_tokens();
+        c.turn_abandoned(&[text_msg("short")]);
+        assert_eq!(
+            c.context_tokens(),
+            baseline,
+            "the re-estimate already dropped the anchor, so there is nothing left to \
+             retract (\"short\" = 5/4 + 1 = 2 tokens)",
         );
     }
 
     #[test]
-    fn reestimate_replaces_the_accumulated_usage() {
+    fn reestimate_replaces_the_usage_anchor() {
         let mut c = Compactor::new(
             CompactionConfig {
                 enabled: true,
@@ -626,12 +957,22 @@ mod tests {
             },
             1000,
         );
-        c.add_usage(&Usage {
-            input_tokens: 900,
-            output_tokens: 900,
-        });
+        c.record_usage(
+            &Usage {
+                input_tokens: 900,
+                output_tokens: 900,
+            },
+            &[],
+        );
         c.reestimate(&[text_msg("short")]);
         assert!(c.context_tokens() < 100, "the estimate replaces the usage");
+        c.refresh(&[text_msg("short")]);
+        assert!(
+            c.context_tokens() < 100,
+            "the ANCHOR is cleared too — a compaction / resume invalidates it, \
+             not just the total, got {}",
+            c.context_tokens()
+        );
     }
 
     #[test]

@@ -195,13 +195,11 @@ pub struct AgentLoop {
     /// The session's current context size in tokens (the `context_usage_
     /// update` frame source — the frontend's context-percentage display).
     ///
-    /// Unlike the `Compactor`'s `context_tokens` (an ACCUMULATION of every
-    /// response's input + output — a deliberately conservative over-estimate
-    /// for the compaction threshold), this is the context as the PROVIDER
-    /// sees it: the last response's `input_tokens` (the prompt size — the
-    /// full context sent to the model) or the compactor's re-estimate (the
-    /// post-compaction / resume anchor, when the provider hasn't reported
-    /// yet).
+    /// The SAME snapshot the compaction threshold reads: the last `Usage`
+    /// the provider reported (`input + output` — the full prompt plus that
+    /// reply's output) plus the local estimate of whatever was appended
+    /// since (the `Compactor`'s anchor + trailing tail). One number for the
+    /// bar and the trigger — never the sum of every call's prompt.
     last_context_tokens: u64,
 }
 
@@ -326,13 +324,24 @@ impl AgentLoop {
         });
     }
 
-    /// Switch the model (the `Compactor` is rebuilt — the context window
-    /// is per-model). The context (the `messages`) is UNCHANGED: the last
-    /// known context size is kept, the frame is re-emitted with the new
-    /// model's window.
+    /// Switch the model. The context (the `messages`) is UNCHANGED, but the
+    /// `Compactor` IS rebuilt (the context window — and therefore the
+    /// threshold — is per-model), which drops the usage anchor: so it is
+    /// RE-ESTIMATED on the current transcript and the frame is emitted from
+    /// that same re-estimate. The number itself usually lands where it was (the
+    /// transcript did not change), but the anchor is gone and the local estimate
+    /// is what stands in until the next `Usage` the provider reports corrects it.
+    ///
+    /// The re-estimate is not cosmetic: emitting the PREVIOUS value while the
+    /// rebuilt `Compactor` still reads `0` would leave the bar and
+    /// `should_compact()` disagreeing until the next prompt, and switching INTO a
+    /// smaller window would defer a compaction that is already due by a whole
+    /// model call (the call that has to send the oversized context).
     pub fn set_model(&mut self, model: Model) {
         self.compactor = Compactor::new(self.catalog.compaction, model.context_window);
         self.model = model;
+        self.compactor.reestimate(&self.messages);
+        self.last_context_tokens = self.compactor.context_tokens();
         self.emit_context_usage();
     }
 
@@ -585,8 +594,18 @@ impl AgentLoop {
             tool_calls: None,
         });
         self.persist_transcript_message();
-
+        // The turn's own opening event FIRST — the context frame below is
+        // session-scoped bookkeeping, so it must not lead the turn it belongs to.
         self.emit(RpcEvent::turn_start);
+        // The prompt is in the transcript: measure it NOW. `should_compact()`
+        // is read at the TOP of the loop below, so a push that left the
+        // `Compactor` untouched was invisible to the turn's FIRST threshold
+        // check — a large pasted prompt therefore deferred a compaction that
+        // was already due by a whole model call (the call that had to send
+        // the oversized context to the provider). Cheap: `refresh` sums only
+        // the trailing slice. Measured AFTER `turn_start` (the frame is
+        // bookkeeping), still BEFORE the first threshold read.
+        self.note_context();
 
         let mut turn_tool_results: Vec<Value> = Vec::new();
         // `message_start` ONCE per assistant message (the nit: a
@@ -734,13 +753,13 @@ impl AgentLoop {
                             }
                             ProviderEvent::Usage(u) => {
                                 acc.usage = Some(u);
-                                self.compactor.add_usage(&u);
-                                // The response's `input_tokens` is the prompt size —
-                                // the context as the provider sees it (the
-                                // `context_usage_update` frame source; the
-                                // `Compactor`'s accumulation is a separate,
-                                // conservative threshold metric).
-                                self.last_context_tokens = u64::from(u.input_tokens);
+                                self.compactor.record_usage(&u, &self.messages);
+                                // The context is the usage ANCHOR the
+                                // provider just set: `input + output` is the
+                                // whole prompt plus this reply's output (the
+                                // same count pi keeps), and the bar and the
+                                // compaction threshold read that ONE number.
+                                self.last_context_tokens = self.compactor.context_tokens();
                                 self.emit_context_usage();
                                 self.emit(RpcEvent::message_update {
                                     usage: acc.usage_value(),
@@ -791,6 +810,22 @@ impl AgentLoop {
                         }
                         _ = tokio::time::sleep(delay) => {}
                     }
+                    // The retry DISCARDS the partial reply this stream was
+                    // producing — and the `Usage` it reported (if any) left the
+                    // `Compactor` with the same optimistic watermark the settle
+                    // paths retract: `messages.len() + 1`, "the reply lands at
+                    // index `len`", when no reply is ever pushed. This
+                    // loop-back is the ONE path that returns to the top of the
+                    // turn — i.e. to `should_compact()` — WITHOUT exiting the
+                    // turn, so `settle_cancelled` / `settle_error` cannot cover
+                    // it: unreconciled, the very next threshold check reads the
+                    // discarded attempt's `output_tokens`, and a large dying
+                    // reply compacts the session before the retry's own call
+                    // even runs. Same reconcile the exits do, and the
+                    // `watermark > len` guard makes it a no-op if the reply did
+                    // land (it cannot here — the push happens only on the clean
+                    // path).
+                    self.compactor.turn_abandoned(&self.messages);
                     continue;
                 }
                 self.emit(RpcEvent::auto_retry_end {
@@ -836,9 +871,9 @@ impl AgentLoop {
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls.clone()),
             });
             self.persist_transcript_message();
-            // The usage-less fallback (the assistant message is now in the
-            // transcript, so the estimate covers it).
-            self.note_context_without_usage(acc.usage.is_none());
+            // The assistant message is now in the transcript, so the
+            // context is re-anchored on it (the usage anchor + the tail).
+            self.note_context();
 
             if tool_calls.is_empty() {
                 // (5) The turn is done.
@@ -954,53 +989,76 @@ impl AgentLoop {
                 });
                 self.persist_transcript_message();
             }
+            // The batch is over: re-anchor the context ONCE for the whole
+            // batch. `should_compact()` is read at the TOP of the next
+            // iteration, so anything appended after the last re-anchor is
+            // invisible to the threshold — and tool results are by far the
+            // largest messages a turn produces (a `read`, a `grep`, a `cat`
+            // of a doc set), so this is the measurement that matters most.
+            // On a usage-less endpoint the usage anchor is `0` and this
+            // estimate is the ONLY measurement there is: pre-fix a whole
+            // batch of huge output stayed uncounted and the session blew
+            // past the window undetected (the provider 400s where compaction
+            // was due). ONCE per batch, not per tool call: the batch is one
+            // logical change to the context, and the frame `note_context`
+            // emits also writes the `sessions` row (`record_context_usage`) —
+            // a per-call refresh would be N re-estimates and N DB writes for
+            // nothing new in between.
+            self.note_context();
             // Loop back to (1) — the model sees the tool results (a NEW
             // assistant message — `message_start` is re-armed).
             message_started = false;
         }
     }
 
-    /// The usage-less fallback (the context bar + the compaction
-    /// threshold): a model call that reported NO `Usage` leaves both the
-    /// `Compactor`'s accumulation and `last_context_tokens` untouched,
-    /// so a session on a usage-stripping endpoint would show a FROZEN
-    /// percentage and could never trip compaction (an unbounded transcript
-    /// until the provider 400s). Re-estimate from the transcript instead
-    /// — the same local estimate the resume / compaction anchors use, so
-    /// the display and the threshold read ONE source.
+    /// Re-anchor the context after the transcript grew: the single point
+    /// where the context is recomputed (the `Compactor`'s usage anchor plus
+    /// the local estimate of the messages appended since), feeding BOTH the
+    /// compaction threshold and the `context_usage_update` frame — one
+    /// number, one source. Called after the assistant message is pushed, so
+    /// the watermark `record_usage` set (past that message) lines up.
     ///
-    /// Only on a usage-less call, and only ever UPWARDS. The estimate is a
-    /// FLOOR-RAISER, never a replacement: an endpoint that reports usage on
-    /// SOME calls only (a proxy that emits the usage chunk intermittently)
-    /// would otherwise have its authoritative usage-based accounting
-    /// overwritten by the smaller `chars / 4` estimate on every gapped
-    /// call — the context bar would visibly move BACKWARDS, and the
-    /// compaction threshold metric would drop, delaying compaction while
-    /// the session grew. A genuine downward reset stays the job of
-    /// `reestimate` (post-compaction) and the resume anchor, where the
-    /// transcript really did shrink.
-    fn note_context_without_usage(&mut self, no_usage: bool) {
-        if !no_usage {
-            return;
+    /// The invariant that matters for the bar and the trigger: a model call
+    /// that reported NO `Usage` cannot shrink the accounting, because the
+    /// anchor only moves when the provider really reports — the estimate is
+    /// purely ADDITIVE on top of it (it replaced the old floor-raiser, which
+    /// had to special-case exactly this). It CAN move down on `reestimate`
+    /// (post-compaction / resume), where the transcript genuinely shrank.
+    ///
+    /// The frame is emitted ONLY when the refresh actually moved the number.
+    /// Equality is the exact condition — no delta threshold: when the stream
+    /// reported usage, the `ProviderEvent::Usage` arm already anchored the
+    /// count and emitted, and the assistant push that follows leaves the
+    /// trailing slice EMPTY, so a re-emit would be a value-identical frame
+    /// AND a value-identical `record_context_usage` — which is not free: the
+    /// frame also writes the `sessions` row (an IPC round trip → an
+    /// `ensure_session_row` SELECT + an `UPDATE`), once per iteration, on the
+    /// COMMON (usage-reporting) path. On a usage-less endpoint the value
+    /// always moves (the reply / the tool batch grew the estimate), so the
+    /// emissions that matter are untouched.
+    fn note_context(&mut self) {
+        let next = self.compactor.refresh(&self.messages);
+        if next != self.last_context_tokens {
+            self.last_context_tokens = next;
+            self.emit_context_usage();
         }
-        // The threshold metric: the accumulation raised to the estimate if
-        // the transcript outgrew it.
-        self.compactor.raise_context_from_estimate(&self.messages);
-        // The display: the last known context size raised to the estimate.
-        // NOT the accumulation — that sums every call's input + output, so
-        // it far exceeds what the provider currently holds, and the bar
-        // would read over 100%.
-        self.last_context_tokens = self
-            .last_context_tokens
-            .max(compact::estimate_context(&self.messages));
-        self.emit_context_usage();
     }
 
     /// Settle a CANCELLED turn: `turn_end` (the open `messageId`'s
     /// accumulators / the UI timeline end cleanly, not mid-message — the
     /// normal exit's `turn_end` shape) followed by `agent_settled` (the
     /// reliable settle signal).
-    fn settle_cancelled(&self, tool_results: Vec<Value>) {
+    ///
+    /// ALSO reconciles the `Compactor` (see [`Compactor::turn_abandoned`]): a
+    /// cancelled turn does NOT persist the partial assistant message, so the
+    /// watermark `record_usage` set points one past the transcript. The
+    /// reconcile lives HERE rather than at the call sites so a future exit
+    /// cannot forget it. No context frame is emitted: the next turn's
+    /// prompt-time `note_context` re-anchors and emits (the value here is
+    /// strictly between two authoritative readings, and the frame also writes
+    /// the `sessions` row).
+    fn settle_cancelled(&mut self, tool_results: Vec<Value>) {
+        self.compactor.turn_abandoned(&self.messages);
         self.emit(RpcEvent::turn_end {
             message: Value::Null,
             tool_results,
@@ -1018,7 +1076,12 @@ impl AgentLoop {
     /// did not close cleanly — one can be reached on a cancel race, since
     /// `select!` picks randomly when `call_with_retry` errors as the token
     /// fires).
-    fn settle_error(&self, tool_results: Vec<Value>) {
+    ///
+    /// Reconciles the `Compactor` for the same reason `settle_cancelled` does
+    /// — a failed turn persists no assistant message — and for the same reason
+    /// lives here rather than at the call sites.
+    fn settle_error(&mut self, tool_results: Vec<Value>) {
+        self.compactor.turn_abandoned(&self.messages);
         self.emit(RpcEvent::turn_end {
             message: Value::Null,
             tool_results,
@@ -1295,7 +1358,7 @@ impl AgentLoop {
         match compact::run_compaction(&mut ctx, &mut self.messages, turn).await {
             compact::CompactionOutcome::Skipped => {}
             compact::CompactionOutcome::Compacted { context_tokens } => {
-                // The re-estimate is the post-compaction anchor (the
+                // The re-estimate is the post-compaction BASELINE (the
                 // `context_usage_update` frame — the percentage drops
                 // after the compaction instead of staying at the
                 // pre-compaction value).
@@ -2555,10 +2618,11 @@ mod tests {
             .cloned()
     }
 
-    /// A provider `Usage` event updates the session's tracked context size
-    /// (the response's `input_tokens` — the prompt size, i.e. the context
-    /// as the provider sees it) and emits a `context_usage_update` frame
-    /// (the window is the session model's `context_window`).
+    /// A provider `Usage` event re-anchors the context to what the provider holds:
+    /// `input + output` — the full prompt INCLUDING the reply it just
+    /// produced — plus anything appended since (the same number pi counts),
+    /// and emits a `context_usage_update` frame (the window is the session
+    /// model's `context_window`).
     #[tokio::test]
     async fn a_usage_event_emits_a_context_usage_update_frame() {
         let updates = Arc::new(StdMutex::new(Vec::new()));
@@ -2588,8 +2652,8 @@ mod tests {
         let frame =
             last_context_usage_frame(&updates).expect("a context_usage_update frame was emitted");
         assert_eq!(
-            frame["usedTokens"], 4321,
-            "the context size is the response's input tokens"
+            frame["usedTokens"], 4421,
+            "the context is the usage anchor (input + output)"
         );
         assert_eq!(frame["windowTokens"], 128000, "the window is the model's");
     }
@@ -2643,12 +2707,13 @@ mod tests {
     /// The P1 review fix: a usage-less turn must never move the context
     /// accounting BACKWARDS. A session that mixes reporting and
     /// non-reporting calls (a proxy that emits the usage chunk on SOME
-    /// responses) would otherwise replace the authoritative usage-based
-    /// count with the smaller `chars / 4` transcript estimate on the
-    /// gapped calls — the bar visibly shrinks and the compaction
-    /// threshold metric drops (compaction delayed while the session
-    /// grows). The estimate is a FLOOR-RAISER: it is adopted only when it
-    /// exceeds what is already known.
+    /// responses) used to risk having the authoritative usage-based count
+    /// replaced by the smaller `chars / 4` transcript estimate on the gapped
+    /// calls — the bar visibly shrinking and the compaction threshold metric
+    /// dropping (compaction delayed while the session grew). The guarantee is
+    /// now STRUCTURAL rather than a floor-raiser: the anchor only moves when
+    /// the provider reports, and a gapped `refresh` merely adds the trailing
+    /// estimate on top of it, so it cannot shrink the accounting.
     #[tokio::test]
     async fn a_usage_less_turn_never_lowers_the_context_accounting() {
         let updates = Arc::new(StdMutex::new(Vec::new()));
@@ -2685,19 +2750,738 @@ mod tests {
         loop_.handle_prompt(&text_prompt("first")).await;
         let after_usage = last_context_usage_frame(&updates).expect("frame after turn 1");
         let authoritative = after_usage["usedTokens"].as_u64().unwrap();
-        assert_eq!(authoritative, 40_000, "turn 1 reports the provider's count");
+        assert_eq!(
+            authoritative, 40_100,
+            "turn 1 anchors on the provider's report (input + output)"
+        );
         loop_.handle_prompt(&text_prompt("second")).await;
         let after_gap = last_context_usage_frame(&updates).expect("frame after turn 2");
-        assert_eq!(
-            after_gap["usedTokens"].as_u64(),
-            Some(authoritative),
-            "the usage-less turn must not shrink the bar to the transcript estimate"
+        assert!(
+            after_gap["usedTokens"].as_u64().unwrap_or(0) >= authoritative,
+            "the usage-less turn must not shrink the bar below the anchor: {} < {authoritative}",
+            after_gap["usedTokens"]
         );
         assert!(
             loop_.compactor.context_tokens() >= authoritative,
             "the compaction threshold metric must not drop on a usage-less turn \
              (it would delay compaction), got {}",
             loop_.compactor.context_tokens()
+        );
+    }
+
+    /// A model whose compaction threshold is exactly `context_window -
+    /// 16384` (the DEFAULT reserve the `Compactor` is built with — the
+    /// config is fixed at `AgentLoop::new`, so the knob a test can turn
+    /// AFTER construction is the window): a threshold of `t` is a window of
+    /// `16384 + t`.
+    fn model_with_threshold(id: &str, threshold: u32) -> Model {
+        Model {
+            context_window: 16_384 + threshold,
+            ..fake_model(id)
+        }
+    }
+
+    /// The kinds of every `RpcEvent` the loop emitted, in order (the tests
+    /// assert on the ORDER of the turn's events, not just their presence).
+    fn event_kinds(rx: &mut mpsc::UnboundedReceiver<RpcEvent>) -> Vec<String> {
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(ev.kind().to_string());
+        }
+        kinds
+    }
+
+    /// The tool batch must be MEASURED before the next threshold check.
+    ///
+    /// `should_compact()` is read at the TOP of the iteration, so anything
+    /// appended after the last re-anchor is invisible to it — and tool
+    /// results are by far the largest messages in an agentic transcript (a
+    /// `read`, a `grep`, a `cat` of a doc set). Pre-fix the batch was pushed
+    /// without re-anchoring, so the ENTIRE batch's output was unmeasured when
+    /// the next check ran: on a usage-less endpoint (anchor 0 — the fallback
+    /// path that exists precisely for those endpoints) the metric lagged a
+    /// whole batch, and one batch of huge output could blow past the window
+    /// undetected so the provider 400s instead of compacting.
+    ///
+    /// The arithmetic: threshold 100 (window `16384 + 100`, the default
+    /// 16384 reserve). Prompt `"go"` = 2/4 + 1 = `1`, the assistant's `"ok"`
+    /// + one tool call = 0 + 20 + 1 = `21` → 22 measured at the top of the
+    /// next iteration: under the threshold. The `read` result is 1200 chars =
+    /// 300 + 1 = `301` → the batch takes the context to 323, clearly over it.
+    /// So the SECOND iteration must see the compaction due — which it can
+    /// only do if the batch was measured when it was appended.
+    #[tokio::test]
+    async fn a_tool_batch_is_measured_before_the_next_compaction_check() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        // NO `Usage` anywhere — the anchor stays 0 and the local estimate is
+        // the ONLY measurement (the usage-less-endpoint case).
+        let (provider, calls) = ScriptedProvider::new(vec![
+            // Call 1: one tool call whose result is huge.
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "big.txt" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            // The summary call (the compaction the batch must trigger).
+            Some(vec![
+                ProviderEvent::TextDelta("SUMMARY".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            // The turn's final reply.
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![model_with_threshold("m1", 100)],
+            None,
+        );
+        // Keep only 1 token of tail, so the compaction is a REAL one (the
+        // older messages are summarized) rather than a skip.
+        loop_.catalog.compaction.keep_recent_tokens = 1;
+        // The tool's input: a 1200-char file (300 tokens by the local
+        // estimate) the `read` returns verbatim.
+        std::fs::write(loop_.space_cwd.join("big.txt"), "x".repeat(1200)).unwrap();
+        loop_.handle_prompt(&text_prompt("go")).await;
+
+        let kinds = event_kinds(&mut events_rx);
+        assert!(
+            kinds.contains(&"compaction_start".to_string()),
+            "the tool batch (301 tokens) takes the context past the threshold, so the \
+             NEXT iteration's `should_compact()` must be due — the batch was appended \
+             without re-anchoring and stayed invisible, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"compaction_end".to_string()),
+            "the compaction ran to completion, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"agent_settled".to_string()),
+            "the turn still settles, got {kinds:?}"
+        );
+        // The batch is ALSO what the display saw: the frames recorded it
+        // (the prompt alone would have been a ~1-token bar).
+        let frame =
+            last_context_usage_frame(&updates).expect("a context_usage_update frame was emitted");
+        assert!(
+            frame["usedTokens"].as_u64().unwrap_or(0) > 100,
+            "the batch is above the threshold in the frame too, got {}",
+            frame["usedTokens"]
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the turn is the tool call, the summary, and the final reply"
+        );
+    }
+
+    /// A large PASTED prompt must be counted before the turn's first
+    /// threshold check (the same one-call lag as the tool batch, on the other
+    /// side of the turn): the push used to leave the `Compactor` untouched, so
+    /// compaction that was ALREADY due was deferred by a whole model call —
+    /// the call that had to send the oversized context to the provider.
+    ///
+    /// Threshold 100, prompt 4000 chars = 1000 + 1 = `1001` — the prompt ALONE
+    /// crosses it, on a provider that reports NO usage. Post-fix the very
+    /// first thing after `turn_start` is the compaction (nothing older to
+    /// summarize yet, so it is a skip — the point is that the threshold READ
+    /// is due), and the FIRST frame of the turn is the prompt's own estimate
+    /// and nothing else (pre-fix it would be the prompt PLUS the assistant
+    /// reply, because the first frame only came after that reply was pushed).
+    #[tokio::test]
+    async fn a_large_prompt_is_measured_before_the_first_compaction_check() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let prompt_text = "x".repeat(4000);
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![model_with_threshold("m1", 100)],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt(&prompt_text)).await;
+
+        // The prompt's own local estimate (the same function the threshold
+        // uses): 4000 / 4 + 1 for the role overhead.
+        let prompt_estimate = compact::estimate_context(&loop_.messages[..1]);
+        assert_eq!(prompt_estimate, 1001, "the prompt alone is 1001 tokens");
+        let kinds = event_kinds(&mut events_rx);
+        // The compaction check fired BEFORE the first model call — i.e. the
+        // prompt was in the number the threshold read.
+        let compaction_at = kinds.iter().position(|k| k == "compaction_start");
+        let first_model_call = kinds.iter().position(|k| k == "message_start");
+        assert!(
+            matches!(
+                (compaction_at, first_model_call),
+                (Some(c), Some(m)) if c < m
+            ),
+            "a prompt that alone crosses the threshold must be due at the turn's FIRST \
+             check, before the oversized context is sent to the provider, got {kinds:?}"
+        );
+        let frames: Vec<Value> = updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .rev()
+            .filter(|u| u["sessionUpdate"] == "context_usage_update")
+            .cloned()
+            .collect();
+        let first = frames
+            .last()
+            .expect("the prompt push itself emitted a context_usage_update frame");
+        assert_eq!(
+            first["usedTokens"].as_u64(),
+            Some(prompt_estimate),
+            "the prompt was measured the moment it was pushed — the frame at that point \
+             is the prompt alone, got {}",
+            first["usedTokens"]
+        );
+        // One source, one number: the LAST frame is what the threshold reads.
+        let last = frames.first().expect("at least one frame");
+        assert_eq!(
+            last["usedTokens"].as_u64(),
+            Some(loop_.compactor.context_tokens()),
+            "the frame and the compaction threshold read ONE number"
+        );
+    }
+
+    /// A sink that interleaves the `RpcEvent` stream with the `session-update`
+    /// frames it receives: on every emission it first drains the event channel
+    /// into the same log, so the log is the turn's TRUE emission order across
+    /// BOTH channels (the context frame bypasses the `RpcEvent` pipeline, so its
+    /// position relative to `turn_start` is otherwise unobservable).
+    struct OrderingSink {
+        log: Arc<StdMutex<Vec<String>>>,
+        events: Arc<StdMutex<mpsc::UnboundedReceiver<RpcEvent>>>,
+    }
+
+    impl EventSink for OrderingSink {
+        fn emit(&self, event: &str, payload: Value) {
+            if let Ok(mut rx) = self.events.try_lock() {
+                while let Ok(ev) = rx.try_recv() {
+                    self.log
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(ev.kind().to_string());
+                }
+            }
+            let kind = payload
+                .get("update")
+                .and_then(|u| u["sessionUpdate"].as_str())
+                .unwrap_or(event)
+                .to_string();
+            self.log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(kind);
+        }
+    }
+
+    /// The turn's opening event opens the turn: the prompt-time context frame is
+    /// session-scoped bookkeeping, so it belongs AFTER `turn_start`, not before
+    /// it. The measurement itself stays where it must be — before the turn's
+    /// first `should_compact()` read.
+    #[tokio::test]
+    async fn the_context_frame_of_a_turn_follows_turn_start() {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(OrderingSink {
+            log: log.clone(),
+            events: Arc::new(StdMutex::new(events_rx)),
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![model_with_threshold("m1", 100)],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt(&"x".repeat(4000))).await;
+        let log = log.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let turn_start_at = log
+            .iter()
+            .position(|k| k == "turn_start")
+            .expect("the turn opened with `turn_start`");
+        let frame_at = log
+            .iter()
+            .position(|k| k == "context_usage_update")
+            .expect("the prompt push emitted the context frame");
+        assert!(
+            turn_start_at < frame_at,
+            "every turn opens with its own `turn_start`, THEN the context frame that \
+             describes it — not a frame ahead of the turn it belongs to: {log:?}"
+        );
+        // And the real guarantee (commit `a846abb`) survives the reordering: the
+        // prompt was measured before the threshold was read, so the compaction
+        // check fires before the oversized context is sent.
+        let compaction_at = log
+            .iter()
+            .position(|k| k == "compaction_start")
+            .expect("a prompt that alone crosses the threshold is due at the FIRST check");
+        let model_call_at = log
+            .iter()
+            .position(|k| k == "message_start")
+            .expect("the model call");
+        assert!(
+            compaction_at < model_call_at,
+            "the compaction is checked BEFORE the oversized context goes out: {log:?}"
+        );
+    }
+
+    /// A turn whose model call REPORTED usage must emit ONE
+    /// `context_usage_update` frame, not two. The `Usage` arm is the
+    /// authoritative re-anchor (it sets the number from the provider's own
+    /// report and emits), and by the time the assistant message is pushed the
+    /// watermark equals the transcript length — the trailing slice is EMPTY,
+    /// so `note_context`'s refresh recomputes the SAME number. Re-emitting it
+    /// is a duplicate sink frame AND a duplicate `record_context_usage` (an IPC
+    /// round trip → an `ensure_session_row` SELECT + an `UPDATE` on the main
+    /// process's `Db` mutex), once per iteration, for nothing — and this is the
+    /// COMMON path (every usage-reporting endpoint).
+    #[tokio::test]
+    async fn a_turn_that_reported_usage_emits_the_context_frame_once() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Usage(Usage {
+                input_tokens: 4321,
+                output_tokens: 100,
+            }),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            mpsc::unbounded_channel().0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let frames: Vec<Value> = updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "context_usage_update")
+            .cloned()
+            .collect();
+        assert_eq!(
+            frames.len(),
+            2,
+            "two REAL changes — the prompt push, then the provider's report — and the \
+             assistant push that follows the report changes NOTHING, so it must not write a \
+             frame (nor a `sessions` row): {frames:?}"
+        );
+        assert_eq!(
+            frames[1]["usedTokens"], 4421,
+            "the last frame is the provider's own anchor"
+        );
+        assert_ne!(
+            frames[0]["usedTokens"], frames[1]["usedTokens"],
+            "no two frames of a turn carry the same number"
+        );
+        assert_eq!(
+            loop_.compactor.context_tokens(),
+            4421,
+            "and the threshold reads the same number"
+        );
+    }
+
+    /// …while a turn that reported NO usage still moves the number (the
+    /// assistant push grows the estimate), so its frame is untouched by the
+    /// emit-if-changed guard above.
+    #[tokio::test]
+    async fn a_turn_without_usage_emits_a_frame_per_context_change() {
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("a somewhat longer reply".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            mpsc::unbounded_channel().0,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![fake_model("m1")],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let frames: Vec<Value> = updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "context_usage_update")
+            .cloned()
+            .collect();
+        assert_eq!(
+            frames.len(),
+            2,
+            "the prompt push and the assistant push are two REAL changes on a \
+             usage-less endpoint — both must still be recorded: {frames:?}"
+        );
+        let prompt_only = frames[0]["usedTokens"].as_u64().unwrap();
+        let with_reply = frames[1]["usedTokens"].as_u64().unwrap();
+        assert!(
+            with_reply > prompt_only,
+            "the reply grew the estimate ({prompt_only} → {with_reply})"
+        );
+    }
+
+    /// A `Provider` whose FIRST call reports a `Usage` and then STALLS
+    /// forever, cancelling the TURN token the moment the loop asks for the
+    /// next event: the stream-consume `select!` takes the `Usage` (the one
+    /// event that lands — nothing is cancelled yet, so that arm is
+    /// unopposed) and then the cancel arm wins deterministically (the stream
+    /// never becomes ready again) → `settle_cancelled` with NO assistant
+    /// message pushed, which is exactly what a Stop does to a partial reply.
+    /// Later calls reply normally with no usage (the turn AFTER the cancel).
+    struct CancelAfterUsageProvider {
+        calls: AtomicU32,
+        turn_cancel: Arc<StdMutex<CancellationToken>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CancelAfterUsageProvider {
+        async fn complete(
+            &self,
+            _req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(futures_util::stream::iter(vec![
+                    ProviderEvent::TextDelta("hi".to_string()),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ])
+                .boxed());
+            }
+            let token = self
+                .turn_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            Ok(futures_util::stream::unfold(0u8, move |s| {
+                let token = token.clone();
+                async move {
+                    match s {
+                        0 => Some((
+                            ProviderEvent::Usage(Usage {
+                                input_tokens: 90,
+                                output_tokens: 50,
+                            }),
+                            1u8,
+                        )),
+                        // The loop asks for the NEXT event: that is when the
+                        // Stop lands, so the usage above is always recorded
+                        // before the turn settles.
+                        _ => {
+                            token.cancel();
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                    }
+                }
+            })
+            .boxed())
+        }
+    }
+
+    /// A turn that ENDS WITHOUT the assistant message (here: the provider
+    /// reported a `Usage`, then the stream died and the retry budget
+    /// exhausted) leaves the `Compactor`'s watermark pointing PAST the reply
+    /// that was never pushed — a failed (or cancelled) turn deliberately does
+    /// NOT persist a partial reply. The next turn's prompt then lands INSIDE
+    /// the watermark window, so it is excluded from the trailing estimate: the
+    /// very lag commit `a846abb` exists to prevent, resurrected for the
+    /// post-failure case, and the anchor still carries the discarded reply's
+    /// output.
+    ///
+    /// The arithmetic: threshold 300 (`model_with_threshold`), prompt `"go"`
+    /// = 1, the failed call reports `input 90 + output 50` = a 140 anchor over
+    /// a 1-message transcript, so the watermark claims 2 messages. The NEXT
+    /// prompt is 4000 chars = 1001. Left unreconciled the snapshot is the bare
+    /// 140 — under the 300 threshold, so no compaction and the oversized
+    /// context goes to the provider. Reconciled it is `90 + 1001 = 1091`
+    /// (the discarded 50 of output is gone with the reply) and the SECOND
+    /// turn's first threshold check is due.
+    #[tokio::test]
+    async fn a_failed_turn_still_measures_the_next_prompt() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        // Call 1 (turn 1): a usage report, then `Done(Error)` — with a
+        // ONE-attempt budget the turn settles FAILED after that single call,
+        // never pushing a reply. Call 2 (turn 2): an ordinary usage-less
+        // reply.
+        let (provider, calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 90,
+                    output_tokens: 50,
+                }),
+                ProviderEvent::Done(FinishReason::Error),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("hi".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            // ONE attempt: the mid-stream error exhausts the budget at once,
+            // so turn 1 is exactly one model call (no backoff sleeps).
+            RetryPolicy::new_with(1, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![model_with_threshold("m1", 300)],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+        assert!(
+            !event_kinds(&mut events_rx).contains(&"compaction_start".to_string()),
+            "the failed turn itself is not due (140 < 300)"
+        );
+        assert_eq!(
+            loop_.messages.len(),
+            1,
+            "a failed turn persists the prompt ONLY — no assistant reply"
+        );
+
+        loop_.handle_prompt(&text_prompt(&"x".repeat(4000))).await;
+
+        let kinds = event_kinds(&mut events_rx);
+        assert!(
+            kinds.contains(&"compaction_start".to_string()),
+            "the SECOND turn must measure the prompt its predecessor's watermark \
+             swallowed — an abandoned reply must not make a 1091-token context look \
+             like a 140-token one, got {kinds:?}"
+        );
+        let prompt_estimate = compact::estimate_context(&loop_.messages[1..2]);
+        assert_eq!(prompt_estimate, 1001, "the prompt alone is 1001 tokens");
+        let frames: Vec<Value> = updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "context_usage_update")
+            .cloned()
+            .collect();
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["usedTokens"].as_u64() == Some(90 + prompt_estimate)),
+            "the prompt is measured on top of the ANCHOR LESS the discarded reply's \
+             output (90 + {prompt_estimate}), got {frames:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one failed call, then turn 2's reply"
+        );
+    }
+
+    /// The same reconcile on the CANCEL exit (the case that motivated it — a
+    /// Stop drops the partial reply, it is never persisted). Same arithmetic
+    /// as the failed-turn test: the reported `output_tokens` of the reply that
+    /// never landed must leave the anchor, and the watermark must pull back so
+    /// the next prompt is measured.
+    #[tokio::test]
+    async fn a_cancelled_turn_still_measures_the_next_prompt() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let provider = CancelAfterUsageProvider {
+            calls: AtomicU32::new(0),
+            turn_cancel: turn_cancel.clone(),
+        };
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![model_with_threshold("m1", 300)],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+        assert!(
+            !event_kinds(&mut events_rx).contains(&"compaction_start".to_string()),
+            "the cancelled turn itself is not due (140 < 300)"
+        );
+        assert_eq!(
+            loop_.messages.len(),
+            1,
+            "a cancelled turn persists the prompt ONLY — the partial reply is NOT \
+             persisted, which is what makes the watermark wrong"
+        );
+        // The provider cancelled the TURN token (that is how it makes the cancel
+        // arm win), so the test re-arms it before the next prompt. It has to:
+        // `handle_prompt` does install a fresh token, but only AFTER its
+        // Stop-pending guard — which sees the cancelled token, drains the queue,
+        // settles, and SKIPS the prompt. In the live loop `run()` re-arms a
+        // stale idle token between turns, so a later prompt is a FRESH turn.
+        *turn_cancel.lock().unwrap_or_else(|p| p.into_inner()) = CancellationToken::new();
+
+        loop_.handle_prompt(&text_prompt(&"x".repeat(4000))).await;
+
+        let kinds = event_kinds(&mut events_rx);
+        assert!(
+            kinds.contains(&"compaction_start".to_string()),
+            "the prompt after a cancelled turn must be measured before that turn's \
+             first threshold check, got {kinds:?}"
+        );
+        let prompt_estimate = compact::estimate_context(&loop_.messages[1..2]);
+        let frames: Vec<Value> = updates
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "context_usage_update")
+            .cloned()
+            .collect();
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["usedTokens"].as_u64() == Some(90 + prompt_estimate)),
+            "the anchor dropped the cancelled reply's output (90 + {prompt_estimate}), \
+             got {frames:?}"
+        );
+    }
+
+    /// The reconcile is needed INSIDE the turn as well: the mid-stream retry
+    /// loop-back is the one path that returns to `should_compact()` WITHOUT
+    /// exiting the turn, so the settle paths' coverage cannot reach it. A
+    /// stream that reports a `Usage` and THEN dies retryably takes that branch
+    /// — it pushes NO assistant message (the partial reply is discarded and
+    /// re-generated), yet the watermark `record_usage` wrote still claims the
+    /// reply landed and the anchor still carries the discarded reply's
+    /// `output_tokens`. Pre-fix the very next iteration's threshold check read
+    /// that phantom output — tokens the provider generated for a reply it threw
+    /// away — so a dying reply large enough to cross `window - reserve`
+    /// compacted the session BEFORE the retry's own (successful) call:
+    /// "Compacting context…" for a context nobody holds, the exact symptom this
+    /// metric exists to kill.
+    ///
+    /// The arithmetic: threshold 100 (`model_with_threshold`), and the dying
+    /// call reports `input 90 + output 50` = a 140 anchor over a 1-message
+    /// transcript. So the phantom 140 is OVER the threshold while the honest 90
+    /// is UNDER it: the observable is `compaction_start` itself, not an
+    /// internal field.
+    #[tokio::test]
+    async fn a_retried_model_call_does_not_compact_for_the_reply_it_threw_away() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let updates = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+            updates: updates.clone(),
+        });
+        // Call 1: a usage report, THEN the stream dies retryably
+        // (`Done(Error)`) — the reply is discarded, no assistant message is
+        // pushed. Call 2: the retry succeeds.
+        let (provider, calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 90,
+                    output_tokens: 50,
+                }),
+                ProviderEvent::Done(FinishReason::Error),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("hi".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let mut loop_ = build_loop_with_dispatcher(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            // TWO attempts: the mid-stream error retries ONCE and the retry
+            // succeeds (a 1 ms backoff), so the turn ends CLEANLY — no
+            // `settle_error` to reconcile for it.
+            RetryPolicy::new_with(2, Duration::from_millis(1)),
+            sink,
+            None,
+            vec![model_with_threshold("m1", 100)],
+            None,
+        );
+        loop_.handle_prompt(&text_prompt("go")).await;
+
+        let kinds = event_kinds(&mut events_rx);
+        assert!(
+            !kinds.contains(&"compaction_start".to_string()),
+            "the threshold must NOT read the 50 tokens of output the retry threw away: the \
+             context is 90 (not due at 100), the phantom is 140 (due) — a compaction here \
+             was triggered by a reply that was never kept: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"auto_retry_start".to_string()),
+            "the dying stream took the mid-stream retry — the loop-back under test: {kinds:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the retry really re-issued the call"
+        );
+        // …and the same number the threshold just read is the one the bar shows.
+        assert_eq!(
+            loop_.compactor.context_tokens(),
+            90 + compact::estimate_context(&loop_.messages[1..]),
+            "the anchor is the SURVIVING reply on the 90 the provider still holds, not \
+             140 (the discarded attempt's output)"
         );
     }
 
@@ -2805,18 +3589,26 @@ mod tests {
     }
 
     /// A model switch changes the WINDOW (the context — the messages — is
-    /// unchanged): the last known context size is kept, the frame is
-    /// re-emitted with the new model's window.
+    /// unchanged) AND rebuilds the `Compactor`, which drops the usage anchor.
+    /// The frame, the tracked count, and the threshold the next turn reads must
+    /// all agree the moment the switch happens: a switch that emits the OLD
+    /// number while `should_compact()` reads the freshly-reset `0` is a
+    /// transient breach of ADR 0028's "one number, two consumers", and switching
+    /// INTO a smaller window defers an already-due compaction by a whole prompt
+    /// (the call that has to send the oversized context).
     #[tokio::test]
     async fn a_model_switch_emits_a_context_usage_update_with_the_new_window() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let updates = Arc::new(StdMutex::new(Vec::new()));
         let sink: Arc<dyn EventSink> = Arc::new(TestSink {
             updates: updates.clone(),
         });
         let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+        // The switch TARGET is a model whose compaction threshold is 100 (the
+        // default 16384 reserve), so a 1001-token transcript is already due.
         let mut loop_ = build_loop_with_dispatcher(
             Box::new(provider),
-            mpsc::unbounded_channel().0,
+            events_tx,
             Arc::new(StdMutex::new(CancellationToken::new())),
             watch::channel(0u64).0,
             RetryPolicy::new_with(5, Duration::from_millis(1)),
@@ -2827,33 +3619,52 @@ mod tests {
         );
         loop_.load_transcript(vec![ChatMessage {
             role: ChatRole::User,
-            content: MessageContent::Text("u1".to_string()),
+            content: MessageContent::Text("x".repeat(4000)),
             tool_call_id: None,
             tool_calls: None,
         }]);
+        let before = last_context_usage_frame(&updates).expect("a frame from the resume");
+        assert_eq!(before["usedTokens"], 1001, "the resumed context");
+        assert_eq!(
+            before["windowTokens"], 128000,
+            "the window is the old model's"
+        );
         let switched = Model {
-            id: "m2".to_string(),
-            provider: "fake".to_string(),
-            base_url: "http://fake".to_string(),
-            api_key: "k".to_string(),
-            context_window: 64000,
-            cost_per_mtok_in: 0.0,
-            cost_per_mtok_out: 0.0,
-            supports_tools: true,
-            supports_thinking: false,
-            thinking_levels: Vec::new(),
-            api: Some("openai-completions".to_string()),
+            context_window: 16_384 + 100,
+            ..fake_model("m2")
         };
         loop_.set_model(switched);
         let frame = last_context_usage_frame(&updates)
             .expect("a context_usage_update frame was emitted on the model switch");
         assert_eq!(
-            frame["usedTokens"], 1,
-            "the context size is kept (the messages are unchanged)"
+            frame["usedTokens"], 1001,
+            "the frame re-estimates the SAME transcript the switch left the `Compactor` \
+             with — it must not show a number the threshold no longer reads"
         );
         assert_eq!(
-            frame["windowTokens"], 64000,
+            frame["windowTokens"], 16_484,
             "the window is the new model's"
+        );
+        assert_eq!(
+            loop_.compactor.context_tokens(),
+            frame["usedTokens"].as_u64().unwrap(),
+            "one number, two consumers: the bar and the threshold agree IMMEDIATELY \
+             (before the next turn's `note_context`)"
+        );
+        assert!(
+            loop_.compactor.should_compact(),
+            "a transcript already over the NEW window's threshold must be due the moment \
+             the switch happens — not one prompt later"
+        );
+        // …and the next turn acts on it: the threshold is read at the top of
+        // the iteration, so the switch's own number is what fires.
+        loop_.catalog.compaction.keep_recent_tokens = 1;
+        loop_.handle_prompt(&text_prompt("go")).await;
+        let kinds = event_kinds(&mut events_rx);
+        assert!(
+            kinds.contains(&"compaction_start".to_string()),
+            "the switch to a smaller window compacts instead of sending a context it \
+             already knows is too large, got {kinds:?}"
         );
     }
 

@@ -532,7 +532,7 @@ fn request_body(req: &ModelRequest, ask_usage: bool) -> Value {
     // An OpenAI-compatible stream carries NO `usage` chunk unless the
     // request asks for it — and a usage-less session is worse than a
     // cosmetic problem: the `AgentLoop`'s `last_context_tokens` and the
-    // `Compactor`'s accumulation are BOTH fed by the `Usage` event, so
+    // `Compactor`'s usage ANCHOR are BOTH fed by the `Usage` event, so
     // without it the context bar freezes at its first estimate and
     // auto-compaction can NEVER trip (an unbounded transcript until the
     // provider 400s). Streaming-only: OpenAI rejects `stream_options`
