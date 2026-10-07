@@ -1194,10 +1194,16 @@ mod tests {
         );
     }
 
-    /// (d) On a machine with a current header (this one, usually), the audit
-    /// checks every right and skips nothing.
+    /// (d) The REAL header on this machine must AGREE with our constants, and
+    /// must carry the whole ABI 1 floor. What it must NOT be required to do is
+    /// define the NEWER rights — that is a fact about the machine, not about
+    /// this table, and asserting it here is exactly how a test passes on a
+    /// dev box and reddens CI (Ubuntu 24.04's v6.8 header has no `IOCTL_DEV`).
+    /// Full 17-right coverage is proven where it belongs: deterministically,
+    /// against a synthetic current header in
+    /// [`a_current_uapi_header_checks_every_right`].
     #[test]
-    fn the_installed_uapi_header_checks_every_right() {
+    fn the_installed_uapi_header_agrees_with_our_constants() {
         let Ok(text) = std::fs::read_to_string(UAPI_HEADER_PATH) else {
             eprintln!(
                 "NOTE: no {UAPI_HEADER_PATH} on this machine — the header audit \
@@ -1211,11 +1217,37 @@ mod tests {
             "our constants disagree with {UAPI_HEADER_PATH}: {:?}",
             audit.problems
         );
+        assert!(
+            audit.checked >= ABI1_FLOOR.len(),
+            "{UAPI_HEADER_PATH} let only {} right(s) be checked; every right \
+             present since ABI 1 ({}) must be checkable, or the audit proves \
+             nothing (not checkable: {:?})",
+            audit.checked,
+            ABI1_FLOOR.len(),
+            audit.not_checkable
+        );
+    }
+
+    /// A CURRENT header — one that defines every right we know — lets the
+    /// audit check ALL of them and skip nothing. Synthetic, so this holds on
+    /// every machine: the assertion that used to live on the installed header
+    /// silently turned the dev box's newer `linux-libc-dev` into a green CI
+    /// and an older runner into a red one.
+    #[test]
+    fn a_current_uapi_header_checks_every_right() {
+        let mut defines: Vec<(&str, u32)> = v6_8_defines();
+        defines.push(("LANDLOCK_ACCESS_FS_IOCTL_DEV", 15));
+        defines.push(("LANDLOCK_ACCESS_FS_RESOLVE_UNIX", 16));
+        let audit = audit_uapi_rights(&synthetic_header(&defines));
+        assert!(
+            audit.problems.is_empty(),
+            "a current header must agree, got {:?}",
+            audit.problems
+        );
         assert_eq!(
             audit.checked,
             OURS.len(),
-            "a current header must let every right be checked (not checkable: {:?})",
-            audit.not_checkable
+            "a header defining every right must let every one be checked"
         );
         assert!(audit.not_checkable.is_empty());
     }
