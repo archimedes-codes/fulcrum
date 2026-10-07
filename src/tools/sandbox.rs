@@ -1990,8 +1990,17 @@ mod tests {
             .and_then(|s| s.trim().parse().ok())
             .expect("the child reported its own pgid");
         let members = group_members(&before, pgid);
+        // The non-vacuity check is the GRANDCHILD's own row, not a member
+        // COUNT: the executor's read loop collects the child's exit status
+        // as soon as it lands, so `sh` is already REAPED at this sample and
+        // gone from `ps` — a count of 2 saw the grandchild only because the
+        // child used to linger here as an unreaped zombie. The grandchild's
+        // argv is exactly `sleep 1000`; the child's own row (`sh -c sleep
+        // 1000 & …`) merely CONTAINS that substring and must not count.
         assert!(
-            members.len() >= 2,
+            members
+                .iter()
+                .any(|m| m.split_whitespace().skip(2).eq(["sleep", "1000"])),
             "the backgrounded grandchild never shared the child's process group {pgid}: {members:?}"
         );
         let survivors = group_members(&group_snapshot(), pgid);

@@ -323,9 +323,23 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
 
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
+    // The child's pid, captured NOW: `Child::id()` returns `None` once the
+    // child has been reaped, and the process-group kill below needs it —
+    // capturing the exit status early (which the loop does) would
+    // otherwise silently skip the group kill and ORPHAN any grandchild.
+    let group_pid = child.id();
     let mut out: Vec<u8> = Vec::new();
     let mut truncated = false;
     let mut cancelled = false;
+    let mut timed_out = false;
+    // The child's exit status, as SOON as it is observed — deliberately NOT
+    // decided after the drain (see [`bash_exit_report`]: the old code
+    // SIGKILLed a child that had closed its pipes but not yet exited and
+    // reported that self-inflicted signal death as a failed command).
+    let mut status: Option<std::process::ExitStatus> = None;
+    // A failed `wait` means the status can never be learned, so the arm is
+    // retired (re-polling a permanently failing wait would spin the loop).
+    let mut await_status = true;
     let mut stdout_open = true;
     let mut stderr_open = true;
     // One buffer per stream (both select arms borrow them at once).
@@ -369,26 +383,62 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
                     Err(_) => stderr_open = false,
                 }
             },
+            s = child.wait(), if await_status => {
+                // The exit status is captured HERE, in the same `select!` as
+                // the reads, so what a run reports cannot depend on how long
+                // the drain below takes, nor on whether this task gets
+                // scheduled again after it. `wait` is cancel-safe, so
+                // re-polling it per iteration is safe; the arm is retired
+                // once the status lands.
+                if let Ok(s) = s {
+                    status = Some(s);
+                }
+                await_status = false;
+            },
             _ = ctx.cancel.cancelled() => {
                 cancelled = true;
                 break;
             },
-            _ = tokio::time::sleep_until(deadline.into()) => break,
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                timed_out = true;
+                break;
+            },
         }
-        if !stdout_open && !stderr_open {
+        // Pipe EOF is NOT the end of the run: a child that closed its
+        // pipes may not have exited yet (`exec >&- 2>&-; …; exit N`), and
+        // `select!` completes ONE arm per iteration — so on a simultaneous
+        // read-EOF the `child.wait()` arm may not even be polled here.
+        // Breaking on EOF alone would leave `status: None` and hand the
+        // report to the bounded post-loop reap, which expires under CPU
+        // contention and reports a run that finished fine as "exit status
+        // unknown". Break only once the exit status is SETTLED — seen
+        // (`status.is_some()`), or the wait arm retired (`!await_status`):
+        // a child that closed its pipes but has not exited is awaited
+        // (bounded by the `deadline` arm above), never reported early.
+        if !stdout_open && !stderr_open && (status.is_some() || !await_status) {
             break;
         }
     }
 
-    // The loop broke on cancel/timeout while the pipes were still open
-    // (a backgrounded grandchild may hold them): kill the WHOLE process
-    // group (on Unix the child is in its own group via `process_group(0)`)
-    // so the grandchildren are reaped and the pipes close.
+    // Kill the WHOLE process group whenever anything may still be alive:
+    // the loop broke on cancel/timeout with the child's exit unobserved
+    // (`status.is_none()`), or with a pipe still open (a backgrounded
+    // grandchild may hold it). A child that CLOSED ITS PIPES has not
+    // necessarily exited — pipe EOF is not an exit — so an unobserved exit
+    // is a live child until proven otherwise. The kill is skipped ONLY
+    // when the exit was observed AND both pipes are closed: nothing is
+    // alive then, and signalling the (possibly recycled) process group
+    // would be wrong. On Unix the child is in its own group via
+    // `process_group(0)`, so the grandchildren are reaped and the pipes
+    // close.
+    if stdout_open || stderr_open || status.is_none() {
+        kill_bash_process_group(group_pid, &mut child).await;
+    }
+    // Drain what the group's death frees, bounded by a short grace
+    // deadline — NOT an unbounded wait for EOF (a grandchild that
+    // escaped the group could hold the pipes forever). Only meaningful
+    // while a pipe is open: both closed means there is nothing to read.
     if stdout_open || stderr_open {
-        kill_bash_process_group(&mut child).await;
-        // Drain what the group's death frees, bounded by a short grace
-        // deadline — NOT an unbounded wait for EOF (a grandchild that
-        // escaped the group could hold the pipes forever).
         let grace = std::time::Instant::now() + DRAIN_GRACE;
         loop {
             tokio::select! {
@@ -426,26 +476,121 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
         }
     }
 
-    // `kill` is a no-op when the child already exited; on a kill the exit
-    // `code()` is `None` (signal) → reported as -1. `wait` is bounded by
-    // the same grace deadline (a reaped pid's `kill` is a bare no-op, but
-    // the reap must not be allowed to hang the call either).
-    let _ = child.kill().await;
-    let exit_code = match tokio::time::timeout(DRAIN_GRACE, child.wait()).await {
-        Ok(Ok(s)) => s.code().unwrap_or(-1),
-        _ => -1,
-    };
+    // The report is decided by [`bash_exit_report`], from the facts the run
+    // actually has. NO unconditional `kill()`: a child that has written all
+    // its output and closed both pipes is NOT dead yet (pipe EOF is not an
+    // exit), and SIGKILLing it there reported a SUCCESSFUL command as a
+    // failure — the flake that made models retry non-idempotent commands.
+    // If the status is still unknown, give the reap one bounded chance to
+    // land (the child is usually already dead, so this returns at once) —
+    // and if it does not, say so instead of inventing -1.
+    if status.is_none() {
+        if let Ok(Ok(s)) = tokio::time::timeout(DRAIN_GRACE, child.wait()).await {
+            status = Some(s);
+        }
+    }
+    let (exit_code, is_error, note) = bash_exit_report(cancelled, timed_out, status);
+
+    // The note goes into the text the MODEL reads: a `null` exit code on
+    // the wire is invisible to it, and "unknown — check before re-running"
+    // is exactly the thing it must not have to guess.
+    let mut text = String::from_utf8_lossy(&out).into_owned();
+    if let Some(note) = note {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&note);
+        text.push('\n');
+    }
 
     ToolResult {
-        content: vec![ContentBlock::Text {
-            text: String::from_utf8_lossy(&out).into_owned(),
-        }],
+        content: vec![ContentBlock::Text { text }],
         details: Some(json!({
             "exitCode": exit_code,
             "truncated": truncated,
             "cancelled": cancelled,
         })),
-        is_error: exit_code != 0 || cancelled,
+        is_error,
+    }
+}
+
+/// The exit status' terminating SIGNAL (the `None` for a normal exit), or
+/// `None` on a platform whose `ExitStatus` does not expose one.
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// What a `bash` run reports, given everything the executor actually knows.
+///
+/// PURE on purpose — the three inputs are the only facts the run produces
+/// (was it cancelled, did it hit its deadline, was the child's exit status
+/// observed), so the whole truth table is unit-testable without a child and
+/// without timing. This is where the old code fabricated `exitCode: -1`:
+/// a child that had already written all its output and closed both pipes
+/// was still alive for a few more microseconds (EOF on a pipe does NOT mean
+/// the process exited), and the unconditional `kill()` that followed turned
+/// a SUCCESS into a signal death reported as `-1` — a model watching a
+/// successful `git commit` fail, and retrying a non-idempotent command.
+///
+/// Returns `(reported exit code, is_error, note)`: the code is `None` when
+/// it is genuinely unknowable (never a fabricated number), and the `note`
+/// — appended to the text the MODEL reads — explains any outcome the bare
+/// code cannot (`bash_output_capped_at_max`'s cap applies to the captured
+/// output, not to this note).
+fn bash_exit_report(
+    cancelled: bool,
+    timed_out: bool,
+    status: Option<std::process::ExitStatus>,
+) -> (Option<i32>, bool, Option<String>) {
+    /// The warning for an outcome that cannot be known: the model must not
+    /// read silence as success, and must not re-run blind.
+    const UNKNOWN: &str = "The command's exit status is unknown (the process was never reaped): it may have SUCCEEDED, and its side effects may already have landed — inspect the resulting state before re-running this command.";
+
+    let code = status.and_then(|s| s.code());
+    let signal = status.and_then(|s| exit_signal(&s));
+
+    // Cancel wins over the deadline (whichever arm broke the loop first).
+    if cancelled {
+        return (
+            code,
+            true,
+            Some(
+                "The command was cancelled before it finished; it may have completed part of its work.".to_string(),
+            ),
+        );
+    }
+    if timed_out {
+        let mut note = "The command timed out and was killed at its deadline.".to_string();
+        if status.is_none() {
+            note.push(' ');
+            note.push_str(UNKNOWN);
+        }
+        return (code, true, Some(note));
+    }
+    match (code, signal) {
+        // The one non-error row: the child exited 0 and we SAW it do so.
+        (Some(0), None) => (Some(0), false, None),
+        // A normal non-zero exit needs no note — the code IS the report.
+        (Some(n), None) => (Some(n), true, None),
+        // A signal death is NOT dressed up as an exit code: -1 would be
+        // indistinguishable from "unknown", and a real signal death must
+        // stay distinguishable from a non-zero exit.
+        (_, Some(sig)) => (
+            None,
+            true,
+            Some(format!(
+                "The command died on signal {sig} rather than exiting with a code."
+            )),
+        ),
+        // No status at all: honestly unknown.
+        (None, None) => (None, true, Some(UNKNOWN.to_string())),
     }
 }
 
@@ -453,13 +598,17 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
 /// spawned in its own group via `process_group(0)`, so a negative-pid
 /// `kill` SIGKILLs the group (including backgrounded grandchildren that
 /// hold the pipes open); elsewhere fall back to killing the child only.
-async fn kill_bash_process_group(child: &mut tokio::process::Child) {
+///
+/// `pid` is the child's pid captured BEFORE it can be reaped: `Child::id()`
+/// goes `None` the moment the exit status is collected, and a `None` here
+/// skips the group kill and leaves an orphaned grandchild holding the pipes
+/// (and writing the marker file it was about to write).
+async fn kill_bash_process_group(pid: Option<u32>, child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         // A negative pid SIGKILLs the WHOLE process group (the child is
-        // the group leader via `process_group(0)`); `None` when the child
-        // was already reaped (then the kill below is a no-op too).
-        if let Some(pid) = child.id() {
+        // the group leader via `process_group(0)`).
+        if let Some(pid) = pid {
             let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
         // Fallback: kill the direct child as well.
@@ -467,6 +616,7 @@ async fn kill_bash_process_group(child: &mut tokio::process::Child) {
     }
     #[cfg(not(unix))]
     {
+        let _ = pid; // No process groups to kill here.
         let _ = child.kill().await;
     }
 }
@@ -1183,6 +1333,78 @@ mod tests {
         }
     }
 
+    /// Nanny CPU load: one `sh` busy-loop per logical CPU, SIGKILLed (and
+    /// reaped) when the guard drops, so no spinner outlives the test.
+    /// The count is bounded by `available_parallelism()` — this box's own
+    /// topology, which the load test needs in order to saturate it — and no
+    /// assertion reads it, so the test stays machine-independent.
+    #[cfg(target_os = "linux")]
+    struct CpuLoad {
+        supervisor: std::process::Child,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CpuLoad {
+        /// Spawn one detached busy-loop per logical CPU (`sh -c 'while :; do
+        /// :; done'`), capped so a many-core box cannot fork hundreds.
+        fn spin() -> Self {
+            use std::os::unix::process::CommandExt;
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(32);
+            // A single supervisor `sh` owns every spinner, so dropping the
+            // guard kills the whole set with one negative-pid group kill.
+            let script = format!(
+                "trap 'kill 0' EXIT INT TERM; {}; wait",
+                vec!["while :; do :; done &"; n].join(" ")
+            );
+            let supervisor = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .process_group(0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the load spinners start");
+            // Give the spinners a moment to actually be running.
+            std::thread::sleep(Duration::from_millis(100));
+            Self { supervisor }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for CpuLoad {
+        fn drop(&mut self) {
+            // The supervisor traps EXIT and `kill 0`s its own group; the
+            // negative-pid kill here covers the case where it never ran.
+            let pid = self.supervisor.id();
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            let _ = self.supervisor.kill();
+            let _ = self.supervisor.wait();
+        }
+    }
+
+    /// Pin the CALLING thread to cpu 0 (what `taskset -c 0` does to a
+    /// process): a child it spawns INHERITS the mask, so both the executor
+    /// and its `sh` compete for one saturated cpu — the exact shape of the
+    /// measured repro. Linux only (it is the OS this desktop targets for the
+    /// sandbox, and the helper is used by a Linux-only test).
+    #[cfg(target_os = "linux")]
+    fn pin_to_cpu0() {
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_ZERO(&mut set) };
+        unsafe { libc::CPU_SET(0, &mut set) };
+        let rc = unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                std::ptr::addr_of!(set),
+            )
+        };
+        assert_eq!(rc, 0, "the test thread must be pinned to cpu 0");
+    }
+
     // ── serialization ────────────────────────────────────────────────────
 
     #[test]
@@ -1391,6 +1613,377 @@ mod tests {
         assert!(
             !cwd.join("marker.txt").exists(),
             "the backgrounded grandchild was killed with the process group"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A child that CLOSES ITS OWN PIPES and then runs past its deadline
+    /// must still be killed. Pipe EOF is not an exit: with both pipes
+    /// closed the old kill gate (`stdout_open || stderr_open`) skipped the
+    /// process-group kill entirely, so `exec_bash` returned while the child
+    /// was still running — with a note claiming it "was killed at its
+    /// deadline". The marker is written only by a SURVIVING child.
+    #[tokio::test]
+    async fn bash_timeout_kills_a_child_that_closed_its_pipes() {
+        let cwd = temp_cwd("bash-closed-pipes-timeout");
+        let start = std::time::Instant::now();
+        let r = execute_tool(
+            &ctx(&cwd),
+            "bash",
+            &json!({
+                "command": "exec >&- 2>&-; sleep 2; echo ALIVE >> marker.txt",
+                "timeout_ms": 300,
+            }),
+        )
+        .await;
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "the deadline ended the run (took {:?})",
+            start.elapsed()
+        );
+        assert!(
+            r.is_error,
+            "a timed-out run is an error: TEXT={:?} DETAILS={:?}",
+            text_of(&r),
+            r.details
+        );
+        assert_eq!(r.details.as_ref().unwrap()["cancelled"], false);
+        assert!(
+            text_of(&r).contains("timed out"),
+            "the text says it timed out: {:?}",
+            text_of(&r)
+        );
+        // Wait past the moment an UNKILLED child would have written the
+        // marker (2 s after spawn, well past the 300 ms deadline) — with
+        // the process-group kill it never gets there.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !cwd.join("marker.txt").exists(),
+            "the child was killed at its deadline before it could write"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The cancel path applies the same rule: a cancelled child that had
+    /// already closed its pipes is still alive (pipe EOF is not an exit)
+    /// and must be killed with its group, not left running.
+    #[tokio::test]
+    async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
+        let cwd = temp_cwd("bash-closed-pipes-cancel");
+        let token = CancellationToken::new();
+        let c = ToolCtx {
+            cwd: cwd.clone(),
+            cancel: token.clone(),
+            skill_roots: None,
+            boundary: vec![cwd.clone()],
+            file_policy: crate::agent::policy::FilePolicy::default(),
+            protected: Vec::new(),
+        };
+        let handle = tokio::spawn(async move {
+            execute_tool(
+                &c,
+                "bash",
+                &json!({
+                    "command": "exec >&- 2>&-; sleep 2; echo ALIVE >> marker.txt",
+                    "timeout_ms": 10_000,
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        token.cancel();
+        let r = handle.await.unwrap();
+        assert_eq!(r.details.as_ref().unwrap()["cancelled"], true);
+        assert!(
+            r.is_error,
+            "a cancelled run is an error: TEXT={:?} DETAILS={:?}",
+            text_of(&r),
+            r.details
+        );
+        // Wait past the moment an UNKILLED child would have written the
+        // marker — with the process-group kill it never gets there.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !cwd.join("marker.txt").exists(),
+            "the cancelled child was killed with its process group"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ── the exit-status truth table (pure — no child, no timing) ─────────
+    //
+    // A `sh -c` child reports EOF on its pipes the instant its LAST writing
+    // fd closes, which happens BEFORE the process has exited. The old code
+    // therefore SIGKILLed (or raced) a child that had already finished its
+    // work, and reported the resulting signal death as the fabricated
+    // `exitCode: -1` — a model watching a successful `git commit` see a
+    // failure and RETRY a non-idempotent command. These rows pin the
+    // decision itself, with no timing involved.
+
+    /// A wait status from a raw `waitpid` value (`exit N` → `N << 8`; a
+    /// signal death → the signal number, whose low bits are the cause).
+    #[cfg(unix)]
+    fn wait_status(raw: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(raw)
+    }
+
+    /// THE BUG: a command that exited 0 and whose exit status was observed
+    /// is a SUCCESS. Not an error, code 0, no note.
+    #[cfg(unix)]
+    #[test]
+    fn bash_exit_report_success_is_not_an_error() {
+        let (code, is_error, note) = bash_exit_report(false, false, Some(wait_status(0 << 8)));
+        assert!(
+            !is_error,
+            "a successful run must NOT be reported as a failure"
+        );
+        assert_eq!(code, Some(0));
+        assert_eq!(note, None, "a success has nothing to warn about");
+    }
+
+    /// A non-zero exit is an error carrying the REAL code (the shape
+    /// `bash_nonzero_exit_is_error` asserts on the wire).
+    #[cfg(unix)]
+    #[test]
+    fn bash_exit_report_nonzero_exit_is_an_error_with_its_real_code() {
+        let (code, is_error, note) = bash_exit_report(false, false, Some(wait_status(3 << 8)));
+        assert!(is_error);
+        assert_eq!(code, Some(3), "the real code, never a fabricated one");
+        assert_eq!(note, None);
+    }
+
+    /// A signal death is an error, but is NOT dressed up as exit code -1 —
+    /// it says which signal killed it (a real signal death must stay
+    /// distinguishable from a non-zero exit).
+    #[cfg(unix)]
+    #[test]
+    fn bash_exit_report_signal_death_names_the_signal() {
+        let (code, is_error, note) = bash_exit_report(false, false, Some(wait_status(9)));
+        assert!(is_error, "killed by a signal is a failure");
+        assert_eq!(code, None, "a signal death has no exit code");
+        let note = note.expect("the note names the signal");
+        assert!(note.contains("signal 9"), "got {note:?}");
+    }
+
+    /// A cancelled run is an error whatever the status says (the user asked
+    /// for it to stop, so it did not complete).
+    #[cfg(unix)]
+    #[test]
+    fn bash_exit_report_cancelled_is_always_an_error() {
+        // Even a status of 0: the run was interrupted, it did not finish.
+        let statuses: [Option<std::process::ExitStatus>; 3] =
+            [None, Some(wait_status(0 << 8)), Some(wait_status(9))];
+        for status in statuses {
+            let (code, is_error, note) = bash_exit_report(true, false, status);
+            assert!(is_error, "a cancelled run is an error (status {status:?})");
+            assert!(
+                note.is_some(),
+                "the model is told it was cancelled (status {status:?})"
+            );
+            assert!(code.is_none() || code == Some(0), "got {code:?}");
+        }
+    }
+
+    /// A deadline run is an error, and says it TIMED OUT (the old code
+    /// inferred "timeout" from a fabricated -1, which is indistinguishable
+    /// from any other unknown outcome).
+    #[cfg(unix)]
+    #[test]
+    fn bash_exit_report_timeout_is_an_error_that_says_timed_out() {
+        let (code, is_error, note) = bash_exit_report(false, true, None);
+        assert!(is_error);
+        assert_eq!(code, None, "no status was seen, so no code is claimed");
+        let note = note.expect("the note says the deadline was hit");
+        assert!(note.contains("timed out"), "got {note:?}");
+        // A timeout that DID see the status still reports it (the kill
+        // landed after the child had already exited).
+        let (code, is_error, _) = bash_exit_report(false, true, Some(wait_status(0 << 8)));
+        assert!(
+            is_error,
+            "a timed-out run is an error even with a clean status"
+        );
+        assert_eq!(code, Some(0));
+    }
+
+    /// The genuinely-unknowable case: NO status was captured. It stays an
+    /// error, claims NO code, and tells the model to check the side effects
+    /// before re-running (re-running a non-idempotent command blindly is
+    /// the dangerous outcome this whole path exists to avoid).
+    #[test]
+    fn bash_exit_report_unknown_status_says_so_and_claims_no_code() {
+        let (code, is_error, note) = bash_exit_report(false, false, None);
+        assert!(is_error, "an unknown outcome is NOT silently a success");
+        assert_eq!(code, None, "no status known means no code invented");
+        let note = note.expect("the note says the status is unknown");
+        assert!(note.contains("unknown"), "got {note:?}");
+        assert!(
+            note.contains("re-run") || note.contains("rerun"),
+            "the note must warn about re-running: {note:?}"
+        );
+    }
+
+    /// The one non-error row of the table is (not cancelled, not timed out,
+    /// exited 0) — everything else is an error. Asserted as a table so a
+    /// future edit cannot widen the success case.
+    #[cfg(unix)]
+    #[test]
+    fn bash_exit_report_success_is_the_only_non_error_row() {
+        let rows = [
+            (false, false, Some(wait_status(0 << 8))),
+            (false, false, Some(wait_status(1 << 8))),
+            (false, false, Some(wait_status(9))),
+            (false, false, None),
+            (true, false, Some(wait_status(0 << 8))),
+            (false, true, Some(wait_status(0 << 8))),
+        ];
+        let ok: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (c, t, s))| !bash_exit_report(*c, *t, *s).1)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            ok,
+            vec![0],
+            "only the first row (exit 0, untouched) is a success"
+        );
+    }
+
+    // ── the same bug, end-to-end ─────────────────────────────────────────
+
+    /// A `sh -c` child closes its stdout/stderr as part of exiting, and the
+    /// read loop breaks on that EOF while the child is still alive for a
+    /// few more microseconds. The old code SIGKILLed the child at that
+    /// moment — so a command that had ALREADY succeeded was reported as
+    /// `exitCode: -1` under CPU contention. This test closes the pipes
+    /// EXPLICITLY (`>&-`) and then stays alive briefly, which is that same
+    /// window made deterministic: the output is complete, the pipes are
+    /// closed, and the process has NOT exited yet.
+    #[tokio::test]
+    async fn bash_success_after_closing_its_pipes_is_not_an_error() {
+        let cwd = temp_cwd("bash-closed-pipes");
+        let r = execute_tool(
+            &ctx(&cwd),
+            "bash",
+            &json!({
+                "command": "echo done; exec >&- 2>&-; sleep 0.2; exit 0",
+                "timeout_ms": 10_000,
+            }),
+        )
+        .await;
+        assert!(
+            !r.is_error,
+            "a command that succeeded must not be reported as a failure: TEXT={:?} DETAILS={:?}",
+            text_of(&r),
+            r.details
+        );
+        assert_eq!(
+            r.details.as_ref().unwrap()["exitCode"],
+            0,
+            "the real exit code, got {:?}",
+            r.details
+        );
+        assert!(
+            text_of(&r).contains("done"),
+            "the output captured before the pipes closed is returned: {:?}",
+            text_of(&r)
+        );
+        assert_eq!(r.details.as_ref().unwrap()["cancelled"], false);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The other half of "report the REAL exit status": a child that closed
+    /// its pipes early and then exited NON-ZERO must come back as an error
+    /// carrying its real code — never "exit status unknown", never a code
+    /// guessed after a grace period. Two shapes, same expectation: the
+    /// short one pins the ordinary case (the bounded post-loop reap usually
+    /// catches a 0.2 s sleep, so it cannot pin the hole alone), and
+    /// the long one — a sleep that outlasts [`DRAIN_GRACE`] — pins the
+    /// read loop's OWN EOF break: it must wait for the exit status itself
+    /// instead of leaning on the post-loop reap, which expires under CPU
+    /// contention and reports a run that really exited 7 as "unknown".
+    #[tokio::test]
+    async fn bash_nonzero_exit_after_closing_its_pipes_reports_its_real_code() {
+        let cwd = temp_cwd("bash-closed-pipes-nz");
+        for cmd in [
+            "echo done; exec >&- 2>&-; sleep 0.2; exit 7",
+            "echo done; exec >&- 2>&-; sleep 3; exit 7",
+        ] {
+            let r = execute_tool(
+                &ctx(&cwd),
+                "bash",
+                &json!({ "command": cmd, "timeout_ms": 10_000 }),
+            )
+            .await;
+            assert!(
+                !r.details.as_ref().unwrap()["cancelled"].as_bool().unwrap(),
+                "{cmd}: not a cancellation"
+            );
+            assert!(
+                r.is_error,
+                "{cmd}: a non-zero exit is an error: TEXT={:?} DETAILS={:?}",
+                text_of(&r),
+                r.details
+            );
+            assert_eq!(
+                r.details.as_ref().unwrap()["exitCode"],
+                7,
+                "{cmd}: the real exit code, got {:?}",
+                r.details
+            );
+            assert!(
+                text_of(&r).contains("done"),
+                "{cmd}: the output captured before the pipes closed is returned: {:?}",
+                text_of(&r)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The flake's shape, reproduced on purpose: the executor pinned to ONE
+    /// cpu (`sched_setaffinity`, what `taskset -c 0` does) while every cpu on
+    /// the box is saturated by busy-loop spinners, running a trivially
+    /// successful command over and over. Measured against the pre-fix code
+    /// on this box — 30 runs of this test — every command came back
+    /// `isError=true, exitCode: -1` (360 of 360) with CORRECT output and
+    /// `cancelled: false`: a model watching a successful `git commit` fail.
+    /// The assertions are machine-independent (only "a successful run
+    /// reports success"), so a faster or slower box cannot redden it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bash_success_survives_a_saturated_machine() {
+        let cwd = temp_cwd("bash-load");
+        let _load = CpuLoad::spin();
+        let c = ctx(&cwd);
+        let bad = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .spawn_scoped(s, move || {
+                    pin_to_cpu0();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let mut bad = Vec::new();
+                        for i in 0..12 {
+                            let cmd = format!("echo LOAD-{i} > out{i}.txt && cat out{i}.txt");
+                            let r = execute_tool(&c, "bash", &json!({ "command": cmd })).await;
+                            let code = r.details.as_ref().unwrap()["exitCode"].clone();
+                            if r.is_error || code != serde_json::json!(0) {
+                                bad.push(format!("{cmd} → isError={} {code}", r.is_error));
+                            }
+                        }
+                        bad
+                    })
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        assert!(
+            bad.is_empty(),
+            "successful runs reported under load: {bad:?}"
         );
         let _ = std::fs::remove_dir_all(&cwd);
     }
