@@ -962,13 +962,278 @@ mod tests {
         ("LANDLOCK_ACCESS_FS_RESOLVE_UNIX", ACCESS_RESOLVE_UNIX),
     ];
 
+    // ── the header audit: parser + coverage floor ────────────────────────
+
+    /// Where the kernel UAPI header lives when the machine has one.
+    const UAPI_HEADER_PATH: &str = "/usr/include/linux/landlock.h";
+
+    /// Parse every `#define LANDLOCK_ACCESS_FS_*  (1ULL << N)` out of header
+    /// text. Pure — no filesystem — so it can be driven with a synthetic
+    /// v6.8 header. The name is matched as a whole token, so the NET rights
+    /// (which reuse bit numbers 0..=3) cannot be mistaken for FS ones.
+    fn parse_uapi_rights(header_text: &str) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for line in header_text.lines() {
+            let Some(rest) = line
+                .trim_start()
+                .strip_prefix("#define LANDLOCK_ACCESS_FS_")
+            else {
+                continue;
+            };
+            let Some(name_end) = rest.find(|c: char| c.is_whitespace()) else {
+                continue;
+            };
+            let name = format!("LANDLOCK_ACCESS_FS_{}", &rest[..name_end]);
+            let Some(bits) = rest[name_end..].split("<<").nth(1) else {
+                continue;
+            };
+            let shift = bits
+                .trim()
+                .trim_end_matches(')')
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u32>().ok());
+            if let Some(shift) = shift.filter(|s| *s < 64) {
+                out.push((name, 1u64 << shift));
+            }
+        }
+        out
+    }
+
+    /// What an audit of one header text produced.
+    #[derive(Debug, Default)]
+    struct HeaderAudit {
+        /// Rights found in the header AND compared against our constants.
+        checked: usize,
+        /// Ours that the header does not define — NOT failures, simply not
+        /// checkable on that header version (e.g. `IOCTL_DEV`, which a v6.8
+        /// `linux-libc-dev` does not have).
+        not_checkable: Vec<&'static str>,
+        /// Everything that IS a failure: a bit mismatch, or an ABI-1 right
+        /// missing from a header that defines Landlock at all.
+        problems: Vec<String>,
+    }
+
+    /// The rights that have been in the UAPI header since Landlock landed
+    /// (ABI 1, bits 0..=12): a header that defines `linux/landlock.h` at all
+    /// MUST define these, so their absence is a broken header, not an old
+    /// one. This is the coverage floor that keeps the audit from degenerating
+    /// into checking nothing.
+    const ABI1_FLOOR: &[&str] = &[
+        "LANDLOCK_ACCESS_FS_EXECUTE",
+        "LANDLOCK_ACCESS_FS_WRITE_FILE",
+        "LANDLOCK_ACCESS_FS_READ_FILE",
+        "LANDLOCK_ACCESS_FS_READ_DIR",
+        "LANDLOCK_ACCESS_FS_REMOVE_DIR",
+        "LANDLOCK_ACCESS_FS_REMOVE_FILE",
+        "LANDLOCK_ACCESS_FS_MAKE_CHAR",
+        "LANDLOCK_ACCESS_FS_MAKE_DIR",
+        "LANDLOCK_ACCESS_FS_MAKE_REG",
+        "LANDLOCK_ACCESS_FS_MAKE_SOCK",
+        "LANDLOCK_ACCESS_FS_MAKE_FIFO",
+        "LANDLOCK_ACCESS_FS_MAKE_BLOCK",
+        "LANDLOCK_ACCESS_FS_MAKE_SYM",
+    ];
+
+    /// Compare our constants against parsed header rights, honouring the
+    /// coverage floor. Returns the problems rather than panicking so the
+    /// synthetic cases can assert on them.
+    fn audit_uapi_rights(header_text: &str) -> HeaderAudit {
+        let parsed = parse_uapi_rights(header_text);
+        let mut audit = HeaderAudit::default();
+        for (name, ours) in OURS {
+            let Some((_, theirs)) = parsed.iter().find(|(n, _)| n == name) else {
+                // Not defined: an older header. Only a failure if this right
+                // has been in the header since Landlock landed.
+                if ABI1_FLOOR.contains(name) {
+                    audit.problems.push(format!(
+                        "{name} is an ABI 1 right (it has been in the UAPI header \
+                         since Landlock landed) but this header does not define it \
+                         — the header is broken or truncated"
+                    ));
+                } else {
+                    audit.not_checkable.push(name);
+                }
+                continue;
+            };
+            if ours != theirs {
+                audit.problems.push(format!(
+                    "{name}: our constant is {ours:#x} but the header says {theirs:#x} \
+                     (bit {})",
+                    theirs.trailing_zeros()
+                ));
+            }
+            audit.checked += 1;
+        }
+        audit
+    }
+
+    /// Audit a header AND say out loud what could not be checked — a partial
+    /// audit must never look like a full pass (this module's `SKIP-SANDBOX` /
+    /// `SANDBOX-COVERAGE` convention).
+    fn audit_rights_against_header(header_text: &str) -> HeaderAudit {
+        let audit = audit_uapi_rights(header_text);
+        if !audit.not_checkable.is_empty() {
+            eprintln!(
+                "SKIP-UAPI: {} right(s) absent from this kernel header so NOT checkable \
+                 here: {} — {} right(s) WERE compared to the header",
+                audit.not_checkable.len(),
+                audit.not_checkable.join(", "),
+                audit.checked
+            );
+        } else {
+            eprintln!(
+                "UAPI-COVERAGE: all {} right(s) compared to the header, 0 not checkable",
+                audit.checked
+            );
+        }
+        audit
+    }
+
+    /// A synthetic header body, in the exact shape the real one has
+    /// (`#define NAME<TAB>(1ULL << N)`), including the NET rights — which
+    /// share bit numbers with the FS ones and MUST NOT be matched.
+    fn synthetic_header(defines: &[(&str, u32)]) -> String {
+        let mut text = String::from(
+            "/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */\n\
+             #ifndef _LINUX_LANDLOCK_H\n#define _LINUX_LANDLOCK_H\n\n",
+        );
+        for (name, shift) in defines {
+            text.push_str(&format!("#define {name}\t\t\t(1ULL << {shift})\n"));
+        }
+        text.push_str(
+            "\n#define LANDLOCK_ACCESS_NET_BIND_TCP\t\t\t(1ULL << 0)\n\
+             #define LANDLOCK_ACCESS_NET_CONNECT_TCP\t\t\t(1ULL << 1)\n\
+             #endif /* _LINUX_LANDLOCK_H */\n",
+        );
+        text
+    }
+
+    /// The defines a v6.8 (Ubuntu 24.04 `linux-libc-dev`) header has: every
+    /// right up to `TRUNCATE`, no `IOCTL_DEV` (v6.10) and no `RESOLVE_UNIX`.
+    fn v6_8_defines() -> Vec<(&'static str, u32)> {
+        OURS.iter()
+            .filter(|(n, _)| {
+                !matches!(
+                    *n,
+                    "LANDLOCK_ACCESS_FS_IOCTL_DEV" | "LANDLOCK_ACCESS_FS_RESOLVE_UNIX"
+                )
+            })
+            .map(|(n, b)| (*n, b.trailing_zeros()))
+            .collect()
+    }
+
+    /// (a) A v6.8-style header — the CI header — passes: the 15 rights it
+    /// defines (the 13 ABI-1 ones plus REFER and TRUNCATE) are compared, and
+    /// the 2 newer ones are reported as not checkable rather than failed.
+    #[test]
+    fn an_older_uapi_header_is_audited_for_what_it_defines() {
+        let text = synthetic_header(&v6_8_defines());
+        let audit = audit_rights_against_header(&text);
+        assert!(
+            audit.problems.is_empty(),
+            "a v6.8 header must pass, got: {:?}",
+            audit.problems
+        );
+        assert_eq!(
+            audit.checked,
+            OURS.len() - 2,
+            "13 ABI-1 rights + REFER + TRUNCATE must be checked"
+        );
+        assert_eq!(
+            audit.not_checkable,
+            vec![
+                "LANDLOCK_ACCESS_FS_IOCTL_DEV",
+                "LANDLOCK_ACCESS_FS_RESOLVE_UNIX"
+            ],
+            "the two rights a v6.8 header lacks must be reported, not failed"
+        );
+    }
+
+    /// (b) THE load-bearing case: the bug this guard exists for is a wrong
+    /// BIT, and it must still be caught. `READ_FILE` declared as `1 << 0`
+    /// is exactly the mistranscription that shipped once.
+    #[test]
+    fn a_mistranscribed_bit_in_the_header_fails_the_audit() {
+        let mut defines = v6_8_defines();
+        for (name, shift) in defines.iter_mut() {
+            if *name == "LANDLOCK_ACCESS_FS_READ_FILE" {
+                *shift = 0; // the original bug: READ_FILE transcribed as bit 0
+            }
+        }
+        let audit = audit_rights_against_header(&synthetic_header(&defines));
+        assert_eq!(audit.problems.len(), 1, "got: {:?}", audit.problems);
+        let problem = &audit.problems[0];
+        assert!(
+            problem.contains("LANDLOCK_ACCESS_FS_READ_FILE"),
+            "the failure must name the right, got: {problem}"
+        );
+        assert!(
+            problem.contains("0x4") && problem.contains("0x1"),
+            "the failure must show BOTH bits (ours 0x4, header 0x1), got: {problem}"
+        );
+    }
+
+    /// (c) The coverage floor: a header that defines Landlock but not the
+    /// rights that have existed since ABI 1 is a broken header, and an audit
+    /// that quietly checks less must never go green.
+    #[test]
+    fn a_header_missing_an_abi_1_right_fails_the_coverage_floor() {
+        let defines: Vec<(&str, u32)> = v6_8_defines()
+            .into_iter()
+            .filter(|(n, _)| *n != "LANDLOCK_ACCESS_FS_READ_DIR")
+            .collect();
+        let audit = audit_rights_against_header(&synthetic_header(&defines));
+        assert!(
+            audit
+                .problems
+                .iter()
+                .any(|p| p.contains("LANDLOCK_ACCESS_FS_READ_DIR") && p.contains("ABI 1")),
+            "a missing ABI-1 right must be a problem, got: {:?}",
+            audit.problems
+        );
+    }
+
+    /// (d) On a machine with a current header (this one, usually), the audit
+    /// checks every right and skips nothing.
+    #[test]
+    fn the_installed_uapi_header_checks_every_right() {
+        let Ok(text) = std::fs::read_to_string(UAPI_HEADER_PATH) else {
+            eprintln!(
+                "NOTE: no {UAPI_HEADER_PATH} on this machine — the header audit \
+                 ran only on synthetic headers"
+            );
+            return;
+        };
+        let audit = audit_rights_against_header(&text);
+        assert!(
+            audit.problems.is_empty(),
+            "our constants disagree with {UAPI_HEADER_PATH}: {:?}",
+            audit.problems
+        );
+        assert_eq!(
+            audit.checked,
+            OURS.len(),
+            "a current header must let every right be checked (not checkable: {:?})",
+            audit.not_checkable
+        );
+        assert!(audit.not_checkable.is_empty());
+    }
+
     /// THE regression test for the mistranscribed table: the hand-rolled
     /// `ACCESS_*` bits are the ABI, and a wrong one does not fail loudly —
     /// it enforces a different (weaker) right set while the ruleset still
-    /// builds. When the UAPI header is on this machine, EVERY value is
-    /// parsed from it and compared. When it is not, the table is still
-    /// checked against the transcribed copy above (so this test NEVER skips
-    /// silently, it just checks less on a machine without kernel headers).
+    /// builds. When the UAPI header is on this machine, EVERY right it
+    /// defines is parsed from it and compared; the table is ALSO checked
+    /// against the transcribed copy above, so this test never skips.
+    ///
+    /// An OLD header checks FEWER rights, and that is not a failure: Linux
+    /// v6.8 (Ubuntu 24.04's `linux-libc-dev`) has no `IOCTL_DEV` (added in
+    /// v6.10) and no `RESOLVE_UNIX`, so those two are simply not checkable
+    /// there — the test says so out loud (`SKIP-UAPI:`) instead of passing
+    /// partially in silence. What keeps "fewer" honest is [`ABI1_FLOOR`]:
+    /// every right present since ABI 1 MUST be found and compared, or the
+    /// header is broken and the test fails.
     #[test]
     fn the_access_right_table_matches_the_kernel_uapi_header() {
         // (a) our constants vs. the transcribed UAPI values: always asserted.
@@ -993,45 +1258,23 @@ mod tests {
         let union = OURS.iter().fold(0u64, |m, (_, b)| m | b);
         assert_eq!(union, ALL_KNOWN_ACCESS, "ALL_KNOWN_ACCESS is not the union");
 
-        // (c) the real header, when this machine has it.
-        let header = match std::fs::read_to_string("/usr/include/linux/landlock.h") {
+        // (c) the real header, when this machine has it: compare whatever it
+        // defines, and never pretend the undefined ones were checked.
+        let header = match std::fs::read_to_string(UAPI_HEADER_PATH) {
             Ok(text) => text,
             Err(_) => {
                 eprintln!(
-                    "NOTE: no /usr/include/linux/landlock.h here — checked the \
-                     transcribed table only"
+                    "NOTE: no {UAPI_HEADER_PATH} here — checked the transcribed \
+                     table only"
                 );
                 return;
             }
         };
-        let mut checked = 0;
-        for (name, ours) in OURS {
-            let line = header
-                .lines()
-                .find(|l| l.trim_start().starts_with(&format!("#define {name}")))
-                .unwrap_or_else(|| panic!("{name} is not in the installed UAPI header"));
-            // `#define X<TAB>(1ULL << N)` — read the shift amount.
-            let shift: u32 = line
-                .split("<<")
-                .nth(1)
-                .unwrap_or_else(|| panic!("cannot parse {line}"))
-                .trim()
-                .trim_end_matches(')')
-                .trim()
-                .parse()
-                .unwrap_or_else(|_| panic!("cannot parse the shift in {line}"));
-            assert_eq!(
-                *ours,
-                1u64 << shift,
-                "{name}: our constant is bit {ours:#x} but the header says bit {}",
-                1u64 << shift
-            );
-            checked += 1;
-        }
-        assert_eq!(
-            checked,
-            OURS.len(),
-            "every right must be found in the installed header"
+        let audit = audit_rights_against_header(&header);
+        assert!(
+            audit.problems.is_empty(),
+            "our constants disagree with {UAPI_HEADER_PATH}: {:?}",
+            audit.problems
         );
     }
 
