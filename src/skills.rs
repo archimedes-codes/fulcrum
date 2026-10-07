@@ -45,6 +45,15 @@ pub enum SkillScope {
     User,
 }
 
+impl std::fmt::Display for SkillScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SkillScope::Space => "space",
+            SkillScope::User => "user",
+        })
+    }
+}
+
 /// Discover skills for `space_path` (its roots + the user-level roots).
 /// `space_path: None` → user-level skills only.
 ///

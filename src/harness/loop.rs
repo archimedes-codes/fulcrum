@@ -1174,11 +1174,15 @@ impl AgentLoop {
             return self.dispatch_subagent(&tc.arguments, turn).await;
         }
         match tc.name.as_str() {
-            "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" => {
+            "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
+            | "read_skill" => {
                 execute_tool(
                     &ToolCtx {
                         cwd: self.space_cwd.clone(),
                         cancel: turn.clone(),
+                        // `None` = the real discovery roots (the same
+                        // `discover_skills` the prompt builder used).
+                        skill_roots: None,
                     },
                     &tc.name,
                     &tc.arguments,
@@ -1672,6 +1676,40 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                     "long": { "type": "boolean" }
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: "list_skills".into(),
+            description: "List the discoverable Skills (name, scope, description) — the catalog the \
+                          `<skills>` system-prompt section advertises, re-read from disk."
+                .into(),
+            parameters: json!({ "type": "object" }),
+        },
+        ToolSpec {
+            name: "read_skill".into(),
+            description: [
+                "Load a Skill's instructions by NAME — the sanctioned way to read a skill file.",
+                "",
+                "`name` matches a discovered Skill (see list_skills, or the `<available_skills>` \
+                section); no `path` returns that skill's `SKILL.md` body. `path` reads a file \
+                BUNDLED with that skill, resolved against the skill's directory — it must stay \
+                inside it.",
+                "",
+                "Skills live OUTSIDE the session sandbox (`~/.agents/skills`, `.agents/skills`), \
+                so the read tool CANNOT reach them — `read` on a skill path always fails with \
+                \"path escapes the session sandbox\". Use this tool instead.",
+            ]
+            .join("\n"),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The Skill's name" },
+                    "path": {
+                        "type": "string",
+                        "description": "A file inside the skill's directory (e.g. a referenced ./format.md)"
+                    }
+                },
+                "required": ["name"]
             }),
         },
         ToolSpec {
@@ -3898,7 +3936,7 @@ mod tests {
     /// schema must match this EXACTLY: a drift makes the model send
     /// params the executor never reads (a dead tool) or omit ones it
     /// does (an undiscoverable feature).
-    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 7] {
+    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 9] {
         [
             ("bash", &["command", "timeout_ms"]),
             ("read", &["path", "offset", "limit"]),
@@ -3907,6 +3945,8 @@ mod tests {
             ("find", &["pattern", "path", "max_results"]),
             ("grep", &["pattern", "path", "glob", "max_results", "-i"]),
             ("ls", &["path", "long"]),
+            ("list_skills", &[]),
+            ("read_skill", &["name", "path"]),
         ]
     }
 

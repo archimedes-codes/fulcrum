@@ -12,6 +12,13 @@
 //! anywhere (the permission gate is the control, exactly as in pi's own
 //! `bash`). Only the path-param tools (`read`/`write`/`edit`/`find`/
 //! `grep`/`ls`) are sandbox-validated via `FsBackend`.
+//!
+//! The skill tools (`list_skills`/`read_skill`) are the deliberate
+//! EXCEPTION to the sandbox rule, and the reason it is safe: a session's
+//! skills live outside its sandbox (`~/.agents/skills`), so a sandboxed
+//! `read` can never load one. They take a skill NAME, never a path — the
+//! discovered skill set is the allowlist — and a bundled-file `path` is
+//! scoped to that one skill's directory by a per-skill `FsBackend`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,7 +29,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::fs_backend::FsBackend;
+use crate::agent::fs_backend::{FsBackend, FsError};
 
 /// The default `bash` deadline when no `timeout_ms` is given (300 s —
 /// matching the interactive channel's `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`: the native
@@ -129,6 +136,13 @@ pub struct ToolCtx {
     pub cwd: PathBuf,
     /// Cancelled when the tool's AbortSignal fires (kills the `bash` child).
     pub cancel: CancellationToken,
+    /// The skill roots the `list_skills` / `read_skill` tools resolve
+    /// against. `None` (the harness's value) → `discover_skills(Some(cwd))`,
+    /// the SAME call the prompt builder makes, so a tool can never list a
+    /// skill the `<skills>` section did not advertise nor miss one it did.
+    /// `Some` pins EXPLICIT roots — the test seam (a test must never read
+    /// the real `~/.agents/skills`), mirroring `skills::discover_in_roots`.
+    pub skill_roots: Option<Vec<(PathBuf, crate::skills::SkillScope)>>,
 }
 
 /// Run a shell command (`sh -c` on Unix; the command is NOT re-parsed) in
@@ -847,6 +861,120 @@ pub async fn exec_ls(ctx: &ToolCtx, params: &Value) -> ToolResult {
     ToolResult::ok_text(names.join("\n"), Some(json!({ "entries": names.len() })))
 }
 
+/// The skills the skill tools may resolve against (see
+/// [`ToolCtx::skill_roots`]): the pinned roots when set (the test seam),
+/// otherwise the SAME discovery call the prompt builder makes — so a tool
+/// can never list a skill the `<skills>` section did not advertise, nor miss
+/// one it did.
+fn skills_for(ctx: &ToolCtx) -> Vec<crate::skills::SkillInfo> {
+    match ctx.skill_roots.as_ref() {
+        Some(roots) => crate::skills::discover_in_roots(roots),
+        None => crate::skills::discover_skills(Some(&ctx.cwd)),
+    }
+}
+
+/// List the discoverable skills — the catalog the `<skills>` system prompt
+/// section advertises, resolved through the SAME discovery call.
+///
+/// Skills live OUTSIDE the session sandbox (user skills are in
+/// `~/.agents/skills` / `~/.pi/agent/skills`), so the sandboxed `read` can
+/// never reach them; this tool is the sanctioned read path, and the
+/// discovered set is its allowlist.
+///
+/// `params`: `{}`.
+pub async fn exec_list_skills(ctx: &ToolCtx, _params: &Value) -> ToolResult {
+    let skills = skills_for(ctx);
+    if skills.is_empty() {
+        return ToolResult::ok_text("none".to_string(), Some(json!({ "skills": 0 })));
+    }
+    let lines: Vec<String> = skills
+        .iter()
+        .map(|s| {
+            // A block-scalar `description` can hold newlines — flatten it so
+            // the one-line-per-skill contract holds (as `list_agents` does).
+            let description = s.description.replace('\n', " ");
+            format!("{} ({}): {}", s.name, s.scope, description)
+        })
+        .collect();
+    ToolResult::ok_text(lines.join("\n"), Some(json!({ "skills": skills.len() })))
+}
+
+/// Read a skill's `SKILL.md` (no `path`) or one of its bundled files
+/// (`path`, resolved against the skill's directory).
+///
+/// The `name` must match a discovered skill — that is the allowlist, so no
+/// arbitrary path is ever reachable. With a `path`, the read is scoped to
+/// the skill's OWN directory via a per-skill [`FsBackend`]: `..` traversal,
+/// an absolute path, and a symlink out of the dir are all rejected, and a
+/// sibling skill's files are NOT reachable (the boundary is the skill dir,
+/// not the skill root).
+///
+/// `params`: `{ name: String, path?: String }`.
+pub async fn exec_read_skill(ctx: &ToolCtx, params: &Value) -> ToolResult {
+    let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
+        return ToolResult::fail("read_skill: missing `name` parameter".to_string(), None);
+    };
+    let skills = skills_for(ctx);
+    let key = name.to_lowercase();
+    let Some(skill) = skills.iter().find(|s| s.name.to_lowercase() == key) else {
+        return ToolResult::fail(
+            format!("read_skill: unknown skill {name:?} — call list_skills for the names"),
+            None,
+        );
+    };
+
+    // The per-skill mini-sandbox: the skill's dir is the boundary.
+    let backend = FsBackend {
+        root: PathBuf::from(&skill.dir),
+    };
+    let Some(rel) = params.get("path").and_then(|v| v.as_str()) else {
+        // No `path` → the `SKILL.md` BODY (discovery already stripped the
+        // frontmatter — exactly what progressive disclosure wants).
+        return ToolResult::ok_text(
+            skill.body.clone(),
+            Some(json!({
+                "skill": skill.name,
+                "scope": skill.scope.to_string(),
+                "dir": skill.dir,
+            })),
+        );
+    };
+
+    let resolved = match backend.validate(Path::new(rel)) {
+        Ok(p) => p,
+        Err(FsError::PathEscape { .. }) => {
+            // NEVER surface the `FsError` here: `PathEscape` carries the
+            // CANONICALIZED path, which for a symlink INSIDE the skill dir
+            // is its target OUTSIDE it — information the model never
+            // supplied (it named only `link`). Echoing it turns a
+            // repo-shipped skill (`data.txt` -> `~/.ssh/id_rsa`) into a
+            // path-disclosure oracle. `read` may echo a path the model
+            // itself passed; `read_skill` must never invent one. Name only
+            // what the model sent + the boundary it already knows.
+            return ToolResult::fail(
+                format!(
+                    "read_skill: `{rel}` resolves outside the skill directory {} — a skill's `path` must stay inside its own directory (a symlink that leaves it is rejected)",
+                    skill.dir
+                ),
+                None,
+            );
+        }
+        // An `Io` failure (missing file, a directory, bad encoding) discloses
+        // nothing the model did not already name — safe to surface verbatim.
+        Err(e) => return ToolResult::fail(format!("read_skill: {e}"), None),
+    };
+    match backend.read(&resolved) {
+        Ok(text) => ToolResult::ok_text(
+            text,
+            Some(json!({
+                "skill": skill.name,
+                "path": rel,
+            })),
+        ),
+        Err(e) => ToolResult::fail(format!("read_skill: {e}"), None),
+    }
+}
+
 /// Dispatch a tool call to its executor (the entry point the native
 /// harness calls).
 pub async fn execute_tool(ctx: &ToolCtx, tool: &str, params: &Value) -> ToolResult {
@@ -858,6 +986,8 @@ pub async fn execute_tool(ctx: &ToolCtx, tool: &str, params: &Value) -> ToolResu
         "find" => exec_find(ctx, params).await,
         "grep" => exec_grep(ctx, params).await,
         "ls" => exec_ls(ctx, params).await,
+        "list_skills" => exec_list_skills(ctx, params).await,
+        "read_skill" => exec_read_skill(ctx, params).await,
         other => ToolResult::fail(format!("unknown tool: {other}"), None),
     }
 }
@@ -877,6 +1007,7 @@ mod tests {
         ToolCtx {
             cwd: cwd.to_path_buf(),
             cancel: CancellationToken::new(),
+            skill_roots: None,
         }
     }
 
@@ -948,6 +1079,7 @@ mod tests {
         let c = ToolCtx {
             cwd: cwd.clone(),
             cancel: token.clone(),
+            skill_roots: None,
         };
         let handle = tokio::spawn(async move {
             let start = std::time::Instant::now();
@@ -1455,6 +1587,248 @@ mod tests {
         let r = execute_tool(&ctx(&cwd), "ls", &json!({ "path": "../" })).await;
         assert!(r.is_error, "a sandbox escape must be rejected");
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ── list_skills / read_skill ─────────────────────────────────────────
+
+    /// A skill root holding `<name>/SKILL.md`; returns the root.
+    fn skill_root(tag: &str, name: &str, content: &str) -> PathBuf {
+        let root = temp_cwd(tag);
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+        root
+    }
+
+    /// `roots` as the ONLY discovery roots — the skill tools take their
+    /// roots from `ToolCtx::skill_roots` so a test never reads the real
+    /// `~/.agents/skills` (the `discover_in_roots` convention).
+    fn ctx_with_roots(cwd: &Path, roots: &[PathBuf]) -> ToolCtx {
+        ToolCtx {
+            cwd: cwd.to_path_buf(),
+            cancel: CancellationToken::new(),
+            skill_roots: Some(
+                roots
+                    .iter()
+                    .map(|r| (r.clone(), crate::skills::SkillScope::Space))
+                    .collect(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_skills_lists_name_scope_and_description() {
+        let cwd = temp_cwd("skills-list");
+        let root = skill_root(
+            "skills-list-root",
+            "alpha",
+            "---\nname: alpha\ndescription: Does alpha.\n---\nBody.\n",
+        );
+        let r = execute_tool(&ctx_with_roots(&cwd, &[root]), "list_skills", &json!({})).await;
+        assert!(!r.is_error);
+        assert_eq!(text_of(&r), "alpha (space): Does alpha.");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn list_skills_empty_is_none_not_error() {
+        let cwd = temp_cwd("skills-list-empty");
+        let root = temp_cwd("skills-list-empty-root");
+        let r = execute_tool(&ctx_with_roots(&cwd, &[root]), "list_skills", &json!({})).await;
+        assert!(!r.is_error, "an empty catalog is not a failure");
+        assert_eq!(text_of(&r), "none");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_reads_skill_md_without_touching_the_sandbox() {
+        // THE regression: the skill lives OUTSIDE `ctx.cwd` (the real-world
+        // case — user skills live in `~/.agents/skills`), so `read` rejects
+        // it and `read_skill` must not.
+        let cwd = temp_cwd("skill-outside");
+        let root = skill_root(
+            "skill-outside-root",
+            "alpha",
+            "---\nname: alpha\ndescription: Does alpha.\n---\nUse the alpha way.\n",
+        );
+        let skill_md = root.join("alpha/SKILL.md");
+        assert!(
+            !skill_md.starts_with(&cwd),
+            "the fixture must sit outside the session sandbox"
+        );
+        // The premise: the sandboxed `read` genuinely rejects it.
+        let escaped = execute_tool(
+            &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
+            "read",
+            &json!({ "path": skill_md }),
+        )
+        .await;
+        assert!(escaped.is_error, "`read` must still reject the escape");
+
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, &[root]),
+            "read_skill",
+            &json!({ "name": "alpha" }),
+        )
+        .await;
+        assert!(!r.is_error, "{}", text_of(&r));
+        assert_eq!(text_of(&r), "Use the alpha way.");
+        assert_eq!(r.details.as_ref().unwrap()["skill"], "alpha");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_name_is_case_insensitive_and_flattens_nothing() {
+        let cwd = temp_cwd("skill-case");
+        let root = skill_root("skill-case-root", "Alpha", "---\nname: Alpha\n---\nBody.\n");
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, &[root]),
+            "read_skill",
+            &json!({ "name": "alpha" }),
+        )
+        .await;
+        assert!(!r.is_error);
+        assert_eq!(text_of(&r), "Body.");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_bundled_file_resolves_relative_to_the_skill_dir() {
+        let cwd = temp_cwd("skill-bundle");
+        let root = skill_root(
+            "skill-bundle-root",
+            "discuss",
+            "---\nname: discuss\n---\nSee [adr](./adr-format.md).\n",
+        );
+        std::fs::write(root.join("discuss/adr-format.md"), "# ADR format\n").unwrap();
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, &[root]),
+            "read_skill",
+            &json!({ "name": "discuss", "path": "./adr-format.md" }),
+        )
+        .await;
+        assert!(!r.is_error, "{}", text_of(&r));
+        // A bundled file is returned VERBATIM (the file's own bytes, unlike
+        // `read`'s line-join) — the whole point is reaching the exact file a
+        // skill references.
+        assert_eq!(text_of(&r), "# ADR format\n");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_bundled_escape_is_rejected() {
+        // A `path` that leaves the SKILL's dir must be rejected even though
+        // it stays inside a sibling skill — the boundary is the skill dir,
+        // not the skill ROOT.
+        let cwd = temp_cwd("skill-esc");
+        let root = skill_root("skill-esc-root", "alpha", "---\nname: alpha\n---\nA.\n");
+        std::fs::write(root.join("secret.txt"), "top secret").unwrap();
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
+            "read_skill",
+            &json!({ "name": "alpha", "path": "../secret.txt" }),
+        )
+        .await;
+        assert!(r.is_error, "an escape from the skill dir must be rejected");
+        assert!(
+            !text_of(&r).contains("top secret"),
+            "the escaped content must not leak: {}",
+            text_of(&r)
+        );
+        // An ABSOLUTE path outside the skill dir is rejected too.
+        let outside = std::env::temp_dir().join("definitely-not-in-the-skill.txt");
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, &[root]),
+            "read_skill",
+            &json!({ "name": "alpha", "path": outside }),
+        )
+        .await;
+        assert!(
+            r.is_error,
+            "an absolute path outside the skill dir is rejected"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_unknown_name_is_error_with_the_catalog() {
+        let cwd = temp_cwd("skill-unknown");
+        let root = skill_root("skill-unknown-root", "alpha", "---\nname: alpha\n---\nA.\n");
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, &[root]),
+            "read_skill",
+            &json!({ "name": "nope" }),
+        )
+        .await;
+        assert!(r.is_error);
+        let text = text_of(&r);
+        assert!(text.contains("unknown skill"), "{text}");
+        // The hint points at the tool that WOULD have listed them.
+        assert!(text.contains("list_skills"), "{text}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_missing_name_param_is_error() {
+        let cwd = temp_cwd("skill-noparam");
+        let r = execute_tool(&ctx(&cwd), "read_skill", &json!({})).await;
+        assert!(r.is_error);
+        assert!(text_of(&r).contains("`name`"), "{}", text_of(&r));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_bundled_binary_is_an_error_not_garbage() {
+        // `FsBackend::read` is `read_to_string`, so a bundled IMAGE fails
+        // (the documented ADR 0029 limitation — unlike `read`'s image path).
+        let cwd = temp_cwd("skill-binary");
+        let root = skill_root("skill-binary-root", "alpha", "---\nname: alpha\n---\nA.\n");
+        std::fs::write(root.join("alpha/pic.png"), [0x89, 0x50, 0x4e, 0x47, 0x00]).unwrap();
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
+            "read_skill",
+            &json!({ "name": "alpha", "path": "./pic.png" }),
+        )
+        .await;
+        assert!(r.is_error, "a non-UTF-8 bundled file is an error");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_rejected_symlink_does_not_disclose_its_target() {
+        // The model names ONLY `link` (which looks in-bounds). The resolved
+        // target is information it does NOT have — echoing it would turn a
+        // repo-shipped skill (`data.txt` -> `~/.ssh/id_rsa`) into a
+        // path-disclosure oracle. `read` may echo a path the model itself
+        // supplied; `read_skill` must not invent one.
+        let cwd = temp_cwd("skill-sym-oi");
+        let root = skill_root("skill-sym-oi-root", "alpha", "---\nname: alpha\n---\nA.\n");
+        let outside = std::env::temp_dir().join(format!("oi-target-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, "secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("alpha/link")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, root.join("alpha/link")).unwrap();
+
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
+            "read_skill",
+            &json!({ "name": "alpha", "path": "link" }),
+        )
+        .await;
+        assert!(r.is_error, "the symlink must be rejected");
+        let text = text_of(&r);
+        let target = outside.to_string_lossy().into_owned();
+        assert!(
+            !text.contains(&target),
+            "the resolved target must not be disclosed: {text}"
+        );
+        assert!(
+            text.contains("link"),
+            "the call must still be diagnosable: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_file(&outside);
     }
 
     // ── dispatch ─────────────────────────────────────────────────────────

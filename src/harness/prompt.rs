@@ -105,9 +105,14 @@ pub fn build_main_prompt(ctx: &PromptContext) -> String {
         sections.push(format!("<project_context>\n{body}\n</project_context>"));
     }
 
-    // `<skills>`: only when skills are present AND a `read` (preferred) or
-    // `bash` spec is advertised (pi's `["read", "bash"].find` order).
-    let file_read_tool = if ctx.tools.iter().any(|t| t.name == "read") {
+    // `<skills>`: only when skills are present AND a skill-loading tool is
+    // advertised. `read_skill` is preferred; else pi's `["read", "bash"]`
+    // order (the fallback for a session whose tool set excludes it — where
+    // loading a USER-scope skill will genuinely fail, but a SPACE-scope
+    // skill inside the sandbox still works).
+    let file_read_tool = if ctx.tools.iter().any(|t| t.name == "read_skill") {
+        Some("read_skill")
+    } else if ctx.tools.iter().any(|t| t.name == "read") {
         Some("read")
     } else if ctx.tools.iter().any(|t| t.name == "bash") {
         Some("bash")
@@ -240,15 +245,24 @@ fn push_deduped(
 fn format_skills_for_prompt(skills: &[SkillInfo], file_read_tool: &str) -> String {
     let mut lines: Vec<String> = vec![
         "The following skills provide specialized instructions for specific tasks.".to_string(),
-        if file_read_tool == "read" {
-            "Use the read tool to load a skill's file when the task matches its description."
-                .to_string()
-        } else {
-            "Use bash to load a skill's file when the task matches its description."
-                .to_string()
+        match file_read_tool {
+            "read_skill" => "Use the read_skill tool to load a skill's instructions by name."
+                .to_string(),
+            "read" => {
+                "Use the read tool to load a skill's file when the task matches its description."
+                    .to_string()
+            }
+            _ => "Use bash to load a skill's file when the task matches its description.".to_string(),
         },
-        "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands."
-            .to_string(),
+        match file_read_tool {
+            // The `<location>` is outside the session sandbox, so the
+            // bundled-file rule must not send the model to a path-param tool
+            // that cannot read it.
+            "read_skill" => "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and read the bundled file with read_skill's `path` parameter."
+                .to_string(),
+            _ => "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands."
+                .to_string(),
+        },
         String::new(),
         "<available_skills>".to_string(),
     ];
@@ -593,6 +607,61 @@ When a skill file references a relative path, resolve it against the skill direc
         assert!(
             !prompt.contains("Use bash to load"),
             "no bash line when read present: {prompt}"
+        );
+    }
+
+    // 4b — `read_skill` wins over `read`/`bash` for the instruction line
+    // (skills are outside the sandbox, so `read` on a `<location>` always
+    // fails — the prompt must never tell the model to make that call).
+    #[test]
+    fn the_skills_instruction_prefers_read_skill() {
+        let root = scratch();
+        let cwd = root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let skill_md = root.join("s/SKILL.md").to_string_lossy().into_owned();
+        let skills = vec![skill("alpha", "Does alpha.", &skill_md)];
+
+        let with_tools = |tools: &[ToolSpec]| -> String {
+            let ctx = PromptContext {
+                cwd: &cwd,
+                agent_dir: Path::new(""),
+                tools,
+                skills: &skills,
+            };
+            build_main_prompt(&ctx)
+        };
+
+        // read_skill ALONE → the section is present (no read/bash needed).
+        let prompt = with_tools(&[spec("read_skill", "Load a skill by name.")]);
+        assert!(prompt.contains("<skills>"), "section present: {prompt}");
+        assert!(
+            prompt.contains("Use the read_skill tool to load a skill's instructions by name."),
+            "read_skill line: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use the read tool"),
+            "never the doomed read line: {prompt}"
+        );
+
+        // read_skill + read → the read_skill line.
+        let prompt = with_tools(&[
+            spec("read", "Read a file."),
+            spec("read_skill", "Load a skill by name."),
+        ]);
+        assert!(
+            prompt.contains("Use the read_skill tool to load a skill's instructions by name."),
+            "read_skill wins over read: {prompt}"
+        );
+        // The `<location>` is still advertised (the chosen design), and the
+        // relative-path rule now says the bundled file also goes through
+        // read_skill.
+        assert!(
+            prompt.contains(&skill_md),
+            "<location> still present: {prompt}"
+        );
+        assert!(
+            prompt.contains("read the bundled file with read_skill's `path` parameter"),
+            "the relative-path rule points at read_skill: {prompt}"
         );
     }
 
