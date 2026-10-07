@@ -70,6 +70,56 @@ pub fn permission_key(session_id: &str, request_id: &str) -> String {
 /// How long a permission prompt stays open before it auto-cancels.
 const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The human-readable title of a permission prompt (ADR 0030): the user is
+/// approving ONE access, so the title names the thing being reached for —
+/// the path for the path tools (`read ../../.ssh/config`), the pattern AND
+/// the directory for the search tools (`grep SECRET in /tmp`), and the
+/// command for `bash`. The frontend (`PermissionPrompt.tsx`) renders this
+/// verbatim, so the shape here IS what the user reads.
+///
+/// It never fails: an argument the tool would default (`path` → `"."`, the
+/// same default the executors apply) is defaulted here too, and a tool this
+/// function does not know falls back to the pre-ADR-0030
+/// `"{tool} {compact args}"` rendering. A title that could not be built
+/// would mean a prompt the user never sees, which is a silent deny.
+pub fn permission_title(tool: &str, args: &serde_json::Value) -> String {
+    // The `path` argument as the executor would read it. `None` only when
+    // the key is absent or not a string (a number is rendered, not
+    // dropped — the user should see what the model actually asked for).
+    let arg = |key: &str| -> Option<String> {
+        args.get(key).map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    };
+    // The directory tools default `path` to the `cwd` (".") in the
+    // executor; a prompt must name the same directory the tool would use.
+    let dir = || arg("path").unwrap_or_else(|| ".".to_string());
+    match tool {
+        "bash" => match arg("command") {
+            Some(c) => format!("{tool} {c}"),
+            None => tool.to_string(),
+        },
+        // The search tools take a pattern AND a directory — both matter to
+        // the decision (a `grep` of `/tmp` is not a `grep` of `~/.ssh`).
+        "find" | "grep" => match arg("pattern") {
+            Some(p) => format!("{tool} {p} in {}", dir()),
+            None => format!("{tool} {}", dir()),
+        },
+        "read" | "write" | "edit" => match arg("path") {
+            // These three REQUIRE a path (the executor rejects the call
+            // without one), so a missing one is the bare tool name rather
+            // than a title pointing at a directory they would never use.
+            Some(p) => format!("{tool} {p}"),
+            None => tool.to_string(),
+        },
+        // `ls` defaults its directory to the `cwd` (like `find`/`grep`).
+        "ls" => format!("{tool} {}", dir()),
+        // Anything else: the verbatim pre-ADR-0030 shape.
+        _ => format!("{tool} {args}"),
+    }
+}
+
 /// The handle-free permission gate for the native `AgentLoop`: it
 /// registers a `PendingPermissions` oneshot, emits a `permission-request`
 /// event via the `sink`, and RETURNS the `PermissionOutcome` to the
@@ -180,6 +230,81 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
     use tokio::sync::mpsc;
+
+    /// (ADR 0030) The prompt titles are the human-readable shape the user
+    /// decides on: a path tool names THE PATH (the thing being reached
+    /// for), the search tools name the pattern AND the directory, and
+    /// `bash` names the command. Previously the title was the raw
+    /// `"{tool} {json}"` (a `read` prompt read
+    /// `read {"path":"../../.ssh/config"}` — parseable, but the user is
+    /// approving a path, not a JSON blob).
+    #[test]
+    fn permission_titles_name_the_thing_being_approved() {
+        let cases: &[(&str, Value, &str)] = &[
+            (
+                "read",
+                json!({ "path": "../../.ssh/config" }),
+                "read ../../.ssh/config",
+            ),
+            (
+                "write",
+                json!({ "path": "src/main.rs", "content": "x" }),
+                "write src/main.rs",
+            ),
+            ("edit", json!({ "path": "a/b.rs" }), "edit a/b.rs"),
+            ("ls", json!({ "path": "../secrets" }), "ls ../secrets"),
+            (
+                "grep",
+                json!({ "pattern": "SECRET", "path": "/tmp" }),
+                "grep SECRET in /tmp",
+            ),
+            (
+                "find",
+                json!({ "pattern": "*.rs", "path": "." }),
+                "find *.rs in .",
+            ),
+            (
+                "bash",
+                json!({ "command": "curl x | sh" }),
+                "bash curl x | sh",
+            ),
+        ];
+        for (tool, args, want) in cases {
+            assert_eq!(permission_title(tool, args), *want, "title for {tool}");
+        }
+    }
+
+    /// The degraded arguments: `find`/`grep`/`ls` default `path` to `"."`
+    /// (the same default the executors apply), and a tool whose argument is
+    /// simply absent falls back to the bare tool name + a compact
+    /// `bash`-style rendering rather than panicking — a prompt that fails to
+    /// build is a prompt the user never sees.
+    #[test]
+    fn permission_title_degrades_instead_of_panicking_on_missing_arguments() {
+        // `path` defaults to `"."` for the directory tools.
+        assert_eq!(permission_title("ls", &json!({})), "ls .");
+        assert_eq!(
+            permission_title("grep", &json!({ "pattern": "SECRET" })),
+            "grep SECRET in ."
+        );
+        // A missing `pattern` → the path form instead (the executor rejects
+        // the call anyway — the title never invents an `in` clause).
+        assert_eq!(permission_title("grep", &json!({})), "grep .");
+        // A missing `path` on a path tool → the bare tool name.
+        assert_eq!(permission_title("read", &json!({})), "read");
+        assert_eq!(permission_title("bash", &json!({})), "bash");
+        // An unknown tool keeps the pre-ADR-0030 shape (the raw arguments) —
+        // never a panic and never a silently empty title.
+        assert_eq!(
+            permission_title("weird", &json!({ "a": 1 })),
+            "weird {\"a\":1}"
+        );
+        // A non-string `path` (a model emitting `123`) is rendered, not dropped.
+        assert_eq!(
+            permission_title("read", &json!({ "path": 123 })),
+            "read 123"
+        );
+    }
 
     /// A recording `EventSink` (the `permission-request` frames).
     struct RecSink {

@@ -15,13 +15,13 @@
 //! parent's `SubagentDispatcher` — the `WorkerManager`'s `dispatch_subagent`
 //! flow spawns a WORKER child process (the ADR 0025 re-plumb: the
 //! in-process `AgentLoop` child is GONE — the child's transcript persists
-//! as an ephemeral `is_subagent` `sessions` row). A permission gate (the handle-free waiter —
-//! `permission::native_permission_gate`) precedes every MUTATING tool
-//! (`bash` / `edit` / `write`): a trusted Space is auto-approved
-//! (ADR 0010), a deny is a tool-result error `"permission denied"`.
+//! as an ephemeral `is_subagent` `sessions` row). A permission gate precedes
+//! every tool call the file-access policy (ADR 0030) sends to `Ask`: a
+//! trusted Space is auto-approved (ADR 0010), a deny is a tool-result
+//! error `"permission denied"`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
+use crate::agent::fs_backend::{FsBackend, FsError};
 use crate::agent::harness::catalog::{Model, ModelCatalog};
 use crate::agent::harness::compact::{self, Compactor};
 use crate::agent::harness::dispatch::SubagentDispatcher;
@@ -48,14 +49,57 @@ use crate::agent::interactive::{
 };
 use crate::agent::mcp::{mcp_tool, McpManager};
 use crate::agent::normalize::{compute_display_rows, normalize, ThoughtState, TurnState};
-use crate::agent::permission::{native_permission_gate, PendingPermissions, PermissionOutcome};
+use crate::agent::permission::{
+    native_permission_gate, permission_title, PendingPermissions, PermissionOutcome,
+};
+use crate::agent::policy::{decision_for, AccessPolicy, Decision, FilePolicy};
 use crate::agent::todo::TodoStore;
+use crate::agent::tools::exec::protected_refusal_text;
 use crate::agent::tools::{execute_tool, ContentBlock, ImageRef, ToolCtx, ToolResult};
 
-/// The built-ins the `ToolRegistry` gates before execution
-/// (`bash` / `edit` / `write` — the mutating built-ins; `read` /
-/// `find` / `grep` / `ls` are read-only and skip the gate).
-const MUTATING_TOOLS: &[&str] = &["bash", "edit", "write"];
+/// The built-ins the file-access policy (ADR 0030) judges, and the DIRECTION
+/// each is judged in: the read-direction tools are measured against the read
+/// boundary (`cwd` + the discovery roots), the write-direction ones against
+/// the session `cwd` alone. `bash` is listed for the gate's benefit but has
+/// NO path to judge (it is always `beyond`, see
+/// [`crate::agent::policy::decision_for`]).
+///
+/// Deliberately absent: `read_skill` / `list_skills` (their own per-skill
+/// containment, ADR 0029 — a skill may never read a sibling skill, so the
+/// session boundary is not their judge), `subagent` / `mcp` /
+/// `manage_todo_list` / the interactive flows (no argument of theirs reaches
+/// the filesystem in a way this policy describes).
+const POLICIED_TOOLS: &[(&str, PolicyDirection)] = &[
+    ("bash", PolicyDirection::Shell),
+    ("read", PolicyDirection::Read),
+    ("find", PolicyDirection::Read),
+    ("grep", PolicyDirection::Read),
+    ("ls", PolicyDirection::Read),
+    ("write", PolicyDirection::Write),
+    ("edit", PolicyDirection::Write),
+];
+
+/// The direction a policed tool is judged in (ADR 0030: the policy is
+/// per-DIRECTION, so `read` obeys `reads` and `edit` obeys `writes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyDirection {
+    /// Judged against the read boundary; policy `reads`.
+    Read,
+    /// Judged against the session `cwd`; policy `writes`.
+    Write,
+    /// No path: always `beyond`; policy `shell`.
+    Shell,
+}
+
+/// The tool the file-access policy judges, and in which direction
+/// (`None` = ungated — the skill tools, `subagent`, `mcp`, the interactive
+/// flows, everything else).
+fn policed_direction(tool: &str) -> Option<PolicyDirection> {
+    POLICIED_TOOLS
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map(|(_, dir)| *dir)
+}
 
 /// A prompt to the loop (the `prompt_queue` item): the text + the image
 /// attachments (`ImageRef` — the pi `ImageContent` shape; the manager
@@ -201,6 +245,23 @@ pub struct AgentLoop {
     /// since (the `Compactor`'s anchor + trailing tail). One number for the
     /// bar and the trigger — never the sum of every call's prompt.
     last_context_tokens: u64,
+    /// (ADR 0030) The session's READ boundary — `cwd` + the discovery roots
+    /// (user + space level), computed ONCE at construction (the boundary is
+    /// frozen for the session's life: a skill dir created mid-session must
+    /// not silently widen it). Handed to every `ToolCtx`.
+    read_boundary: Vec<PathBuf>,
+    /// (ADR 0030) The write DENY-LIST (`boundary::protected_dirs()` — the
+    /// user-level agent-definition dirs), frozen with the boundary.
+    protected: Vec<PathBuf>,
+    /// (ADR 0030 Task 3) The file-access policy IN FORCE for the current
+    /// turn — refreshed from `settings.json` at the top of every
+    /// `handle_prompt` (Deviation 4: one read per turn, so every tool call
+    /// in a turn agrees and a mid-turn hand-edit is observed at the NEXT
+    /// prompt; the same in-process read `launch.rs` does per dispatch).
+    /// `config_dir: None` → all-`Allow` (no settings layer to read).
+    /// Handed to every `ToolCtx` so the executor enforces the SAME tier the
+    /// gate decided, and read by the gate itself.
+    file_policy: FilePolicy,
 }
 
 impl AgentLoop {
@@ -240,6 +301,12 @@ impl AgentLoop {
             space_cwd.clone(),
             config_dir.as_deref(),
         );
+        // (ADR 0030) The boundary is computed ONCE here, not per tool call
+        // (it is frozen for the session, and `read_roots` walks the tree +
+        // canonicalizes). Reading `$HOME` is legitimate HERE — the Worker
+        // process already does it for MCP and for skill discovery.
+        let read_boundary = crate::agent::boundary::read_roots(&space_cwd);
+        let protected = crate::agent::boundary::protected_dirs();
         Self {
             session_id,
             space_cwd,
@@ -276,6 +343,12 @@ impl AgentLoop {
             compactor,
             force_compact: false,
             last_context_tokens: 0,
+            read_boundary,
+            protected,
+            // Refreshed per turn by `handle_prompt` (Deviation 4); the
+            // construction value only covers a tool call made BEFORE the
+            // first prompt, of which there are none.
+            file_policy: FilePolicy::default(),
         }
     }
 
@@ -518,6 +591,20 @@ impl AgentLoop {
     /// blocks — when images are present; a text-only prompt keeps the
     /// `Text` shape).
     pub async fn handle_prompt(&mut self, prompt: &Prompt) {
+        // (ADR 0030 Task 3, Deviation 4) The policy is re-read from
+        // `settings.json` ONCE per turn — the same in-process read
+        // `launch.rs` does per dispatch, so a user who flips a select in
+        // Settings affects an ALREADY-RUNNING session at its next prompt
+        // (no restart, no relaunch). ONE read per turn (not per tool call):
+        // every tool call in a turn must agree, or a half-asked batch would
+        // be a policy the user never chose. `config_dir: None` → the
+        // all-`Allow` default (no settings layer).
+        self.file_policy = self
+            .config_dir
+            .as_deref()
+            .map(crate::config::load_settings)
+            .map(|s| s.file_policy)
+            .unwrap_or_default();
         // A Stop is pending (the turn token is cancelled — `NativeHandle::cancel`
         // cancelled it): a queued prompt must not start a FRESH turn after the
         // user pressed Stop. Drain the queue + skip this prompt (the token is
@@ -947,25 +1034,31 @@ impl AgentLoop {
                 } else if turn.is_cancelled() {
                     Self::cancelled_tool_result()
                 } else {
-                    // Mutating tools (the `bash` / `edit` / `write` triple)
-                    // require a `permission_request` round-trip — `gate_tool`
-                    // blocks until the user responds (or the turn is
-                    // cancelled); the other tools run ungated.
-                    let allowed = if MUTATING_TOOLS.contains(&tc.name.as_str()) {
-                        self.gate_tool(tc, turn).await
-                    } else {
-                        true
-                    };
-                    if allowed {
-                        self.dispatch_tool(tc, turn).await
-                    } else {
-                        ToolResult {
-                            content: vec![ContentBlock::Text {
-                                text: "permission denied".to_string(),
-                            }],
-                            details: None,
-                            is_error: true,
+                    // (ADR 0030) The ONE policy decision point. `Ask` is the
+                    // ONLY outcome that prompts (`gate_tool` blocks until the
+                    // user responds, or the turn is cancelled); `Deny` is a
+                    // tool-result error that NEVER reaches the UI; `Allow` and
+                    // `Confine` dispatch (a `Confine`d `bash` confines itself
+                    // in the executor — Task 5). Ungated tools (`read_skill`,
+                    // `mcp`, the interactive flows, …) fall straight through.
+                    // (A `match` GUARD cannot `.await`, hence the nested `if`.)
+                    match self.policy_verdict(tc) {
+                        Some(Decision::Ask) => {
+                            if self.gate_tool(tc, turn).await {
+                                self.dispatch_tool(tc, turn).await
+                            } else {
+                                ToolResult {
+                                    content: vec![ContentBlock::Text {
+                                        text: "permission denied".to_string(),
+                                    }],
+                                    details: None,
+                                    is_error: true,
+                                }
+                            }
                         }
+                        Some(Decision::Deny) => self.deny_tool_result(tc),
+                        // `Allow` / `Confine` / an ungated tool: dispatch.
+                        _ => self.dispatch_tool(tc, turn).await,
                     }
                 };
                 let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
@@ -1089,19 +1182,183 @@ impl AgentLoop {
         self.emit(RpcEvent::agent_settled);
     }
 
+    /// The file-access verdict for one tool call (ADR 0030), or `None` for
+    /// a tool the policy does NOT judge (`read_skill` / `list_skills` —
+    /// their own containment, ADR 0029 — `subagent`, `mcp`,
+    /// `manage_todo_list`, the interactive flows).
+    ///
+    /// "Beyond the boundary" is answered by the SAME canonicalize-then-check
+    /// the ADR 0029 attack matrix proved (`FsBackend::validate` over the
+    /// direction's boundary roots) — deliberately NOT a second canonicalizer
+    /// here: a gate and an executor that resolve `..` / symlinks differently
+    /// is the classic sandbox escape, so they share one resolver and can not
+    /// drift. `Ok` = in bounds; ANY `Err` (escape, or a root set that cannot
+    /// be judged) = `beyond`, so an unjudgeable path is never silently
+    /// allowed.
+    ///
+    /// A tool call with NO usable `path` is in bounds (the executor's own
+    /// "missing parameter" error still fires, ungated — a malformed call is
+    /// not a policy event), and a `find` / `grep` / `ls` whose `path` is
+    /// omitted means the `cwd` (their advertised default), so it too is in
+    /// bounds.
+    fn policy_verdict(&self, tc: &ToolCall) -> Option<Decision> {
+        let dir = policed_direction(&tc.name)?;
+        let (policy, beyond) = match dir {
+            PolicyDirection::Shell => {
+                // No path to judge: a command can reach ANYWHERE, so it is
+                // always beyond the boundary (see `decision_for`).
+                (self.file_policy.shell, true)
+            }
+            PolicyDirection::Read | PolicyDirection::Write => {
+                let Some(raw) = tc.arguments.get("path").and_then(|v| v.as_str()) else {
+                    // `read` / `write` / `edit` REQUIRE a path (the executor
+                    // rejects the call without one) and the directory tools
+                    // default it to the `cwd` — either way there is nothing
+                    // to gate.
+                    return Some(Decision::Allow);
+                };
+                let policy = self.direction_policy(dir);
+                let beyond = self.beyond_error(dir, Path::new(raw)).is_some();
+                (policy, beyond)
+            }
+        };
+        let trusted = self
+            .trust
+            .as_ref()
+            .map(|t| t.is_trusted(&self.space_cwd))
+            .unwrap_or(false);
+        Some(decision_for(
+            policy,
+            beyond,
+            trusted,
+            dir == PolicyDirection::Shell,
+        ))
+    }
+
+    /// The policy that governs a direction (ADR 0030: the settings are
+    /// per-direction, which is why `read` and `edit` can disagree).
+    fn direction_policy(&self, dir: PolicyDirection) -> AccessPolicy {
+        match dir {
+            PolicyDirection::Read => self.file_policy.reads,
+            PolicyDirection::Write => self.file_policy.writes,
+            PolicyDirection::Shell => self.file_policy.shell,
+        }
+    }
+
+    /// The root set a direction is judged against: the READ boundary (the
+    /// `cwd` plus the discovery roots) for reads, the session `cwd` ALONE
+    /// for writes (`boundary::write_roots` — a repo-level `.agents/skills`
+    /// is repo content and stays writable from a package cwd). NOT the
+    /// policy-derived executor roots, which widen to `/` under `Ask`/`Allow`
+    /// — the gate must see the real boundary even when the executor is
+    /// unrestricted (that widening is the gate's DECISION, not its input).
+    fn direction_boundary(&self, dir: PolicyDirection) -> Vec<PathBuf> {
+        match dir {
+            PolicyDirection::Read | PolicyDirection::Shell => self.read_boundary.clone(),
+            PolicyDirection::Write => vec![self.space_cwd.clone()],
+        }
+    }
+
+    /// The error the direction's boundary check produced for a path, or
+    /// `None` when the path is IN bounds. This is the single answer the gate
+    /// needs: `Some` is exactly "beyond" (which a `Deny` implies), and its
+    /// payload is what the rejection quotes back.
+    ///
+    /// Answered by the SAME canonicalize-then-check the ADR 0029 attack
+    /// matrix proved (`FsBackend::validate`), so gate and executor cannot
+    /// resolve `..` / a symlink differently — a gate that resolves differently
+    /// than the thing it gates is the classic escape, hence ONE resolver
+    /// shared by both layers rather than a second canonicalizer here. ANY
+    /// error — an escape, or a root set that cannot be judged at all — means
+    /// beyond, so an unjudgeable path is never silently allowed.
+    fn beyond_error(&self, dir: PolicyDirection, path: &Path) -> Option<FsError> {
+        let roots = self.direction_boundary(dir);
+        FsBackend { roots }.validate(path).err()
+    }
+
+    /// The tool-result error for a policy DENY (never a prompt). Worded like
+    /// the executor's own rejection — `FsError`'s display, prefixed with the
+    /// tool name exactly as the executors prefix it — so a read the GATE
+    /// denied looks identical to the model to one the executor would have
+    /// rejected: the model's recovery behavior must not depend on which
+    /// layer said no. A write into a user-level agent-definition dir gets the
+    /// deny-list wording instead (the true reason — refused there in EVERY
+    /// policy, so "escapes the sandbox" would send the model off looking for
+    /// a boundary that is not the problem).
+    fn deny_tool_result(&self, tc: &ToolCall) -> ToolResult {
+        let dir = policed_direction(&tc.name);
+        let text = match tc.arguments.get("path").and_then(|v| v.as_str()) {
+            Some(raw) => {
+                let path = Path::new(raw);
+                // The deny-list is a WRITE-floor question (`protected_dirs`
+                // are dirs a WRITE may not enter), and it is checked BEFORE
+                // the boundary: the refusal is true in every policy, so its
+                // wording must win over "escapes the sandbox", which would
+                // send the model hunting for a boundary that is not the
+                // problem.
+                let protected = (dir == Some(PolicyDirection::Write))
+                    .then(|| protected_refusal_text(&self.protected, &tc.name, path))
+                    .flatten();
+                match protected {
+                    Some(msg) => msg,
+                    None => self.escape_text(dir, &tc.name, path, raw),
+                }
+            }
+            // `bash` has no path: the policy simply refused the command.
+            None => format!("{}: refused by the file-access policy (Sandboxed)", tc.name),
+        };
+        ToolResult {
+            content: vec![ContentBlock::Text { text }],
+            details: None,
+            is_error: true,
+        }
+    }
+
+    /// The escape rejection's text, in the executor's own words: the tool
+    /// name, then `FsError::PathEscape` — exactly what a `read` of the same
+    /// path would have returned. The variant's `path` is the RAW argument
+    /// the model passed, which is also what the executor's own rejection
+    /// carries when the path canonicalizes to nothing useful; a
+    /// `FsError::Io` (no boundary at all) is reported verbatim.
+    fn escape_text(
+        &self,
+        dir: Option<PolicyDirection>,
+        tool: &str,
+        path: &Path,
+        raw: &str,
+    ) -> String {
+        let dir = dir.unwrap_or(PolicyDirection::Read);
+        let body = FsError::PathEscape {
+            path: match self.beyond_error(dir, path) {
+                // The RESOLVED form when the canonicalizer produced one — it
+                // tells the user where the path actually landed (`../x` under
+                // a symlinked `cwd` is not where it looks).
+                Some(FsError::PathEscape { path }) => path,
+                _ => raw.to_string(),
+            },
+        };
+        format!("{tool}: {body}")
+    }
+
     /// The permission gate (the handle-free waiter — reviewer-corrected
-    /// Major #14): a MUTATING tool on an untrusted Space prompts
-    /// (`permission-request` via the sink, a `PendingPermissions` oneshot;
-    /// a deny / cancel is a denial); a TRUSTED Space is auto-approved
-    /// (ADR 0010 — replicated here: the native path has no
+    /// Major #14): a tool the policy sent to `Ask` on an untrusted Space
+    /// prompts (`permission-request` via the sink, a `PendingPermissions`
+    /// oneshot; a deny / cancel is a denial); a TRUSTED Space is
+    /// auto-approved (ADR 0010 — replicated here: the native path has no
     /// `handle_extension_ui_request` to do it). A CANCELLED turn is a
     /// `Cancelled` (a deny) — the gate consults the token BEFORE the
     /// trusted short-circuit (finding 8a).
+    ///
+    /// The trust check inside the gate is now REDUNDANT with
+    /// `decision_for` (which returns `Allow` for a trusted Space, so an
+    /// `Ask` reaching here already implies untrusted); it stays because the
+    /// gate is also the seam that answers `trust-space`, and a
+    /// fail-closed gate is cheaper than a clever one.
     async fn gate_tool(&self, tc: &ToolCall, turn: &CancellationToken) -> bool {
         let outcome = native_permission_gate(
             &self.session_id,
             &tc.id,
-            &format!("{} {}", tc.name, tc.arguments),
+            &permission_title(&tc.name, &tc.arguments),
             &self.sink,
             &self.pending_permissions,
             self.trust.as_deref(),
@@ -1183,6 +1440,14 @@ impl AgentLoop {
                         // `None` = the real discovery roots (the same
                         // `discover_skills` the prompt builder used).
                         skill_roots: None,
+                        // (ADR 0030) The frozen boundary + deny-list.
+                        boundary: self.read_boundary.clone(),
+                        protected: self.protected.clone(),
+                        // (ADR 0030 Task 3) The policy the gate decided with
+                        // — the SAME per-turn value, so the executor cannot
+                        // re-decide differently from the gate (it enforces
+                        // the `Sandboxed` floor and confines `bash`).
+                        file_policy: self.file_policy,
                     },
                     &tc.name,
                     &tc.arguments,
@@ -5961,5 +6226,728 @@ mod tests {
             "a cancelled `mcp` call is an error result: {result:?}"
         );
         assert_eq!(result["content"][0]["text"], "cancelled");
+    }
+
+    // ── (ADR 0030 Task 3) the file-access policy gate ───────────────────
+
+    /// `handle_prompt` under a hard bound. Every policy test uses it: a
+    /// gate that regressed into prompting on a turn nobody answers would
+    /// otherwise hang the suite until the test harness timeout (a FAIL
+    /// pointing at the gate is the point — not a stall).
+    async fn bounded_prompt(loop_: &mut AgentLoop, text: &str) {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            loop_.handle_prompt(&text_prompt(text)),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the turn never settled — a prompt nobody answered, or a tool that hung")
+        });
+    }
+
+    /// The `settings.json` shape the policy tests pin (the wire key is
+    /// `filePolicy` — the same one the Settings UI writes).
+    fn policy_settings(reads: &str, writes: &str, shell: &str) -> String {
+        format!(
+            r#"{{ "filePolicy": {{ "reads": "{reads}", "writes": "{writes}", "shell": "{shell}" }} }}"#
+        )
+    }
+
+    /// A fresh temp dir (created, removed on drop — the boundary tests'
+    /// `Tmp`, local to this module).
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let d =
+                std::env::temp_dir().join(format!("loop-policy-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The policy-gate fixture: an `AgentLoop` whose `config_dir` holds a
+    /// `settings.json` with the given policy JSON (`None` = NO `config_dir`
+    /// at all — the no-settings-layer case), on a fresh `space_cwd`, with a
+    /// RECORDING sink (the `TestSink` cannot see `permission-request`) and
+    /// `trust: None` (untrusted — fail-closed, so an `Ask` really prompts).
+    /// The `config_dir` is returned WITH the loop: it must outlive it (the
+    /// loop re-reads the file every turn, and the temp dir is removed on
+    /// drop — dropping it early would silently degrade every test to the
+    /// all-`Allow` default).
+    ///
+    /// The caller pins `$HOME` FIRST (the `RestoreHome` + `env_lock`
+    /// pattern) so `AgentLoop::new`'s `read_roots` / `protected_dirs` see an
+    /// empty scratch home: the read boundary is then EXACTLY the `cwd` and
+    /// the deny-list is whatever the test created, never whatever happens to
+    /// be in the developer's real `~/.agents`.
+    fn build_policy_loop(
+        provider: Box<dyn Provider>,
+        events: mpsc::UnboundedSender<RpcEvent>,
+        sink: Arc<dyn EventSink>,
+        settings: Option<&str>,
+    ) -> (AgentLoop, Option<Tmp>) {
+        let config_dir = settings.map(|_| Tmp::new("cfg"));
+        if let (Some(dir), Some(json)) = (config_dir.as_ref(), settings) {
+            std::fs::write(dir.path().join("settings.json"), json).unwrap();
+        }
+        let (mut loop_, _db) = build_loop_with_db(
+            provider,
+            events,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            config_dir
+                .as_ref()
+                .map(|d| d.path().to_path_buf())
+                .as_deref(),
+        );
+        // Swap the `TestSink` for the recording one (the field is `pub`).
+        loop_.sink = sink;
+        (loop_, config_dir)
+    }
+
+    /// The tool call the policy tests share: a `read` of `path`.
+    fn read_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "read".to_string(),
+            arguments: json!({ "path": path }),
+        }
+    }
+
+    /// Await the loop's pending-permission entry and answer it (the mock
+    /// handle-free waiter — the `tests/harness_loop.rs` pattern, the
+    /// `pending` map being a `pub` field). Spawned BEFORE the prompt so a
+    /// gate that must NOT prompt can never hang the test.
+    async fn answer_permission(pending: PendingPermissions, session: &str, option: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut map = pending.lock().await;
+            if let Some(key) = map
+                .keys()
+                .find(|k| k.starts_with(&format!("{session}/")))
+                .cloned()
+            {
+                let sender = map.remove(&key).expect("the entry is in the map");
+                let _ = sender.send(PermissionOutcome::Selected {
+                    option_id: option.to_string(),
+                });
+                return;
+            }
+            drop(map);
+            if tokio::time::Instant::now() >= deadline {
+                return; // the test asserts no prompt arrived
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The `permission-request` frames a sink recorded.
+    fn permission_requests(events: &[(String, Value)]) -> Vec<Value> {
+        events
+            .iter()
+            .filter(|(name, _)| name == "permission-request")
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+
+    /// Drain every event the turn emitted and return the
+    /// `tool_execution_end` results keyed by tool-call id (a turn may batch
+    /// several calls, so ONE drain collects them all — draining per id would
+    /// consume the later calls' events while looking for an earlier one).
+    fn tool_ends(events: &mut mpsc::UnboundedReceiver<RpcEvent>) -> HashMap<String, (Value, bool)> {
+        let mut out = HashMap::new();
+        while let Ok(ev) = events.try_recv() {
+            if let RpcEvent::tool_execution_end {
+                tool_call_id,
+                result,
+                is_error,
+                ..
+            } = ev
+            {
+                out.insert(tool_call_id, (result, is_error));
+            }
+        }
+        out
+    }
+
+    /// (ADR 0030) `reads: Ask` + an out-of-boundary `read` on an UNTRUSTED
+    /// Space: a `permission-request` naming THE PATH (not a JSON blob), and
+    /// after the user allows, the read really lands.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn ask_beyond_the_boundary_prompts_naming_the_path_then_runs() {
+        let home = Tmp::new("ask-home");
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span; no other thread mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let outside = Tmp::new("ask-outside");
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+        let path = outside.path().join("secret.txt");
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(read_call("t1", &path.display().to_string())),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let (mut loop_, _cfg) = build_policy_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(RecordingSink {
+                events: sink_events.clone(),
+            }),
+            Some(&policy_settings("ask", "ask", "ask")),
+        );
+        let pending = loop_.pending_permissions.clone();
+        let answer = tokio::spawn(answer_permission(pending, "s1", "allow"));
+        bounded_prompt(&mut loop_, "go").await;
+        answer.await.unwrap();
+
+        let prompts = permission_requests(&sink_events.lock().unwrap());
+        assert_eq!(prompts.len(), 1, "exactly one prompt, got {prompts:?}");
+        assert_eq!(prompts[0]["requestId"], "t1");
+        assert_eq!(
+            prompts[0]["request"]["toolCall"]["title"],
+            format!("read {}", path.display()),
+            "the prompt names the path in plain form"
+        );
+        let ends = tool_ends(&mut events_rx);
+        let (result, is_error) = ends.get("t1").expect("the read dispatched").clone();
+        assert!(!is_error, "the allowed read succeeded: {result:?}");
+        assert_eq!(result["content"][0]["text"], "OUTSIDE-CONTENT");
+    }
+
+    /// (ADR 0030) `reads: Sandboxed` + an out-of-boundary `read`: a
+    /// tool-result error worded like the executor's own rejection, and NO
+    /// `permission-request` (a Deny never reaches the UI — Trust included:
+    /// this loop is untrusted, and the trusted case is the sibling test).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn sandboxed_beyond_the_boundary_errors_with_no_prompt() {
+        let home = Tmp::new("deny-home");
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let outside = Tmp::new("deny-outside");
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+        let path = outside.path().join("secret.txt");
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(read_call("t1", &path.display().to_string())),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let (mut loop_, _cfg) = build_policy_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(RecordingSink {
+                events: sink_events.clone(),
+            }),
+            Some(&policy_settings("sandboxed", "sandboxed", "allow")),
+        );
+        bounded_prompt(&mut loop_, "go").await;
+
+        assert!(
+            permission_requests(&sink_events.lock().unwrap()).is_empty(),
+            "a Deny emits no permission-request"
+        );
+        assert!(
+            loop_.pending_permissions.try_lock().unwrap().is_empty(),
+            "and registers no oneshot"
+        );
+        let ends = tool_ends(&mut events_rx);
+        let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+        assert!(is_error, "the denied read is an error");
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        assert_eq!(
+            text,
+            format!(
+                "read: path escapes the session sandbox: {}",
+                path.canonicalize().unwrap().display()
+            ),
+            "worded EXACTLY like the executor's rejection, so the model cannot tell which layer said no"
+        );
+    }
+
+    /// (ADR 0030, Deviation 2 — the intended widening) the DEFAULT policy
+    /// (all `Allow`, and the no-`config_dir` case that behaves the same):
+    /// an out-of-boundary `read` AND an out-of-boundary `write` both
+    /// dispatch silently — no prompt, no error — and the write LANDS. This
+    /// is the behavior the feature deliberately widens (pre-feature a write
+    /// prompted); it is asserted as the widening, so a regression that
+    /// re-tightens the default reddens it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_default_policy_reads_and_writes_beyond_the_boundary_in_silence() {
+        let home = Tmp::new("allow-home");
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let outside = Tmp::new("allow-outside");
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+        let read_path = outside.path().join("secret.txt");
+        let write_path = outside.path().join("written-by-agent.txt");
+        for settings in [Some(&policy_settings("allow", "allow", "allow")), None] {
+            let (provider, _calls) = ScriptedProvider::new(vec![
+                Some(vec![
+                    ProviderEvent::ToolCall(read_call("t1", &read_path.display().to_string())),
+                    ProviderEvent::ToolCall(ToolCall {
+                        id: "t2".to_string(),
+                        name: "write".to_string(),
+                        arguments: json!({
+                            "path": write_path.display().to_string(),
+                            "content": "WROTE-IT",
+                        }),
+                    }),
+                    ProviderEvent::Done(FinishReason::ToolCalls),
+                ]),
+                Some(vec![
+                    ProviderEvent::TextDelta("done".to_string()),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ]),
+            ]);
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+            let (mut loop_, _cfg) = build_policy_loop(
+                Box::new(provider),
+                events_tx,
+                Arc::new(RecordingSink {
+                    events: sink_events.clone(),
+                }),
+                settings.map(|s| s.as_str()),
+            );
+            bounded_prompt(&mut loop_, "go").await;
+            assert!(
+                permission_requests(&sink_events.lock().unwrap()).is_empty(),
+                "the default policy prompts for nothing"
+            );
+            // The `read` AND the `write` are separate tool calls in one
+            // batch: the script emits them as two `ToolCall` events (the
+            // provider stream carries one call per event — see the
+            // `read`-then-`write` batch this mirrors).
+            let ends = tool_ends(&mut events_rx);
+            let (result, is_error) = ends.get("t1").expect("the read dispatched").clone();
+            assert!(!is_error, "the default policy never errors: {result:?}");
+            assert_eq!(result["content"][0]["text"], "OUTSIDE-CONTENT");
+            let (result, is_error) = ends.get("t2").expect("the write dispatched").clone();
+            assert!(
+                !is_error,
+                "the default policy writes beyond the cwd: {result:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&write_path).unwrap_or_default(),
+                "WROTE-IT",
+                "the widened write actually landed"
+            );
+            std::fs::remove_file(&write_path).unwrap();
+        }
+    }
+
+    /// (ADR 0030 Deviation 4 — "affects an already-running session") the
+    /// policy is re-read from `settings.json` at the top of EVERY prompt:
+    /// a settings edit BETWEEN two prompts changes the SECOND prompt's
+    /// gating, with no restart and no relaunch.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_settings_edit_between_prompts_changes_the_next_turns_gating() {
+        let home = Tmp::new("fresh-home");
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let outside = Tmp::new("fresh-outside");
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+        let path = outside.path().join("secret.txt").display().to_string();
+        // A THREE-call script: turn 1's `read`, the summary-free turn 2's
+        // `read`, then the final text (the provider repeats its LAST entry,
+        // so the third script entry must be the terminal one).
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(read_call("t1", &path)),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("first done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::ToolCall(read_call("t2", &path)),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("second done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let settings = policy_settings("ask", "ask", "ask");
+        let (mut loop_, _cfg) = build_policy_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(RecordingSink {
+                events: sink_events.clone(),
+            }),
+            Some(&settings),
+        );
+        // The loop's own `config_dir` (the fixture's temp dir): re-read
+        // between the prompts, exactly as a user editing Settings would.
+        let config_dir = loop_.config_dir.clone().expect("a settings dir");
+
+        // Turn 1: `reads: ask` → the prompt fires (answered `allow`).
+        let pending = loop_.pending_permissions.clone();
+        let answer = tokio::spawn(answer_permission(pending, "s1", "allow"));
+        bounded_prompt(&mut loop_, "one").await;
+        answer.await.unwrap();
+        assert_eq!(
+            permission_requests(&sink_events.lock().unwrap()).len(),
+            1,
+            "turn 1 prompts under `ask`"
+        );
+
+        // The user edits the file BETWEEN the prompts: `ask` → `sandboxed`.
+        std::fs::write(
+            config_dir.join("settings.json"),
+            policy_settings("sandboxed", "sandboxed", "allow"),
+        )
+        .unwrap();
+
+        // Turn 2: the SAME out-of-boundary read is now a Deny — no prompt,
+        // an error result. A per-session (or per-process) snapshot of the
+        // policy would still prompt here, which is what this asserts against.
+        bounded_prompt(&mut loop_, "two").await;
+        assert_eq!(
+            permission_requests(&sink_events.lock().unwrap()).len(),
+            1,
+            "the second turn must NOT prompt after the file changed to `sandboxed`"
+        );
+        let ends = tool_ends(&mut events_rx);
+        let (result, is_error) = ends.get("t2").expect("a tool result for t2").clone();
+        assert!(is_error, "the now-Sandboxed read is refused: {result:?}");
+    }
+
+    /// (ADR 0030 Task 5) `shell: Sandboxed` means CONFINE: the gate never
+    /// prompts, the command runs INSIDE the Landlock ruleset, and a kernel
+    /// that cannot confine FAILS CLOSED with a visible error instead of
+    /// running unsandboxed. Both branches assert "no prompt".
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_sandboxed_shell_dispatches_confined_with_no_prompt() {
+        let home = Tmp::new("shell-home");
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: json!({ "command": "touch confined_ran.txt" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let cwd = {
+            let (mut loop_, _cfg) = build_policy_loop(
+                Box::new(provider),
+                events_tx,
+                Arc::new(RecordingSink {
+                    events: sink_events.clone(),
+                }),
+                Some(&policy_settings("allow", "allow", "sandboxed")),
+            );
+            let cwd = loop_.space_cwd.clone();
+            bounded_prompt(&mut loop_, "go").await;
+            cwd
+        };
+        assert!(
+            permission_requests(&sink_events.lock().unwrap()).is_empty(),
+            "`shell: sandboxed` asks nothing — it confines (here: refuses to run unsandboxed)"
+        );
+        let ends = tool_ends(&mut events_rx);
+        let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+        // Can THIS machine confine? `cfg`-gated (not `cfg!`) so a non-Linux
+        // build does not name the sandbox module, which is not compiled
+        // there at all.
+        #[cfg(target_os = "linux")]
+        let confined_here = crate::agent::tools::sandbox::landlock_available();
+        #[cfg(not(target_os = "linux"))]
+        let confined_here = false;
+        if confined_here {
+            // The kernel confines → the command RUNS (inside the ruleset)
+            // and its write inside the boundary lands.
+            assert!(!is_error, "a confined run succeeds: {result:?}");
+            assert!(
+                cwd.join("confined_ran.txt").exists(),
+                "the confined command ran inside the boundary"
+            );
+        } else {
+            // No Landlock / not Linux → a VISIBLE error and NO run.
+            assert!(is_error, "an unavailable sandbox is an error: {result:?}");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Sandboxed shell is unavailable"),
+                "the error names the reason: {result:?}"
+            );
+            assert!(
+                !cwd.join("confined_ran.txt").exists(),
+                "fail CLOSED: the command must not have run"
+            );
+        }
+    }
+
+    /// (ADR 0030 Deviation 3) a write into a user-level agent-definition dir
+    /// is refused by the GATE in the deny-list's own words (the same text the
+    /// executor produces), even though `writes: Sandboxed` would otherwise
+    /// read as an escape — the deny-list is the true reason there.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_gate_denial_of_a_protected_dir_uses_the_protected_wording() {
+        let home = Tmp::new("protected-home");
+        for dir in [
+            ".agents/skills",
+            ".pi/agent/skills",
+            ".agents/agents",
+            ".pi/agent/agents",
+        ] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let target = home.path().join(".agents/skills/pwn/SKILL.md");
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": target.display().to_string(), "content": "PWNED" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let (mut loop_, _cfg) = build_policy_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(RecordingSink {
+                events: sink_events.clone(),
+            }),
+            // `writes: allow` on purpose: the deny-list is a FLOOR — it
+            // refuses whatever the policy says (the executor owns that
+            // case; here the gate never sees it, so `sandboxed` is used to
+            // exercise the GATE's wording).
+            Some(&policy_settings("allow", "sandboxed", "allow")),
+        );
+        bounded_prompt(&mut loop_, "go").await;
+        assert!(
+            permission_requests(&sink_events.lock().unwrap()).is_empty(),
+            "a protected write is a Deny, never a prompt"
+        );
+        let ends = tool_ends(&mut events_rx);
+        let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+        assert!(is_error, "the protected write is refused: {result:?}");
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        assert!(
+            text.contains("protected agent-definition directory"),
+            "the refusal names the real reason, got {text:?}"
+        );
+        assert!(
+            !target.exists(),
+            "and nothing was written (the gate stopped it before the executor)"
+        );
+    }
+
+    /// (ADR 0030) A TRUSTED Space suppresses an `Ask` at the GATE: the
+    /// verdict itself is `Allow` (so no `PendingPermissions` entry is ever
+    /// registered), and the out-of-boundary `read` runs. Asserted on
+    /// `policy_verdict` DIRECTLY as well as end-to-end — the end-to-end half
+    /// alone cannot tell the gate's own trust check apart from
+    /// `decision_for`'s (both suppress, by design), and the precedence rule
+    /// is worth pinning at the layer that owns it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_trusted_space_suppresses_the_prompt_the_policy_would_raise() {
+        let home = Tmp::new("trust-home");
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let outside = Tmp::new("trust-outside");
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+        let path = outside.path().join("secret.txt");
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(read_call("t1", &path.display().to_string())),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let (mut loop_, _cfg) = build_policy_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(RecordingSink {
+                events: sink_events.clone(),
+            }),
+            // `ask` — the policy WOULD prompt; Trust is what stops it.
+            Some(&policy_settings("ask", "ask", "ask")),
+        );
+        // The Space the loop's `space_cwd` points at, marked trusted (the
+        // `Db` the fixture built is reachable through `loop_.store`, so the
+        // trust source is wired to the same rows).
+        let db = Arc::new(Db::open(&home.path().join("trust.db")).unwrap());
+        let cwd = loop_.space_cwd.clone();
+        db.upsert_space(&cwd.display().to_string(), false).unwrap();
+        db.set_space_trusted(&cwd.display().to_string(), true)
+            .unwrap();
+        loop_.trust = Some(Arc::new(
+            crate::agent::harness::trust::SqliteTrustSource::new(db),
+        ));
+
+        // The gate's OWN verdict, read AFTER the turn (so `file_policy` is
+        // the `ask` the settings file carries — before the first prompt the
+        // field is still the all-`Allow` default and any verdict would
+        // pass). `Allow`, not `Ask`: Trust suppressed it before any prompt
+        // machinery was reached.
+        bounded_prompt(&mut loop_, "go").await;
+        let tc = read_call("t1", &path.display().to_string());
+        assert_eq!(
+            loop_.policy_verdict(&tc),
+            Some(Decision::Allow),
+            "Trust suppresses the `Ask` at the decision point itself"
+        );
+        // CONTRAST (so the assertion above cannot pass vacuously on a
+        // policy that was never `ask`): the SAME loop and call with the
+        // trust removed is an `Ask`.
+        loop_.trust = None;
+        assert_eq!(
+            loop_.policy_verdict(&tc),
+            Some(Decision::Ask),
+            "without Trust the very same access prompts"
+        );
+
+        assert!(
+            permission_requests(&sink_events.lock().unwrap()).is_empty(),
+            "a trusted Space is never prompted (Trust suppresses `Ask`)"
+        );
+        let ends = tool_ends(&mut events_rx);
+        let (result, is_error) = ends.get("t1").expect("the read dispatched").clone();
+        assert!(!is_error, "and the read runs: {result:?}");
+        assert_eq!(result["content"][0]["text"], "OUTSIDE-CONTENT");
+    }
+
+    /// (ADR 0030) A tool the policy does NOT judge stays ungated:
+    /// `read_skill` takes a skill NAME and carries its own per-skill
+    /// containment (ADR 0029), so a `Sandboxed` read policy must not touch
+    /// it — and it must not gain a prompt either.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_skill_tools_stay_outside_the_policy_gate() {
+        let home = Tmp::new("skill-home");
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let (provider, _calls) = ScriptedProvider::new(vec![
+            Some(vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "t1".to_string(),
+                    name: "read_skill".to_string(),
+                    arguments: json!({ "name": "nope" }),
+                }),
+                ProviderEvent::Done(FinishReason::ToolCalls),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("done".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+        let (mut loop_, _cfg) = build_policy_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(RecordingSink {
+                events: sink_events.clone(),
+            }),
+            Some(&policy_settings("sandboxed", "sandboxed", "sandboxed")),
+        );
+        bounded_prompt(&mut loop_, "go").await;
+        assert!(
+            permission_requests(&sink_events.lock().unwrap()).is_empty(),
+            "the skill tools never prompt"
+        );
+        let ends = tool_ends(&mut events_rx);
+        let (result, _is_error) = ends.get("t1").expect("a tool result").clone();
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        assert!(
+            text.contains("unknown skill"),
+            "the executor's OWN error (the gate stayed out of it), got {text:?}"
+        );
+        assert!(
+            !text.contains("escapes the session sandbox"),
+            "the policy must not re-word the skill tool's failure: {text:?}"
+        );
     }
 }

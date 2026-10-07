@@ -107,9 +107,12 @@ pub fn build_main_prompt(ctx: &PromptContext) -> String {
 
     // `<skills>`: only when skills are present AND a skill-loading tool is
     // advertised. `read_skill` is preferred; else pi's `["read", "bash"]`
-    // order (the fallback for a session whose tool set excludes it — where
-    // loading a USER-scope skill will genuinely fail, but a SPACE-scope
-    // skill inside the sandbox still works).
+    // order (the fallback for a session whose tool set excludes it — `read`
+    // reaches a USER-scope skill too, because ADR 0030's read boundary
+    // includes the user- and space-level skill dirs in every policy; it is
+    // `bash` at `Shell = Sandboxed` that cannot, since the Landlock
+    // allow-list carries the session `cwd`, the system dirs and the temp
+    // dirs, not the agent-definition dirs).
     let file_read_tool = if ctx.tools.iter().any(|t| t.name == "read_skill") {
         Some("read_skill")
     } else if ctx.tools.iter().any(|t| t.name == "read") {
@@ -255,9 +258,11 @@ fn format_skills_for_prompt(skills: &[SkillInfo], file_read_tool: &str) -> Strin
             _ => "Use bash to load a skill's file when the task matches its description.".to_string(),
         },
         match file_read_tool {
-            // The `<location>` is outside the session sandbox, so the
-            // bundled-file rule must not send the model to a path-param tool
-            // that cannot read it.
+            // `read_skill` resolves a bundled file inside its own skill dir
+            // under ADR 0029's per-skill containment, whatever the session
+            // policy is, whereas a path-param tool is judged against the
+            // boundary (ADR 0030) — so when `read_skill` is advertised the
+            // bundled-file rule names it rather than a path tool.
             "read_skill" => "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and read the bundled file with read_skill's `path` parameter."
                 .to_string(),
             _ => "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands."

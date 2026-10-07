@@ -1,5 +1,5 @@
 //! The Rust tool executors (native-agent-harness Task 1): one per built-in
-//! tool, each sandboxed to the session's `cwd` (via the existing
+//! tool, each contained by the session's root set (via the existing
 //! [`FsBackend`]) and returning a pi-shaped [`ToolResult`] — `content` is
 //! what the LLM sees, `details` is what the UI sees (matching pi's
 //! built-in renderers). The native harness (in-process) calls
@@ -8,17 +8,27 @@
 //! `powershell` is deliberately absent (Windows-only; the harness is
 //! Linux-only) — it lands with the Windows native sessions (Task 6).
 //!
-//! Security note: `bash` is GATED, not sandboxed — `sh -c` can read/write
-//! anywhere (the permission gate is the control, exactly as in pi's own
-//! `bash`). Only the path-param tools (`read`/`write`/`edit`/`find`/
-//! `grep`/`ls`) are sandbox-validated via `FsBackend`.
+//! Security note: `bash` is GATED and — at `Shell=Sandboxed` — CONFINED
+//! (ADR 0030 Task 5, `tools/sandbox.rs`): the child runs inside a Landlock
+//! ruleset confined to the session's write boundary + the system's program
+//! dirs + the temp dirs. It is not isolation (system files stay readable
+//! and this ruleset enables no network rules at any ABI — read that
+//! module's doc). At
+//! `Ask`/`Allow` `sh -c` can still reach anywhere (the permission gate is
+//! the control, exactly as in pi's own `bash`). Only the path-param tools
+//! (`read`/`write`/`edit`/`find`/`grep`/`ls`) are validated via
+//! `FsBackend`, whose roots are POLICY-DERIVED (ADR 0030):
+//! `Sandboxed` → the direction's boundary, `Ask`/`Allow` → unrestricted
+//! (the gate already decided, and an approved `Ask` must be able to land).
+//! Writes carry the [`crate::agent::boundary::protected_dirs`] deny-list on
+//! TOP of that, refused in every policy.
 //!
-//! The skill tools (`list_skills`/`read_skill`) are the deliberate
-//! EXCEPTION to the sandbox rule, and the reason it is safe: a session's
-//! skills live outside its sandbox (`~/.agents/skills`), so a sandboxed
-//! `read` can never load one. They take a skill NAME, never a path — the
+//! The skill tools (`list_skills`/`read_skill`) keep their OWN containment
+//! regardless of policy: they take a skill NAME, never a path — the
 //! discovered skill set is the allowlist — and a bundled-file `path` is
-//! scoped to that one skill's directory by a per-skill `FsBackend`.
+//! scoped to that one skill's directory by a per-skill [`FsBackend`] that
+//! sees NEITHER the session boundary NOR the deny-list (a skill must not be
+//! able to read a sibling skill).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -127,9 +137,10 @@ impl ToolResult {
     }
 }
 
-/// The execution context for a tool call: the session's `cwd` (the sandbox
-/// root for the path-param tools) + the cancellation token wired to the
-/// tool's AbortSignal.
+/// The execution context for a tool call: the session's `cwd` (the base of
+/// the path-param tools' sandbox), the boundary / policy the executor
+/// enforces (ADR 0030), and the cancellation token wired to the tool's
+/// AbortSignal.
 #[derive(Clone)]
 pub struct ToolCtx {
     /// The session's `cwd` — the sandbox boundary.
@@ -143,6 +154,69 @@ pub struct ToolCtx {
     /// `Some` pins EXPLICIT roots — the test seam (a test must never read
     /// the real `~/.agents/skills`), mirroring `skills::discover_in_roots`.
     pub skill_roots: Option<Vec<(PathBuf, crate::skills::SkillScope)>>,
+    /// (ADR 0030) The read boundary (frozen at session start; `vec![cwd]` in
+    /// tests — hermeticity: NEVER call `boundary::read_roots` here, it reads
+    /// `$HOME`).
+    pub boundary: Vec<PathBuf>,
+    /// (ADR 0030) The policy in force for this call.
+    pub file_policy: crate::agent::policy::FilePolicy,
+    /// (ADR 0030) The write deny-list (`boundary::protected_dirs()`, frozen
+    /// at session start; `vec![]` in tests).
+    pub protected: Vec<PathBuf>,
+}
+
+/// The read-direction backend for this context (ADR 0030): the executor's
+/// roots are `boundary::executor_roots` over `ctx.boundary` and
+/// `ctx.file_policy.reads`.
+fn read_backend(ctx: &ToolCtx) -> FsBackend {
+    FsBackend {
+        roots: crate::agent::boundary::executor_roots(
+            &ctx.cwd,
+            &ctx.boundary,
+            ctx.file_policy.reads,
+        ),
+    }
+}
+
+/// The write-direction backend: the boundary is the session `cwd` ONLY
+/// (`boundary::write_roots` — space-level agent dirs are repo content and
+/// stay writable as descendants of a repo-root cwd, and the user-level ones
+/// are refused by `ctx.protected` regardless).
+fn write_backend(ctx: &ToolCtx) -> FsBackend {
+    FsBackend {
+        roots: crate::agent::boundary::executor_roots(
+            &ctx.cwd,
+            std::slice::from_ref(&ctx.cwd),
+            ctx.file_policy.writes,
+        ),
+    }
+}
+
+/// The write DENY-LIST check (ADR 0030 Deviation 3): a resolved path under
+/// one of `ctx.protected` (the user-level agent-definition dirs) is refused
+/// in EVERY policy — including `writes: Allow` — because a model that can
+/// rewrite `~/.agents/skills/*/SKILL.md` rewrites its own instructions for
+/// every future session. Independent of `roots` (it is a deny, not a
+/// boundary). `Some(message)` is the refusal, worded like an `FsError`.
+fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> Option<String> {
+    protected_refusal_text(&ctx.protected, tool, resolved)
+}
+
+/// The refusal text itself, split out so the GATE (`loop.rs`) refuses a
+/// protected write in EXACTLY the executor's words — two copies of that
+/// sentence would drift, and a gate-level deny that reads differently from
+/// the executor-level one is indistinguishable from a bug to a user.
+pub(crate) fn protected_refusal_text(
+    protected: &[PathBuf],
+    tool: &str,
+    resolved: &Path,
+) -> Option<String> {
+    let hit = protected.iter().find(|dir| resolved.starts_with(dir))?;
+    Some(format!(
+        "{tool}: {} is a protected agent-definition directory ({}) — writing there is refused in every policy",
+        resolved.display(),
+        hit.display()
+    ))
 }
 
 /// Run a shell command (`sh -c` on Unix; the command is NOT re-parsed) in
@@ -154,12 +228,19 @@ pub struct ToolCtx {
 /// reaped and the pipes close) and the pipes are drained with a bounded
 /// [`DRAIN_GRACE`] deadline — never an unbounded wait for EOF.
 ///
+/// `Shell=Sandboxed` (ADR 0030) confines the CHILD in a Landlock ruleset
+/// ([`crate::agent::tools::sandbox`]); see the module doc for what that
+/// does and does NOT promise. It changes nothing here except one extra
+/// `pre_exec` step: the process group and the negative-pid group kill stay
+/// exactly as they are, so a confined child is still reapable.
+///
 /// `params`: `{ command: String, timeout_ms?: u64 }`.
 pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     let command = match params.get("command").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
         None => return ToolResult::fail("bash: missing `command` parameter".to_string(), None),
     };
+    let confined = ctx.file_policy.shell == crate::agent::policy::AccessPolicy::Sandboxed;
     let timeout = params
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
@@ -190,10 +271,55 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
+    // (ADR 0030) The confined tier: build the ruleset and install it in the
+    // CHILD (`pre_exec`) so the Worker and the desktop are never confined.
+    // FAIL CLOSED, VISIBLY: no ruleset means no run — an unsandboxed run
+    // here would break exactly the promise the user selected, so every
+    // failure is a tool-result error naming the reason. Off Linux the
+    // sandbox module is not compiled at all, so the tier fails closed.
+    //
+    // The guard MUST outlive `spawn` (the child's forked fd table refers to
+    // the parent's ruleset fd), hence a binding rather than a temporary.
+    #[cfg(not(target_os = "linux"))]
+    if confined {
+        return ToolResult::fail(
+            "Sandboxed shell is unavailable on this platform".to_string(),
+            None,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    let sandbox = if confined {
+        match crate::agent::tools::sandbox::Sandbox::create(&ctx.cwd) {
+            Ok(sandbox) => {
+                sandbox.install(&mut cmd);
+                Some(sandbox)
+            }
+            Err(reason) => {
+                return ToolResult::fail(format!("Sandboxed shell is unavailable: {reason}"), None)
+            }
+        }
+    } else {
+        None
+    };
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
+        // A `pre_exec` failure surfaces here (std reports the closure's
+        // errno as the spawn error): still a confined run that never
+        // happened, so the message names the sandbox, not a bare "failed
+        // to start".
+        Err(e) if confined => {
+            return ToolResult::fail(
+                format!("Sandboxed shell is unavailable: could not start the confined child ({e})"),
+                None,
+            )
+        }
         Err(e) => return ToolResult::fail(format!("bash: failed to start: {e}"), None),
     };
+    // The parent's ruleset fd is no longer needed once the child is forked
+    // (the child has its own descriptor), so it is closed immediately.
+    #[cfg(target_os = "linux")]
+    drop(sandbox);
 
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
@@ -357,9 +483,7 @@ pub async fn exec_read(ctx: &ToolCtx, params: &Value) -> ToolResult {
     };
     let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(1);
     let limit = params.get("limit").and_then(|v| v.as_u64());
-    let backend = FsBackend {
-        root: ctx.cwd.clone(),
-    };
+    let backend = read_backend(ctx);
     let resolved = match backend.validate(Path::new(&path)) {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("read: {e}"), None),
@@ -430,13 +554,15 @@ pub async fn exec_write(ctx: &ToolCtx, params: &Value) -> ToolResult {
             )
         }
     };
-    let backend = FsBackend {
-        root: ctx.cwd.clone(),
-    };
+    let backend = write_backend(ctx);
     let resolved = match backend.validate(Path::new(&path)) {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("write: {e}"), None),
     };
+    // The deny-list (ADR 0030): unconditional, independent of `roots`.
+    if let Some(msg) = protected_refusal(ctx, "write", &resolved) {
+        return ToolResult::fail(msg, None);
+    }
     let bytes = content.len();
     if let Err(e) = backend.write(&resolved, &content) {
         return ToolResult::fail(format!("write: {e}"), None);
@@ -475,13 +601,15 @@ pub async fn exec_edit(ctx: &ToolCtx, params: &Value) -> ToolResult {
         .get("replace_all")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let backend = FsBackend {
-        root: ctx.cwd.clone(),
-    };
+    let backend = write_backend(ctx);
     let resolved = match backend.validate(Path::new(&path)) {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("edit: {e}"), None),
     };
+    // The deny-list (ADR 0030): an edit is a write.
+    if let Some(msg) = protected_refusal(ctx, "edit", &resolved) {
+        return ToolResult::fail(msg, None);
+    }
     let old = match backend.read(&resolved) {
         Ok(t) => t,
         Err(e) => return ToolResult::fail(format!("edit: {e}"), None),
@@ -568,9 +696,7 @@ pub async fn exec_find(ctx: &ToolCtx, params: &Value) -> ToolResult {
         .and_then(|v| v.as_u64())
         .map(|v| v as u32)
         .unwrap_or(DEFAULT_MAX_RESULTS);
-    let backend = FsBackend {
-        root: ctx.cwd.clone(),
-    };
+    let backend = read_backend(ctx);
     let resolved = match backend.validate(Path::new(&dir)) {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("find: {e}"), None),
@@ -743,9 +869,7 @@ pub async fn exec_grep(ctx: &ToolCtx, params: &Value) -> ToolResult {
         .map(|v| v as u32)
         .unwrap_or(DEFAULT_MAX_RESULTS);
     let ignore_case = params.get("-i").and_then(|v| v.as_bool()).unwrap_or(false);
-    let backend = FsBackend {
-        root: ctx.cwd.clone(),
-    };
+    let backend = read_backend(ctx);
     let resolved = match backend.validate(Path::new(&dir)) {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("grep: {e}"), None),
@@ -814,9 +938,7 @@ pub async fn exec_ls(ctx: &ToolCtx, params: &Value) -> ToolResult {
         .get("long")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let backend = FsBackend {
-        root: ctx.cwd.clone(),
-    };
+    let backend = read_backend(ctx);
     let resolved = match backend.validate(Path::new(&dir)) {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("ls: {e}"), None),
@@ -923,9 +1045,11 @@ pub async fn exec_read_skill(ctx: &ToolCtx, params: &Value) -> ToolResult {
         );
     };
 
-    // The per-skill mini-sandbox: the skill's dir is the boundary.
+    // The per-skill mini-sandbox: the skill's dir is the boundary. NOT the
+    // session boundary (ADR 0030): a skill must not be able to read a
+    // sibling skill, so this backend sees exactly ONE root and no deny-list.
     let backend = FsBackend {
-        root: PathBuf::from(&skill.dir),
+        roots: vec![PathBuf::from(&skill.dir)],
     };
     let Some(rel) = params.get("path").and_then(|v| v.as_str()) else {
         // No `path` → the `SKILL.md` BODY (discovery already stripped the
@@ -1003,11 +1127,51 @@ mod tests {
         dir
     }
 
+    /// The test `ToolCtx`. HERMETIC BY DESIGN: `boundary` is the single
+    /// `cwd` and `protected` is EMPTY — this must NEVER derive them from the
+    /// `$HOME`-reading boundary helpers (they would make these tests depend
+    /// on whatever happens to be in the developer's `~/.agents`, the same
+    /// trap `ToolCtx::skill_roots: Option<…>` exists to avoid).
+    ///
+    /// The policy pins `Sandboxed` for reads and writes: these are
+    /// CONTAINMENT tests, so they pin the tier that enforces the boundary
+    /// (`shell: Allow` — no test here gates `bash`). The other tiers are
+    /// covered by the explicit tier tests below.
     fn ctx(cwd: &Path) -> ToolCtx {
         ToolCtx {
             cwd: cwd.to_path_buf(),
             cancel: CancellationToken::new(),
             skill_roots: None,
+            boundary: vec![cwd.to_path_buf()],
+            file_policy: crate::agent::policy::FilePolicy {
+                reads: crate::agent::policy::AccessPolicy::Sandboxed,
+                writes: crate::agent::policy::AccessPolicy::Sandboxed,
+                shell: crate::agent::policy::AccessPolicy::Allow,
+            },
+            protected: Vec::new(),
+        }
+    }
+
+    /// The same ctx with one policy overridden (the tier tests).
+    fn ctx_policy(cwd: &Path, policy: crate::agent::policy::FilePolicy) -> ToolCtx {
+        ToolCtx {
+            file_policy: policy,
+            ..ctx(cwd)
+        }
+    }
+
+    /// Whether THIS machine can confine a child (Linux + a Landlock
+    /// kernel). The confined tests branch on it: a kernel that cannot
+    /// confine must exercise the fail-closed path, and CI on such a kernel
+    /// stays reproducible instead of reddening.
+    fn can_confine() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            crate::agent::tools::sandbox::landlock_available()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
         }
     }
 
@@ -1057,6 +1221,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// (ADR 0030 Task 5) `Shell=Sandboxed` runs the command INSIDE the
+    /// Landlock ruleset: writes inside the boundary land, and where the
+    /// kernel cannot confine, the tier FAILS CLOSED with a visible error
+    /// and the command never runs (the marker file is the proof either way
+    /// — an error message alone would pass while the command had already
+    /// landed unsandboxed). The confinement itself is asserted behaviorally
+    /// in `agent::tools::sandbox`'s tests; this is the executor's wiring.
+    #[tokio::test]
+    async fn a_sandboxed_shell_runs_confined_or_fails_closed_visibly() {
+        use crate::agent::policy::{AccessPolicy, FilePolicy};
+        let cwd = temp_cwd("bash-sandboxed");
+        let confined = ctx_policy(
+            &cwd,
+            FilePolicy {
+                reads: AccessPolicy::Allow,
+                writes: AccessPolicy::Allow,
+                shell: AccessPolicy::Sandboxed,
+            },
+        );
+        let r = execute_tool(&confined, "bash", &json!({ "command": "touch marker.txt" })).await;
+        if can_confine() {
+            // The kernel confines: the run happens, and a write INSIDE the
+            // boundary is allowed (that is what "confined to the project"
+            // means — see `sandbox.rs`'s behavioral tests for the deny).
+            assert!(
+                !r.is_error,
+                "a confined run succeeds inside the boundary: {:?}",
+                text_of(&r)
+            );
+            assert!(cwd.join("marker.txt").exists(), "the confined write landed");
+        } else {
+            // No sandbox available → a VISIBLE error and NO run.
+            assert!(r.is_error, "an unavailable sandbox is an error, not a run");
+            assert!(
+                text_of(&r).contains("Sandboxed shell is unavailable"),
+                "the error says why, got {:?}",
+                text_of(&r)
+            );
+            assert!(
+                !cwd.join("marker.txt").exists(),
+                "the command must NOT have run (fail closed, not fail open)"
+            );
+        }
+        // CONTRAST (so this cannot pass vacuously): the SAME command under
+        // the default `shell: Allow` runs.
+        let r = execute_tool(&ctx(&cwd), "bash", &json!({ "command": "touch ran.txt" })).await;
+        assert!(!r.is_error, "the default policy still runs bash");
+        assert!(cwd.join("ran.txt").exists());
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The confined stub is scoped to the SHELL direction: a path-param
+    /// tool is unaffected by `shell: Sandboxed` (it is neither confined nor
+    /// refused — its direction is `reads`/`writes`).
+    #[tokio::test]
+    async fn a_sandboxed_shell_does_not_touch_the_path_tools() {
+        use crate::agent::policy::{AccessPolicy, FilePolicy};
+        let cwd = temp_cwd("bash-sandboxed-read");
+        std::fs::write(cwd.join("a.txt"), "hello").unwrap();
+        let confined = ctx_policy(
+            &cwd,
+            FilePolicy {
+                reads: AccessPolicy::Allow,
+                writes: AccessPolicy::Allow,
+                shell: AccessPolicy::Sandboxed,
+            },
+        );
+        let r = execute_tool(&confined, "read", &json!({ "path": "a.txt" })).await;
+        assert!(!r.is_error, "a read is not gated by the shell policy");
+        assert!(text_of(&r).contains("hello"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     #[tokio::test]
     async fn bash_nonzero_exit_is_error() {
         let cwd = temp_cwd("bash-err");
@@ -1080,6 +1317,9 @@ mod tests {
             cwd: cwd.clone(),
             cancel: token.clone(),
             skill_roots: None,
+            boundary: vec![cwd.clone()],
+            file_policy: crate::agent::policy::FilePolicy::default(),
+            protected: Vec::new(),
         };
         let handle = tokio::spawn(async move {
             let start = std::time::Instant::now();
@@ -1589,6 +1829,243 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    // ── the policy tiers (ADR 0030) ───────────────────────────────────────
+
+    /// The point of the whole feature: with `reads: Allow` the gate is the
+    /// only decision point, so a read BEYOND the boundary lands. The
+    /// `Sandboxed` contrast is `read_escape_rejected` above (the same path,
+    /// rejected) — without it this test would pass vacuously.
+    #[tokio::test]
+    async fn read_beyond_the_boundary_succeeds_when_reads_allow() {
+        use crate::agent::policy::{AccessPolicy, FilePolicy};
+        // A PARENT dir so the out-of-boundary file stays inside the test's
+        // own temp tree (`../outside.txt` from the cwd lands in the parent).
+        let parent = temp_cwd("tier-read");
+        let cwd = parent.join("space");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = parent.join("outside.txt");
+        std::fs::write(&target, "OUTSIDE-OK").unwrap();
+        // The premise: the path is genuinely beyond the boundary.
+        assert!(!target.starts_with(&cwd));
+
+        let policy = FilePolicy {
+            reads: AccessPolicy::Allow,
+            ..FilePolicy::default()
+        };
+        let r = execute_tool(
+            &ctx_policy(&cwd, policy),
+            "read",
+            &json!({ "path": "../outside.txt" }),
+        )
+        .await;
+        assert!(!r.is_error, "an allowed read must land: {}", text_of(&r));
+        assert_eq!(text_of(&r), "OUTSIDE-OK");
+
+        // And the ABSOLUTE form lands too (the unrestricted root is `/`).
+        let r = execute_tool(
+            &ctx_policy(&cwd, policy),
+            "read",
+            &json!({ "path": target }),
+        )
+        .await;
+        assert!(!r.is_error, "{}", text_of(&r));
+
+        // The CONTRAST (so this is not vacuous): the same file under
+        // `reads: Sandboxed` is rejected.
+        let r = execute_tool(&ctx(&cwd), "read", &json!({ "path": "../outside.txt" })).await;
+        assert!(r.is_error, "a sandboxed read must NOT land");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The read boundary is a SET: under `Sandboxed`, a file in a SECOND
+    /// boundary root (a skill dir at the repo root — outside the session
+    /// `cwd`) is readable, while a file in neither root is not.
+    #[tokio::test]
+    async fn read_reaches_a_second_boundary_root_when_sandboxed() {
+        let cwd = temp_cwd("tier-multi-root");
+        let skill_dir = temp_cwd("tier-multi-root-skills");
+        std::fs::write(skill_dir.join("SKILL.md"), "SKILL-BODY").unwrap();
+        let ToolCtx { boundary, .. } = ctx(&cwd);
+        // The boundary the harness would hand the tools: cwd FIRST, then the
+        // discovery root.
+        let c = ToolCtx {
+            boundary: vec![cwd.clone(), skill_dir.clone()],
+            ..ctx(&cwd)
+        };
+        assert_eq!(boundary, vec![cwd.clone()]);
+
+        let r = execute_tool(&c, "read", &json!({ "path": skill_dir.join("SKILL.md") })).await;
+        assert!(
+            !r.is_error,
+            "a boundary root must be readable: {}",
+            text_of(&r)
+        );
+        assert_eq!(text_of(&r), "SKILL-BODY");
+
+        // A dir that is neither the cwd nor a root is still rejected.
+        let elsewhere = temp_cwd("tier-multi-root-elsewhere");
+        std::fs::write(elsewhere.join("no.txt"), "NO").unwrap();
+        let r = execute_tool(&c, "read", &json!({ "path": elsewhere.join("no.txt") })).await;
+        assert!(r.is_error, "a non-root must stay rejected");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&skill_dir);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// `writes: Allow` widens the WRITE direction the same way (an approved
+    /// `Ask` must be able to land, or the prompt lies). The `Sandboxed`
+    /// contrast is `write_escape_rejected` above.
+    #[tokio::test]
+    async fn write_beyond_the_boundary_succeeds_when_writes_allow() {
+        use crate::agent::policy::{AccessPolicy, FilePolicy};
+        let parent = temp_cwd("tier-write");
+        let cwd = parent.join("space");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let policy = FilePolicy {
+            writes: AccessPolicy::Allow,
+            ..FilePolicy::default()
+        };
+        let r = execute_tool(
+            &ctx_policy(&cwd, policy),
+            "write",
+            &json!({ "path": "../outside.txt", "content": "landed" }),
+        )
+        .await;
+        assert!(!r.is_error, "an allowed write must land: {}", text_of(&r));
+        let landed = parent.join("outside.txt");
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "landed");
+        // The CONTRAST: the same path under `writes: Sandboxed` is refused
+        // and creates nothing.
+        let r = execute_tool(
+            &ctx(&cwd),
+            "write",
+            &json!({ "path": "../other.txt", "content": "nope" }),
+        )
+        .await;
+        assert!(r.is_error, "a sandboxed write must NOT land");
+        assert!(!parent.join("other.txt").exists());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The DENY-LIST is unconditional: a write whose resolved path is under a
+    /// `protected` dir is refused under EVERY policy — `Sandboxed` (where it
+    /// is also outside the boundary) AND `Allow` (where the boundary admits
+    /// it). A model that can rewrite `~/.agents/skills/*/SKILL.md` rewrites
+    /// its own instructions, so this is never a prompt and never widened.
+    #[tokio::test]
+    async fn write_into_a_protected_dir_is_refused_under_every_policy() {
+        use crate::agent::policy::{AccessPolicy, FilePolicy};
+        for policy_writes in [
+            AccessPolicy::Sandboxed,
+            AccessPolicy::Ask,
+            AccessPolicy::Allow,
+        ] {
+            let cwd = temp_cwd("tier-protect");
+            // A PINNED protected dir INSIDE the cwd: the root check passes
+            // for it, so only the deny-list can refuse the write (which is
+            // exactly what makes this the deny-list's own test).
+            let protected = cwd.join(".agents/skills");
+            std::fs::create_dir_all(&protected).unwrap();
+            std::fs::write(protected.join("SKILL.md"), "OLD").unwrap();
+            let c = ToolCtx {
+                protected: vec![protected.clone()],
+                file_policy: FilePolicy {
+                    writes: policy_writes,
+                    ..FilePolicy::default()
+                },
+                ..ctx(&cwd)
+            };
+            let r = execute_tool(
+                &c,
+                "write",
+                &json!({ "path": ".agents/skills/SKILL.md", "content": "PWNED" }),
+            )
+            .await;
+            assert!(
+                r.is_error,
+                "{policy_writes:?}: a write into a protected dir must be refused"
+            );
+            let text = text_of(&r).to_string();
+            assert!(text.contains("protected"), "{policy_writes:?}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(protected.join("SKILL.md")).unwrap(),
+                "OLD",
+                "{policy_writes:?}: the file must be untouched"
+            );
+            // `edit` is a write, so the deny-list covers it too.
+            let r = execute_tool(
+                &c,
+                "edit",
+                &json!({ "path": ".agents/skills/SKILL.md", "old_text": "OLD", "new_text": "PWNED" }),
+            )
+            .await;
+            assert!(r.is_error, "{policy_writes:?}: `edit` must be refused too");
+            // And a NON-protected path in the same cwd is unaffected.
+            let ok = execute_tool(
+                &c,
+                "write",
+                &json!({ "path": "notes.txt", "content": "fine" }),
+            )
+            .await;
+            assert!(!ok.is_error, "{policy_writes:?}: {}", text_of(&ok));
+            let _ = std::fs::remove_dir_all(&cwd);
+        }
+    }
+
+    /// The deny-list is a PREFIX check on the RESOLVED path, so a new file
+    /// created under a protected dir is refused too (the dir need not hold
+    /// the file yet).
+    #[tokio::test]
+    async fn write_a_new_file_under_a_protected_dir_is_refused() {
+        use crate::agent::policy::{AccessPolicy, FilePolicy};
+        let cwd = temp_cwd("tier-protect-new");
+        let protected = cwd.join(".pi/agent/skills");
+        std::fs::create_dir_all(&protected).unwrap();
+        let c = ToolCtx {
+            protected: vec![protected.clone()],
+            file_policy: FilePolicy {
+                writes: AccessPolicy::Allow,
+                ..FilePolicy::default()
+            },
+            ..ctx(&cwd)
+        };
+        let r = execute_tool(
+            &c,
+            "write",
+            &json!({ "path": ".pi/agent/skills/new/SKILL.md", "content": "PWNED" }),
+        )
+        .await;
+        assert!(r.is_error, "a new file under a protected dir is refused");
+        assert!(!protected.join("new").exists(), "nothing is created");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// `bash` IGNORES the boundary (its `Sandboxed` tier is Landlock, Task 5):
+    /// a sandboxed read cannot reach a file that `bash` can happily cat, so
+    /// the boundary must not pretend to bound the shell.
+    #[tokio::test]
+    async fn bash_ignores_the_file_boundary() {
+        let cwd = temp_cwd("tier-bash");
+        let sibling = temp_cwd("tier-bash-sibling");
+        std::fs::write(sibling.join("f.txt"), "FROM-OUTSIDE").unwrap();
+        let r = execute_tool(
+            &ctx(&cwd),
+            "bash",
+            &json!({ "command": format!("cat {}", sibling.join("f.txt").display()) }),
+        )
+        .await;
+        assert!(
+            !r.is_error,
+            "bash is not boundary-sandboxed: {}",
+            text_of(&r)
+        );
+        assert_eq!(text_of(&r), "FROM-OUTSIDE");
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
     // ── list_skills / read_skill ─────────────────────────────────────────
 
     /// A skill root holding `<name>/SKILL.md`; returns the root.
@@ -1603,16 +2080,20 @@ mod tests {
     /// `roots` as the ONLY discovery roots — the skill tools take their
     /// roots from `ToolCtx::skill_roots` so a test never reads the real
     /// `~/.agents/skills` (the `discover_in_roots` convention).
+    /// `roots` as the ONLY discovery roots — the skill tools take their
+    /// roots from `ToolCtx::skill_roots` so a test never reads the real
+    /// `~/.agents/skills` (the `discover_in_roots` convention). The policy is
+    /// the same `Sandboxed` containment tier as [`ctx`] — these tests assert
+    /// that a sandboxed `read` STILL rejects a skill file outside the cwd.
     fn ctx_with_roots(cwd: &Path, roots: &[PathBuf]) -> ToolCtx {
         ToolCtx {
-            cwd: cwd.to_path_buf(),
-            cancel: CancellationToken::new(),
             skill_roots: Some(
                 roots
                     .iter()
                     .map(|r| (r.clone(), crate::skills::SkillScope::Space))
                     .collect(),
             ),
+            ..ctx(cwd)
         }
     }
 
