@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use super::types::{classify_server, ServerDef};
@@ -56,9 +57,74 @@ pub fn load_servers(
     out
 }
 
+/// One effective MCP server for the `#`-mention picker (a config read
+/// only — NO live connect; the per-session `McpManager` rule,
+/// ADR 0018/0019, is untouched).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerInfo {
+    pub name: String,
+    /// `"http" | "stdio"` (the `ServerDef` classification).
+    pub kind: String,
+    /// HTTP: the `url`. Stdio: `command` + `args` joined with a space
+    /// (e.g. `npx -y x-mcp`; the command alone when there are no args).
+    /// NOT length-bounded here: these come from a possibly CLONED repo's
+    /// `<cwd>/.pi/mcp.json`, so the injection point caps them
+    /// (`capInterpolated` in `src/lib/skills.ts`, the agent description's
+    /// 1024-code-point budget) — otherwise one `#name` pick would flood the
+    /// prompt AND the persisted message.
+    pub summary: String,
+}
+
+/// Map the effective set (`load_servers`' output) to the picker shape.
+/// Deterministic (a `BTreeMap` input → name-sorted output).
+///
+/// The `#`-MENTION surface: entries whose name can never equal a mention
+/// token (`crate::skills::is_mentionable_name`, which is strictly stronger
+/// than tag-safety) are DROPPED here — the one place besides
+/// `commands::agents::list_agent_definitions_for_space` where a name reaches
+/// the picker. The name is interpolated UNESCAPED into `<mcp name="…">` by
+/// `buildMcpBlock`, and `expandMentions` looks it up by
+/// `name.toLowerCase() === token` with a `[a-z0-9-]` token, so such a name
+/// can NEVER be expanded: offering it would insert a dead token. (The
+/// grammar check here is ASCII-only while the TS lookup case-FOLDS, so a
+/// name carrying U+212A is hidden here though TS would match it — an
+/// accepted LOST-FEATURE divergence, see `crate::skills::is_mentionable_name`.)
+/// Filtering here (and NOT in `load_servers`) is deliberate — the session
+/// layer keeps connecting to whatever the user configured.
+pub fn server_infos(servers: &BTreeMap<String, ServerDef>) -> Vec<McpServerInfo> {
+    servers
+        .iter()
+        .filter(|(name, _)| crate::skills::is_mentionable_name(name))
+        .map(|(name, def)| {
+            let (kind, summary) = match def {
+                ServerDef::Http(h) => ("http".to_string(), h.url.clone()),
+                ServerDef::Stdio(s) => (
+                    "stdio".to_string(),
+                    if s.args.is_empty() {
+                        s.command.clone()
+                    } else {
+                        // A SPACE separator between the command and the
+                        // args — the `+` operator concatenates with NO
+                        // separator ("npx" + "-y x-mcp" would be
+                        // "npx-y x-mcp").
+                        format!("{} {}", s.command, s.args.join(" "))
+                    },
+                ),
+            };
+            McpServerInfo {
+                name: name.clone(),
+                kind,
+                summary,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::mcp::types::{AuthSpec, HttpDef, StdioDef};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -182,6 +248,132 @@ mod tests {
         let home = temp_dir("home"); // no mcp.json
         let project = temp_dir("project"); // no mcp.json
         assert!(load_servers(&home, &project, None).is_empty());
+    }
+
+    #[test]
+    fn server_infos_maps_http_to_url_summary() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "a".to_string(),
+            ServerDef::Http(HttpDef {
+                url: "https://a".into(),
+                headers: Default::default(),
+                auth: AuthSpec::None,
+            }),
+        );
+        let infos = server_infos(&servers);
+        assert_eq!(
+            infos,
+            vec![McpServerInfo {
+                name: "a".into(),
+                kind: "http".into(),
+                summary: "https://a".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn server_infos_maps_stdio_to_command_plus_args_summary() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "s".to_string(),
+            ServerDef::Stdio(StdioDef {
+                command: "npx".into(),
+                args: vec!["-y".into(), "x-mcp".into()],
+                env: Default::default(),
+                cwd: None,
+            }),
+        );
+        let infos = server_infos(&servers);
+        assert_eq!(infos.len(), 1);
+        // A SPACE separator between the command and the args.
+        assert_eq!(infos[0].summary, "npx -y x-mcp");
+        assert_eq!(infos[0].kind, "stdio");
+        assert_eq!(infos[0].name, "s");
+        // No args: the command alone.
+        let mut bare = BTreeMap::new();
+        bare.insert(
+            "b".to_string(),
+            ServerDef::Stdio(StdioDef {
+                command: "solo".into(),
+                args: vec![],
+                env: Default::default(),
+                cwd: None,
+            }),
+        );
+        let infos = server_infos(&bare);
+        assert_eq!(infos[0].summary, "solo");
+    }
+
+    #[test]
+    fn server_infos_is_name_sorted() {
+        let mut servers = BTreeMap::new();
+        // Insert out of order — the `BTreeMap` keeps them name-sorted.
+        servers.insert(
+            "b".to_string(),
+            ServerDef::Http(HttpDef {
+                url: "https://b".into(),
+                headers: Default::default(),
+                auth: AuthSpec::None,
+            }),
+        );
+        servers.insert(
+            "a".to_string(),
+            ServerDef::Http(HttpDef {
+                url: "https://a".into(),
+                headers: Default::default(),
+                auth: AuthSpec::None,
+            }),
+        );
+        let infos = server_infos(&servers);
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn server_infos_drops_names_that_can_never_match_a_mention_token() {
+        // A3 — the picker round-trip constraint. A name that can never equal a
+        // mention token (`skills.ts` looks a token up by
+        // `name.toLowerCase() === token`, and a token is `[a-z0-9-]`) is
+        // UNNAMEABLE from the composer: offering it would insert a dead token
+        // that never expands. The server name is a raw JSON object key
+        // (`mcp.json` / the desktop `settings.json` / a CLONED repo's
+        // `<cwd>/.pi/mcp.json`), so it is attacker-controlled text — the same
+        // `"` that `skills.rs` skips for `<skill name="…">` would break
+        // `<mcp name="…">`.
+        let mut servers = BTreeMap::new();
+        for name in [
+            "good",
+            "Mixed",          // nameable: matching is case-insensitive
+            "x\" onload=\"y", // a `"` → breaks the `<mcp name="…">` attribute
+            "has space",      // a token has no whitespace → never matches
+            "tab\there",      // a control character
+        ] {
+            servers.insert(
+                name.to_string(),
+                ServerDef::Http(HttpDef {
+                    url: "https://x".into(),
+                    headers: Default::default(),
+                    auth: AuthSpec::None,
+                }),
+            );
+        }
+        let infos = server_infos(&servers);
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Mixed", "good"]);
+    }
+
+    #[test]
+    fn load_servers_keeps_unmentionable_names_for_the_session_layer() {
+        // The filter is at the MENTION surface ONLY: `load_servers` (what the
+        // session actually connects to) must keep serving an oddly-named
+        // entry — dropping it there would silently disable a user's server.
+        let home =
+            home_with_mcp_json(r#"{ "mcpServers": { "has space": { "url": "https://a" } } }"#);
+        let project = temp_dir("project");
+        let servers = load_servers(&home, &project, None);
+        assert!(servers.contains_key("has space"));
+        assert!(server_infos(&servers).is_empty());
     }
 
     #[test]

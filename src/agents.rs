@@ -296,15 +296,41 @@ fn parse_agent_file(
 
     // 4. `name` empty or whitespace-only after parsing (an `""` value,
     //    a `"   "` value, or a block with no indented lines) → fallback
-    //    (the stem). NO tag-safety skip (unlike skills: an agent name is
-    //    never interpolated unescaped into a prompt tag — it appears only
-    //    in the `list_agents` tool RESULT, which the wire JSON-escapes).
+    //    (the stem).
+    //
+    //    NO tag-safety skip here — and the reason is NOT that the name never
+    //    reaches a prompt tag. It DOES: the composer's `@`-mention expansion
+    //    interpolates it UNESCAPED into `<agent name="NAME">` and into the
+    //    block body (`definition "NAME"`, `agentName "NAME"`) — see
+    //    `buildAgentBlock` in `src/lib/skills.ts`. What makes that safe is
+    //    `expandMentions`' EXACT-MATCH lookup: a hit requires
+    //    `name.toLowerCase() === token` and every tag-UNSAFE character (`"`,
+    //    `<`, control chars) is UNCHANGED by `toLowerCase()`, so a name
+    //    containing one equals no `[a-z0-9-]` token and can NEVER be
+    //    interpolated at all (the argument is NOT injectivity — U+212A KELVIN
+    //    SIGN folds to `k`, and is harmless only because it is itself
+    //    tag-safe) — and the picker surfaces hide such names so no dead token
+    //    is ever offered (`commands::agents::list_agent_definitions_for_space`).
+    //
+    //    Discovery itself must therefore NOT skip unsafe names: the harness's
+    //    `agentName` dispatch still honors them (a name with a space is
+    //    dispatchable — the model passes it verbatim), so skipping would
+    //    silently break existing user files. `list_agents` needs no guard
+    //    either — its output crosses the wire JSON-escaped.
     let name = name
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| fallback_name.to_string());
-    // `description` left as parsed (may be `""`). NO 1024-char cap
-    // (unlike skills: a description is not prompt-injected — it appears
-    //    only in `list_agents` output on demand).
+    // `description` left as parsed (may be empty). NO 1024-char cap HERE,
+    //    unlike skills — but NOT because it is not prompt-injected: it IS,
+    //    as the first line of the composer's `<agent>` block. The skill side
+    //    enforces its cap at discovery by SKIPPING the skill; this module
+    //    cannot skip (the definition must stay dispatchable and visible in
+    //    Settings), so the cap lives at the INJECTION POINT instead —
+    //    `capInterpolated` in `src/lib/skills.ts` truncates to the SAME 1024
+    //    code points before interpolating (the MCP `summary` gets the same
+    //    budget for the same reason — both are repo-controlled and
+    //    length-unbounded). What is parsed here stays verbatim so
+    //    the Settings page and `list_agents` show the real frontmatter.
     let description = description.unwrap_or_default();
     // `model` / `thinking` empty after parsing → None.
     let model = model.filter(|m| !m.trim().is_empty());

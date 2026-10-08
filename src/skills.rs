@@ -338,8 +338,77 @@ fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, Strin
 /// tag the agent mis-parses, and a control character (e.g. a `|` block
 /// value joined with newlines) is equally unsafe. A string containing
 /// either is NOT tag-safe (the skill is skipped, never listed).
-fn is_tag_safe_name(name: &str) -> bool {
+///
+/// `pub(crate)` because it is the crate's ONE tag-safety predicate — the
+/// same reasoning applies to every resource name interpolated unescaped
+/// into a prompt tag, and the MENTION-PICKER surfaces
+/// (`agent::mcp::config::server_infos`,
+/// `commands::agents::list_agent_definitions_for_space`) build on it via
+/// [`is_mentionable_name`] so a resource whose name can never match a
+/// mention token is never offered. Mirrors
+/// how `agents.rs` already reuses this module's `home_dir` (the shared
+/// helper lives here rather than being copy-pasted into a second,
+/// divergent copy). ADR 0020's "keep the modules independent" rule is
+/// about `parse_value` (the two frontmatter shapes); it does not bind a
+/// predicate this module invented and that has exactly one semantics.
+///
+/// NOT applied at AGENT discovery on purpose: an agent name is dispatchable
+/// by the harness's `agentName` param regardless of shape, so skipping it
+/// would break existing user files (see the comment in `agents.rs`).
+pub(crate) fn is_tag_safe_name(name: &str) -> bool {
     !name.contains('"') && !name.chars().any(char::is_control)
+}
+
+/// The MENTION form of [`is_tag_safe_name`]: can this resource name EVER be
+/// produced by a mention token? `skills.ts` resolves a mention by exact
+/// lookup — `entry.name.toLowerCase() === token` — and a token is
+/// `[a-z0-9]+(-[a-z0-9]+)*` (a bare `-` is not allowed at either end or
+/// doubled: `[a-z0-9]` must follow every one). So a name over that charset
+/// (up to case) is the ONLY kind a picker offer can ever expand; anything
+/// else is UNNAMEABLE from the composer, and offering it would insert a dead
+/// token that silently never expands.
+///
+/// "Over that charset (up to case)" is deliberately approximate, and the
+/// approximation is ACCEPTED: this predicate is the ASCII grammar, while the
+/// TS comparison is a case-FOLD. A name like `fe\u{212A}tch` (U+212A KELVIN
+/// SIGN) is hidden here — `is_ascii_alphanumeric` rejects it — yet the TS
+/// side WOULD match it from a `#fetch` token, because JS
+/// `"fe\u{212A}tch".toLowerCase() === "fetch"`. That is a divergence in the
+/// LOST-FEATURE direction (a resource the picker will not offer), never in
+/// the UNSAFE one: U+212A is TAG-SAFE (no `"`, no `<`, no control char), so
+/// even a hand-typed token cannot malform the tag. Case-folding before the
+/// grammar check to close it is not worth the complexity for a character
+/// nobody names resources with — do NOT add it; document the divergence.
+///
+/// This is strictly STRONGER than tag-safety — every name it accepts is
+/// tag-safe (no `"`, no control char, and no space either: a space is NOT a
+/// control character, so `is_tag_safe_name` alone would keep offering
+/// `has space`, whose token can never exist). The two questions are
+/// different on purpose:
+/// - discovery-time (`skills.rs`): "would this name malFORM the tag?" →
+///   `is_tag_safe_name` (skip);
+/// - picker-time (`agent::mcp::config::server_infos`,
+///   `commands::agents::list_agent_definitions_for_space`): "can this name
+///   ever be MENTIONED?" → this predicate (hide, do not skip — the resource
+///   stays live for the session and for dispatch).
+pub(crate) fn is_mentionable_name(name: &str) -> bool {
+    let mut expect_segment = true; // a segment is due (start, or after a `-`)
+    for c in name.chars() {
+        if c == '-' {
+            if expect_segment {
+                return false; // leading `-`, or `--`
+            }
+            expect_segment = true;
+            continue;
+        }
+        if !c.is_ascii_alphanumeric() {
+            return false; // space, `_`, `.`, `"`, a control char, …
+        }
+        expect_segment = false;
+    }
+    // Must end on a segment (a trailing `-` matches no token), and must not
+    // be empty.
+    !expect_segment
 }
 
 /// Parse the value of a top-level `key: <rest>` line (step 3).
@@ -416,4 +485,62 @@ fn parse_value(fm: &[&str], idx: usize, rest: &str) -> Option<String> {
         return None;
     }
     Some(inline.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_mentionable_name, is_tag_safe_name};
+
+    #[test]
+    fn is_tag_safe_name_rejects_quotes_and_control_chars_only() {
+        assert!(is_tag_safe_name("scout"));
+        assert!(is_tag_safe_name("has space")); // a SPACE is not a control char
+        assert!(!is_tag_safe_name("x\" onload=\"y"));
+        assert!(!is_tag_safe_name("a\nb</agent>"));
+        assert!(!is_tag_safe_name("tab\there"));
+    }
+
+    #[test]
+    fn is_mentionable_name_accepts_exactly_the_token_grammar_up_to_case() {
+        for ok in [
+            "scout",
+            "Scout",
+            "SCOUT",
+            "a",
+            "0",
+            "fast-recon",
+            "a1-b2-c3",
+        ] {
+            assert!(is_mentionable_name(ok), "{ok} must be mentionable");
+        }
+        for no in [
+            "",
+            "has space",
+            "x\" onload=\"y",
+            "a\nb</agent>",
+            "a<b",
+            "tab\there",
+            "a_b",
+            "a.b",
+            "a/b",
+            "a--b", // the token grammar needs an alnum after every `-`
+            "-lead",
+            "trail-",
+            "café", // a non-ASCII letter lowercases to something no token can hold
+        ] {
+            assert!(!is_mentionable_name(no), "{no} must NOT be mentionable");
+        }
+    }
+
+    #[test]
+    fn is_mentionable_name_is_strictly_stronger_than_is_tag_safe_name() {
+        // Everything mentionable is tag-safe (the picker filter can never
+        // weaken the tag invariant), and the converse fails on a space — the
+        // case that makes the two predicates DIFFERENT questions rather than
+        // one copy.
+        for name in ["scout", "a1-b2", "MIXED"] {
+            assert!(is_mentionable_name(name) && is_tag_safe_name(name));
+        }
+        assert!(is_tag_safe_name("has space") && !is_mentionable_name("has space"));
+    }
 }
