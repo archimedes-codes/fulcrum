@@ -831,15 +831,39 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
 /// `ctx.cwd` via `FsBackend`.
 ///
 /// Deliberately NOT shared with `commands::files::collect_files` (the `?`
-/// file picker, ADR 0033), even though both walk a tree: this prefers a
-/// subprocess (`fd`), and its `walkdir` FALLBACK differs in ways the picker
-/// cannot accept — its dot-skip is per-FILE (so dot-named files vanish from
-/// the completion list, which wants `.gitignore`/`.env` kept) and it
-/// descends INTO `.git` instead of pruning it, while the fallback's
-/// `to_string_lossy()` relative path would emit `\` on Windows. Sharing
-/// would mean either a subprocess spawn per keystroke or a slower agent
-/// `find`; the two are cross-referenced by comment instead — the discipline
-/// recorded for the mirrored `parse_value`. Do not "unify" them.
+/// file picker, ADR 0033/0034), even though both walk a tree. The reason they
+/// stay apart is unchanged — sharing would mean either a subprocess spawn per
+/// keystroke or a slower agent `find` — so they remain cross-referenced by
+/// comment instead (the discipline recorded for the mirrored `parse_value`).
+/// Do not "unify" them.
+///
+/// HOW THEY DIFFER TODAY (as of the picker learning the repo's ignore rules):
+///
+/// * **Ignore rules.** The picker always applies them (`.gitignore` +
+///   `.ignore` + `.git/info/exclude`, repo-scoped, never machine-wide).
+///   `exec_find` applies them only as a side effect of `fd`, which honours
+///   `.gitignore` by default — the `walkdir` fallback applies NONE. So this
+///   tool's result set depends on whether `fd` happens to be installed, while
+///   the picker's never does. That fd/no-fd divergence is a KNOWN defect,
+///   recorded separately and deliberately not fixed here.
+/// * **Dot-naming.** The fallback's dot-skip is per-FILE, so dot-named files
+///   (`.gitignore`, `.env`) vanish from its results — the opposite of what the
+///   completion list wants — and it descends INTO `.git`, listing paths under
+///   it. The picker is the mirror image: it keeps every dot-named FILE and
+///   prunes DIRECTORIES, but only the VCS metadata ones (`.git`, `.hg`, `.svn`)
+///   and only at any depth below the root (a Space opened AT a directory named
+///   `.git` is listed, never pruned) — every other dot-directory is walked and
+///   listed unless the repo's own ignore rules exclude it. So
+///   `.github/workflows/ci.yml` IS
+///   completable in the picker, while this tool's `fd` arm never sees it (`fd`
+///   hides hidden names by default, and no `--hidden` is passed) even though
+///   the fallback walks right into it — another face of the fd/no-fd defect
+///   above. `.git/…` paths run the other way: never in the picker, offered by
+///   the fallback.
+/// * **Separators.** The fallback builds its relative path with
+///   `to_string_lossy()`, which emits `\` on Windows; the picker joins
+///   `components()` with `/`, because `\` is outside the composer's token
+///   charset.
 ///
 /// `params`: `{ pattern: String, path?: String, max_results?: u32 }`.
 pub async fn exec_find(ctx: &ToolCtx, params: &Value) -> ToolResult {
