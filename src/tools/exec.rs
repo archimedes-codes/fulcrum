@@ -830,6 +830,17 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
 /// walk with a built-in glob matcher. The search path is validated against
 /// `ctx.cwd` via `FsBackend`.
 ///
+/// Deliberately NOT shared with `commands::files::collect_files` (the `?`
+/// file picker, ADR 0033), even though both walk a tree: this prefers a
+/// subprocess (`fd`), and its `walkdir` FALLBACK differs in ways the picker
+/// cannot accept — its dot-skip is per-FILE (so dot-named files vanish from
+/// the completion list, which wants `.gitignore`/`.env` kept) and it
+/// descends INTO `.git` instead of pruning it, while the fallback's
+/// `to_string_lossy()` relative path would emit `\` on Windows. Sharing
+/// would mean either a subprocess spawn per keystroke or a slower agent
+/// `find`; the two are cross-referenced by comment instead — the discipline
+/// recorded for the mirrored `parse_value`. Do not "unify" them.
+///
 /// `params`: `{ pattern: String, path?: String, max_results?: u32 }`.
 pub async fn exec_find(ctx: &ToolCtx, params: &Value) -> ToolResult {
     let pattern = match params.get("pattern").and_then(|v| v.as_str()) {
