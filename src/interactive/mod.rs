@@ -15,8 +15,9 @@
 //! register a oneshot in `pending_bridge` (keyed `"{session_id}/{request_id}"`,
 //! the `permission` convention) **before** emitting the `interactive-request`
 //! event (the UI's `respond_interactive_request` may race the emission and
-//! must find the entry), then await the answer (330 s cap; a session close —
-//! the `cancel` token — is the immediate-cancel signal).
+//! must find the entry), then await the answer — with NO deadline: a prompt
+//! ends when the PERSON answers or the session is cancelled (the `cancel`
+//! token), never when a clock runs out.
 //!
 //! **The `sudo_exec` core** (Phase 2): the same flow, but the desktop
 //! ANSWERS the `confirm` / `password` sub-prompts itself (the `pending_sudo`
@@ -94,8 +95,8 @@ pub const SUDO_TTL: Duration = Duration::from_millis(900_000);
 
 /// The `sudo_exec` default command timeout (the suite's
 /// `DEFAULT_SUDO_CONFIG.defaultTimeoutMs` — 120 s): the RUN is bounded by
-/// the caller's `timeoutMs` (absent = this), NOT by the 330 s sub-prompt
-/// cap.
+/// the caller's `timeoutMs` (absent = this). The `confirm` / `password`
+/// sub-prompts are NOT bounded — they wait for the person.
 pub const SUDO_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 /// The `tool_exec` per-method timeout (native-agent-harness Task 2): fast
@@ -116,11 +117,6 @@ pub struct SudoRun {
     pub timed_out: bool,
     pub error: Option<String>,
 }
-
-/// How long an interactive request stays open before it auto-cancels (the
-/// agent's 5-minute timeout + a 30 s margin, so the agent's cancel
-/// deterministically wins).
-pub const DEFAULT_INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(330);
 
 /// Parse + validate the `dispatch_subagent` params: `task` (required,
 /// non-empty) + the optional `launch` config (`model` / `systemPrompt` /
@@ -399,7 +395,8 @@ pub(crate) async fn sudo_run_flow(
     // the instant it sees the event — the same race class the generic path
     // guards, `b3c920a`). The `requestId` is the DERIVED `"{id}:confirm"`
     // (NOT the bare frame `id` — a bare id would miss the
-    // `respond_interactive_request` lookup and silently time out at 330 s).
+    // `respond_interactive_request` lookup and leave the user's answer
+    // unrouted, which now hangs the prompt instead of timing it out).
     let confirm_key = interactive_key(sid, &format!("{request_id}:confirm"));
     let (confirm_tx, confirm_rx) = oneshot::channel();
     {
@@ -420,10 +417,9 @@ pub(crate) async fn sudo_run_flow(
     );
     let r: Result<Value, ()> = tokio::select! {
         r = confirm_rx => r.map_err(|_| ()),
-        _ = tokio::time::sleep(DEFAULT_INTERACTIVE_TIMEOUT) => Err(()),
         _ = cancel.cancelled() => Err(()),
     };
-    // EVERY exit path (answered, timeout, cancel — the entry was inserted
+    // EVERY exit path (answered, cancel — the entry was inserted
     // BEFORE the select, so it must be removed on all of them) removes the
     // entry (no leaked dead-receiver entries — mirrors the `pending_bridge`
     // remove in the generic path). A cancel resolves to `false` (a
@@ -493,7 +489,6 @@ pub(crate) async fn sudo_run_flow(
         );
         let r: Result<Value, ()> = tokio::select! {
             r = pw_rx => r.map_err(|_| ()),
-            _ = tokio::time::sleep(DEFAULT_INTERACTIVE_TIMEOUT) => Err(()),
             _ = cancel.cancelled() => Err(()),
         };
         pending_sudo.lock().await.remove(&password_key);
@@ -512,9 +507,9 @@ pub(crate) async fn sudo_run_flow(
             .filter(|p| !p.is_empty()) // an EMPTY `""` password is a cancel
     });
     let Some(password) = password else {
-        // Cancelled (an empty password, a timeout, a session close, or a
-        // cancel) — the suite's result (`tool.ts:437-447`): nothing was
-        // cached, nothing was run.
+        // Cancelled (an empty password, a session close, or a Stop) — the
+        // suite's result (`tool.ts:437-447`): nothing was cached, nothing
+        // was run.
         return ToolResult {
             content: vec![ContentBlock::Text {
                 text: "Password entry cancelled — not executed, and nothing was cached."
@@ -541,7 +536,8 @@ pub(crate) async fn sudo_run_flow(
 
     // ── run sudo on the DESKTOP host via the INJECTABLE `SudoRunner` ──
     // `timeout` = `params.timeoutMs` (or the 120 s default) — the RUN is
-    // bounded by the caller's `timeoutMs`, NOT by the 330 s sub-prompt cap.
+    // bounded by the caller's `timeoutMs`; the sub-prompts above are not
+    // bounded at all (they wait for the person).
     let timeout_ms = params
         .get("timeoutMs")
         .and_then(Value::as_u64)

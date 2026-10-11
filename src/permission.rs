@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -51,7 +50,7 @@ use crate::agent::harness::trust::TrustSource;
 pub enum PermissionOutcome {
     /// The user selected one of the offered options; `option_id` is its id.
     Selected { option_id: String },
-    /// The user dismissed the prompt (or it timed out / the session closed).
+    /// The user dismissed the prompt (or the turn / session was cancelled).
     Cancelled,
 }
 
@@ -66,9 +65,6 @@ pub type PendingPermissions = Arc<Mutex<HashMap<String, oneshot::Sender<Permissi
 pub fn permission_key(session_id: &str, request_id: &str) -> String {
     format!("{session_id}/{request_id}")
 }
-
-/// How long a permission prompt stays open before it auto-cancels.
-const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The human-readable title of a permission prompt (ADR 0030): the user is
 /// approving ONE access, so the title names the thing being reached for —
@@ -200,14 +196,15 @@ pub async fn native_permission_gate(
         }),
     );
 
-    // (c) Await the user's answer (bounded by the 300 s timeout;
-    // a timeout / cancel is a `Cancelled` — the caller maps it to a
-    // deny, NOT an auto-allow).
+    // (c) Await the user's answer — NO DEADLINE: the prompt ends when the
+    // PERSON answers or the turn is cancelled (a Stop), never when a clock
+    // runs out. The 300 s cap this used to carry resolved `Cancelled`,
+    // which the caller maps to a DENY — so a prompt the user never saw (or
+    // answered late) became a silent `"permission denied"` five minutes
+    // after it opened. A dropped oneshot (the session closed) is likewise a
+    // `Cancelled` — the caller maps it to a deny, NOT an auto-allow.
     let outcome = tokio::select! {
-        r = tokio::time::timeout(PERMISSION_TIMEOUT, rx) => match r {
-            Ok(Ok(outcome)) => outcome,
-            _ => PermissionOutcome::Cancelled,
-        },
+        r = rx => r.unwrap_or(PermissionOutcome::Cancelled),
         _ = cancel.cancelled() => PermissionOutcome::Cancelled,
     };
 
@@ -229,6 +226,7 @@ mod tests {
     use crate::storage::Db;
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     /// (ADR 0030) The prompt titles are the human-readable shape the user
@@ -314,6 +312,76 @@ mod tests {
         fn emit(&self, event: &str, payload: Value) {
             let _ = self.tx.send((event.to_string(), payload));
         }
+    }
+
+    /// A prompt waits for the PERSON, never for a clock. The gate used to
+    /// carry a 300 s timeout, which resolved to `Cancelled` — the caller
+    /// maps that to a DENY — so a prompt the user never saw (or answered
+    /// late) became a silent `"permission denied"` five minutes after it
+    /// opened. Only a Stop, or the user's own answer, may decide.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_permission_prompt_never_settles_on_a_clock() {
+        let pending: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx });
+        let cwd = std::path::PathBuf::from("/tmp");
+        let (p, s, c) = (pending.clone(), sink.clone(), cwd.clone());
+        let cancel = CancellationToken::new();
+        let gate = tokio::spawn(async move {
+            native_permission_gate(
+                "s1",
+                "r1",
+                "read ../../.ssh/config",
+                &s,
+                &p,
+                None,
+                &c,
+                &cancel,
+            )
+            .await
+        });
+
+        let key = permission_key("s1", "r1");
+        for _ in 0..100 {
+            if pending.lock().await.contains_key(&key) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            pending.lock().await.contains_key(&key),
+            "the prompt is open"
+        );
+
+        // 20 minutes — four times the cap the gate used to carry.
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !gate.is_finished(),
+            "an unanswered prompt must not become a silent deny on a clock"
+        );
+
+        // The late answer still decides.
+        pending
+            .lock()
+            .await
+            .remove(&key)
+            .expect("the prompt is still pending")
+            .send(PermissionOutcome::Selected {
+                option_id: "allow".to_string(),
+            })
+            .expect("the gate is listening");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), gate)
+                .await
+                .expect("the answer resolves the gate")
+                .expect("the gate did not panic"),
+            PermissionOutcome::Selected {
+                option_id: "allow".to_string()
+            }
+        );
     }
 
     /// A temp `Db` + a temp `cwd` dir (the `spaces` rows are keyed by

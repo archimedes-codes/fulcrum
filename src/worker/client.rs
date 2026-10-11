@@ -186,6 +186,44 @@ impl Clone for WorkerHandle {
     }
 }
 
+/// Drain a piped child stream line-by-line into `on_line` (a DEDICATED
+/// TASK that only ever awaits the read — never a `select!` arm, because a
+/// dropped tokio `read_line` future takes the bytes it already consumed
+/// with it). The EOF (the child's exit) ends the task, and the read errors
+/// are swallowed (a pipe that dies mid-read has nothing left to say).
+fn spawn_pipe_reader<R, F>(pipe: R, mut on_line: F) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    F: FnMut(String) + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(pipe);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                // EOF — the child is gone. A final line with NO trailing
+                // newline still gets forwarded (a panic message that dies
+                // mid-pipe is exactly the line worth keeping).
+                Ok(0) => {
+                    let tail = line.trim_end();
+                    if !tail.is_empty() {
+                        on_line(tail.to_string());
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    let line = line.trim_end();
+                    if !line.is_empty() {
+                        on_line(line.to_string());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
 impl WorkerHandle {
     /// Spawn `<exe> --worker` (piped stdio). The `exe` PATH is a
     /// PARAMETER: production callers pass
@@ -198,7 +236,14 @@ impl WorkerHandle {
         cmd.arg("--worker");
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::null());
+        // STDERR IS PIPE-D, NOT `/dev/null`: a Worker's own diagnostics
+        // (`bad inbound line`, `prompt send failed`, the harness's
+        // `eprintln!`s) were unobservable, which is how a swallowed IPC
+        // frame stayed invisible for a session. The `spawn_pipe_reader`
+        // task below drains it into the `ARCHIMEDES_DEBUG` log (and
+        // draining it also means a chatty Worker cannot block on a full
+        // pipe).
+        cmd.stderr(std::process::Stdio::piped());
         // The child owns its process group (a single async-signal-safe
         // libc call — the `RealSudoRunner` pattern): `kill` SIGKILLs
         // the whole group (a Worker that forked further does not
@@ -222,10 +267,17 @@ impl WorkerHandle {
         // `&mut Child`).
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
         // The child is `Arc`-wrapped (the handle is `Clone` — the
         // manager stores + pumps + reaps clones; the read task holds
         // the lock ONLY across the final `wait()`).
         let child = std::sync::Arc::new(tokio::sync::Mutex::new(child));
+
+        // The stderr drain (a DEDICATED TASK — its `read_line` is never
+        // cancelled, so no line can be lost mid-read).
+        let _stderr_drain = spawn_pipe_reader(stderr, |line| {
+            debuglog::log_truncated("worker-stderr:", &line);
+        });
 
         // The `ready` / `exited` watches (the `exited` watch is ALSO
         // the stdin writer's shutdown signal — the writer `select`s
@@ -657,6 +709,42 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every line of a piped stream reaches the sink WHOLE and IN ORDER,
+    /// however the writer chunks it (the same partial-delivery hazard that
+    /// made the Worker's `read_line` lose an IPC frame — here the reader is
+    /// never cancelled, so nothing is lost), and the task ends at EOF.
+    #[tokio::test]
+    async fn every_line_of_a_piped_stream_reaches_the_sink_whole_and_in_order() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let got: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let drain = spawn_pipe_reader(rx, move |l| g.lock().unwrap().push(l));
+
+        // Chunked writes: two whole lines split across three writes, then a
+        // final line with NO trailing newline (the EOF tail).
+        tx.write_all(b"first ").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.write_all(b"line\nsecond\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.write_all(b"tail without a newline").await.unwrap();
+        drop(tx); // EOF.
+
+        // The task ends at EOF.
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("the drain task ends at EOF")
+            .expect("the drain task does not panic");
+        assert_eq!(
+            &*got.lock().unwrap(),
+            &[
+                "first line".to_string(),
+                "second".to_string(),
+                "tail without a newline".to_string()
+            ],
+            "every line arrived whole, in order, including the EOF tail"
+        );
+    }
 
     /// The `fake_worker` fixture (the `fake_mcp_stdio` convention — the
     /// `CARGO_MANIFEST_DIR`/`target/debug` path; `cargo test` builds the

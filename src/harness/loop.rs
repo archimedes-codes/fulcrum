@@ -1472,12 +1472,13 @@ impl AgentLoop {
                 }
             }
             "sudo_exec" => {
-                // RACED against the TURN token (finding 8b, round 2 —
-                // the confirm / password sub-prompts `select!` only on
-                // the SESSION teardown token + the 330 s interactive
-                // timeout: a Stop while a dialog is open would wait out
-                // up to 330 s, and a confirm answered AFTER the Stop
-                // would still EXECUTE the elevated command).
+                // RACED against the TURN token (finding 8b, round 2 — the
+                // confirm / password sub-prompts `select!`ed only on the
+                // SESSION teardown token: a Stop while a dialog was open
+                // waited for the answer, and a confirm answered AFTER the
+                // Stop still EXECUTED the elevated command). The prompts
+                // now carry no deadline at all, so this turn-token race is
+                // the ONLY thing that settles a Stop promptly.
                 tokio::select! {
                     r = sudo_run_flow(
                         &self.session_id,
@@ -2646,8 +2647,8 @@ mod tests {
     /// (finding 8b, round 2) A `sudo_exec` blocking on its confirm
     /// sub-prompt + a TURN cancel → the flow returns a cancelled result
     /// PROMPTLY (the turn token is raced — pre-fix the flow selected
-    /// only on the SESSION teardown token + the 330 s interactive timeout,
-    /// so a Stop waited out up to 330 s, and a confirm answered AFTER
+    /// only on the SESSION teardown token, so a Stop waited for an answer
+    /// that might never come, and a confirm answered AFTER
     /// the Stop still EXECUTED the elevated command). The command is
     /// NEVER run.
     #[tokio::test]
@@ -2684,7 +2685,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect(
-                "the turn settled promptly (it did not wait out the 330 s interactive timeout)",
+                "the turn settled promptly (the Stop won the race — the prompt has no deadline to wait out)",
             );
         assert!(
             !ran.load(Ordering::SeqCst),

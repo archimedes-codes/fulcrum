@@ -1,12 +1,11 @@
 //! The `ask`-for-user flow and its result shapers (extracted from
 //! `r#loop` in the loop.rs decomposition): the in-process interactive
 //! `ask` method (a `pending_bridge` oneshot, the `interactive-request`
-//! event, and the 300 s cap) plus the suite's `shapeAskResult`,
+//! event, NO deadline) plus the suite's `shapeAskResult`,
 //! `responseToResults`, and `buildAskSessionContent` shaping. No loop
 //! state — the flow takes the bridge, the sink, and the session id.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,17 +16,17 @@ use crate::agent::events::EventSink;
 use crate::agent::interactive::{interactive_key, PendingInteractive};
 use crate::agent::tools::{ContentBlock, ToolResult};
 
-/// The `ask` flow's cap (the suite's `timeoutMs: 300_000` — 5 min; the
-/// agent's 300 s cancel deterministically wins the desktop's 330 s
-/// waiter, so a 330 s client timeout would RACE the desktop's own
-/// waiter).
-const ASK_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// The in-process `ask` flow (the `ask` interactive method's flow — a
-/// `pending_bridge` oneshot + `interactive-request` event + the 300 s
-/// cap): the user's answer is shaped per the suite's
-/// `shapeAskResult` (a cancel → the cancelled shape; otherwise the
-/// `User answers` content).
+/// `pending_bridge` oneshot + `interactive-request` event): the user's
+/// answer is shaped per the suite's `shapeAskResult` (a cancel → the
+/// cancelled shape; otherwise the `User answers` content).
+///
+/// NO DEADLINE (the suite's own `timeoutMs: 300_000` is deliberately NOT
+/// carried over): the waiter ends when the PERSON answers or the turn is
+/// cancelled — never when a clock runs out. A 5-minute cap answered
+/// `"User cancelled the question."` while the modal was still on screen,
+/// so stepping away for a coffee silently threw the question away and left
+/// a modal answering into the void.
 pub(crate) async fn ask_flow(
     pending_bridge: &PendingInteractive,
     sink: &Arc<dyn EventSink>,
@@ -53,9 +52,10 @@ pub(crate) async fn ask_flow(
             "params": params,
         }),
     );
+    // The two ways this ends: the user answers, or the turn is cancelled
+    // (a Stop). There is NO timeout arm — see the flow's doc.
     let response = tokio::select! {
         r = rx => r.ok(),
-        _ = tokio::time::sleep(ASK_TIMEOUT) => None,
         _ = turn.cancelled() => None,
     };
     pending_bridge.lock().await.remove(&key);
@@ -273,6 +273,75 @@ fn question_context(r: &AskQuestionResult, index: usize) -> String {
 mod tests {
     use super::*;
     use crate::agent::harness::r#loop::result_text;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// A no-op `EventSink` (the flow's `sink` seam).
+    struct NoopSink;
+    impl EventSink for NoopSink {
+        fn emit(&self, _event: &str, _payload: Value) {}
+    }
+
+    /// A prompt waits for the PERSON, never for a clock. An unanswered
+    /// question must not settle however far time moves: the old 300 s cap
+    /// answered `"User cancelled the question."` while the modal was still
+    /// on screen, so a user who stepped away came back to a question the
+    /// app had already thrown away (and a modal answering into the void).
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_question_never_settles_on_a_clock() {
+        let pending: PendingInteractive = Arc::new(TokioMutex::new(HashMap::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
+        let params = json!({
+            "questions": [{ "id": "q1", "question": "Which?", "options": [{ "label": "A" }] }]
+        });
+        let key = interactive_key("s1", "r1");
+        let (p, s, prm) = (pending.clone(), sink.clone(), params.clone());
+        let turn = CancellationToken::new();
+        let flow = tokio::spawn(async move { ask_flow(&p, &s, "s1", &prm, "r1", &turn).await });
+
+        // The request is registered (the flow has reached its wait).
+        for _ in 0..100 {
+            if pending.lock().await.contains_key(&key) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            pending.lock().await.contains_key(&key),
+            "the question is open"
+        );
+
+        // 20 minutes: four times the cap the flow used to carry.
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !flow.is_finished(),
+            "an unanswered question must not settle on a clock"
+        );
+
+        // And the late answer still lands.
+        let tx = pending
+            .lock()
+            .await
+            .remove(&key)
+            .expect("the question is still pending");
+        tx.send(
+            json!({ "cancelled": false, "results": [{ "id": "q1", "selectedOptions": ["A"] }] }),
+        )
+        .expect("the flow is listening");
+        let r = tokio::time::timeout(Duration::from_secs(1), flow)
+            .await
+            .expect("the answer resolves the flow")
+            .expect("the flow did not panic");
+        assert!(
+            result_text(&r).contains("q1: A"),
+            "the answered shape, not the cancelled one: {}",
+            result_text(&r)
+        );
+    }
 
     #[test]
     fn shape_ask_result_cancelled() {
