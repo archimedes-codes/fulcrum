@@ -1946,8 +1946,8 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_skills".into(),
-            description: "List the discoverable Skills (name, scope, description) — the catalog the \
-                          `<skills>` system-prompt section advertises, re-read from disk."
+            description: "List the model-visible Skills (name, scope, description) — the catalog \
+                          the `<skills>` system-prompt section advertises, re-read from disk."
                 .into(),
             parameters: json!({ "type": "object" }),
         },
@@ -1961,9 +1961,14 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                 BUNDLED with that skill, resolved against the skill's directory — it must stay \
                 inside it.",
                 "",
-                "Skills live OUTSIDE the session sandbox (`~/.agents/skills`, `.agents/skills`), \
-                so the read tool CANNOT reach them — `read` on a skill path always fails with \
-                \"path escapes the session sandbox\". Use this tool instead.",
+                "A Skill whose frontmatter sets `disable-model-invocation: true` is model-hidden: \
+                it is not advertised and this tool refuses it — ask the user to send it as a \
+                `$name` Mention, or to load it explicitly if its name is outside the mention \
+                token grammar.",
+                "",
+                "Skills live OUTSIDE the session `cwd` (`~/.agents/skills`, `.agents/skills`). \
+                The skill tools are the sanctioned route: `read_skill` resolves a NAME against \
+                the discovered catalog and confines every read to that skill's own directory.",
             ]
             .join("\n"),
             parameters: json!({
@@ -4282,14 +4287,120 @@ mod tests {
         );
     }
 
+    /// (ADR 0036) the `list_skills` description says which SET it returns. It
+    /// said "the discoverable Skills", but DISCOVERABLE is this repo's word for
+    /// the TOTAL set (`CONTEXT.md`'s Skill entry — discovery is total so the
+    /// `$` Mention route survives; pinned by
+    /// `discovery_still_returns_model_hidden_skills` in `tests/skills.rs`),
+    /// while this tool returns the model-VISIBLE subset. The word is the kind of
+    /// thing a later reader "corrects" back toward discovery, so the description
+    /// is pinned byte-for-byte like the `read_skill` one.
+    #[test]
+    fn list_skills_description_names_the_model_visible_subset() {
+        let specs = tool_specs();
+        let spec = specs
+            .iter()
+            .find(|s| s.name == "list_skills")
+            .expect("`list_skills` in `tool_specs`");
+        assert_eq!(
+            spec.description,
+            "List the model-visible Skills (name, scope, description) — the catalog the \
+             `<skills>` system-prompt section advertises, re-read from disk."
+        );
+        // "discoverable" is the TOTAL set — it must not return to a sentence
+        // about the filtered one.
+        assert!(
+            !spec.description.contains("discoverable"),
+            "`list_skills` returns the model-visible SUBSET, so its description \
+             must not use the repo's word for the total set: {}",
+            spec.description
+        );
+    }
+
+    /// (ADR 0036) the `read_skill` description tells the truth. It used to
+    /// claim that `read` on a skill path "always fails with `path escapes the
+    /// session sandbox`" — which died with ADR 0030's `boundary::read_roots`,
+    /// grants the read Boundary the skill discovery roots, so a `read` on a
+    /// skill path IS in bounds in every policy. A `ToolSpec.description` is
+    /// printed VERBATIM into every session's `<tools>` section and the model
+    /// ACTS on it (it skips a `read` that would work), so the text is pinned
+    /// byte-for-byte — and the negative guards are what keep the dead lie from
+    /// creeping back in through a reworded paragraph, alongside the assertion
+    /// that the model-hidden paragraph covers BOTH name shapes (a `$name`
+    /// Mention, or an explicit load for a name the token grammar cannot carry).
+    #[test]
+    fn read_skill_description_is_honest_about_read_and_model_hidden() {
+        let specs = tool_specs();
+        let spec = specs
+            .iter()
+            .find(|s| s.name == "read_skill")
+            .expect("`read_skill` in `tool_specs`");
+        assert_eq!(
+            spec.description,
+            "Load a Skill's instructions by NAME — the sanctioned way to read a skill file.\
+             \n\
+             \n\
+             `name` matches a discovered Skill (see list_skills, or the `<available_skills>` section); no `path` returns that skill's `SKILL.md` body. `path` reads a file BUNDLED with that skill, resolved against the skill's directory — it must stay inside it.\
+             \n\
+             \n\
+             A Skill whose frontmatter sets `disable-model-invocation: true` is model-hidden: it is not advertised and this tool refuses it — ask the user to send it as a `$name` Mention, or to load it explicitly if its name is outside the mention token grammar.\
+             \n\
+             \n\
+             Skills live OUTSIDE the session `cwd` (`~/.agents/skills`, `.agents/skills`). The skill tools are the sanctioned route: `read_skill` resolves a NAME against the discovered catalog and confines every read to that skill's own directory."
+        );
+        // The ADR 0030 lie must not return, in any wording that keeps it.
+        assert!(
+            !spec.description.contains("always fails"),
+            "the description must not claim a `read` on a skill path always fails"
+        );
+        assert!(
+            !spec.description.contains("CANNOT reach"),
+            "the description must not claim `read` cannot reach a skill path"
+        );
+        // The paragraph must cover BOTH name shapes. This text is printed into
+        // the `<tools>` section BEFORE any call, so a blanket "send $name" is
+        // acted on for a name like `has space`, whose `$has space` token
+        // expands NOTHING (`is_mentionable_name`) — the model would send the
+        // user on a dead errand instead of loading it explicitly.
+        assert!(
+            spec.description
+                .contains("outside the mention token grammar"),
+            "the description must not promise a `$name` route a name outside the \
+             token grammar cannot take: {}",
+            spec.description
+        );
+    }
+
+    /// The DEFAULT child's full tool set, pinned (both halves).
+    ///
     /// (ADR 0020) a subagent CHILD gets neither `subagent` (the recursion
     /// guard) nor `list_agents` (a child cannot dispatch, so listing
     /// dispatch targets is pointless token burn). The CONTRAST assertions
     /// (the parent advertises BOTH) are what keep this test from passing
     /// VACUOUSLY — without them, "the child drops `list_agents`" is
     /// trivially true while the spec is not in `tool_specs()` yet.
+    ///
+    /// (ADR 0036) The other half of the child story is pinned HERE too, in the
+    /// same shape: a child holds BOTH skill tools (`read_skill`/`list_skills`).
+    /// The DEFAULT child's message is `build_child_system_message`'s REDUCED
+    /// one, which carries no `<skills>` section (ADR 0017), so for THAT shape the
+    /// TOOLS are the only surface left that filters — which holds only while a
+    /// child still HAS them. (The one child shape with no reduced message at
+    /// all — no launch/definition prompt AND no `manage_todo_list` in the
+    /// resolved child tools, so `build_child_system_message` returns `None` —
+    /// falls through to the MAIN-prompt arm in `worker/core.rs`, whose section
+    /// is FILTERED the same way; ADR 0036's subagent bullet owns that shape.)
+    /// Drop either spec and the DEFAULT child would have neither a catalog nor
+    /// the tool that filters, and the ADR's claim would be silently false rather
+    /// than tested.
+    ///
+    /// SCOPE: this pins the DEFAULT child — `enabled_tools: None`, i.e. every
+    /// spec minus the two dispatch tools. An Agent definition that names a
+    /// `tools:` list may legitimately drop the skill tools (that is ADR 0020's
+    /// allowlist working), so "a child always has skill tools" is NOT what is
+    /// claimed here.
     #[test]
-    fn a_child_does_not_advertise_subagent_or_list_agents() {
+    fn the_child_tool_set_is_pinned() {
         let child = AgentLoop::advertised_tool_specs(&None, true);
         assert!(
             !child.iter().any(|s| s.name == "subagent"),
@@ -4308,6 +4419,27 @@ mod tests {
         assert!(
             parent.iter().any(|s| s.name == "list_agents"),
             "a parent advertises `list_agents` (contrast)"
+        );
+        // ADR 0036's PREMISE for the DEFAULT child pinned here: its reduced
+        // message (ADR 0017) carries no skill CATALOG, so the skill tools are
+        // the ONLY surface left that can filter a model-hidden skill — and a
+        // child must still hold both of them, or "children inherit the
+        // filtering for free" is an untested claim. (The contrast lives in the
+        // assertions above: this set IS reduced — it lost the two dispatch
+        // tools — yet neither skill tool went with them.) The `None`
+        // fall-through child (no prompt AND no `manage_todo_list`) does get a
+        // section — the main prompt's, FILTERED the same way — so the flag holds
+        // for that shape too; ADR 0036's subagent bullet states it, and what the
+        // assertions here pin is the DEFAULT shape's tool set.
+        assert!(
+            child.iter().any(|s| s.name == "read_skill"),
+            "a child still advertises `read_skill` — the tool that refuses a \
+             model-hidden skill by name (ADR 0036's child premise)"
+        );
+        assert!(
+            child.iter().any(|s| s.name == "list_skills"),
+            "a child still advertises `list_skills` — the tool that omits a \
+             model-hidden skill from the list (ADR 0036's child premise)"
         );
     }
 

@@ -28,7 +28,8 @@
 //! discovered skill set is the allowlist — and a bundled-file `path` is
 //! scoped to that one skill's directory by a per-skill [`FsBackend`] that
 //! sees NEITHER the session boundary NOR the deny-list (a skill must not be
-//! able to read a sibling skill).
+//! able to read a sibling skill), and the set they ADVERTISE is the
+//! `model_visible` SUBSET of the discovered set (ADR 0036).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -149,10 +150,27 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     /// The skill roots the `list_skills` / `read_skill` tools resolve
     /// against. `None` (the harness's value) → `discover_skills(Some(cwd))`,
-    /// the SAME call the prompt builder makes, so a tool can never list a
-    /// skill the `<skills>` section did not advertise nor miss one it did.
-    /// `Some` pins EXPLICIT roots — the test seam (a test must never read
-    /// the real `~/.agents/skills`), mirroring `skills::discover_in_roots`.
+    /// the SAME call the prompt builder makes, so both seams start from the
+    /// SAME discovered set. They then filter it DIFFERENTLY, on purpose
+    /// (ADR 0036): the ADVERTISED catalog — the `<skills>` prompt section and
+    /// `list_skills` — is the `model_visible` subset, while `read_skill`
+    /// RESOLVES against the FULL set so it can tell a model-hidden name from
+    /// an unknown one and REFUSE it.
+    ///
+    /// WHAT the seam guarantees is therefore a claim about ONE INSTANT: read at
+    /// the same moment, the two catalogs are the same SET — same roots, same
+    /// `model_visible()` predicate (`read_skill` resolving the wider set is the
+    /// deliberate exception, and it refuses per hit). They are NOT promised to
+    /// agree ACROSS time: the `<skills>` section is FROZEN at the transcript's
+    /// seq-0 prompt while BOTH skill tools re-discover on EVERY call, so a
+    /// session born before a flag flip — or before a skill appeared on disk —
+    /// already speaks the tools' live set while its own prompt still carries the
+    /// old one. ADR 0036's frozen-vs-live bullet owns that divergence and states
+    /// it as accepted; do not restate it here as agreement.
+    ///
+    /// `Some` pins EXPLICIT roots — the test seam (a
+    /// test must never read the real `~/.agents/skills`), mirroring
+    /// `skills::discover_in_roots`.
     pub skill_roots: Option<Vec<(PathBuf, crate::skills::SkillScope)>>,
     /// (ADR 0030) The read boundary (frozen at session start; `vec![cwd]` in
     /// tests — hermeticity: NEVER call `boundary::read_roots` here, it reads
@@ -1168,11 +1186,15 @@ pub async fn exec_ls(ctx: &ToolCtx, params: &Value) -> ToolResult {
     ToolResult::ok_text(names.join("\n"), Some(json!({ "entries": names.len() })))
 }
 
-/// The skills the skill tools may resolve against (see
+/// The ONE discovery call the skill tools make per tool call (see
 /// [`ToolCtx::skill_roots`]): the pinned roots when set (the test seam),
-/// otherwise the SAME discovery call the prompt builder makes — so a tool
-/// can never list a skill the `<skills>` section did not advertise, nor miss
-/// one it did.
+/// otherwise the SAME discovery call the prompt builder makes — ADR 0029's
+/// no-drift seam, which is about ADVERTISEMENT: what the tools and the
+/// `<skills>` section advertise is exactly the `model_visible` SUBSET of this
+/// set (ADR 0036). The set itself is UNFILTERED, and resolution is
+/// deliberately WIDER than advertisement: `exec_read_skill` resolves against
+/// this FULL set on purpose, so it can tell a model-hidden name from an
+/// unknown one and answer each with its own message rather than a lie.
 fn skills_for(ctx: &ToolCtx) -> Vec<crate::skills::SkillInfo> {
     match ctx.skill_roots.as_ref() {
         Some(roots) => crate::skills::discover_in_roots(roots),
@@ -1180,17 +1202,35 @@ fn skills_for(ctx: &ToolCtx) -> Vec<crate::skills::SkillInfo> {
     }
 }
 
-/// List the discoverable skills — the catalog the `<skills>` system prompt
-/// section advertises, resolved through the SAME discovery call.
+/// The skills the tools may ADVERTISE (ADR 0036): `skills_for` minus the
+/// model-hidden ones. `read_skill` does NOT use this — it resolves against
+/// `skills_for` so it can distinguish hidden from unknown.
+fn model_skills_for(ctx: &ToolCtx) -> Vec<crate::skills::SkillInfo> {
+    skills_for(ctx)
+        .into_iter()
+        .filter(|s| s.model_visible())
+        .collect()
+}
+
+/// List the skills the Agent may use — the catalog the `<skills>` system
+/// prompt section advertises, resolved through the SAME discovery call and
+/// filtered on the SAME predicate, so the two cannot drift in WHAT they filter
+/// (ADR 0029 + ADR 0036): a model-hidden skill is simply ABSENT here. They DO
+/// differ in WHEN — this list is re-discovered per call while the prompt
+/// section is frozen at seq 0, so a session can list a set its own prompt no
+/// longer matches (or does not yet); [`ToolCtx::skill_roots`] and ADR 0036 own
+/// that divergence.
 ///
-/// Skills live OUTSIDE the session sandbox (user skills are in
-/// `~/.agents/skills` / `~/.pi/agent/skills`), so the sandboxed `read` can
-/// never reach them; this tool is the sanctioned read path, and the
-/// discovered set is its allowlist.
+/// Skills live OUTSIDE the session `cwd` (user skills are in
+/// `~/.agents/skills` / `~/.pi/agent/skills`); these tools are the sanctioned
+/// route to them — keyed by NAME and contained to the skill's own directory
+/// (ADR 0029). Whether a `read` reaches a skill path is NOT decided here: it
+/// is the **Boundary**'s call, and ADR 0030 grants the read Boundary the
+/// discovery roots. The discovered set is this tool's allowlist.
 ///
 /// `params`: `{}`.
 pub async fn exec_list_skills(ctx: &ToolCtx, _params: &Value) -> ToolResult {
-    let skills = skills_for(ctx);
+    let skills = model_skills_for(ctx);
     if skills.is_empty() {
         return ToolResult::ok_text("none".to_string(), Some(json!({ "skills": 0 })));
     }
@@ -1210,11 +1250,23 @@ pub async fn exec_list_skills(ctx: &ToolCtx, _params: &Value) -> ToolResult {
 /// (`path`, resolved against the skill's directory).
 ///
 /// The `name` must match a discovered skill — that is the allowlist, so no
-/// arbitrary path is ever reachable. With a `path`, the read is scoped to
-/// the skill's OWN directory via a per-skill [`FsBackend`]: `..` traversal,
-/// an absolute path, and a symlink out of the dir are all rejected, and a
-/// sibling skill's files are NOT reachable (the boundary is the skill dir,
-/// not the skill root).
+/// arbitrary path is ever reachable. A model-hidden skill DOES resolve (so
+/// the model is not told a lie) but is REFUSED per hit, before any read, with
+/// the sanctioned user route named back at it — the `$name` Mention, but ONLY
+/// when the token grammar can carry that name (ADR 0031); otherwise the
+/// refusal says the Skill must be loaded explicitly, so it never promises a
+/// dead token (ADR 0036) — so neither its `SKILL.md` nor any bundled file is
+/// ever read. Unlike `list_skills`, which filters the LIST, this filters the
+/// HIT: it needs the unfiltered set to tell hidden
+/// apart from unknown. Both filter the same predicate, so the tools' catalog
+/// still cannot drift from the prompt's catalog in WHAT is filtered (ADR 0029);
+/// the frozen prompt vs the per-call tool (`WHEN`) is the caveat
+/// [`ToolCtx::skill_roots`] carries.
+///
+/// With a `path`, the read is scoped to the skill's OWN directory via a
+/// per-skill [`FsBackend`]: `..` traversal, an absolute path, and a symlink
+/// out of the dir are all rejected, and a sibling skill's files are NOT
+/// reachable (the boundary is the skill dir, not the skill root).
 ///
 /// `params`: `{ name: String, path?: String }`.
 pub async fn exec_read_skill(ctx: &ToolCtx, params: &Value) -> ToolResult {
@@ -1229,6 +1281,49 @@ pub async fn exec_read_skill(ctx: &ToolCtx, params: &Value) -> ToolResult {
             None,
         );
     };
+    if !skill.model_visible() {
+        // ADR 0029's disclosure rule holds for BOTH shapes: name ONLY what the
+        // model sent — no path, no dir, no scope (ADR 0036: this runs BEFORE
+        // the `FsBackend` below exists, so nothing is read).
+        //
+        // The `$mention` route is promised ONLY when the grammar can actually
+        // carry the name. The `$` token is `[a-z0-9]+(-[a-z0-9]+)*` (ADR 0031)
+        // while discovery screens a name merely for tag-safety, so a legal name
+        // like `has space` / `foo_bar` is TYPEABLE NOWHERE: promising
+        // `$has space` would send the model (and the user, via the dialog
+        // tooltip) to a token that silently expands NOTHING.
+        //
+        // This predicate filters the `@` and `#` picker catalogs
+        // (`commands::agents::list_agent_definitions_for_space`,
+        // `agent::mcp::config::server_infos`). It does NOT filter the `$` SKILL
+        // catalog: those rows are built from the FULL discovery output with
+        // only a name-substring filter (`ChatStream.tsx`), deliberately — the
+        // Client's skill catalog must stay total or this flag would delete the
+        // user's own route (ADR 0036). So for Skills the predicate is enforced
+        // in exactly TWO places — this refusal and the Skills-dialog tooltip —
+        // and the `$` picker CAN offer a name this tool refuses. That is the
+        // accepted shape, not a drift to fix.
+        let route = if crate::skills::is_mentionable_name(&skill.name) {
+            // `${key}` is LOWERCASED on purpose: the token grammar is
+            // lowercase-only, so `$DeBuG` expands nothing while `$debug` does.
+            format!("ask the user to send ${key}")
+        } else {
+            // NO `$` anywhere in this branch, and no absolute claim. The
+            // predicate is the ASCII token grammar, while the Client's match is
+            // a JS case-FOLD, so "it cannot be typed" is false for exactly one
+            // input (a name holding U+212A lowercases to `k` in JS and WOULD
+            // expand, while `is_ascii_alphanumeric` rejects it here) — the
+            // accurate statement is that the name is OUTSIDE THE GRAMMAR. And a
+            // literal `$` in the sentence is a token the model can still copy.
+            "ask the user to load this Skill explicitly (its name is outside the \
+             mention token grammar)"
+                .to_string()
+        };
+        return ToolResult::fail(
+            format!("read_skill: {name:?} is model-hidden — the Agent may not load it; {route}"),
+            None,
+        );
+    }
 
     // The per-skill mini-sandbox: the skill's dir is the boundary. NOT the
     // session boundary (ADR 0030): a skill must not be able to read a
@@ -2707,12 +2802,12 @@ mod tests {
 
     /// `roots` as the ONLY discovery roots — the skill tools take their
     /// roots from `ToolCtx::skill_roots` so a test never reads the real
-    /// `~/.agents/skills` (the `discover_in_roots` convention).
-    /// `roots` as the ONLY discovery roots — the skill tools take their
-    /// roots from `ToolCtx::skill_roots` so a test never reads the real
     /// `~/.agents/skills` (the `discover_in_roots` convention). The policy is
-    /// the same `Sandboxed` containment tier as [`ctx`] — these tests assert
-    /// that a sandboxed `read` STILL rejects a skill file outside the cwd.
+    /// the same `Sandboxed` containment tier as [`ctx`], whose `boundary` is
+    /// the `cwd` ALONE — a FIXTURE choice, not the shipped read Boundary,
+    /// which ADR 0030 widens with the discovery roots. So a `read` of a skill
+    /// path is out of bounds HERE only because of this fixture's root set;
+    /// nothing below is a claim about what `read` does in a real session.
     fn ctx_with_roots(cwd: &Path, roots: &[PathBuf]) -> ToolCtx {
         ToolCtx {
             skill_roots: Some(
@@ -2746,6 +2841,218 @@ mod tests {
         let r = execute_tool(&ctx_with_roots(&cwd, &[root]), "list_skills", &json!({})).await;
         assert!(!r.is_error, "an empty catalog is not a failure");
         assert_eq!(text_of(&r), "none");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn list_skills_omits_model_hidden_skills() {
+        // ADR 0036: to the Agent a model-hidden skill is NOT in the catalog —
+        // its name AND its description (the routing hint) are both absent.
+        let cwd = temp_cwd("skills-list-hidden");
+        let a = skill_root(
+            "tag-a",
+            "alpha",
+            "---\nname: alpha\ndescription: D\n---\nA.\n",
+        );
+        let o = skill_root(
+            "tag-o",
+            "omega",
+            "---\nname: omega\ndescription: D\ndisable-model-invocation: true\n---\nO.\n",
+        );
+        let r = execute_tool(&ctx_with_roots(&cwd, &[a, o]), "list_skills", &json!({})).await;
+        assert!(!r.is_error, "{}", text_of(&r));
+        assert_eq!(text_of(&r), "alpha (space): D");
+        assert!(!text_of(&r).contains("omega"), "{}", text_of(&r));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn list_skills_is_none_when_every_skill_is_model_hidden() {
+        // A Space can present an EMPTY catalog to the Agent while the Skills
+        // dialog shows a full one — that is the feature, and an empty catalog
+        // is still not a failure (cf. `list_skills_empty_is_none_not_error`).
+        let cwd = temp_cwd("skills-list-all-hidden");
+        let root = skill_root(
+            "skills-list-all-hidden-root",
+            "omega",
+            "---\nname: omega\ndescription: D\ndisable-model-invocation: true\n---\nO.\n",
+        );
+        let r = execute_tool(&ctx_with_roots(&cwd, &[root]), "list_skills", &json!({})).await;
+        assert!(!r.is_error, "an empty catalog is not a failure");
+        assert_eq!(text_of(&r), "none");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The names the `<skills>` section ADVERTISES, in the prompt (the
+    /// `<name>` values, inside the section ONLY — the rest of the prompt must
+    /// not be scanned, or a skill name echoed in another section would count).
+    fn advertised_in_prompt(prompt: &str) -> std::collections::BTreeSet<String> {
+        let section = prompt
+            .split("<skills>\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n</skills>").next())
+            .expect("the `<skills>` section is present (`read_skill` is advertised)");
+        section
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("<name>")
+                    .and_then(|s| s.strip_suffix("</name>"))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// The names the `list_skills` output ADVERTISES: one
+    /// `{name} ({scope}): {description}` line each (`none` → the empty set).
+    fn advertised_by_tool(text: &str) -> std::collections::BTreeSet<String> {
+        if text == "none" {
+            return std::collections::BTreeSet::new();
+        }
+        text.lines()
+            .map(|line| {
+                line.split_once(" (")
+                    .map(|(name, _)| name.to_string())
+                    .unwrap_or_else(|| panic!("unexpected `list_skills` line {line:?}"))
+            })
+            .collect()
+    }
+
+    /// A `ToolSpec` of the shape `prompt.rs`'s test helper builds (the
+    /// `parameters` schema is irrelevant here — only the NAME decides whether
+    /// the `<skills>` section is emitted at all).
+    fn spec(name: &str) -> crate::agent::harness::provider::ToolSpec {
+        crate::agent::harness::provider::ToolSpec {
+            name: name.to_string(),
+            description: format!("The {name} tool."),
+            parameters: serde_json::Value::Null,
+        }
+    }
+
+    /// THE anti-drift test (ADR 0029's "the tool's catalog cannot drift from
+    /// the prompt's catalog" + ADR 0036's "to the Agent a model-hidden Skill
+    /// is not in the catalog").
+    ///
+    /// The two CATALOGS are produced by two SEPARATE seams — the prompt's
+    /// `format_skills_for_prompt` (`harness/prompt.rs`) and the tools'
+    /// `model_skills_for` → `exec_list_skills` (here) — which today share only
+    /// the `model_visible` PREDICATE. Every other ADR 0036 test checks ONE seam,
+    /// so either seam growing its own second filter (a scope test, a count cap,
+    /// a re-filter of an already-filtered list) would leave the OTHER advertising
+    /// a skill the model was never told about — or, worse, promise a skill that
+    /// `read_skill` then refuses. This gives BOTH seams the same discovery ROOTS
+    /// (the prompt builder is handed the discovered rows directly; the tools
+    /// RE-DISCOVER from those same roots, so the rows are equal by construction
+    /// and not by sharing a `Vec`), and asserts the two advertised name sets are
+    /// EQUAL, so the drift is a test failure and not a transcript surprise. The
+    /// mixed visible/hidden × Space/User fixture is what gives the equality its
+    /// teeth: a per-seam scope filter, or a seam that stops filtering on the
+    /// flag, both break the set equality rather than passing silently.
+    #[tokio::test]
+    async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
+        use crate::agent::harness::prompt::{build_main_prompt, PromptContext};
+        use crate::skills::{discover_in_roots, SkillScope};
+
+        // The prompt builder walks UP from `cwd` for `AGENTS.md`s; an empty
+        // `.git` here bounds that walk at this scratch dir (the `prompt.rs`
+        // `scratch()` convention) so a stray `AGENTS.md` in `/tmp` cannot
+        // inject a `<project_context>` section (which could mention a skill
+        // name and pollute nothing here, but keeps the fixture honest).
+        let cwd = temp_cwd("skills-catalog-drift");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+
+        // One skill per root (`skill_root` makes exactly one), four roots:
+        // visible + hidden, each at BOTH scopes.
+        let roots: Vec<(PathBuf, SkillScope)> = vec![
+            (
+                skill_root(
+                    "drift-visible-space",
+                    "alpha",
+                    "---\nname: alpha\ndescription: Does alpha.\n---\nA.\n",
+                ),
+                SkillScope::Space,
+            ),
+            (
+                skill_root(
+                    "drift-visible-user",
+                    "beta",
+                    "---\nname: beta\ndescription: Does beta.\n---\nB.\n",
+                ),
+                SkillScope::User,
+            ),
+            (
+                skill_root(
+                    "drift-hidden-space",
+                    "omega",
+                    "---\nname: omega\ndescription: Does omega.\ndisable-model-invocation: true\n---\nO.\n",
+                ),
+                SkillScope::Space,
+            ),
+            (
+                skill_root(
+                    "drift-hidden-user",
+                    "zeta",
+                    "---\nname: zeta\ndescription: Does zeta.\ndisable-model-invocation: true\n---\nZ.\n",
+                ),
+                SkillScope::User,
+            ),
+        ];
+        // The SAME rows for both seams: the prompt builder is handed the
+        // discovered set directly, and the tool ctx takes the SAME roots (the
+        // tools re-discover them through `skills_for` — `skill_roots` is the
+        // pinned-root seam, never a pre-filtered list, which is exactly what
+        // this test is guarding).
+        let skills = discover_in_roots(&roots);
+        assert_eq!(
+            skills.len(),
+            4,
+            "the fixture must discover all four skills (the premise)"
+        );
+        let paths: Vec<PathBuf> = roots.iter().map(|(p, _)| p.clone()).collect();
+
+        // Seam 1: the prompt's `<skills>` section. `read_skill` is advertised so
+        // the section is emitted at all (ADR 0017's skill-loading-tool guard).
+        let tool_specs = vec![spec("read_skill"), spec("list_skills")];
+        let prompt = build_main_prompt(&PromptContext {
+            cwd: &cwd,
+            // `Path::new("")` skips the global context file (the documented
+            // convention: `build_main_prompt` treats an empty dir as "none").
+            agent_dir: std::path::Path::new(""),
+            tools: &tool_specs,
+            skills: &skills,
+        });
+        let prompt_names = advertised_in_prompt(&prompt);
+
+        // Seam 2: the `list_skills` output, from the SAME roots. Built from the
+        // SAME `ctx` helper as `ctx_with_roots` — but pinned per-root instead of
+        // all-`Space`, because the fixture needs BOTH scopes (a per-seam scope
+        // filter is one of the drifts this test must catch).
+        let ctx = ToolCtx {
+            skill_roots: Some(roots.clone()),
+            ..ctx(&cwd)
+        };
+        let r = execute_tool(&ctx, "list_skills", &json!({})).await;
+        assert!(!r.is_error, "{}", text_of(&r));
+        let tool_names = advertised_by_tool(text_of(&r));
+
+        // THE anti-drift assertion.
+        assert_eq!(
+            prompt_names, tool_names,
+            "the `<skills>` section and `list_skills` advertise DIFFERENT catalogs"
+        );
+        // And neither may name a model-hidden skill (ADR 0036): the equality
+        // above alone would hold for two identically-WRONG catalogs.
+        let visible: std::collections::BTreeSet<String> = ["alpha".to_string(), "beta".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            prompt_names, visible,
+            "the advertised catalog is not exactly the model-visible set"
+        );
+
+        for root in paths {
+            let _ = std::fs::remove_dir_all(&root);
+        }
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -2874,6 +3181,176 @@ mod tests {
         assert!(text.contains("unknown skill"), "{text}");
         // The hint points at the tool that WOULD have listed them.
         assert!(text.contains("list_skills"), "{text}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_rejects_a_model_hidden_skill_with_the_mention_route() {
+        // A hidden name resolves (so the model is not lied to) but is refused,
+        // and the failure names the ONE route that works: the user's `$name`
+        // Mention. The whole string is pinned — it is the model's only
+        // instruction about that route (ADR 0036).
+        let cwd = temp_cwd("skill-hidden-route");
+        let root = skill_root(
+            "skill-hidden-route-root",
+            "omega",
+            "---\nname: omega\ndescription: D\ndisable-model-invocation: true\n---\nO.\n",
+        );
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
+            "read_skill",
+            &json!({ "name": "omega" }),
+        )
+        .await;
+        assert!(r.is_error, "a model-hidden skill must be refused");
+        assert_eq!(
+            text_of(&r),
+            "read_skill: \"omega\" is model-hidden — the Agent may not load it; ask the user to send $omega"
+        );
+
+        // The `$` Mention token grammar is LOWERCASE-only (ADR 0031), so the
+        // route echoed back is the lowercased key: `$DeBuG` expands nothing
+        // while `$debug` does.
+        let dbg = skill_root(
+            "skill-hidden-route-debug",
+            "DeBuG",
+            "---\nname: DeBuG\ndisable-model-invocation: true\n---\nD.\n",
+        );
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, &[dbg]),
+            "read_skill",
+            &json!({ "name": "debug" }),
+        )
+        .await;
+        assert!(r.is_error);
+        assert!(
+            text_of(&r).ends_with("ask the user to send $debug"),
+            "{}",
+            text_of(&r)
+        );
+        assert!(
+            !text_of(&r).contains(&root.to_string_lossy().into_owned()),
+            "the failure must not disclose a path: {}",
+            text_of(&r)
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_refuses_a_non_mentionable_hidden_skill_without_a_dead_token() {
+        // A skill name is only screened by `is_tag_safe_name`, so `has space`
+        // IS discovered (a space is tag-safe) — yet the `$` token grammar
+        // cannot carry it (ADR 0031), so the usual refusal would point the
+        // model AND the user at a `$has space` token that expands NOTHING.
+        // The refusal must therefore stay actionable without promising a
+        // token: no `$mention` suggestion at all.
+        //
+        // (Discovery note: the frontmatter `name` WINS over the
+        // directory-name fallback, and `is_tag_safe_name` admits a space, so
+        // this frontmatter is the path that actually yields a hidden,
+        // non-mentionable skill.)
+        let cwd = temp_cwd("skill-hidden-unmentionable");
+        let root = skill_root(
+            "skill-hidden-unmentionable-root",
+            "has-space",
+            "---\nname: has space\ndescription: D\ndisable-model-invocation: true\n---\nH.\n",
+        );
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
+            "read_skill",
+            &json!({ "name": "has space" }),
+        )
+        .await;
+        assert!(r.is_error, "a model-hidden skill must be refused");
+        let text = text_of(&r);
+        assert!(text.contains("model-hidden"), "{text}");
+        assert!(text.contains("has space"), "{text}");
+        // The branch is REALLY taken: the refusal carries NO `$` at all — not
+        // the pinned `send $<name>` tail, and not a `$mention` mentioned in
+        // prose (a `$` in a message whose whole point is "this name has no
+        // token" is a dead token the model can still copy).
+        assert!(
+            !text.contains('$'),
+            "must not promise an untypeable $mention token: {text}"
+        );
+        // And no absolute claim: `is_mentionable_name` is the ASCII grammar, so
+        // a name it rejects can still be expandable client-side (U+212A
+        // lowercases to `k` in JS), which makes "cannot be typed" false.
+        assert!(
+            !text.contains("cannot be typed"),
+            "the refusal must not state an impossibility: {text}"
+        );
+        assert!(
+            text.contains("outside the mention token grammar"),
+            "the refusal must name the real reason without a `$`: {text}"
+        );
+        assert!(
+            text.contains("explicitly"),
+            "the refusal must still name a route the user can take: {text}"
+        );
+        // ADR 0029: name ONLY what the model sent — no path, no dir, no scope.
+        assert!(
+            !text.contains(&root.to_string_lossy().into_owned()),
+            "the failure must not disclose a path: {text}"
+        );
+        assert!(
+            !text.contains("has-space"),
+            "the failure must not disclose the directory name: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn read_skill_rejects_a_model_hidden_skill_before_reading_a_bundled_file() {
+        // Enforcement lands BEFORE any `FsBackend` is built, so a hidden
+        // skill's bundled files are never read — not merely reported as
+        // escaped.
+        let cwd = temp_cwd("skill-hidden-bundle");
+        let hidden = skill_root(
+            "skill-hidden-bundle-hidden",
+            "omega",
+            "---\nname: omega\ndisable-model-invocation: true\n---\nO.\n",
+        );
+        std::fs::write(hidden.join("omega/ref.md"), "HIDDEN-BUNDLED-BODY\n").unwrap();
+        // The visible CONTROL: a visible skill's bundled file still reads, so
+        // this test cannot pass merely because the bundled path is broken.
+        let visible = skill_root(
+            "skill-hidden-bundle-visible",
+            "alpha",
+            "---\nname: alpha\n---\nA.\n",
+        );
+        std::fs::write(visible.join("alpha/ref.md"), "CONTROL-BODY\n").unwrap();
+
+        let r = execute_tool(
+            &ctx_with_roots(&cwd, &[hidden]),
+            "read_skill",
+            &json!({ "name": "omega", "path": "ref.md" }),
+        )
+        .await;
+        assert!(r.is_error, "a model-hidden skill must be refused");
+        assert_eq!(
+            text_of(&r),
+            "read_skill: \"omega\" is model-hidden — the Agent may not load it; ask the user to send $omega"
+        );
+        assert!(
+            !text_of(&r).contains("HIDDEN-BUNDLED-BODY"),
+            "the bundled body must never be returned: {}",
+            text_of(&r)
+        );
+        assert!(
+            !text_of(&r).contains("resolves outside the skill directory"),
+            "the hidden branch must run before the containment check: {}",
+            text_of(&r)
+        );
+
+        let c = execute_tool(
+            &ctx_with_roots(&cwd, &[visible]),
+            "read_skill",
+            &json!({ "name": "alpha", "path": "ref.md" }),
+        )
+        .await;
+        assert!(!c.is_error, "{}", text_of(&c));
+        assert_eq!(text_of(&c), "CONTROL-BODY\n");
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

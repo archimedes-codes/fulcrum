@@ -36,6 +36,16 @@ pub struct SkillInfo {
     /// `SKILL.md` content MINUS the frontmatter, trimmed (the injected
     /// block's BODY).
     pub body: String,
+    /// Frontmatter `disable-model-invocation: true` — the Skill is
+    /// MODEL-HIDDEN: unadvertised and unresolvable by name (ADR 0036).
+    pub disable_model_invocation: bool,
+}
+
+impl SkillInfo {
+    /// The one predicate every model-facing seam filters on (ADR 0036).
+    pub fn model_visible(&self) -> bool {
+        !self.disable_model_invocation
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -90,7 +100,9 @@ pub fn discover_in_roots(roots: &[(PathBuf, SkillScope)]) -> Vec<SkillInfo> {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let Some((name, description, body)) = parse_skill_file(&content, &fallback) else {
+            let Some((name, description, body, disable_model_invocation)) =
+                parse_skill_file(&content, &fallback)
+            else {
                 continue;
             };
             // First-wins across the whole run (a Space root shadows a
@@ -123,6 +135,7 @@ pub fn discover_in_roots(roots: &[(PathBuf, SkillScope)]) -> Vec<SkillInfo> {
                     dir,
                     scope: *scope,
                     body,
+                    disable_model_invocation,
                 },
             );
         }
@@ -254,7 +267,14 @@ fn walk(dir: &Path, dir_depth: u32, out: &mut Vec<PathBuf>, seen: &mut HashSet<P
 /// The tolerant frontmatter reader (no YAML crate): any failure mode
 /// (missing closing `---`, a >1024-char description, …) → `None` (the
 /// skill is skipped, never a crash).
-fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, String, String)> {
+///
+/// A DUPLICATE top-level key is the clearest place this reader is deliberately
+/// LESS strict than pi: pi's YAML parser throws `DUPLICATE_KEY`, its frontmatter
+/// parse fails, and pi skips the WHOLE `SKILL.md`; here the first occurrence
+/// wins and the skill is kept (ADR 0036). The glued `disable-model-invocation:true`
+/// (no space after the colon) is a second such place — pi's `yaml` throws
+/// `MISSING_CHAR` and drops the file, where this prefix match reads the key.
+fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, String, String, bool)> {
     // 1. Normalize `\r\n` and lone `\r` to `\n`.
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let lines: Vec<&str> = normalized.split('\n').collect();
@@ -273,18 +293,20 @@ fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, Strin
         if !is_tag_safe_name(&name) {
             return None;
         }
-        return Some((name, String::new(), normalized.trim().to_string()));
+        return Some((name, String::new(), normalized.trim().to_string(), false));
     }
     let close = lines[1..].iter().position(|l| *l == "---")?;
     let fm_end = 1 + close;
     let fm: &[&str] = &lines[1..fm_end];
     let body = lines[fm_end + 1..].join("\n").trim().to_string();
 
-    // 3. Top-level (non-indented) `name:` and `description:` keys only
-    //    (indented lines belong to the previous key's block value; any
-    //    other top-level key is ignored).
+    // 3. Top-level (non-indented) `name:`, `description:` and
+    //    `disable-model-invocation:` keys only (indented lines belong to
+    //    the previous key's block value; any other top-level key is
+    //    ignored).
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
+    let mut disable: Option<bool> = None;
     let mut i = 0;
     while i < fm.len() {
         let line = fm[i];
@@ -299,6 +321,57 @@ fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, Strin
                     description = parse_value(fm, i, rest);
                 }
             }
+            if disable.is_none() {
+                if let Some(rest) = line.strip_prefix("disable-model-invocation:") {
+                    // pi: `yaml.parse(frontmatter)["disable-model-invocation"]
+                    // === true`. The YAML 1.2 CORE SCHEMA that pi's `yaml`
+                    // package implements resolves `true`, `True` and `TRUE`
+                    // to the boolean `true`, and a plain scalar ENDS at a `#`
+                    // that follows whitespace (a comment) — so every one of
+                    // those HIDES. `yes` / `on` are plain strings in the core
+                    // schema, `1` is a number, a QUOTED "true" is a string,
+                    // `true#x` (no space) is ONE plain scalar, and a `>` or
+                    // `|` block scalar folds to the string `"true\n"` — none
+                    // of those is `=== true`, so none hides. Anything else we
+                    // read differently from pi would make the desktop and pi
+                    // disagree on the same file (ADR 0036).
+                    //
+                    // ASCII SPACE AND TAB ONLY, at both trims. YAML separates
+                    // a plain scalar on space and tab alone, so `true\u{A0}` /
+                    // `true\u{3000}` / `true\u{B}` / `true\u{85}` are STRINGS
+                    // to pi and stay model-VISIBLE there; a bare `trim()` /
+                    // `trim_end()` removes every `char::is_whitespace` and
+                    // would HIDE them — the fail-CLOSED direction, which is
+                    // the one place THIS key's branch would silently swallow a
+                    // skill pi advertises. It is NOT this reader's only
+                    // skip-where-pi-publishes site — step 4b (a tag-unsafe name)
+                    // and step 5 (a `description` over 1024 chars) are two
+                    // others, each stated on its own step — so keep the claim
+                    // per-step rather than widening it to the whole file. The
+                    // same rule `parse_value`'s dedent states for the same
+                    // reason.
+                    let value = rest.trim_matches([' ', '\t']);
+                    let value = match value.find('#') {
+                        // A `#` only opens a comment when a space or a tab
+                        // precedes it; glued to the token it is scalar text.
+                        Some(i) if value[..i].ends_with([' ', '\t']) => {
+                            value[..i].trim_end_matches([' ', '\t'])
+                        }
+                        _ => value,
+                    };
+                    disable = Some(matches!(value, "true" | "True" | "TRUE"));
+                    // ASYMMETRY, deliberate and SCOPED OUT: this branch strips
+                    // a ` #` comment, `parse_value` (which reads `name` and
+                    // `description`) does NOT — so `description: Do the thing #
+                    // note` is advertised here WITH the comment pi strips, and
+                    // `name: a # note` becomes a literal name no `$` token can
+                    // address. Fixing that would change the advertised text of
+                    // every commented `SKILL.md` in the wild, which is a larger
+                    // and separately-reviewable change; the flag branch strips
+                    // because a wrong BOOLEAN here changes ENFORCEMENT, not
+                    // prose. Do not "unify" the two readers by reflex.
+                }
+            }
         }
         i += 1;
     }
@@ -310,12 +383,18 @@ fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, Strin
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| fallback_name.to_string());
     let description = description.unwrap_or_default();
+    let disable_model_invocation = disable.unwrap_or(false);
 
     // 4b. The final name is interpolated UNESCAPED into the injected
     //     `<skill name="…">` attribute: a `"` there would produce a
     //     malformed tag the agent mis-parses, and a control character
     //     (e.g. a `|` block value joined with newlines) is equally
     //     unsafe → skip the skill (malformed → skip, never crash).
+    //     DIVERGENCE, deliberate: pi only WARNS on an invalid name and
+    //     "still load[s] the skill even with warnings"
+    //     (`dist/core/skills.js`), so this is a place we swallow a skill pi
+    //     publishes — tag safety beats parity because the name is injected
+    //     UNESCAPED.
     if !is_tag_safe_name(&name) {
         return None;
     }
@@ -323,13 +402,16 @@ fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, Strin
     // 5. `description` longer than 1024 CHARS → skip the skill
     //    (ZCode's `skill_description_too_long` rule; chars, not bytes —
     //    a CJK description is ≈3 bytes/char and must not be dropped
-    //    at ~341 chars).
+    //    at ~341 chars). Second skip-where-pi-publishes site (the first is
+    //    step 4b): pi's `validateDescription` only WARNS here and still loads
+    //    the skill, so a >1024-char `description` is advertised by pi and
+    //    absent here.
     if description.chars().count() > 1024 {
         return None;
     }
 
     // 6. `body` = the content after the closing `---` (trimmed).
-    Some((name, description, body))
+    Some((name, description, body, disable_model_invocation))
 }
 
 /// The string is interpolated UNESCAPED into the injected `<skill>` tag
@@ -390,7 +472,21 @@ pub(crate) fn is_tag_safe_name(name: &str) -> bool {
 /// - picker-time (`agent::mcp::config::server_infos`,
 ///   `commands::agents::list_agent_definitions_for_space`): "can this name
 ///   ever be MENTIONED?" → this predicate (hide, do not skip — the resource
-///   stays live for the session and for dispatch).
+///   stays live for the session and for dispatch);
+/// - route-naming-time, for SKILLS only: `exec_read_skill`'s model-hidden
+///   refusal and the Skills-dialog tooltip decide whether to PROMISE a `$name`.
+///   The `$` skill picker is deliberately NOT filtered by it — the Client's
+///   skill catalog stays total (ADR 0036), so the picker can legitimately offer
+///   a name the refusal will not promise. Do not describe this as "what the
+///   picker filters on" for Skills: no skill code path filters on it.
+///
+/// MATCHED PAIR: `isMentionableSkillName` in `src/lib/skills.ts` is the
+/// TypeScript side of THIS predicate (the Skills-dialog tooltip uses it to
+/// decide whether to promise a `$name` route, and `read_skill` here uses it
+/// for the same reason). The two must agree on the grammar — change one, the
+/// other moves with it, and both sides carry tests for the same name set
+/// (`scout` / `fast-recon` / mixed case in; `has space`, `a_b`, `a.b`,
+/// `café`, `a--b`, `-lead`, `trail-` out).
 pub(crate) fn is_mentionable_name(name: &str) -> bool {
     let mut expect_segment = true; // a segment is due (start, or after a `-`)
     for c in name.chars() {

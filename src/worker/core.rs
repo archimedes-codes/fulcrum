@@ -234,7 +234,11 @@ pub fn default_build_loop(
                 // the `cwd`, the `~/.pi/agent` roots (best-effort: no
                 // home dir → no global file), the advertised tool specs
                 // (the `<tools>` section matches the `tools[]` API param),
-                // the discovered skills (ADR 0013).
+                // the discovered skills (ADR 0013). NOTE: this arm is NOT
+                // main-session-only in practice — a child whose REDUCED message
+                // resolved to `None` arrives here too, so such a child gets this
+                // whole prompt (its `<skills>` section filtered the same way);
+                // ADR 0036's subagent bullet owns that shape.
                 let agent_dir = crate::skills::home_dir()
                     .map(|h| h.join(".pi/agent"))
                     .unwrap_or_default();

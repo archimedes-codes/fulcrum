@@ -105,14 +105,19 @@ pub fn build_main_prompt(ctx: &PromptContext) -> String {
         sections.push(format!("<project_context>\n{body}\n</project_context>"));
     }
 
-    // `<skills>`: only when skills are present AND a skill-loading tool is
-    // advertised. `read_skill` is preferred; else pi's `["read", "bash"]`
-    // order (the fallback for a session whose tool set excludes it — `read`
-    // reaches a USER-scope skill too, because ADR 0030's read boundary
-    // includes the user- and space-level skill dirs in every policy; it is
-    // `bash` at `Shell = Sandboxed` that cannot, since the Landlock
-    // allow-list carries the session `cwd`, the system dirs and the temp
-    // dirs, not the agent-definition dirs).
+    // `<skills>`: only when the FILTERED body is non-empty AND a
+    // skill-loading tool is advertised. The filter is the model-hidden one
+    // (ADR 0036), and the guard is evaluated AFTER it — pi's second guard
+    // (`system-prompt.js:105` `skills.length > 0`, then `:107`
+    // `if (skillsPrompt)` on the filtered output): a Space whose skills are
+    // ALL model-hidden leaves no trace, exactly like a Space with no skills
+    // (this function's own promise). `read_skill` is preferred; else pi's
+    // `["read", "bash"]` order (the fallback for a session whose tool set
+    // excludes it — `read` reaches a USER-scope skill too, because ADR
+    // 0030's read boundary includes the user- and space-level skill dirs in
+    // every policy; it is `bash` at `Shell = Sandboxed` that cannot, since
+    // the Landlock allow-list carries the session `cwd`, the system dirs and
+    // the temp dirs, not the agent-definition dirs).
     let file_read_tool = if ctx.tools.iter().any(|t| t.name == "read_skill") {
         Some("read_skill")
     } else if ctx.tools.iter().any(|t| t.name == "read") {
@@ -122,9 +127,9 @@ pub fn build_main_prompt(ctx: &PromptContext) -> String {
     } else {
         None
     };
-    if !ctx.skills.is_empty() {
-        if let Some(tool) = file_read_tool {
-            let body = format_skills_for_prompt(ctx.skills, tool);
+    if let Some(tool) = file_read_tool {
+        let body = format_skills_for_prompt(ctx.skills, tool);
+        if !body.is_empty() {
             sections.push(format!("<skills>\n{body}\n</skills>"));
         }
     }
@@ -139,8 +144,11 @@ pub fn build_main_prompt(ctx: &PromptContext) -> String {
 /// The subagent child's REDUCED system message (ADR 0017): the `launch`
 /// `systemPrompt` (if any — an empty/whitespace-only value counts as `None`,
 /// so no leading blank line) + the `manage_todo_list` guidance line (when the
-/// child has the tool) — no preamble, no tools list. `None` + no tool →
-/// `None` (no system message at all).
+/// child has the tool) — no preamble, no tools list. `None` + no tool → `None`,
+/// and `None` means "no REDUCED message", NOT "no system message": the worker's
+/// `(StartMode::Fresh, None)` arm then builds the MAIN prompt for that child,
+/// whose `<skills>` section is FILTERED like any other (ADR 0036's subagent
+/// bullet is the authoritative statement of both child shapes).
 pub fn build_child_system_message(
     system_prompt: Option<&str>,
     has_todo_tool: bool,
@@ -241,11 +249,17 @@ fn push_deduped(
     }
 }
 
-/// A Rust port of pi's `formatSkillsForPrompt` (metadata only — the native
-/// `SkillInfo`/`discover_skills` (ADR 0013) has no `disableModelInvocation`
-/// field, so no filtering in v1): the per-skill block is byte-identical to
-/// pi's, with pi's leading `"\n\n"` trimmed.
+/// A Rust port of pi's `formatSkillsForPrompt`: the per-skill block is
+/// byte-identical to pi's, with pi's leading `"\n\n"` trimmed — INCLUDING
+/// pi's filter, which drops the model-hidden skills (ADR 0036) and returns
+/// `""` for an empty visible set.
 fn format_skills_for_prompt(skills: &[SkillInfo], file_read_tool: &str) -> String {
+    let visible: Vec<&SkillInfo> = skills.iter().filter(|s| s.model_visible()).collect();
+    if visible.is_empty() {
+        // pi: `if (visibleSkills.length === 0) return ""` — BEFORE the
+        // header lines, so an all-hidden catalog leaves NO trace.
+        return String::new();
+    }
     let mut lines: Vec<String> = vec![
         "The following skills provide specialized instructions for specific tasks.".to_string(),
         match file_read_tool {
@@ -271,7 +285,7 @@ fn format_skills_for_prompt(skills: &[SkillInfo], file_read_tool: &str) -> Strin
         String::new(),
         "<available_skills>".to_string(),
     ];
-    for skill in skills {
+    for skill in visible {
         lines.push("  <skill>".to_string());
         lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
         lines.push(format!(
@@ -320,6 +334,16 @@ mod tests {
             dir: path.to_string(),
             scope: SkillScope::User,
             body: "body".to_string(),
+            disable_model_invocation: false,
+        }
+    }
+
+    /// Like `skill`, but MODEL-HIDDEN (frontmatter
+    /// `disable-model-invocation: true`, ADR 0036).
+    fn hidden_skill(name: &str, description: &str, path: &str) -> SkillInfo {
+        SkillInfo {
+            disable_model_invocation: true,
+            ..skill(name, description, path)
         }
     }
 
@@ -953,6 +977,84 @@ When a skill file references a relative path, resolve it against the skill direc
         );
         assert_eq!(body, expected);
     }
+    // 14b — a model-hidden skill (ADR 0036) appears NOWHERE in the
+    // prompt: not in the `<available_skills>` list, not in the description.
+    #[test]
+    fn the_skills_section_omits_model_hidden_skills() {
+        let root = scratch();
+        let cwd = root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let skills = vec![
+            skill(
+                "alpha",
+                "Does alpha.",
+                &root.join("a/SKILL.md").to_string_lossy(),
+            ),
+            hidden_skill(
+                "omega",
+                "Does omega.",
+                &root.join("o/SKILL.md").to_string_lossy(),
+            ),
+        ];
+        let tools = vec![spec("read_skill", "Load a skill by name.")];
+        let ctx = PromptContext {
+            cwd: &cwd,
+            agent_dir: Path::new(""),
+            tools: &tools,
+            skills: &skills,
+        };
+        let prompt = build_main_prompt(&ctx);
+        assert!(
+            prompt.contains("<name>alpha</name>"),
+            "the model-visible skill is advertised: {prompt}"
+        );
+        assert!(
+            !prompt.contains("omega"),
+            "the model-hidden skill is not in the prompt at all: {prompt}"
+        );
+    }
+
+    // 14c — pi's SECOND guard: an all-hidden catalog leaves NO trace. The
+    // tools MUST carry a skill-loading tool in both builds, else the
+    // pre-existing `file_read_tool` guard suppresses the section and this
+    // test is vacuous.
+    #[test]
+    fn all_model_hidden_skills_omit_the_skills_section_entirely() {
+        let root = scratch();
+        let cwd = root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let hidden = hidden_skill(
+            "omega",
+            "Does omega.",
+            &root.join("o/SKILL.md").to_string_lossy(),
+        );
+        let tools = vec![spec("read_skill", "Load a skill by name.")];
+        let build = |skills: &[SkillInfo]| {
+            let ctx = PromptContext {
+                cwd: &cwd,
+                agent_dir: Path::new(""),
+                tools: &tools,
+                skills,
+            };
+            build_main_prompt(&ctx)
+        };
+
+        let prompt_with_hidden = build(&[hidden]);
+        let prompt_no_skills = build(&[]);
+
+        assert!(
+            !prompt_with_hidden.contains("<skills>"),
+            "an all-hidden catalog ships no <skills> section: {prompt_with_hidden}"
+        );
+        // The strongest form of "leaves no trace": byte-identical to a
+        // session with no skills at all.
+        assert_eq!(prompt_with_hidden, prompt_no_skills);
+        assert!(
+            !prompt_with_hidden.contains("\n\n\n"),
+            "no dangling blank lines: {prompt_with_hidden}"
+        );
+    }
+
     // 15 — XML-escape name/description per pi's `escapeXml` table.
     #[test]
     fn skills_xml_escaping() {
