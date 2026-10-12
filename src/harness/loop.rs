@@ -824,18 +824,30 @@ impl AgentLoop {
                                 });
                             }
                             ProviderEvent::ToolCall(tc) => {
+                                // The transcript keeps the model's OWN bytes
+                                // (`acc.tool_calls` is what is replayed to the
+                                // provider), but the RENDERER copies are
+                                // normalized: the persisted `tool-call` row and
+                                // its reload replay must carry the SAME payload
+                                // the live card draws, and the raw `ask`
+                                // arguments do not (a bare-string option has no
+                                // `label` to read). Normalization is a pure
+                                // function of this same value, and `ask_flow`
+                                // applies the same function to the raw copy, so
+                                // the event and the stored row cannot drift.
+                                let display_tc = self.normalized_for_display(&tc);
                                 acc.tool_calls.push(tc.clone());
                                 self.emit(RpcEvent::message_update {
                                     usage: acc.usage_value(),
                                     assistant_message_event: json!({
                                         "type": "toolcall_end",
-                                        "toolCall": tc,
+                                        "toolCall": display_tc,
                                     }),
                                 });
                                 self.emit(RpcEvent::tool_execution_start {
                                     tool_call_id: tc.id.clone(),
                                     tool_name: tc.name.clone(),
-                                    args: tc.arguments.clone(),
+                                    args: display_tc.arguments.clone(),
                                 });
                             }
                             ProviderEvent::Usage(u) => {
@@ -1772,6 +1784,31 @@ impl AgentLoop {
         }
     }
 
+    /// The tool call as the RENDERER should see it.
+    ///
+    /// Only `ask` has a payload whose raw form is not renderable: its options
+    /// may be bare strings (no `label` to read, so the card draws blank rows)
+    /// and its questions may have no `id` (so every per-question draft
+    /// collapses into one bucket). Everything else — the tool name, the id, and
+    /// every other tool's arguments — is passed through untouched, and the
+    /// CALLER's `ToolCall` (the transcript copy replayed to the provider) is
+    /// never mutated: the model is told what the model said.
+    ///
+    /// `ask_flow` normalizes the raw copy it is dispatched with, applying the
+    /// SAME pure function, which is why the `interactive-request` event and the
+    /// persisted `tool-call` row this feeds are byte-identical rather than
+    /// merely similar.
+    fn normalized_for_display(&self, tc: &ToolCall) -> ToolCall {
+        if tc.name != "ask" {
+            return tc.clone();
+        }
+        ToolCall {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments: crate::agent::harness::ask::normalize_ask_params(&tc.arguments),
+        }
+    }
+
     /// Emit one `RpcEvent`: through the EXISTING `normalize` +
     /// `compute_display_rows` + `Store::persist_display` pipeline (the
     /// FROZEN `session-update` frames via the sink + the display
@@ -1996,9 +2033,39 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                             "properties": {
                                 "id": { "type": "string" },
                                 "question": { "type": "string" },
-                                "options": { "type": "array", "items": { "type": "object" } },
+                                // An option is a bare label string OR an object
+                                // with a `label` — because that is what the
+                                // parser ACCEPTS, and the app's own model has
+                                // been sending the string form all along (80 of
+                                // the 395 options in the session store). The
+                                // schema used to say `{"type": "object"}`, which
+                                // forbade the form the app was silently handling:
+                                // a payload the model was told not to send, and
+                                // that rendered fine anyway. `description` is
+                                // spelled out because 312 recorded options carry
+                                // one and the renderer shows it.
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "anyOf": [
+                                            { "type": "string" },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "label": { "type": "string" },
+                                                    "description": { "type": "string" }
+                                                },
+                                                "required": ["label"]
+                                            }
+                                        ]
+                                    }
+                                },
                                 "multi": { "type": "boolean" }
                             },
+                            // `id` stays REQUIRED on purpose: the parser now
+                            // synthesizes a positional id when one is missing
+                            // (so a missing id can no longer break the card),
+                            // but a real id is still what the model should send.
                             "required": ["id", "question", "options"]
                         }
                     }
@@ -2239,6 +2306,22 @@ mod tests {
         updates: Arc<StdMutex<Vec<Value>>>,
     }
 
+    /// A recording `EventSink` that keeps EVERY emission (the `ask` tests
+    /// assert on the `interactive-request` the flow emits, which is not a
+    /// `session-update`).
+    struct AllEventsSink {
+        events: Arc<StdMutex<Vec<(String, Value)>>>,
+    }
+
+    impl EventSink for AllEventsSink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((event.to_string(), payload));
+        }
+    }
+
     impl EventSink for TestSink {
         fn emit(&self, event: &str, payload: Value) {
             if event == "session-update" {
@@ -2266,6 +2349,37 @@ mod tests {
         models: Vec<Model>,
         config_dir: Option<&std::path::Path>,
     ) -> (AgentLoop, Arc<Db>) {
+        let sink = Arc::new(TestSink {
+            updates: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let (loop_, db) = build_loop_with_sink(
+            provider,
+            events,
+            turn_cancel,
+            settle_tx,
+            retry,
+            models,
+            config_dir,
+            sink,
+        );
+        (loop_, db)
+    }
+
+    /// `build_loop_with_db` with the sink INJECTED (the tests that assert on
+    /// what the loop EMITTED, not only on what it stored). The argument list is
+    /// `AgentLoop::new`'s own (which carries the same allow) minus the parts the
+    /// builder fixes for every test.
+    #[allow(clippy::too_many_arguments)]
+    fn build_loop_with_sink(
+        provider: Box<dyn Provider>,
+        events: mpsc::UnboundedSender<RpcEvent>,
+        turn_cancel: Arc<StdMutex<CancellationToken>>,
+        settle_tx: watch::Sender<u64>,
+        retry: RetryPolicy,
+        models: Vec<Model>,
+        config_dir: Option<&std::path::Path>,
+        sink: Arc<dyn EventSink>,
+    ) -> (AgentLoop, Arc<Db>) {
         let dir = std::env::temp_dir().join(format!("harness-loop-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
@@ -2290,9 +2404,7 @@ mod tests {
             compaction: CompactionConfig::default(),
         };
         let (prompt_tx, prompt_rx) = mpsc::channel(8);
-        let sink: Arc<dyn EventSink> = Arc::new(TestSink {
-            updates: Arc::new(StdMutex::new(Vec::new())),
-        });
+        let sink: Arc<dyn EventSink> = sink;
         let loop_ = AgentLoop::new(
             "s1".to_string(),
             dir,
@@ -2416,6 +2528,132 @@ mod tests {
         );
         // ...and the settle watch fired (the reliable signal).
         assert_eq!(*settle_rx.borrow(), 1, "the settle watch fired");
+    }
+
+    /// THE regression this file exists for: the payload the LIVE card is drawn
+    /// from and the payload a RELOAD reads back out of SQLite are the SAME
+    /// normalized shape.
+    ///
+    /// The ask payload leaves Rust at THREE sites — the `interactive-request`
+    /// event (the live card), the `tool-call` display row that is persisted
+    /// (`rawInput`, written from `tool_execution_start`), and the
+    /// `load_history` → `rowToMessages` replay a reload / restart reads. Only
+    /// ONE of them can be normalized: normalizing the event alone gives a card
+    /// that looks right live and is blank after a reload (the classic
+    /// write-path/read-path split), because the replay reads `rawInput` from
+    /// storage, not the event.
+    #[tokio::test]
+    async fn the_persisted_ask_row_and_the_emitted_request_carry_the_same_payload() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        // The shape this app's own model sends: bare-string options, no `id`.
+        let raw = json!({
+            "questions": [{
+                "question": "Which framework?",
+                "options": ["Tauri", "Electron"]
+            }]
+        });
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "ask".to_string(),
+                arguments: raw.clone(),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ])]);
+        let sink = Arc::new(AllEventsSink {
+            events: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let captured = sink.events.clone();
+        let (mut loop_, db) = build_loop_with_sink(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
+            sink,
+        );
+        let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("hello")).await });
+        wait_for_event(
+            &mut events_rx,
+            5000,
+            |e| matches!(e, RpcEvent::tool_execution_start { tool_name, .. } if tool_name == "ask"),
+        )
+        .await
+        .expect("the `ask` tool started");
+
+        // The LIVE payload (what the modal renders from).
+        let emitted = {
+            let mut found = None;
+            for _ in 0..100 {
+                // The guard is scoped to this block: it is DROPPED before the
+                // await below, never held across it.
+                found = captured
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .find(|(event, _)| event == "interactive-request")
+                    .map(|(_, payload)| payload["params"].clone());
+                if found.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            found.expect("the interactive-request was emitted")
+        };
+
+        // The PERSISTED payload (`load_history` reads this row back on a
+        // reload; `rowToMessages` hands its `rawInput` to the transcript).
+        let persisted = {
+            let mut found = None;
+            for _ in 0..100 {
+                found = db
+                    .messages_for("s1")
+                    .expect("messages_for")
+                    .iter()
+                    .find(|r| r.kind == "tool-call" && r.message_key.as_deref() == Some("t1"))
+                    .and_then(|r| serde_json::from_str::<Value>(&r.payload_json).ok())
+                    .and_then(|payload| {
+                        payload["rawInput"]["questions"]
+                            .is_array()
+                            .then(|| payload["rawInput"].clone())
+                    });
+                if found.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            found.expect("the `ask` tool-call row was persisted with the questions")
+        };
+
+        // THE invariant: byte-for-byte the same normalized payload.
+        assert_eq!(
+            persisted, emitted,
+            "the persisted/replayed payload must EQUAL the emitted payload"
+        );
+        assert_eq!(
+            persisted["questions"][0]["options"],
+            json!([{ "label": "Tauri" }, { "label": "Electron" }]),
+            "the reloaded card must not be blank: the bare strings became `{{label}}` objects, got {persisted}"
+        );
+        assert_eq!(
+            persisted["questions"][0]["id"],
+            json!("q0"),
+            "the reloaded card's question has the same positional id the live card used"
+        );
+        // The raw model arguments are NOT what gets stored/emitted.
+        assert_ne!(
+            persisted, raw,
+            "the raw tool arguments are no longer what leaves Rust"
+        );
+
+        turn_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     /// (finding 8a) A turn with 2 tool calls: a cancel after the first
