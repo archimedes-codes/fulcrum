@@ -979,6 +979,7 @@ mod compute_display_rows_tests {
             capabilities: serde_json::json!({}),
             config_options: None,
             archived: false,
+            title: None,
             context_usage: None,
             is_subagent: false,
         })

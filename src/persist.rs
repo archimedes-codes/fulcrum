@@ -171,6 +171,10 @@ impl TranscriptPersister {
             capabilities: Value::Null,
             config_options: None,
             archived: false,
+            // Never titled: a subagent row is hidden from `list_sessions`
+            // (the naming pass never sees it), and `record_session` does not
+            // write `title` anyway.
+            title: None,
             context_usage: None,
             is_subagent,
         };
