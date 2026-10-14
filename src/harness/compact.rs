@@ -8,7 +8,9 @@
 //! `CompactionConfig`, which is currently ALWAYS the defaults (`16384` /
 //! `20000`): `Settings` has no `compaction` field, so `merge_catalog`
 //! carries the base catalog's own config and there is no settings surface
-//! to override it from (yet). The snapshot is RE-ANCHORED by
+//! to override it from (yet). The keep-recent BUDGET the compaction actually
+//! spends is that `keepRecentTokens` capped by what the model's own window can
+//! afford — see [`Compactor::keep_budget`]. The snapshot is RE-ANCHORED by
 //! `AgentLoop::note_context` wherever the transcript grows, and RETRACTED
 //! by [`Compactor::turn_abandoned`] when a turn — or a retried model call
 //! within one — ends without the assistant reply `record_usage` had
@@ -125,6 +127,25 @@ impl Compactor {
         let threshold =
             u64::from(self.context_window).saturating_sub(u64::from(self.config.reserve_tokens));
         self.context_tokens > threshold
+    }
+
+    /// The keep-recent budget THIS model's window can afford: the configured
+    /// `keep_recent_tokens` CAPPED by `window − reserve − headroom`. The catalog
+    /// budget is catalog-wide and the window is per-model, so an uncapped budget
+    /// can cover the whole transcript — `older` comes back empty, the compaction
+    /// is a no-op, and `should_compact()` stays true forever.
+    ///
+    /// No floor, deliberately: `split_for_compaction` with budget 0 keeps exactly
+    /// the last message (it breaks before spending anything, then snaps back off a
+    /// `tool` message), which is the shrinking a tiny window needs. A floor would
+    /// also override the small budgets the tests use to force a real compaction.
+    pub fn keep_budget(&self) -> u32 {
+        const HEADROOM_CAP: u32 = 4_096;
+        let headroom = self.config.reserve_tokens.min(HEADROOM_CAP);
+        let affordable = u64::from(self.context_window)
+            .saturating_sub(u64::from(self.config.reserve_tokens))
+            .saturating_sub(u64::from(headroom));
+        u64::from(self.config.keep_recent_tokens).min(affordable) as u32
     }
 
     /// Re-estimate the context from the (post-compaction) messages — the
@@ -270,8 +291,16 @@ pub(crate) struct CompactionCtx<'a> {
     pub model: &'a Model,
     pub provider: &'a dyn Provider,
     pub store: &'a Arc<dyn Store>,
-    /// The keep-recent budget (the caller's `catalog.compaction`).
+    /// The keep-recent budget. Production passes [`Compactor::keep_budget`]
+    /// (the configured budget capped by what THIS model's window can afford);
+    /// a caller may pass an explicit one — the seam the tests use to force a
+    /// real compaction.
     pub keep_recent_tokens: u32,
+    /// The caller's EXTRA summary instructions (`/compact <args>` — the user's
+    /// own words on what the summary must keep). `None` (the automatic paths:
+    /// the threshold check, an overflow recovery) and a blank string both mean
+    /// "no extra instructions" and leave the summary prompt untouched.
+    pub instructions: Option<String>,
     /// The session's compactor — RE-ESTIMATED on the compacted transcript
     /// (the post-compaction BASELINE: the re-estimated count of what the
     /// context now is REPLACES the tracked total, and the usage ANCHOR is
@@ -379,6 +408,24 @@ pub(crate) async fn run_compaction(
     }
 }
 
+/// The summary's system prompt: the base instruction, plus ONE line carrying
+/// the caller's extra instructions when there are any (`/compact <args>` —
+/// the user's own words on what the summary must keep). The base text is
+/// unchanged either way (pinned by the `summarize_*` prompt tests): the
+/// automatic paths (the threshold check, an overflow recovery) pass `None`,
+/// and args that are only whitespace are no instructions at all.
+fn summary_system_prompt(instructions: Option<&str>) -> String {
+    let base = "Summarize these messages concisely, preserving decisions, \
+                file paths, and open tasks. Respond with the summary only."
+        .to_string();
+    match instructions {
+        Some(s) if !s.trim().is_empty() => {
+            format!("{base}\nAdditional instructions for this summary: {s}")
+        }
+        _ => base,
+    }
+}
+
 /// The summary model call (a "summarize these messages" system prompt
 /// over the older messages — NO tools; the stream is consumed
 /// silently — the summary is internal, like pi's). The call + stream
@@ -396,11 +443,7 @@ pub(crate) async fn summarize(
 ) -> Result<String, ProviderError> {
     let system = ChatMessage {
         role: ChatRole::System,
-        content: MessageContent::Text(
-            "Summarize these messages concisely, preserving decisions, \
-             file paths, and open tasks. Respond with the summary only."
-                .to_string(),
-        ),
+        content: MessageContent::Text(summary_system_prompt(ctx.instructions.as_deref())),
         tool_call_id: None,
         tool_calls: None,
     };
@@ -573,6 +616,106 @@ mod tests {
             supports_thinking: false,
             thinking_levels: Vec::new(),
             api: Some("openai-completions".to_string()),
+        }
+    }
+
+    /// The summary system prompt, byte for byte (`/compact <args>` APPENDS a
+    /// line to it — the base text must never move).
+    const SUMMARY_SYSTEM: &str = "Summarize these messages concisely, preserving decisions, file paths, and open tasks. Respond with the summary only.";
+
+    /// A `Provider` that records the SYSTEM message of every request (the
+    /// observation point for the `/compact` extra instruction line).
+    struct SystemPromptRecordingProvider {
+        recorded: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SystemPromptRecordingProvider {
+        fn new(recorded: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self { recorded }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SystemPromptRecordingProvider {
+        async fn complete(
+            &self,
+            req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            if let Some(ChatMessage {
+                role: ChatRole::System,
+                content: MessageContent::Text(t),
+                ..
+            }) = req.messages.first()
+            {
+                self.recorded
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(t.clone());
+            }
+            Ok(futures_util::stream::iter(vec![
+                ProviderEvent::TextDelta("ok".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ])
+            .boxed())
+        }
+    }
+
+    /// The summary system prompt for one `summarize` run with `instructions`
+    /// (the recorded system text).
+    async fn recorded_summary_prompt(instructions: Option<String>) -> String {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = SystemPromptRecordingProvider::new(recorded.clone());
+        let (_db, store) = temp_store();
+        let model = fake_model("m1");
+        let mut compactor = Compactor::new(CompactionConfig::default(), model.context_window);
+        let older = vec![text_msg("history")];
+        let summary = {
+            let ctx = CompactionCtx {
+                session_id: "s1",
+                model: &model,
+                provider: &provider,
+                store: &store,
+                keep_recent_tokens: 1,
+                instructions,
+                compactor: &mut compactor,
+            };
+            summarize(&ctx, &older, &CancellationToken::new())
+                .await
+                .expect("summarize succeeds")
+        };
+        assert_eq!(summary, "ok", "the canned summary landed");
+        let prompts = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(prompts.len(), 1, "one model call for the summary");
+        prompts[0].clone()
+    }
+
+    /// `/compact <args>` (ADR 0044): the user's extra instructions ride the
+    /// summary system prompt as ONE appended line, after the unchanged base
+    /// text.
+    #[tokio::test]
+    async fn summarize_appends_the_caller_instructions_as_an_extra_line() {
+        let prompt = recorded_summary_prompt(Some("keep every test name".to_string())).await;
+        assert_eq!(
+            prompt,
+            format!(
+                "{SUMMARY_SYSTEM}\nAdditional instructions for this summary: keep every test name"
+            ),
+            "the base prompt is byte-identical and the instructions ride the next line"
+        );
+    }
+
+    /// Threshold / overflow pass `None`, and a `/compact` whose args are only
+    /// whitespace is no instructions at all: the summary prompt stays
+    /// byte-identical to the base text either way.
+    #[tokio::test]
+    async fn summarize_without_instructions_is_the_unchanged_base_prompt() {
+        for instructions in [None, Some(String::new()), Some("   ".to_string())] {
+            assert_eq!(
+                recorded_summary_prompt(instructions.clone()).await,
+                SUMMARY_SYSTEM,
+                "no instructions ({instructions:?}) must not touch the prompt"
+            );
         }
     }
 
@@ -976,6 +1119,40 @@ mod tests {
         );
     }
 
+    /// The keep-recent budget is capped by what the MODEL's window can
+    /// afford: the catalog's `keep_recent_tokens` is catalog-wide while the
+    /// window is per-model, so an uncapped 20 000 covers the WHOLE transcript
+    /// of a small-window model — `older` comes back empty, the compaction is a
+    /// no-op and `should_compact()` stays true forever. Pinned against
+    /// `CompactionConfig::default()` (16 384 reserve, 20 000 keep).
+    #[test]
+    fn keep_budget_caps_the_keep_to_what_the_window_affords() {
+        let budget_for =
+            |window: u32| Compactor::new(CompactionConfig::default(), window).keep_budget();
+        // Big models are UNCHANGED: the configured budget still wins.
+        assert_eq!(budget_for(200_000), 20_000, "a 200k window affords it all");
+        assert_eq!(budget_for(65_536), 20_000, "65 536 − 16 384 − 4 096");
+        // The window caps it.
+        assert_eq!(budget_for(32_768), 12_288, "32 768 − 16 384 − 4 096");
+        // And it has NO floor: a window that cannot afford any keep at all
+        // budgets 0, which keeps the last message and still shrinks.
+        assert_eq!(budget_for(8_192), 0, "a window under its own reserve");
+        // No floor ALSO means no override of a small CONFIGURED budget — the
+        // seam the test fixtures use to force a real compaction.
+        assert_eq!(
+            Compactor::new(
+                CompactionConfig {
+                    keep_recent_tokens: 1,
+                    ..Default::default()
+                },
+                128_000,
+            )
+            .keep_budget(),
+            1,
+            "a configured budget below what the window affords is left alone"
+        );
+    }
+
     #[test]
     fn split_keeps_the_recent_tail() {
         let msgs = vec![
@@ -1296,6 +1473,62 @@ mod tests {
         }
     }
 
+    /// The regression the derived budget exists for: a model whose window
+    /// cannot afford the catalog's 20 000 keep-recent budget must still SHRINK
+    /// when it is over its threshold. Pre-fix the budget was the raw catalog
+    /// value, `split_for_compaction` walked the whole transcript without ever
+    /// exhausting it, `older` came back empty, and the compaction was a
+    /// `Skipped` that left `should_compact()` true forever (and left Task 6's
+    /// overflow recovery with nothing to shrink).
+    #[tokio::test]
+    async fn a_small_window_compaction_actually_shrinks_the_transcript() {
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("the summary".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let (_db, store) = temp_store();
+        let mut harness = Harness::new(&provider, store);
+        // A 32k model: 32 768 − 16 384 reserve − 4 096 headroom = 12 288 of the
+        // configured 20 000, read from the COMPACTOR — where production reads
+        // it (`keep = None` would run the fixture's budget 1 and pin nothing).
+        harness.compactor = Compactor::new(CompactionConfig::default(), 32_768);
+        harness.keep = Some(harness.compactor.keep_budget());
+        // 9 × (8 000 chars / 4 + 1) = 18 009 tokens — the BAND that makes this a
+        // regression test: over the 32 768 − 16 384 = 16 384 threshold (a
+        // compaction IS due) and under the configured 20 000 (so the OLD
+        // uncapped budget walked the whole transcript and skipped).
+        harness.messages = (0..9).map(|_| text_msg(&"x".repeat(8_000))).collect();
+        let before = harness.messages.len();
+        let estimate = estimate_context(&harness.messages);
+        assert!(
+            estimate > 16_384 && estimate < 20_000,
+            "the fixture must sit between the 32k window's threshold and the configured \
+             keep, got {estimate}"
+        );
+        harness.compactor.reestimate(&harness.messages);
+        assert!(
+            harness.compactor.should_compact(),
+            "the transcript is over the 32k window's threshold, so a compaction is due"
+        );
+
+        let outcome = harness.run().await;
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "the derived 12 288 budget leaves an older head to summarize; a `Skipped` is \
+             the old bug (the 20 000 catalog budget covering the whole transcript)"
+        );
+        assert!(
+            harness.messages.len() < before,
+            "the compaction shrank the transcript ({} messages → {})",
+            before,
+            harness.messages.len(),
+        );
+        assert!(
+            harness.messages.iter().any(is_compaction_summary),
+            "one of the resulting messages is the compaction summary"
+        );
+    }
+
     #[tokio::test]
     async fn summarize_model_request_carries_the_session_id() {
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1328,20 +1561,26 @@ mod tests {
             provider,
             store: &store,
             keep_recent_tokens: 1,
+            instructions: None,
             compactor: &mut compactor,
         };
         summarize(&ctx, older, &CancellationToken::new()).await
     }
 
     /// The moved tests' fixture: the ctx's inputs + the mutable transcript
-    /// (what the `AgentLoop` owned). `keep_recent_tokens: 1` mirrors the
-    /// old tests' `loop_.catalog.compaction.keep_recent_tokens = 1`.
+    /// (what the `AgentLoop` owned). `keep: None` mirrors the old tests' budget
+    /// (`loop_.catalog.compaction.keep_recent_tokens = 1`); `Some(k)` runs the
+    /// ctx at `k`, which is how a test pins a DERIVED budget.
     struct Harness<'a> {
         model: Model,
         store: Arc<dyn Store>,
         compactor: Compactor,
         pub messages: Vec<ChatMessage>,
         provider: &'a dyn Provider,
+        /// The keep-recent budget [`Harness::run`] passes to the ctx — `None`
+        /// keeps the fixture's historical `1`, so every existing `Harness`
+        /// test is untouched.
+        keep: Option<u32>,
     }
 
     impl<'a> Harness<'a> {
@@ -1354,16 +1593,19 @@ mod tests {
                 compactor,
                 messages: Vec::new(),
                 provider,
+                keep: None,
             }
         }
 
         async fn run(&mut self) -> CompactionOutcome {
+            let keep_recent_tokens = self.keep.unwrap_or(1);
             let mut ctx = CompactionCtx {
                 session_id: "s1",
                 model: &self.model,
                 provider: self.provider,
                 store: &self.store,
-                keep_recent_tokens: 1,
+                keep_recent_tokens,
+                instructions: None,
                 compactor: &mut self.compactor,
             };
             run_compaction(&mut ctx, &mut self.messages, &CancellationToken::new()).await

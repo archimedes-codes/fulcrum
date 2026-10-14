@@ -743,6 +743,34 @@ mod tests {
         );
     }
 
+    /// (ADR 0046) The ANTI-DOUBLE-COUNT pin for the Responses wire. Its
+    /// `usage.input_tokens` is ALREADY the whole prompt — cached tokens
+    /// included — and `input_tokens_details.cached_tokens` is a SUBSET of
+    /// it, so the count passes through UNCHANGED and the detail is NOT
+    /// read at all (summing it "for consistency" with the Anthropic wire
+    /// would double the cached prefix and make compaction arrive EARLY).
+    /// An INPUT-ONLY usage is still a report here (`response_usage`
+    /// accepts one side), so the `0` output is the documented rule, not a
+    /// dropped count.
+    #[tokio::test]
+    async fn responses_usage_does_not_add_the_cached_tokens_detail() {
+        let events = collect(responses_stream(&[
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"input_tokens_details\":{\"cached_tokens\":800}}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 1000,
+                    output_tokens: 0,
+                }),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn responses_sse_reasoning_summary() {
         // The reasoning streams as `reasoning_summary_text.delta` fragments

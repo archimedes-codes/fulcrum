@@ -122,6 +122,25 @@ pub enum ControlCmd {
     SetModel(Model),
     /// Set the thinking level (`None` = the model's default).
     SetThinkingLevel(Option<String>),
+    /// Compact NOW (the `/compact` Composer command — ADR 0044). Applied when
+    /// IDLE — a command sent mid-turn queues behind the turn, the same rule as
+    /// `SetModel`. `instructions` are the user's extra summary instructions.
+    Compact { instructions: Option<String> },
+}
+
+/// A compaction the loop must run before its next model call, and what to
+/// report it as (`reason` is a UI contract — ADR 0045; `will_retry` is true
+/// only for overflow recovery, where the turn continues on the other side of
+/// the indicator with the SAME model call).
+///
+/// This replaced the `force_compact: bool` flag, which could carry the
+/// instruction "compact" but not the reason the mid-turn caller needed to
+/// report: an overflow recovery and a threshold check looked identical on the
+/// wire (and the flag never had a production caller until the overflow).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompactionTrigger {
+    pub reason: &'static str,
+    pub will_retry: bool,
 }
 
 /// The suite's `sudo_exec` state (the frame-free core's dependencies —
@@ -233,9 +252,20 @@ pub struct AgentLoop {
     /// The provider transcript (the `native_messages` content).
     messages: Vec<ChatMessage>,
     compactor: Compactor,
-    /// Set by `compact()` (a forced compaction before the next model
-    /// call).
-    force_compact: bool,
+    /// The "compact before the next model call" flag — read INSIDE a turn
+    /// (so only a path that runs in a turn can set it: the overflow recovery),
+    /// and carrying the `reason` / `will_retry` that recovery has to report.
+    /// A hand-triggered `/compact` does NOT use it — a command is an IDLE
+    /// action (`ControlCmd::Compact`).
+    ///
+    /// Its lifetime is ONE TURN, and `handle_turn` ENFORCES that by clearing it
+    /// on entry: both producers set it and `continue` straight to the loop top,
+    /// where the cancellation check runs FIRST, so a Stop that lands as the
+    /// overflow is handled settles the turn (`settle_cancelled`) without ever
+    /// taking the trigger — leaving it armed would make the NEXT prompt run the
+    /// canceled turn's overflow recovery (and, when that compaction shrinks
+    /// nothing, end the new turn as an error before its own model call).
+    force_compact: Option<CompactionTrigger>,
     /// The session's current context size in tokens (the `context_usage_
     /// update` frame source — the frontend's context-percentage display).
     ///
@@ -341,7 +371,7 @@ impl AgentLoop {
             thought_state: std::sync::Mutex::new(ThoughtState::default()),
             messages: Vec::new(),
             compactor,
-            force_compact: false,
+            force_compact: None,
             last_context_tokens: 0,
             read_boundary,
             protected,
@@ -514,11 +544,6 @@ impl AgentLoop {
             .clone()
     }
 
-    /// Force a compaction before the next model call.
-    pub fn compact(&mut self) {
-        self.force_compact = true;
-    }
-
     /// The loop body (the spawned tokio task): receive prompts (and
     /// control commands) until the session teardown or the queue closes.
     pub async fn run(mut self) {
@@ -572,6 +597,29 @@ impl AgentLoop {
                 cmd = self.control_queue.recv() => match cmd {
                     Some(ControlCmd::SetModel(m)) => self.set_model(m),
                     Some(ControlCmd::SetThinkingLevel(l)) => self.set_thinking_level(l),
+                    Some(ControlCmd::Compact { instructions }) => {
+                        // Arm a fresh TURN token here (never in
+                        // `WorkerCore::handle`: a `Compact` can arrive while a
+                        // turn is still in flight — the command QUEUES here —
+                        // and arming there would swap out the token that
+                        // in-flight turn is racing, so a Stop for it would be
+                        // silently lost). The existing Stop path
+                        // (`Inbound::Abort`) cancels whatever token is in the
+                        // shared mutex, so THIS is what makes an idle
+                        // compaction cancellable — `summarize` already races
+                        // `turn.cancelled()`. The cancelled token is left in
+                        // place: this `select!`'s turn-cancel arm re-arms it,
+                        // and `handle_prompt` arms its own fresh token per
+                        // prompt, so a cancel cannot leak into the next turn.
+                        let turn = {
+                            let fresh = CancellationToken::new();
+                            *self.turn_cancel.lock().unwrap_or_else(|p| p.into_inner()) =
+                                fresh.clone();
+                            fresh
+                        };
+                        self.run_compaction("manual", false, instructions, &turn)
+                            .await;
+                    }
                     None => break,
                 },
                 p = self.prompt_queue.recv() => match p {
@@ -642,6 +690,13 @@ impl AgentLoop {
     /// `ask` / `subagent` / `summarize` flows all race it — a cancel
     /// stops the turn, it is never waited out).
     async fn handle_turn(&mut self, turn: &CancellationToken, text: &str, images: &[ImageRef]) {
+        // A queued compaction belongs to the turn that queued it, and this turn
+        // has queued none: drop whatever a PREVIOUS turn left behind (see the
+        // field — a Stop racing an overflow recovery exits BEFORE the trigger is
+        // consumed). Without this the fresh prompt inherits the dead turn's
+        // `overflow` trigger, compacts for a reason it never hit, and — `run_compaction`
+        // having shrunk nothing — settles as an error without a model call.
+        self.force_compact = None;
         // The display `user` row is written SOLELY by the manager's
         // `send_prompt_with_images` (`record_message` — the command
         // delegates to it and adds no persistence of its own): the loop
@@ -701,6 +756,14 @@ impl AgentLoop {
         // suppresses it. A new model call after tool results resets it —
         // a new assistant message).
         let mut message_started = false;
+        // (ADR 0045) ONE compact-and-retry per overflow EPISODE. Reset when a
+        // model call SUCCEEDS (pi resets on `stopReason !== "error"`), because
+        // a long turn can cross the window more than once legitimately — a
+        // per-TURN guard would kill the second recovery, the one that would
+        // have been needed. Without this a provider that keeps overflowing (or
+        // a compaction that keeps failing) would loop compact → fail → compact
+        // forever inside a single turn.
+        let mut overflow_recovered = false;
         loop {
             if turn.is_cancelled() {
                 // A CANCELLED turn settles with `turn_end` +
@@ -709,13 +772,29 @@ impl AgentLoop {
                 self.settle_cancelled(std::mem::take(&mut turn_tool_results));
                 return;
             }
-            // (1) The `Compactor` (the context threshold or a forced
-            // `compact()`): a summary model call, the older messages
-            // replaced by the summary, `compaction_start` /
+            // (1) The `Compactor` (the context threshold) or a queued trigger
+            // (the overflow recovery): a summary model call, the older
+            // messages replaced by the summary, `compaction_start` /
             // `compaction_end` emitted.
-            if self.compactor.should_compact() || self.force_compact {
-                self.force_compact = false;
-                self.run_compaction(turn).await;
+            let trigger = self.force_compact.take();
+            let due = trigger.is_some() || self.compactor.should_compact();
+            if due {
+                let t = trigger.unwrap_or(CompactionTrigger {
+                    reason: "threshold",
+                    will_retry: false,
+                });
+                let shrank = self
+                    .run_compaction(t.reason, t.will_retry, None, turn)
+                    .await;
+                if t.reason == "overflow" && !shrank {
+                    // No doomed second request: the oversized prompt is exactly
+                    // what just failed, and a request that cannot succeed costs
+                    // a round trip. `run_compaction` has already emitted the
+                    // single `compaction_end` carrying the actionable
+                    // `error_message` — emit NOTHING here.
+                    self.settle_error(std::mem::take(&mut turn_tool_results));
+                    return;
+                }
             }
             // (2) The model call (the `RetryPolicy` wraps it — on
             // `ProviderError::Retryable`, exponential backoff up to 5
@@ -754,11 +833,31 @@ impl AgentLoop {
             self.retry = retry;
             let stream = match stream {
                 Ok(s) => s,
+                // (ADR 0045) The context window, hit head-on: retract the dead
+                // attempt (nothing was persisted), queue the forced compaction
+                // with the reason it must report, and go round again — the SAME
+                // turn, so the user types nothing. The retry ladder never sees
+                // this tier (`context_overflow_is_never_retried`), so the
+                // compaction is the only mechanism claiming it, and
+                // `overflow_recovered` bounds it to one attempt per episode.
+                Err(ProviderError::ContextOverflow(_)) if !overflow_recovered => {
+                    overflow_recovered = true;
+                    self.compactor.turn_abandoned(&self.messages);
+                    self.force_compact = Some(CompactionTrigger {
+                        reason: "overflow",
+                        will_retry: true,
+                    });
+                    continue;
+                }
                 Err(e) => {
                     // The retry budget is exhausted (or a non-retryable
                     // error) — end the turn (finding 7: settle with
                     // `turn_end` + `agent_settled`, so the timeline closes
-                    // cleanly).
+                    // cleanly). ALSO the give-up path for a SECOND overflow (a
+                    // retry that failed again, or one after a recovery that
+                    // already happened): the ladder has no more answers, and
+                    // the transcript line the compaction printed is the last
+                    // word the user gets.
                     eprintln!("harness: model call failed: {e}");
                     self.settle_error(std::mem::take(&mut turn_tool_results));
                     return;
@@ -935,10 +1034,33 @@ impl AgentLoop {
                 self.settle_error(std::mem::take(&mut turn_tool_results));
                 return;
             }
+            // (ADR 0045) A mid-stream overflow (the ONLY producer is
+            // `map_anthropic_error`: a provider can accept the request and fail
+            // it once it has read the prompt). Intercepted HERE — where
+            // `mid_stream_error` is HANDLED — not at the capture site inside
+            // the consumption loop, where a `continue` would re-poll the same
+            // dying stream. Safe to loop back from here: `turn_tool_results`
+            // intentionally survives a loop-back (the mid-stream RETRY above
+            // does the same), `message_started` stays `true` so the retried
+            // call reuses the `message_start` already announced, and the
+            // compaction emits its own `context_usage_update`.
+            if let Some(ProviderError::ContextOverflow(_)) = &mid_stream_error {
+                if !overflow_recovered {
+                    overflow_recovered = true;
+                    self.compactor.turn_abandoned(&self.messages);
+                    self.force_compact = Some(CompactionTrigger {
+                        reason: "overflow",
+                        will_retry: true,
+                    });
+                    continue; // binds to the TURN loop from here
+                }
+            }
             if let Some(e) = mid_stream_error {
                 // A non-retryable mid-stream error — end the turn (finding
                 // 7: settle with `turn_end` + `agent_settled`, so the
-                // timeline closes cleanly).
+                // timeline closes cleanly). A SECOND overflow lands here too
+                // (the guard is spent): the actionable line the compaction
+                // emitted already told the user what to do.
                 eprintln!("harness: mid-stream model error: {e}");
                 self.settle_error(std::mem::take(&mut turn_tool_results));
                 return;
@@ -973,6 +1095,11 @@ impl AgentLoop {
             // The assistant message is now in the transcript, so the
             // context is re-anchored on it (the usage anchor + the tail).
             self.note_context();
+            // (ADR 0045) The model call SUCCEEDED, so the overflow episode is
+            // over: a later call in this same turn that crosses the window
+            // again gets its own compact-and-retry (the guard bounds one
+            // EPISODE, not one turn).
+            overflow_recovered = false;
 
             if tool_calls.is_empty() {
                 // (5) The turn is done.
@@ -1623,23 +1750,80 @@ impl AgentLoop {
     /// the `compaction_start` / `compaction_end` `RpcEvent` emission (which
     /// needs the loop's `normalize` / display-persistence pipeline) and the
     /// post-compaction `context_usage_update` frame.
-    async fn run_compaction(&mut self, turn: &CancellationToken) {
+    ///
+    /// `reason` is the TRIGGER (`manual` for `/compact`, `threshold` for the
+    /// context-pressure check, `overflow` for a provider context-overflow
+    /// recovery) — it rides both events and the renderer's `compaction_update`
+    /// state frame. `will_retry` is the event's "the turn continues on the
+    /// other side of this compaction" flag. `instructions` are the user's
+    /// extra summary instructions (`/compact <args>`); the automatic paths
+    /// (threshold / overflow) pass `None`.
+    ///
+    /// Returns whether the transcript actually SHRANK (`Compacted` — the older
+    /// messages were replaced by a summary): `Skipped` (nothing old enough to
+    /// summarize) and `Failed` (the summary call errored, the transcript is
+    /// intact) both shrink nothing. A caller recovering from an overflow reads
+    /// this to decide whether a second request is worth sending at all.
+    ///
+    /// For `reason: "overflow"` the SAME `compaction_end` also carries an
+    /// ACTIONABLE `error_message` when the transcript did not shrink (ADR 0045):
+    /// the caller settles the turn right there, so the one event the user sees
+    /// must say what to do (a larger window, or that the summary call failed and
+    /// the transcript is unchanged). It is composed HERE rather than by the
+    /// caller because this is the only place that emits `compaction_end` — a
+    /// second one would double the transcript line and the state frame.
+    async fn run_compaction(
+        &mut self,
+        reason: &str,
+        will_retry: bool,
+        instructions: Option<String>,
+        turn: &CancellationToken,
+    ) -> bool {
         self.emit(RpcEvent::compaction_start {
-            reason: "context_limit".to_string(),
+            reason: reason.to_string(),
         });
         let mut aborted = false;
         let mut error_message: Option<String> = None;
+        // The overflow recovery's outcome needs a DIFFERENT message from the
+        // transient ones (below): the caller has already decided not to send
+        // another request, so the user is the only one who can act.
+        let overflow = reason == "overflow";
+        // Whether the rewrite happened (the return value — see above).
+        let mut shrank = false;
+        // The keep-recent budget comes from the COMPACTOR (its config copy +
+        // THIS model's window), not from `catalog.compaction` directly: the
+        // catalog budget is catalog-wide while the window is per-model, and an
+        // uncapped budget can cover the whole transcript of a small-window
+        // model — a compaction that shrinks nothing (see `keep_budget`).
+        // Computed BEFORE the ctx: `keep_budget(&self)` must not overlap the
+        // `compactor: &mut self.compactor` borrow.
+        let keep_recent_tokens = self.compactor.keep_budget();
         let mut ctx = compact::CompactionCtx {
             session_id: &self.session_id,
             model: &self.model,
             provider: &*self.provider,
             store: &self.store,
-            keep_recent_tokens: self.catalog.compaction.keep_recent_tokens,
+            keep_recent_tokens,
+            instructions,
             compactor: &mut self.compactor,
         };
         match compact::run_compaction(&mut ctx, &mut self.messages, turn).await {
-            compact::CompactionOutcome::Skipped => {}
+            compact::CompactionOutcome::Skipped => {
+                // (ADR 0045) An overflow that found NOTHING old enough to
+                // summarize is a dead end the user can act on (only a bigger
+                // window fixes it), so the ONE `compaction_end` carries that
+                // sentence instead of leaving the caller to invent a second
+                // event. `aborted` stays `false` — a `Skipped` compaction is
+                // not an abort, nothing failed.
+                if overflow {
+                    error_message = Some(
+                        "Context overflow: not enough older context to compact — try a larger-context model."
+                            .to_string(),
+                    );
+                }
+            }
             compact::CompactionOutcome::Compacted { context_tokens } => {
+                shrank = true;
                 // The re-estimate is the post-compaction BASELINE (the
                 // `context_usage_update` frame — the percentage drops
                 // after the compaction instead of staying at the
@@ -1649,16 +1833,26 @@ impl AgentLoop {
             }
             compact::CompactionOutcome::Failed { error } => {
                 aborted = true;
-                error_message = Some(error);
+                // An overflow's failure says what it cost: the transcript was
+                // left AS-IS, so the next call would fail exactly the same way
+                // (the caller acts on that by NOT sending it).
+                error_message = Some(if overflow {
+                    format!(
+                        "Context overflow: the summary call failed ({error}) — the transcript was left unchanged."
+                    )
+                } else {
+                    error
+                });
             }
         }
         self.emit(RpcEvent::compaction_end {
-            reason: "context_limit".to_string(),
+            reason: reason.to_string(),
             result: None,
             aborted,
-            will_retry: false,
+            will_retry,
             error_message,
         });
+        shrank
     }
 
     /// The model request (the `messages` vec + the tool specs + the
@@ -2252,6 +2446,57 @@ mod tests {
         ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
         {
             Err(self.error.clone())
+        }
+    }
+
+    /// A `Provider` that plays canned `ProviderEvent`s per `complete` call
+    /// (`scripts[i]` for the i-th call, out of range repeats the last), EXCEPT
+    /// that the calls numbered in `overflow_on` fail PRE-STREAM with a
+    /// `ContextOverflow` — the exact value `transport::map_status` hands back
+    /// for a context-length 400 (ADR 0045). `calls` counts EVERY invocation,
+    /// including the compaction summary's, which is how the give-up test knows
+    /// no doomed request was spent.
+    struct OverflowingProvider {
+        calls: Arc<AtomicU32>,
+        overflow_on: Vec<u32>,
+        scripts: Vec<Vec<ProviderEvent>>,
+    }
+
+    impl OverflowingProvider {
+        fn new(overflow_on: &[u32], scripts: Vec<Vec<ProviderEvent>>) -> (Self, Arc<AtomicU32>) {
+            let calls = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    calls: calls.clone(),
+                    overflow_on: overflow_on.to_vec(),
+                    scripts,
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for OverflowingProvider {
+        async fn complete(
+            &self,
+            _req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.overflow_on.contains(&i) {
+                return Err(ProviderError::ContextOverflow(
+                    "status 400: {\"error\":{\"message\":\"prompt is too long: 213462 tokens > 200000 maximum\"}}"
+                        .to_string(),
+                ));
+            }
+            let script = self
+                .scripts
+                .get(i as usize)
+                .or_else(|| self.scripts.last())
+                .cloned()
+                .unwrap_or_default();
+            Ok(futures_util::stream::iter(script).boxed())
         }
     }
 
@@ -3083,8 +3328,17 @@ mod tests {
                 tool_calls: None,
             })
             .collect();
-        loop_.force_compact = true;
-        loop_.run_compaction(&CancellationToken::new()).await;
+        loop_.force_compact = Some(CompactionTrigger {
+            reason: "threshold",
+            will_retry: false,
+        });
+        // The failed compaction shrinks nothing (the wrapper's return).
+        assert!(
+            !loop_
+                .run_compaction("threshold", false, None, &CancellationToken::new())
+                .await,
+            "a failed compaction rewrote nothing"
+        );
         // The summary failed: the transcript is UNCHANGED (NOT replaced
         // by a truncated summary + a rewritten `native_messages`).
         assert_eq!(loop_.messages.len(), 3, "the transcript is intact");
@@ -3110,6 +3364,668 @@ mod tests {
         };
         assert!(aborted, "the compaction was aborted");
         assert!(error_message.is_some(), "the error was reported");
+    }
+
+    /// A compaction the `Compactor` SKIPPED (the transcript is under the
+    /// keep-recent budget: `older` is empty, so no summary call is made and
+    /// nothing is rewritten) reports that the transcript did NOT shrink.
+    /// The wrapper's return value is "the transcript shrank" — the signal a
+    /// caller reads to decide whether a second request over the shrunken
+    /// context is worth sending at all.
+    #[tokio::test]
+    async fn a_skipped_compaction_reports_no_shrink() {
+        // An empty script: a skipped compaction makes NO model call, so the
+        // test would also catch a summary call that should not have happened.
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        // Two tiny messages — far under the keep-recent budget, so nothing is
+        // old enough to summarize.
+        loop_.messages = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        let len_before = loop_.messages.len();
+        assert!(
+            !loop_
+                .run_compaction("threshold", false, None, &CancellationToken::new())
+                .await,
+            "a skipped compaction shrank nothing"
+        );
+        assert_eq!(loop_.messages.len(), len_before, "the transcript is intact");
+    }
+
+    /// Collect events until `pred` matches (bounded — a missing event is a
+    /// test failure, not a hang). Unlike `event_kinds` this keeps EVERY event
+    /// it saw, so the caller can also assert what did NOT arrive.
+    async fn collect_events_until(
+        rx: &mut mpsc::UnboundedReceiver<RpcEvent>,
+        pred: impl Fn(&RpcEvent) -> bool,
+    ) -> Vec<RpcEvent> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(ev)) => {
+                    let hit = pred(&ev);
+                    events.push(ev);
+                    if hit {
+                        return events;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        events
+    }
+
+    /// A transcript large enough that `older` is non-empty (three ~20 000
+    /// token messages — over the default `keep_recent_tokens` budget), so a
+    /// compaction actually attempts the summary call.
+    fn large_transcript(n: usize) -> Vec<ChatMessage> {
+        (0..n)
+            .map(|i| ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text(format!("m{i}{}", "x".repeat(80000))),
+                tool_call_id: None,
+                tool_calls: None,
+            })
+            .collect()
+    }
+
+    /// A transcript FAR under the keep-recent budget, so a compaction has
+    /// nothing old enough to summarize (`older` empty → `Skipped` → nothing
+    /// shrinks) — the shape an overflow recovery cannot rescue.
+    fn tiny_transcript() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ]
+    }
+
+    /// (ADR 0045) A context-length 400 is recovered INSIDE the turn: the dead
+    /// attempt is retracted, a forced compaction runs, and the SAME model call
+    /// is re-issued — the user types nothing (pre-fix the `Fatal` it used to be
+    /// settled the turn and left a dead transcript to nudge with "continue").
+    /// This is the PRE-STREAM path (`transport::map_status` decides the tier).
+    #[tokio::test]
+    async fn a_context_overflow_error_compacts_and_retries_the_turn() {
+        let (provider, calls) = OverflowingProvider::new(
+            &[0],
+            vec![vec![
+                ProviderEvent::TextDelta("ok".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]],
+        );
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        // Large enough that `older` is non-empty, so the compaction SHRINKS and
+        // the retry is a request that can actually succeed.
+        loop_.messages = large_transcript(3);
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let events =
+            collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
+        let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+        // `reason` is the UI contract (ADR 0045) and `will_retry` is the loop's
+        // promise that the turn continues on the other side of the indicator.
+        let start: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                RpcEvent::compaction_start { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            start,
+            vec!["overflow".to_string()],
+            "exactly one compaction, for the overflow, got {kinds:?}"
+        );
+        let end = events.iter().find_map(|e| match e {
+            RpcEvent::compaction_end {
+                reason,
+                will_retry,
+                error_message,
+                aborted,
+                ..
+            } => Some((reason.clone(), *will_retry, *aborted, error_message.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            end,
+            Some(("overflow".to_string(), true, false, None)),
+            "the end frame repeats the reason and the retry promise; a compaction that SHRANK has no actionable error"
+        );
+
+        // NO error settle: the turn ends the SUCCESSFUL way (`agent_end` then
+        // `turn_end`) — an error settle emits `turn_end` with NO `agent_end`.
+        let agent_end = kinds.iter().position(|k| k == "agent_end");
+        let turn_end = kinds.iter().position(|k| k == "turn_end");
+        assert!(
+            matches!((agent_end, turn_end), (Some(a), Some(t)) if a < t),
+            "the recovered turn completed normally (agent_end then turn_end), got {kinds:?}"
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "turn_end").count(),
+            1,
+            "one settle for the turn, got {kinds:?}"
+        );
+        // The provider was called again — the overflowed call, the summary call,
+        // then the RETRIED model call.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the failed call + the summary + the retry"
+        );
+    }
+
+    /// The SAME recovery for a mid-stream overflow — an SSE `error` event INSIDE
+    /// the stream, which is what `map_anthropic_error` produces (a provider can
+    /// accept the request and then fail it once it has read the prompt). The
+    /// intercept sits where `mid_stream_error` is HANDLED (after the consumption
+    /// loop), not where it is captured: a `continue` at the capture site would
+    /// re-poll the same dying stream.
+    #[tokio::test]
+    async fn a_mid_stream_context_overflow_compacts_and_retries_the_turn() {
+        let (provider, calls) = ScriptedProvider::new(vec![
+            // The call that dies mid-stream, after partial text (no `Done`).
+            Some(vec![
+                ProviderEvent::TextDelta("parti".to_string()),
+                ProviderEvent::Error(ProviderError::ContextOverflow(
+                    "invalid_request_error: prompt is too long: 213462 tokens > 200000 maximum"
+                        .to_string(),
+                )),
+            ]),
+            // The summary call, then the retried model call.
+            Some(vec![
+                ProviderEvent::TextDelta("summary".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("recovered".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]),
+        ]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.messages = large_transcript(3);
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let events =
+            collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
+        let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RpcEvent::compaction_start { reason } if reason == "overflow"
+            )),
+            "the mid-stream overflow compacted the session, got {kinds:?}"
+        );
+        assert!(
+            matches!(
+                events.iter().find(|e| matches!(e, RpcEvent::compaction_end { .. })),
+                Some(RpcEvent::compaction_end {
+                    reason,
+                    will_retry: true,
+                    ..
+                }) if reason == "overflow"
+            ),
+            "the end frame carries reason: overflow + will_retry: true, got {kinds:?}"
+        );
+        // The retry happened, and it is the SAME assistant message: the loop-back
+        // keeps `message_started` true, so the already-announced `message_start`
+        // is reused (a second one would start a second bubble).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the dying call + the summary + the retry"
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "message_start").count(),
+            1,
+            "ONE message_start for the retried message, got {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "agent_end"),
+            "no error settle — the turn completed, got {kinds:?}"
+        );
+    }
+
+    /// The guard bounds one EPISODE, not one turn: a model call that SUCCEEDS
+    /// ends the episode (pi resets on `stopReason !== "error"`), so a later call
+    /// in the SAME turn that crosses the window again gets its own
+    /// compact-and-retry. A 60-call turn can cross the window more than once
+    /// legitimately, and a per-turn guard would kill the second recovery — the
+    /// one that would have been needed.
+    #[tokio::test]
+    async fn a_later_overflow_in_the_same_turn_gets_its_own_compact_and_retry() {
+        let summary = || {
+            vec![
+                ProviderEvent::TextDelta("summary".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        };
+        let (provider, calls) = OverflowingProvider::new(
+            &[0, 3],
+            vec![
+                summary(), // call 0: OVERFLOWED (entry unused)
+                summary(), // call 1: episode 1's summary
+                // call 2: a SUCCESSFUL model call (a `manage_todo_list` read —
+                // ungated, so the test needs no permission bridge) that ends
+                // episode 1 and keeps the turn alive for another model call.
+                vec![
+                    ProviderEvent::ToolCall(ToolCall {
+                        id: "t1".to_string(),
+                        name: "manage_todo_list".to_string(),
+                        arguments: json!({ "operation": "read" }),
+                    }),
+                    ProviderEvent::Done(FinishReason::ToolCalls),
+                ],
+                summary(), // call 3: OVERFLOWED again (entry unused)
+                summary(), // call 4: episode 2's summary
+                // call 5: the retry that lands.
+                vec![
+                    ProviderEvent::TextDelta("recovered twice".to_string()),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ],
+            ],
+        );
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.messages = large_transcript(3);
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let events =
+            collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
+        let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+        let starts: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                RpcEvent::compaction_start { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec!["overflow".to_string(), "overflow".to_string()],
+            "TWO episodes, TWO recoveries — the first successful model call reset the guard, got {kinds:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "2 overflowed calls + 2 summaries + the tool-calling call + the final retry"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "agent_end"),
+            "the turn still ended normally, got {kinds:?}"
+        );
+    }
+
+    /// When the compaction CANNOT shrink the transcript (`Skipped` — the kept
+    /// tail alone is what is over the window) the turn settles there with the
+    /// actionable message and NO second request: the oversized prompt that just
+    /// failed is exactly what a retry would re-send, so a request that cannot
+    /// succeed would only cost a round trip. ONE `compaction_end` (the
+    /// actionable line rides on it — `run_compaction` emits the single one).
+    #[tokio::test]
+    async fn a_second_overflow_after_a_failed_recovery_gives_up_without_a_second_request() {
+        // EVERY call overflows (more of them than this turn could ever make);
+        // the empty script also pins that no summary call is spent on a
+        // compaction that has nothing to summarize.
+        let (provider, calls) = OverflowingProvider::new(&[0, 1, 2, 3, 4], vec![Vec::new()]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(AllEventsSink {
+            events: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let captured = sink.events.clone();
+        let (mut loop_, _db) = build_loop_with_sink(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+            vec![fake_model("m1")],
+            None,
+            sink,
+        );
+        // Too small to compact — `older` is empty.
+        loop_.messages = tiny_transcript();
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let events =
+            collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
+        let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "compaction_start").count(),
+            1,
+            "ONE compact-and-retry attempt per overflow episode, got {kinds:?}"
+        );
+        let ends: Vec<&RpcEvent> = events
+            .iter()
+            .filter(|e| matches!(e, RpcEvent::compaction_end { .. }))
+            .collect();
+        assert_eq!(
+            ends.len(),
+            1,
+            "exactly one compaction_end — a second one would double the transcript line and the state frame, got {kinds:?}"
+        );
+        let RpcEvent::compaction_end {
+            reason,
+            will_retry,
+            error_message,
+            aborted,
+            ..
+        } = ends[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(reason, "overflow");
+        assert!(will_retry, "the trigger was the overflow recovery");
+        assert!(
+            !aborted,
+            "a Skipped compaction is not an abort (nothing failed — there was nothing to summarize)"
+        );
+        assert_eq!(
+            error_message.as_deref(),
+            Some(
+                "Context overflow: not enough older context to compact — try a larger-context model."
+            ),
+            "the user gets an actionable line, not a provider string"
+        );
+
+        // The transcript line the normalize arm produced for that event: ONE
+        // `Compaction failed: …` chunk, and no weld with the success line.
+        let lines: Vec<String> = captured
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(event, _)| event == "session-update")
+            .filter_map(|(_, payload)| {
+                payload["update"]["content"]["text"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .filter(|t| t.starts_with("Compact"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Compacting context…".to_string(),
+                "Compaction failed: Context overflow: not enough older context to compact — try a larger-context model.".to_string(),
+            ],
+            "the failure line REPLACES `Compaction finished` (two system chunks would weld)"
+        );
+
+        // No doomed second request: the overflowed call was the ONLY model call
+        // (the skipped compaction spent none either), and the turn settled as an
+        // error (`turn_end` + `agent_settled`, no `agent_end`).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the retry is not re-issued when the compaction shrank nothing"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == "agent_end"),
+            "the turn settled as a failure, got {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "turn_end"),
+            "the failed turn's timeline still closes, got {kinds:?}"
+        );
+    }
+
+    /// The queued overflow trigger belongs to the turn that queued it. A Stop
+    /// that lands while an overflow is being handled ends the turn at the
+    /// cancellation check at the TOP of the loop — which runs BEFORE the
+    /// trigger the overflow just queued is taken — so a trigger set on the
+    /// LOOP survived the settle. The next prompt then took it: the fresh turn
+    /// compacted under the PREVIOUS turn's `overflow` reason and, that
+    /// compaction having nothing to shrink, settled as an error WITHOUT ever
+    /// calling the model — the user's new prompt died for an overflow it never
+    /// had.
+    #[tokio::test]
+    async fn a_stale_overflow_trigger_does_not_hijack_the_next_turn() {
+        let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("hi".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        // The leak, spelled out: the PREVIOUS turn was cancelled after its
+        // overflow queued this trigger, so it is still armed on the loop.
+        loop_.force_compact = Some(CompactionTrigger {
+            reason: "overflow",
+            will_retry: true,
+        });
+        loop_.handle_prompt(&text_prompt("hello")).await;
+        let events =
+            collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
+        let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+        assert!(
+            !kinds.iter().any(|k| k == "compaction_start"),
+            "a trigger a PREVIOUS turn queued compacts nothing on this one, got {kinds:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the new prompt made its OWN model call instead of dying on the stale trigger"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "agent_end"),
+            "the new turn ran to completion, got {kinds:?}"
+        );
+    }
+
+    /// ADR 0044's `/compact`: the `Compact` CONTROL command compacts with NO
+    /// turn in flight. The composer is locked during a turn, so a
+    /// hand-triggered compaction is ALWAYS an idle action — the idle control
+    /// channel is the channel that reaches the loop. The observable is the
+    /// event pair on the `events` channel, in order, with `reason:
+    /// "manual"` — and nothing else (the command is NOT a prompt: no turn).
+    #[tokio::test]
+    async fn a_compact_control_command_compacts_when_idle() {
+        // The transcript is under the keep-recent budget, so the compaction is
+        // SKIPPED — both frames still fire, and the empty script pins that no
+        // model call happened.
+        let (provider, calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            Arc::new(StdMutex::new(CancellationToken::new())),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        loop_.messages = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: MessageContent::Text("u1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text("a1".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        let control_tx = loop_.control_tx.clone();
+        // The session token (the loop owns it — the clone ends `run()`).
+        let session_cancel = loop_.cancel.clone();
+        let join = tokio::spawn(loop_.run());
+
+        control_tx
+            .send(ControlCmd::Compact { instructions: None })
+            .await
+            .expect("the loop's control queue is open");
+        let events = collect_events_until(&mut events_rx, |e| {
+            matches!(e, RpcEvent::compaction_end { .. })
+        })
+        .await;
+        let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+        let start = kinds.iter().position(|k| k == "compaction_start");
+        let end = kinds.iter().position(|k| k == "compaction_end");
+        assert!(
+            matches!((start, end), (Some(s), Some(e2)) if s < e2),
+            "compaction_start THEN compaction_end, got {kinds:?}"
+        );
+        assert!(
+            events.iter().all(|e| match e {
+                RpcEvent::compaction_start { reason } | RpcEvent::compaction_end { reason, .. } =>
+                    reason == "manual",
+                _ => true,
+            }),
+            "a hand-triggered compaction carries the `manual` reason (ADR 0045), got {kinds:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(RpcEvent::compaction_end {
+                    aborted: false,
+                    will_retry: false,
+                    ..
+                })
+            ),
+            "the compaction ended cleanly and the loop goes back to idle"
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| k == "turn_start" || k == "turn_end" || k == "agent_settled"),
+            "the compact command is NOT a prompt — no turn ran, got {kinds:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a skipped compaction makes no model call"
+        );
+        session_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+    }
+
+    /// The Stop (Esc → `cancel_session` → `Inbound::Abort`) cancels whatever
+    /// token is in the shared `turn_cancel` mutex, so an IDLE compaction is
+    /// cancellable only because `run()`'s compact arm ARMS a fresh turn token
+    /// before compacting. A summary over a large history is bounded solely by
+    /// the transport's `read_timeout` *between bytes*, so this is the real
+    /// hang the arming defends.
+    #[tokio::test]
+    async fn abort_cancels_an_idle_compaction() {
+        // The single script is `None`: `complete` never resolves (the hanging
+        // call the turn-cancel tests use), so the summary is genuinely
+        // in flight when the Stop lands.
+        let (provider, _calls) = ScriptedProvider::new(vec![None]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+        let mut loop_ = build_loop(
+            Box::new(provider),
+            events_tx,
+            turn_cancel.clone(),
+            watch::channel(0u64).0,
+            RetryPolicy::new_with(5, Duration::from_millis(1)),
+        );
+        // Large enough that `older` is non-empty — the summary is attempted.
+        loop_.messages = large_transcript(3);
+        // The observation point for "the transcript is unchanged": a
+        // SUCCESSFUL compaction REWRITES the stored transcript
+        // (`replace_messages`), an aborted one writes nothing.
+        let store = loop_.store.clone();
+        let control_tx = loop_.control_tx.clone();
+        let session_cancel = loop_.cancel.clone();
+        let join = tokio::spawn(loop_.run());
+
+        control_tx
+            .send(ControlCmd::Compact { instructions: None })
+            .await
+            .expect("the loop's control queue is open");
+        wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::compaction_start { .. })
+        })
+        .await
+        .expect("the idle compaction started");
+        // The Stop: `Inbound::Abort` cancels the token in the SHARED mutex —
+        // which is the FRESH token `run()`'s arm armed for this compaction.
+        turn_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .cancel();
+        let end = wait_for_event(&mut events_rx, 5000, |e| {
+            matches!(e, RpcEvent::compaction_end { .. })
+        })
+        .await
+        .expect("the cancelled compaction still ended");
+        assert!(
+            matches!(
+                &end,
+                RpcEvent::compaction_end {
+                    aborted: true,
+                    reason,
+                    ..
+                } if reason == "manual"
+            ),
+            "the compaction ended ABORTED with the manual reason, got {end:?}"
+        );
+        assert!(
+            store.load_messages("s1").expect("load_messages").is_empty(),
+            "an aborted compaction rewrote NOTHING (a failed compaction is never a lost context)"
+        );
+        session_cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
     }
 
     /// (ADR 0017) `prepend_system` PERSISTS the leading system message at
@@ -3807,7 +4723,10 @@ mod tests {
         });
         // Call 1 (turn 1): a usage report, then `Done(Error)` — with a
         // ONE-attempt budget the turn settles FAILED after that single call,
-        // never pushing a reply. Call 2 (turn 2): an ordinary usage-less
+        // never pushing a reply. Call 2 (turn 2): the compaction SUMMARY (the
+        // window is 16 684 against the default 16 384 reserve, so the derived
+        // keep-recent budget is 0 and the due compaction is a REAL one — see
+        // `Compactor::keep_budget`). Call 3 (turn 2): an ordinary usage-less
         // reply.
         let (provider, calls) = ScriptedProvider::new(vec![
             Some(vec![
@@ -3816,6 +4735,10 @@ mod tests {
                     output_tokens: 50,
                 }),
                 ProviderEvent::Done(FinishReason::Error),
+            ]),
+            Some(vec![
+                ProviderEvent::TextDelta("SUMMARY".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
             ]),
             Some(vec![
                 ProviderEvent::TextDelta("hi".to_string()),
@@ -3857,6 +4780,11 @@ mod tests {
         );
         let prompt_estimate = compact::estimate_context(&loop_.messages[1..2]);
         assert_eq!(prompt_estimate, 1001, "the prompt alone is 1001 tokens");
+        assert!(
+            compact::is_compaction_summary(&loop_.messages[0]),
+            "the due compaction SHRANK the transcript — the summary leads, and the prompt \
+             it kept (a budget of 0 keeps the last message) follows it"
+        );
         let frames: Vec<Value> = updates
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -3873,8 +4801,9 @@ mod tests {
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "one failed call, then turn 2's reply"
+            3,
+            "one failed call, then turn 2's summary and reply — the measurement reconcile \
+             still retries nothing",
         );
     }
 
@@ -4100,7 +5029,19 @@ mod tests {
             vec![fake_model("m1")],
             None,
         );
-        loop_.catalog.compaction.keep_recent_tokens = 1;
+        // The keep-recent budget is read from the COMPACTOR (its config copy +
+        // THIS model's window), not from `catalog.compaction` after
+        // `AgentLoop::new`, so mutating the catalog here would be inert: a 128k
+        // window affords the full 20 000, `older` comes back empty and the
+        // compaction is skipped. Replace the compactor so the budget lands where
+        // production reads it.
+        loop_.compactor = Compactor::new(
+            CompactionConfig {
+                keep_recent_tokens: 1,
+                ..Default::default()
+            },
+            128_000,
+        );
         loop_.load_transcript(vec![
             ChatMessage {
                 role: ChatRole::User,
@@ -4127,7 +5068,28 @@ mod tests {
                 tool_calls: None,
             },
         ]);
-        loop_.run_compaction(&CancellationToken::new()).await;
+        // The compaction REALLY shrank the transcript (the wrapper's return).
+        assert!(
+            loop_
+                .run_compaction("threshold", false, None, &CancellationToken::new())
+                .await,
+            "a compaction that rewrote the transcript shrank it"
+        );
+        // The compaction REALLY ran — it is not a `Skipped` whose only frame is
+        // the one `load_transcript` already emitted (which would make the frame
+        // assertions below tautological): the 4-message transcript is now the
+        // summary + the kept tail.
+        assert_eq!(
+            loop_.messages.len(),
+            2,
+            "the compaction rewrote the 4-message transcript to the summary + the kept \
+             tail, got {} messages",
+            loop_.messages.len()
+        );
+        assert!(
+            loop_.messages.iter().any(compact::is_compaction_summary),
+            "the rewritten transcript carries the compaction summary"
+        );
         let frame = last_context_usage_frame(&updates)
             .expect("a context_usage_update frame was emitted after the compaction");
         // The emitted value is the compactor's re-estimated (post-compaction)

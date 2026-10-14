@@ -65,7 +65,11 @@ impl OpenAiCompatibleProvider {
     /// malformed body) stays the `Fatal` it always was and is NOT re-tried.
     /// A false positive — a 400 whose text happens to name the field for
     /// another reason — costs one extra request and then loses usage
-    /// reporting for this session, where the loop's local estimate takes over.
+    /// reporting for this session, where the loop's local estimate takes
+    /// over. The ONE tier that is never eligible is `ContextOverflow` (ADR
+    /// 0045): its body names `stream_options` as often as not (a proxy that
+    /// echoes the request it rejected), and re-issuing the oversized prompt
+    /// cannot succeed.
     async fn send_model_request(
         &self,
         client: &reqwest::Client,
@@ -92,8 +96,14 @@ impl OpenAiCompatibleProvider {
         // The retry is gated on BOTH halves: a client error (a 4xx →
         // `Fatal` — a 429/5xx is the `Retryable` the `RetryPolicy` already
         // handles, and re-issuing here would skip its backoff) that NAMES
-        // the field.
+        // the field. The overflow tier is excluded BY NAME (ADR 0045), not
+        // merely by not being a `Fatal`: re-issuing an oversized prompt just
+        // re-sends the oversized bytes, and latching would drop usage
+        // reporting for the whole session — the very signal the context bar
+        // and the compaction threshold read. Naming the tier here keeps that
+        // true whatever the tier gate becomes.
         if !stream_options
+            || matches!(err, ProviderError::ContextOverflow(_))
             || !matches!(err, ProviderError::Fatal(_))
             || !is_stream_options_rejection(&err)
         {
@@ -575,6 +585,9 @@ mod tests {
     use super::super::types::{ChatMessage, ChatRole, MessageContent, ModelOptions, ToolSpec};
     use super::*;
     use crate::agent::tools::{ContentBlock, ImageRef};
+    // Test-only (the raw-server request counter): importing it at the module
+    // head would be an unused import in the non-test build.
+    use std::sync::atomic::AtomicU32;
 
     /// Build an `SseStream` over RAW byte chunks (the `&str` helper below
     /// cannot split a multi-byte codepoint mid-byte — `&str` is valid
@@ -732,6 +745,37 @@ mod tests {
                 ProviderEvent::TextDelta("x".to_string()),
                 ProviderEvent::Usage(Usage {
                     input_tokens: 10,
+                    output_tokens: 5,
+                }),
+                ProviderEvent::Done(FinishReason::Error),
+            ]
+        );
+    }
+
+    /// (ADR 0046) The ANTI-DOUBLE-COUNT pin. On this wire `prompt_tokens`
+    /// is ALREADY the whole prompt — cached tokens included — and
+    /// `prompt_tokens_details.cached_tokens` is a SUBSET of it, so the
+    /// count passes through UNCHANGED and the detail is NOT read at all.
+    /// (The Anthropic wire reports its cache fields as DISJOINT parts and
+    /// DOES sum them; copying that "for consistency" here would add the
+    /// entire cached prefix a second time, over-read the **Anchor** and
+    /// make compaction arrive EARLY — that tempting edit is exactly what
+    /// this test exists to break.)
+    #[tokio::test]
+    async fn sse_usage_does_not_add_the_cached_tokens_detail() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\n\
+             data: [DONE]\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                // A `usage`-only chunk carries an EMPTY `choices`, so the
+                // only events are the `Usage` and the synthetic `Done`
+                // (no `finish_reason` arrived).
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 1000,
                     output_tokens: 5,
                 }),
                 ProviderEvent::Done(FinishReason::Error),
@@ -1136,5 +1180,134 @@ mod tests {
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    // ── the `stream_options` latch vs the overflow tier (ADR 0045) ──────
+
+    /// A raw HTTP server that answers EVERY request with `status` + `body` and
+    /// counts what it served. The COUNT is the observable: a latch that fires
+    /// re-issues the request, so "exactly one request" is what "the latch did
+    /// not fire" looks like from outside.
+    async fn rejecting_server(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<AtomicU32>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the listener binds");
+        let addr = listener.local_addr().expect("the listener has an address");
+        let hits = std::sync::Arc::new(AtomicU32::new(0));
+        let hits_task = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                hits_task.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let mut data = Vec::new();
+                while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                }
+                let head = format!(
+                    "HTTP/1.1 {status} Nope\r\ncontent-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+        (addr, hits, server)
+    }
+
+    /// A streaming request (the latch only applies to one — `stream_options`
+    /// is what the first streaming call asks for).
+    fn streaming_request() -> ModelRequest {
+        ModelRequest {
+            model: "m/1".to_string(),
+            messages: vec![],
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: true,
+            },
+            session_id: None,
+        }
+    }
+
+    /// (ADR 0045) A context-overflow 400 must NEVER trip the
+    /// `stream_options` retry-and-latch, even when its body names BOTH the
+    /// field and the overflow (a LiteLLM-style proxy echoing the request it
+    /// rejected). The re-issue is pointless — the same oversized bytes fail
+    /// the same way — and latching silently loses usage reporting for the
+    /// rest of the session, which is the one signal the context bar and the
+    /// compaction threshold read. The error surfaces untouched so the loop can
+    /// compact instead.
+    #[tokio::test]
+    async fn a_context_overflow_never_trips_the_stream_options_latch() {
+        let body = r#"{"error":{"message":"Unrecognized field: stream_options — and prompt is too long: 213462 tokens > 200000 maximum"}}"#;
+        let (addr, hits, server) = rejecting_server(400, body).await;
+        let provider = OpenAiCompatibleProvider::new(format!("http://{addr}/v1"), "k".to_string());
+        let err = match provider.complete(&streaming_request()).await {
+            Ok(_) => panic!("a 400 is an error"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ProviderError::ContextOverflow(_)),
+            "the overflow body decides the tier, got {err:?}"
+        );
+        // Give a re-issue (which would be immediate) the chance to land.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the overflow is returned untouched — no re-issue without `stream_options`"
+        );
+        assert!(
+            provider.accepts_stream_options.load(Ordering::Relaxed),
+            "the latch stays closed: usage reporting survives the overflow"
+        );
+        server.abort();
+    }
+
+    /// The OTHER half of the pin: the latch still works for the case it
+    /// exists for (a plain `Fatal` 400 that names the field) — so the overflow
+    /// exclusion cannot quietly disable it for everything.
+    #[tokio::test]
+    async fn a_fatal_stream_options_rejection_still_latches() {
+        let body = r#"{"error":{"message":"Unrecognized field: stream_options"}}"#;
+        let (addr, hits, server) = rejecting_server(400, body).await;
+        let provider = OpenAiCompatibleProvider::new(format!("http://{addr}/v1"), "k".to_string());
+        let err = match provider.complete(&streaming_request()).await {
+            Ok(_) => panic!("both requests are rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ProviderError::Fatal(_)),
+            "a field rejection is still Fatal, got {err:?}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the rejection is re-issued once, without the field"
+        );
+        assert!(
+            !provider.accepts_stream_options.load(Ordering::Relaxed),
+            "and the omission is latched for this instance"
+        );
+        server.abort();
     }
 }

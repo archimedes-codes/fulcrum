@@ -60,6 +60,15 @@ pub enum Inbound {
     },
     #[serde(rename = "abort")]
     Abort,
+    /// `/compact` (ADR 0044 — a Composer command the CLIENT intercepts, so
+    /// this frame is the ONLY way a hand-triggered compaction reaches the
+    /// harness). An idle-time control frame: the Worker forwards it to the
+    /// loop's control queue, which `run()` polls only BETWEEN turns, so a
+    /// command sent mid-turn queues behind the turn. `instructions` are the
+    /// user's extra summary instructions (`/compact <args>`; `None` for a bare
+    /// `/compact`).
+    #[serde(rename = "compact", rename_all = "camelCase")]
+    Compact { instructions: Option<String> },
     #[serde(rename = "close")]
     Close,
     /// The REAL outcome (3-option UI: `Selected { option_id }` ∈
@@ -328,6 +337,7 @@ pub fn decode_inbound(line: &str) -> Result<Inbound, ProtoError> {
         "start"
         | "prompt"
         | "config"
+        | "compact"
         | "abort"
         | "close"
         | "permission-response"
@@ -468,6 +478,9 @@ mod tests {
                 model: Some(test_model()),
                 thinking: Some("low".to_string()),
                 trusted: Some(true),
+            },
+            Inbound::Compact {
+                instructions: Some("keep the tests".to_string()),
             },
             Inbound::Abort,
             Inbound::Close,
@@ -653,6 +666,32 @@ mod tests {
                 }
                 other => panic!("expected `Event`, got {other:?}"),
             }
+        }
+    }
+
+    /// `decode_inbound` routes a `compact` line to the `Compact` variant.
+    /// PINNED on purpose: the decoder matches an EXPLICIT `type` allow-list
+    /// and sends everything else to `Unknown { raw }`, so a `compact` frame
+    /// that is not in that list is a SILENT no-op over real IPC while the
+    /// raw-serde round-trip above still passes.
+    #[test]
+    fn decode_inbound_routes_a_compact_line_to_the_compact_variant() {
+        let line = r#"{"type": "compact", "instructions": "keep the tests"}"#;
+        match decode_inbound(line).expect("the `compact` line decodes") {
+            Inbound::Compact { instructions } => assert_eq!(
+                instructions.as_deref(),
+                Some("keep the tests"),
+                "the user's extra summary instructions ride the frame"
+            ),
+            other => panic!(
+                "`compact` must decode to `Inbound::Compact`, got {other:?} \
+                 (the `decode_inbound` type allow-list is missing `compact`)"
+            ),
+        }
+        // A bare `/compact` carries no extra instructions.
+        match decode_inbound(r#"{"type": "compact"}"#).expect("a bare `compact` decodes") {
+            Inbound::Compact { instructions } => assert_eq!(instructions, None),
+            other => panic!("expected `Compact`, got {other:?}"),
         }
     }
 

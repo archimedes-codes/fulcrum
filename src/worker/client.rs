@@ -507,6 +507,15 @@ impl WorkerHandle {
         self.send_inbound_frame(Inbound::Abort)
     }
 
+    /// A `/compact` (ADR 0044): the idle-time compaction command. The Worker
+    /// forwards it to the loop's control queue (`instructions` = the user's
+    /// extra summary instructions, `None` for a bare `/compact`). The return
+    /// is "the frame was written", NOT "the transcript shrank" — the outcome
+    /// rides the event stream.
+    pub fn send_compact(&self, instructions: Option<String>) -> Result<(), WorkerError> {
+        self.send_inbound_frame(Inbound::Compact { instructions })
+    }
+
     /// The session close (the Worker self-exits 0 — the Supervisor does
     /// NOT close the stdin pipe on `Close`).
     pub fn send_close(&self) -> Result<(), WorkerError> {

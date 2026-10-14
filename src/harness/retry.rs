@@ -1,9 +1,12 @@
 //! The provider retry policy (native-agent-harness Task 6): on
 //! `ProviderError::Retryable`, exponential backoff (1s, 2s, 4s, … up to
 //! 5 attempts) re-calling the model; `Fatal` / `Auth` are returned
-//! verbatim. Emits `auto_retry_start` / `auto_retry_end` (the loop
-//! passes the event emitter in — `auto_retry_end { success: true }` is
-//! the loop's, via [`RetryPolicy::note_success`]; the exhaustion
+//! verbatim — and so is `ContextOverflow` (ADR 0045: an oversized prompt is
+//! NOT the ladder's to fix, retrying re-sends the identical oversized bytes,
+//! so the `AgentLoop` recovers it IN the turn with a forced compaction — see
+//! `context_overflow_is_never_retried`). Emits `auto_retry_start` /
+//! `auto_retry_end` (the loop passes the event emitter in — `auto_retry_end { success: true }`
+//! is the loop's, via [`RetryPolicy::note_success`]; the exhaustion
 //! `auto_retry_end { success: false }` is emitted here).
 //!
 //! The attempt budget is shared per TURN (the `attempt` counter
@@ -105,8 +108,10 @@ impl RetryPolicy {
 
     /// Attempt the call with retries: on `Retryable`, an exponential
     /// backoff (recording the attempt + emitting `auto_retry_start`),
-    /// re-calling `f`; on `Fatal` / `Auth`, return the error verbatim
-    /// (a non-retryable error is never retried).
+    /// re-calling `f`; on `Fatal` / `Auth` / `ContextOverflow`, return the
+    /// error verbatim (a non-retryable error is never retried — the catch-all
+    /// arm is what keeps ADR 0045's overflow tier out of the ladder, so a new
+    /// tier needs no change HERE).
     ///
     /// The backoff `sleep` RACES `cancel` (finding 8 / the backoff nit):
     /// a cancelled turn must not wait out the delay (up to 8 s) — the
@@ -172,6 +177,11 @@ impl RetryPolicy {
                             _ = tokio::time::sleep(delay) => {}
                         }
                     }
+                    // The catch-all: `Fatal` / `Auth` AND the ADR 0045
+                    // `ContextOverflow` tier surface verbatim — only
+                    // `Retryable` is the ladder's, which is what keeps an
+                    // oversized prompt from being re-send byte-for-byte while
+                    // the loop waits to compact it.
                     Err(e) => return Err(e),
                 }
             }
@@ -332,6 +342,52 @@ mod tests {
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(events.is_empty(), "no retry events for a Fatal error");
+    }
+
+    /// (ADR 0045) The fourth tier is NOT the ladder's. pi's rule — "Context
+    /// overflow errors are NOT retryable (handled by compaction instead)" —
+    /// holds because the request BYTES do not change between attempts: every
+    /// retry re-sends the identical oversized prompt, fails identically, and
+    /// burns the attempt budget plus the backoff in between. The recovery
+    /// lives in the `AgentLoop` (a forced compaction, then the same call), and
+    /// if the ladder also claimed the error the two mechanisms would fight over
+    /// the turn. Mirrors [`fatal_is_never_retried`] — the `match` needs no
+    /// change precisely BECAUSE only `Retryable` is retried, which is what this
+    /// pins for a variant added later.
+    #[tokio::test]
+    async fn context_overflow_is_never_retried() {
+        let mut policy = RetryPolicy::new_with(5, Duration::from_millis(1));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_inner = calls.clone();
+        let f = move || {
+            let c = calls_inner.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                if c == 1 {
+                    Err(ProviderError::ContextOverflow(
+                        "prompt is too long: 213462 tokens > 200000 maximum".into(),
+                    ))
+                } else {
+                    Ok(c)
+                }
+            })
+        };
+        let mut events: Vec<RpcEvent> = Vec::new();
+        let result = policy
+            .call_with_retry(f, &CancellationToken::new(), &mut |ev| events.push(ev))
+            .await;
+        assert!(
+            matches!(result, Err(ProviderError::ContextOverflow(_))),
+            "a ContextOverflow is returned verbatim, got {result:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "re-sending the same oversized bytes would fail identically — no second attempt"
+        );
+        assert!(
+            events.is_empty(),
+            "no retry events for a ContextOverflow error"
+        );
     }
 
     #[tokio::test]

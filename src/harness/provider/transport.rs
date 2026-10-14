@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use super::overflow::is_context_overflow_text;
 use super::types::ProviderError;
 
 /// The `User-Agent` the model calls identify with (`archimedes/<version>`
@@ -45,11 +46,18 @@ pub(crate) fn build_client(connect_timeout: Duration, read_timeout: Duration) ->
 
 /// Map an HTTP status to a [`ProviderError`] (the two-tier message contract
 /// of the pre-dedup `complete()`s): 401/403 → `Auth`, 429/5xx → `Retryable`,
-/// other 4xx → `Fatal` — all three embed the error body
+/// a 4xx whose BODY is a context-length rejection → `ContextOverflow` (ADR
+/// 0045 — the status is an ordinary client error, so only the prose tells the
+/// two apart), other 4xx → `Fatal` — all three embed the error body
 /// (`status {status}: {body}`); any OTHER non-success status (1xx / 3xx —
 /// e.g. a 3xx with no `Location` header, which `reqwest` surfaces instead of
 /// following) → the TERMINAL `Fatal(format!("status {status}"))`, with NO
 /// body suffix. `None` for 2xx (a success — no error).
+///
+/// The overflow arm is placed AFTER the status tiers on purpose: a 401 or a
+/// 429 that happens to carry overflow wording keeps the tier its status
+/// already decided, so a credential failure is never mistaken for a prompt
+/// that needs shrinking and a throttle never spends a compaction.
 ///
 /// `body` is `Some` only when the caller READ the body — which happens only
 /// for a 4xx/5xx (see [`map_response`]); pass `None` for a status whose body
@@ -63,6 +71,10 @@ pub(crate) fn map_status(status: reqwest::StatusCode, body: Option<&str>) -> Opt
         Some(ProviderError::Auth(format!("status {status}: {body}")))
     } else if status.as_u16() == 429 || status.is_server_error() {
         Some(ProviderError::Retryable(format!("status {status}: {body}")))
+    } else if is_context_overflow_text(body) {
+        Some(ProviderError::ContextOverflow(format!(
+            "status {status}: {body}"
+        )))
     } else if status.is_client_error() {
         Some(ProviderError::Fatal(format!("status {status}: {body}")))
     } else {
@@ -143,6 +155,85 @@ mod tests {
         }
         assert!(map_status(StatusCode::OK, Some("")).is_none());
         assert!(map_status(StatusCode::CREATED, Some("")).is_none());
+    }
+
+    /// (ADR 0045) A context-length rejection is its OWN tier, decided by the
+    /// BODY — the status is an ordinary client error (a 400, or Anthropic's
+    /// 413), so nothing but the prose separates "your prompt is too long"
+    /// from a bad model name. The arm sits AFTER 401/403 (`Auth`) and
+    /// 429/5xx (`Retryable`), so an auth failure or a throttle that happens
+    /// to carry overflow wording keeps the tier its status already decided:
+    /// the retry ladder and the credential prompt must not be diverted into
+    /// a compaction.
+    #[test]
+    fn map_status_classifies_a_context_overflow_from_the_body() {
+        for (s, body) in [
+            // Anthropic: the token-count rejection.
+            (
+                StatusCode::BAD_REQUEST,
+                "prompt is too long: 213462 tokens > 200000 maximum",
+            ),
+            // Anthropic: the byte-size rejection (413).
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                r#"{"error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#,
+            ),
+            // OpenAI.
+            (
+                StatusCode::BAD_REQUEST,
+                "Your input exceeds the context window of this model",
+            ),
+        ] {
+            let err = map_status(s, Some(body)).expect("a 4xx maps to an error");
+            assert!(
+                matches!(err, ProviderError::ContextOverflow(_)),
+                "{s} with an overflow body should be ContextOverflow, got {err:?}"
+            );
+            // The body rides along in the message (the two-tier message
+            // contract: `status {status}: {body}`).
+            assert_eq!(
+                err,
+                ProviderError::ContextOverflow(format!("status {s}: {body}"))
+            );
+        }
+
+        // A 4xx that is NOT about length stays `Fatal` (a bad model name,
+        // a malformed body — none of which a compaction can fix).
+        assert!(
+            matches!(
+                map_status(
+                    StatusCode::BAD_REQUEST,
+                    Some("The model `gpt-99` does not exist")
+                ),
+                Some(ProviderError::Fatal(_))
+            ),
+            "a non-overflow 4xx is still Fatal"
+        );
+
+        // The status tiers WIN: the overflow arm is reached only after them,
+        // so overflow wording in an auth / throttle body cannot hijack the
+        // turn into a compaction.
+        for s in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert!(
+                matches!(
+                    map_status(s, Some("prompt is too long: 1 > 0 maximum")),
+                    Some(ProviderError::Auth(_))
+                ),
+                "{s} stays Auth whatever the body says"
+            );
+        }
+        for s in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                matches!(
+                    map_status(s, Some("prompt is too long: 1 > 0 maximum")),
+                    Some(ProviderError::Retryable(_))
+                ),
+                "{s} stays Retryable whatever the body says — the ladder owns it"
+            );
+        }
     }
 
     /// The TERMINAL arm (1xx / 3xx — a status that is neither a client nor a

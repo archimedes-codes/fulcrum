@@ -432,6 +432,27 @@ impl WorkerCore {
                 }
                 Vec::new()
             }
+            Inbound::Compact { instructions } => {
+                // The `/compact` command (ADR 0044) — forwarded to the loop's
+                // CONTROL channel, applied when idle. NOTHING is armed here:
+                // `handle` runs on the IPC side and can receive a `Compact`
+                // while a turn is still in flight (the command then QUEUES,
+                // because `run()` only polls the control queue between turns),
+                // so swapping the token in `ctl.turn_cancel` here would replace
+                // the token that in-flight turn is racing and silently lose a
+                // Stop for it. `run()`'s compact arm does the arming, which
+                // only ever executes at idle.
+                if let Some(ctl) = &self.loop_control {
+                    if let Err(e) = ctl
+                        .control_tx
+                        .send(ControlCmd::Compact { instructions })
+                        .await
+                    {
+                        eprintln!("worker: control send failed: {e}");
+                    }
+                }
+                Vec::new()
+            }
             Inbound::Close => {
                 // The existing in-process teardown (`NativeHandle::close`)
                 // cancels BOTH — the session token alone doesn't stop a
@@ -1038,5 +1059,61 @@ mod tests {
             "the session token is NOT cancelled (the session stays alive)"
         );
         assert!(!core.is_closed(), "the session is NOT closed");
+    }
+
+    /// `Compact` (the `/compact` Composer command — ADR 0044) forwards to the
+    /// loop's CONTROL channel and returns NO frame (`handle`'s return is the
+    /// store / sink frames; `RpcEvent`s leave via the PUMP), so the
+    /// observation point is the pump: a `compaction_start` whose `reason` is
+    /// `manual`. The stub transcript is the single system prompt, so the
+    /// outcome is `Skipped` — both frames still fire. (Cancellation is NOT
+    /// asserted here: the canned provider completes synchronously, so no
+    /// cancel window exists — that pin lives in `loop.rs`.)
+    #[tokio::test]
+    async fn inbound_compact_reaches_the_loop() {
+        let (mut core, _out_rx, _in_tx) = stub_core();
+        let env = test_env(StartMode::Fresh, None, None);
+        // The `Start` FIRST — `take_pump` returns `Some` only after it built
+        // the loop.
+        core.handle(Inbound::from(&env)).await;
+        // The pump task (the `run_worker` pump task's logic over the moved
+        // `events_rx`).
+        let (mut events_rx, _task) = core.take_pump().expect("the Start built the loop");
+        let (pump_tx, mut pump_rx) = mpsc::unbounded_channel::<Outbound>();
+        tokio::spawn(async move {
+            while let Some(event) = events_rx.recv().await {
+                let _ = pump_tx.send(Outbound::Event { event });
+            }
+        });
+        core.handle(Inbound::Compact { instructions: None }).await;
+        let frames = collect_until(&mut pump_rx, |f| {
+            matches!(
+                f,
+                Outbound::Event {
+                    event: RpcEvent::compaction_end { .. }
+                }
+            )
+        })
+        .await;
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                Outbound::Event {
+                    event: RpcEvent::compaction_start { reason }
+                } if reason == "manual"
+            )),
+            "the compact frame reached the loop's control queue (a `compaction_start` \
+             with the manual reason), got {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| matches!(
+                f,
+                Outbound::Event {
+                    event: RpcEvent::compaction_end { .. }
+                }
+            )),
+            "the compaction ended (the stub transcript makes it `Skipped` — both frames \
+             still fire), got {frames:?}"
+        );
     }
 }

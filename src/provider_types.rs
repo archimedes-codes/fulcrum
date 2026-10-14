@@ -205,6 +205,25 @@ pub struct ModelOptions {
 /// Token usage reported by the provider (usually a trailing chunk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// The WHOLE prompt the model was shown, **cached prefix included**
+    /// (ADR 0046) — this is the number ADR 0028's **Anchor** is built
+    /// from, so it must be the full context size the Provider held, not
+    /// the uncached remainder.
+    ///
+    /// The wire's cached subsets (`cache_read_input_tokens` /
+    /// `cache_creation_input_tokens` on the Anthropic Messages wire,
+    /// `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`
+    /// on the OpenAI-completions / Responses wires) are DELIBERATELY not
+    /// separate fields: two of those three wires report them as a SUBSET
+    /// of this number, so publishing them as parts invites every consumer
+    /// to add them — which DOUBLE-COUNTS the prefix there, over-reads the
+    /// Anchor and makes compaction arrive EARLY (on Anthropic, where the
+    /// fields are DISJOINT, not adding them UNDER-reads and compaction
+    /// arrives LATE, as a Provider 400). Each parser reconciles its own
+    /// vocabulary at the seam instead: the Anthropic parser SUMS the three
+    /// counts into this field; the OpenAI-shaped parsers pass their count
+    /// through untouched and must keep doing so (both pinned in their own
+    /// modules).
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
@@ -261,6 +280,17 @@ pub enum ProviderError {
     /// Missing / bad credentials (HTTP 401 / 403).
     #[error("auth: {0}")]
     Auth(String),
+    /// The prompt is over the model's context window (ADR 0045) — the FOURTH
+    /// tier, and deliberately NOT one the retry ladder owns. Retrying an
+    /// oversized request re-sends the identical oversized bytes, so every
+    /// attempt fails identically with backoff in between; the tier is
+    /// recovered by the `AgentLoop` IN the turn instead (a forced compaction,
+    /// then the same model call again), which is why [`Retryable`] must stay
+    /// the ladder's only input.
+    ///
+    /// [`Retryable`]: ProviderError::Retryable
+    #[error("context overflow: {0}")]
+    ContextOverflow(String),
 }
 
 /// A model provider. Object-safe (a `Box<dyn Provider>` compiles) so a
