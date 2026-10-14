@@ -148,6 +148,32 @@ impl Compactor {
         u64::from(self.config.keep_recent_tokens).min(affordable) as u32
     }
 
+    /// The summary's OWN output cap (ADR 0047): `min(floor(0.8 ×
+    /// reserve_tokens), 8_192)`. The summary is a model CALL, and a call needs
+    /// an output budget it can afford — pi's rule, same shape. The harness's
+    /// own model calls stay uncapped: their output is the point.
+    pub fn summary_output_cap(&self) -> u32 {
+        const SUMMARY_OUTPUT_CAP: u32 = 8_192;
+        let reserve = u64::from(self.config.reserve_tokens);
+        (reserve * 8 / 10).min(u64::from(SUMMARY_OUTPUT_CAP)) as u32
+    }
+
+    /// The Summary input budget (ADR 0047): what the summary call may CARRY —
+    /// the window minus its own output cap minus the same headroom
+    /// [`Compactor::keep_budget`] charges a small window. A summary built from
+    /// the WHOLE summarized range is a call that overflows on its own way in,
+    /// and the mechanism that fixes an overflow must not need fixing itself.
+    ///
+    /// Zero is a real answer (a window already spent on its reserve), and the
+    /// caller reads it as "no summary is possible", not as "unbounded".
+    pub fn summary_input_budget(&self) -> u32 {
+        const SUMMARY_HEADROOM_CAP: u32 = 4_096;
+        let headroom = self.config.reserve_tokens.min(SUMMARY_HEADROOM_CAP);
+        u64::from(self.context_window)
+            .saturating_sub(u64::from(self.summary_output_cap()))
+            .saturating_sub(u64::from(headroom)) as u32
+    }
+
     /// Re-estimate the context from the (post-compaction) messages — the
     /// RESET path (after a compaction the transcript genuinely shrank, and
     /// a resume has no provider anchor to keep, so the estimate
@@ -207,6 +233,34 @@ fn estimate_message_tokens(m: &ChatMessage) -> u32 {
     (text / 4) as u32 + tools as u32 + 1
 }
 
+/// What one message actually COSTS the summary call (ADR 0047): the shared
+/// [`estimate_message_tokens`] PLUS the serialized tool-call `arguments`.
+///
+/// The two estimates differ ON PURPOSE. `estimate_message_tokens` backs the
+/// context COUNT, which is anchored by the provider's own reported usage
+/// (ADR 0028): a call's arguments are already inside the request the provider
+/// just charged for, so the flat per-call charge is a rounding detail. The
+/// summary budget has NO such anchor — it is the only thing standing between
+/// the call and the window compaction is recovering, and [`summarize`] sends
+/// the summarized messages verbatim, `arguments` included. A file-writing call
+/// costs the shared estimate ~20 tokens and the wire thousands, so measuring
+/// the budget with it green-lights the exact overflow ADR 0047 exists to end.
+fn estimate_summary_payload(m: &ChatMessage) -> u32 {
+    let arguments = m
+        .tool_calls
+        .as_ref()
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|c| c.arguments.to_string().len())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    // The per-call flat cost in `estimate_message_tokens` stays (it covers the
+    // call's id/name framing); the arguments are ADDED to it.
+    estimate_message_tokens(m).saturating_add((arguments / 4) as u32)
+}
+
 /// Split the transcript for compaction: keep the most recent
 /// `keep_recent_tokens` worth of messages (ALWAYS at least the last
 /// message — a zero budget must not drop the latest user message),
@@ -246,6 +300,39 @@ pub fn split_for_compaction(
         messages[..keep_from].to_vec(),
         messages[keep_from..].to_vec(),
     )
+}
+
+/// Trim the summarized range to the Summary input budget (ADR 0047): keep
+/// the NEWEST slice that fits — the recent end is what a summary must not
+/// lose — and report how many messages were dropped, which the harness
+/// writes into the summary it stores.
+///
+/// The budget is measured against [`estimate_summary_payload`], i.e. what the
+/// call actually carries, NOT the context-count estimate: a summarized tool
+/// call ships its full `arguments`, and undercounting them would let the very
+/// call that caused the overflow through the budget meant to contain it.
+///
+/// Like [`split_for_compaction`] the kept slice never STARTS on a `tool`
+/// message, but here the boundary snaps FORWARD (an orphaned `tool` result
+/// 400s on conformant APIs) and the snapped-past messages count as dropped.
+/// The result is always a SUFFIX of `older`, so "the oldest N" is literally
+/// true of the count. An EMPTY slice means the budget fits nothing: there is
+/// no honest summary to ask for and the caller must not send a doomed call.
+pub fn trim_for_summary_budget(older: &[ChatMessage], budget: u32) -> (Vec<ChatMessage>, usize) {
+    let mut keep_from = older.len();
+    let mut acc = 0u32;
+    while keep_from > 0 {
+        let next = acc.saturating_add(estimate_summary_payload(&older[keep_from - 1]));
+        if next > budget {
+            break;
+        }
+        acc = next;
+        keep_from -= 1;
+    }
+    while keep_from < older.len() && matches!(older[keep_from].role, ChatRole::Tool) {
+        keep_from += 1;
+    }
+    (older[keep_from..].to_vec(), keep_from)
 }
 
 // ---------------------------------------------------------------------------
@@ -358,11 +445,36 @@ pub(crate) async fn run_compaction(
     if older.is_empty() {
         return CompactionOutcome::Skipped;
     }
-    match summarize(ctx, &older, turn).await {
+    // (ADR 0047) The summary's own call is bounded: the summarized range is
+    // trimmed to the budget this window affords, and the trim is RECORDED —
+    // an unmarked summary would be a fabricated memory.
+    let budget = ctx.compactor.summary_input_budget();
+    let (summarized, dropped) = trim_for_summary_budget(&older, budget);
+    if summarized.is_empty() {
+        // The budget fits nothing, so there is no honest summary to ask for
+        // and NO call is worth sending. `Skipped` is the honest outcome: the
+        // transcript is unchanged and the caller says so. (For a window this
+        // small this repeats every turn — no request is sent, so it costs the
+        // provider nothing.)
+        return CompactionOutcome::Skipped;
+    }
+    match summarize(ctx, &summarized, dropped, turn).await {
         Ok(summary) => {
+            // The record of the trim travels IN the summary (ADR 0047): the
+            // harness knows the exact count, so the stored row states it —
+            // and so does the model, because this same message is replayed.
+            let record = if dropped > 0 {
+                format!(
+                    "\n\n[Note: this summary is not complete. The oldest \
+                     {dropped} message(s) of the summarized range were dropped \
+                     to fit the summary's own context window.]"
+                )
+            } else {
+                String::new()
+            };
             let summary_msg = ChatMessage {
                 role: ChatRole::System,
-                content: MessageContent::Text(format!("{SUMMARY_PREFIX}\n{summary}")),
+                content: MessageContent::Text(format!("{SUMMARY_PREFIX}\n{summary}{record}")),
                 tool_call_id: None,
                 tool_calls: None,
             };
@@ -414,16 +526,30 @@ pub(crate) async fn run_compaction(
 /// unchanged either way (pinned by the `summarize_*` prompt tests): the
 /// automatic paths (the threshold check, an overflow recovery) pass `None`,
 /// and args that are only whitespace are no instructions at all.
-fn summary_system_prompt(instructions: Option<&str>) -> String {
+///
+/// `dropped` is the trim's count (ADR 0047): only a range that LOST messages
+/// to the Summary input budget gains the extra "this is not the whole story"
+/// line, so `dropped == 0` leaves the prompt byte-identical.
+fn summary_system_prompt(instructions: Option<&str>, dropped: usize) -> String {
     let base = "Summarize these messages concisely, preserving decisions, \
                 file paths, and open tasks. Respond with the summary only."
         .to_string();
-    match instructions {
+    let mut prompt = match instructions {
         Some(s) if !s.trim().is_empty() => {
             format!("{base}\nAdditional instructions for this summary: {s}")
         }
         _ => base,
+    };
+    // (ADR 0047) A trimmed range is not the whole story, and a summary that
+    // does not know it is incomplete writes a summary that reads as complete.
+    if dropped > 0 {
+        prompt.push_str(&format!(
+            "\nThe oldest {dropped} message(s) of this range were dropped to fit \
+             this request. Summarize what is here, and say in the summary that it \
+             is not complete."
+        ));
     }
+    prompt
 }
 
 /// The summary model call (a "summarize these messages" system prompt
@@ -436,14 +562,21 @@ fn summary_system_prompt(instructions: Option<&str>) -> String {
 /// without a `Done` at all is a retryable `Err` — a truncated summary
 /// must NEVER rewrite the transcript (finding 4: the `run_compaction`
 /// error path keeps the transcript intact).
+///
+/// (ADR 0047) `older` is the range ALREADY TRIMMED to the Summary input
+/// budget by the caller, and `dropped` is how many messages that trim
+/// removed — the model is told, so it does not present a partial summary as
+/// the whole history, and the call carries its OWN output cap rather than
+/// riding the provider's default.
 pub(crate) async fn summarize(
     ctx: &CompactionCtx<'_>,
     older: &[ChatMessage],
+    dropped: usize,
     turn: &CancellationToken,
 ) -> Result<String, ProviderError> {
     let system = ChatMessage {
         role: ChatRole::System,
-        content: MessageContent::Text(summary_system_prompt(ctx.instructions.as_deref())),
+        content: MessageContent::Text(summary_system_prompt(ctx.instructions.as_deref(), dropped)),
         tool_call_id: None,
         tool_calls: None,
     };
@@ -455,7 +588,12 @@ pub(crate) async fn summarize(
         tools: Vec::new(),
         options: ModelOptions {
             temperature: Some(0.0),
-            max_tokens: None,
+            // (ADR 0047) The summary's OWN output budget. Uncapped, an
+            // ambitious summary runs to the provider's own default and comes
+            // back `Done(Length)` — which the tail of this function correctly
+            // rejects as a truncated summary. `.max(1)` because a reserve of
+            // 0 must not produce a request that cannot answer with a byte.
+            max_tokens: Some(ctx.compactor.summary_output_cap().max(1)),
             reasoning_effort: None,
             stream: true,
         },
@@ -602,6 +740,31 @@ mod tests {
         }
     }
 
+    /// Records the WHOLE summary `ModelRequest` — the input size and the output
+    /// cap are what ADR 0047 pins.
+    struct RequestRecordingProvider {
+        recorded: Arc<std::sync::Mutex<Vec<crate::agent::harness::provider::ModelRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RequestRecordingProvider {
+        async fn complete(
+            &self,
+            req: &ModelRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError>
+        {
+            self.recorded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(req.clone());
+            Ok(futures_util::stream::iter(vec![
+                ProviderEvent::TextDelta("ok".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ])
+            .boxed())
+        }
+    }
+
     /// A `Model` for a given bare id (the `loop.rs` test fixture, copied).
     fn fake_model(id: &str) -> Model {
         Model {
@@ -680,7 +843,7 @@ mod tests {
                 instructions,
                 compactor: &mut compactor,
             };
-            summarize(&ctx, &older, &CancellationToken::new())
+            summarize(&ctx, &older, 0, &CancellationToken::new())
                 .await
                 .expect("summarize succeeds")
         };
@@ -1153,6 +1316,59 @@ mod tests {
         );
     }
 
+    /// (ADR 0047) The summary's two numbers: an output cap of
+    /// `min(floor(0.8 × reserve), 8_192)` and an input budget of the window
+    /// minus that cap minus the headroom `keep_budget` charges.
+    #[test]
+    fn the_summary_budget_is_the_window_minus_its_own_output_and_headroom() {
+        // reserve 16 384 → cap min(13 107, 8 192) = 8 192; headroom min(16 384, 4 096).
+        let c = Compactor::new(
+            CompactionConfig {
+                reserve_tokens: 16_384,
+                ..Default::default()
+            },
+            32_000,
+        );
+        assert_eq!(c.summary_output_cap(), 8_192);
+        assert_eq!(c.summary_input_budget(), 32_000 - 8_192 - 4_096);
+    }
+
+    /// A reserve below the ceiling caps the summary at 80% of itself — pi's rule.
+    #[test]
+    fn a_small_reserve_caps_the_summary_output_at_eighty_percent() {
+        let c = Compactor::new(
+            CompactionConfig {
+                reserve_tokens: 1_000,
+                ..Default::default()
+            },
+            32_000,
+        );
+        assert_eq!(c.summary_output_cap(), 800);
+    }
+
+    /// A window already spent on its own reserve has NOTHING left for a
+    /// summary, and `saturating_*` makes that ZERO rather than a wrap-around
+    /// that reads as a huge budget. A reserve of 0 affords no output at all.
+    #[test]
+    fn a_window_below_its_own_reserve_has_no_summary_budget() {
+        let c = Compactor::new(
+            CompactionConfig {
+                reserve_tokens: 16_384,
+                ..Default::default()
+            },
+            12_000,
+        );
+        assert_eq!(c.summary_input_budget(), 0);
+        let none = Compactor::new(
+            CompactionConfig {
+                reserve_tokens: 0,
+                ..Default::default()
+            },
+            128_000,
+        );
+        assert_eq!(none.summary_output_cap(), 0);
+    }
+
     #[test]
     fn split_keeps_the_recent_tail() {
         let msgs = vec![
@@ -1226,6 +1442,111 @@ mod tests {
             "the kept tail starts on the assistant message, not an orphaned tool"
         );
         assert!(matches!(recent[1].role, ChatRole::Tool));
+    }
+
+    /// (ADR 0047) The recent END of the summarized range is what a summary
+    /// must not lose, so the trim drops from the OLD end.
+    #[test]
+    fn the_trim_keeps_the_newest_slice_that_fits() {
+        // Each message: "m{i}" + 3 999 x's = 4 001 chars → 4 001/4 + 1 = 1_001.
+        let msgs: Vec<ChatMessage> = (0..4)
+            .map(|i| text_msg(&format!("m{i}{}", "x".repeat(3_999))))
+            .collect();
+        // 2_100 fits two (2_002) but not three (3_003).
+        let (kept, dropped) = trim_for_summary_budget(&msgs, 2_100);
+        assert_eq!(dropped, 2, "the two oldest are dropped");
+        assert_eq!(kept.len(), 2, "the newest two are summarized");
+        assert!(
+            matches!(&kept[0].content, MessageContent::Text(t) if t.starts_with("m2")),
+            "the slice starts at the newest end, got {:?}",
+            kept[0].content
+        );
+    }
+
+    /// The kept slice never STARTS on a `tool` result — the boundary snaps
+    /// FORWARD past it, and the snapped-past message still counts as dropped
+    /// (an orphaned `tool` message 400s on conformant APIs).
+    #[test]
+    fn the_trim_never_starts_the_kept_slice_on_a_tool_message() {
+        let asst = ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![crate::agent::harness::provider::ToolCall {
+                id: "t1".to_string(),
+                name: "bash".to_string(),
+                arguments: serde_json::json!({ "command": "ls" }),
+            }]),
+        };
+        let tool = ChatMessage {
+            role: ChatRole::Tool,
+            content: MessageContent::Text("result".to_string()),
+            tool_call_id: Some("t1".to_string()),
+            tool_calls: None,
+        };
+        // Estimates: "oldest" 2, `asst` 21 (one tool_call = 20, + 1), `tool` 2,
+        // "newest" 2. Budget 10 takes newest (2) + tool (4), stops at `asst`
+        // (25 > 10), so the RAW boundary lands on the tool result at index 2.
+        let msgs = vec![text_msg("oldest"), asst, tool, text_msg("newest")];
+        let (kept, dropped) = trim_for_summary_budget(&msgs, 10);
+        assert_eq!(dropped, 3, "the snapped-past tool result is still dropped");
+        assert_eq!(kept.len(), 1, "only the newest message is summarized");
+        assert!(
+            !matches!(kept[0].role, ChatRole::Tool),
+            "the summarized slice does not start on an orphaned tool result"
+        );
+    }
+
+    /// (ADR 0047) The budget measures the request `summarize` ACTUALLY sends,
+    /// and that request carries the tool-call `arguments` IN FULL. The shared
+    /// context estimate charges a flat ~20 per call and ignores them, so a
+    /// file-writing call — thousands of tokens of `content` — passes a budget
+    /// it cannot fit, and the summary overflows the very window compaction
+    /// exists to recover (the failure ADR 0047 was written to end).
+    #[test]
+    fn the_trim_charges_the_tool_call_arguments_the_summary_sends() {
+        use crate::agent::harness::provider::ToolCall;
+        // ~10 000 tokens of argument — a large `write`, the call that drives
+        // compaction in the first place.
+        let big = "x".repeat(40_000);
+        let writer = ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "t1".to_string(),
+                name: "write".to_string(),
+                arguments: serde_json::json!({ "path": "a.rs", "content": big }),
+            }]),
+        };
+        // The shared estimate sees ONE tool call here: 21 tokens, which fits
+        // 500. The serialized arguments alone are ~10 000, so nothing fits.
+        let (kept, dropped) = trim_for_summary_budget(std::slice::from_ref(&writer), 500);
+        assert!(
+            kept.is_empty(),
+            "a call whose arguments alone dwarf the budget is not summarized"
+        );
+        assert_eq!(dropped, 1, "the unaffordable call counts as dropped");
+
+        // A budget that DOES afford the arguments still keeps the call: the
+        // trim measures the payload, it does not veto tool calls.
+        let (kept, dropped) = trim_for_summary_budget(&[writer], 20_000);
+        assert_eq!(
+            kept.len(),
+            1,
+            "a budget that affords the arguments keeps the call"
+        );
+        assert_eq!(dropped, 0);
+    }
+
+    /// A budget that fits nothing summarizes nothing: the caller must NOT send
+    /// a doomed call, so the empty slice is the signal.
+    #[test]
+    fn a_budget_that_fits_nothing_trims_everything() {
+        let msgs = vec![text_msg("a"), text_msg("b")];
+        let (kept, dropped) = trim_for_summary_budget(&msgs, 0);
+        assert!(kept.is_empty(), "nothing fits a zero budget");
+        assert_eq!(dropped, 2);
     }
 
     // ── (finding 4) a truncated summary stream is NOT a good summary ──
@@ -1544,6 +1865,93 @@ mod tests {
         assert_eq!(sessions[0], Some("s1".to_string()));
     }
 
+    /// (ADR 0047) The summary is a call with an output budget: `max_tokens` is
+    /// the cap the Compactor derived, not the provider's own default.
+    #[tokio::test]
+    async fn the_summary_call_carries_its_own_output_cap() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RequestRecordingProvider {
+            recorded: recorded.clone(),
+        };
+        let summary = call_summarize(&provider, &[text_msg("history")])
+            .await
+            .expect("summarize succeeds");
+        assert_eq!(summary, "ok");
+        let reqs = recorded.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(reqs.len(), 1);
+        // `call_summarize` builds its Compactor with `CompactionConfig::default()`
+        // (reserve 16 384) → min(floor(0.8 × 16 384), 8 192).
+        assert_eq!(reqs[0].options.max_tokens, Some(8_192));
+    }
+
+    /// A trimmed summary SAYS it is trimmed: the model is told the range is
+    /// incomplete, and the stored record carries the harness's exact count.
+    #[tokio::test]
+    async fn a_trimmed_summary_records_what_it_dropped() {
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("the summary".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let (_db, store) = temp_store();
+        let mut harness = Harness::new(&provider, store.clone());
+        // The budget is the binding constraint: 16 384 − 8 192 output − 4 096
+        // headroom = 4 096.
+        harness.compactor = Compactor::new(CompactionConfig::default(), 16_384);
+        harness.keep = Some(1);
+        // 8 × (4 000 chars / 4 + 1) = 8 × 1_001 tokens. A keep-budget of 1 keeps
+        // ONLY the last message, so `older` is 7 (7 007 tokens) — and 4 096
+        // carries four of them (4 004), not five (5 005): 3 are dropped.
+        harness.messages = (0..8).map(|_| text_msg(&"y".repeat(4_000))).collect();
+        let outcome = harness.run().await;
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "four messages still fit the budget, so the compaction proceeds"
+        );
+        let rows = store.load_messages("s1").expect("rows load");
+        let summary = rows
+            .iter()
+            .find(|m| is_compaction_summary(m))
+            .expect("the summary is in the rewritten transcript");
+        let MessageContent::Text(text) = &summary.content else {
+            panic!("the summary is a text message");
+        };
+        assert!(
+            text.contains(
+                "[Note: this summary is not complete. The oldest 3 message(s) of the \
+                 summarized range were dropped"
+            ),
+            "the stored summary records its own trim verbatim, got {text}"
+        );
+    }
+
+    /// A budget that fits NOTHING is an honest `Skipped` — and NO call is sent.
+    /// The doomed request is exactly what ADR 0047 exists to stop.
+    #[tokio::test]
+    async fn a_summary_budget_that_fits_nothing_skips_without_a_call() {
+        let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("never called".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let (_db, store) = temp_store();
+        let mut harness = Harness::new(&provider, store);
+        // The window is already inside its own reserve: budget 0.
+        harness.compactor = Compactor::new(
+            CompactionConfig {
+                reserve_tokens: 16_384,
+                ..Default::default()
+            },
+            12_000,
+        );
+        harness.keep = Some(0);
+        harness.messages = vec![text_msg("one"), text_msg("two")];
+        assert!(matches!(harness.run().await, CompactionOutcome::Skipped));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no summary call is sent when the budget fits nothing"
+        );
+    }
+
     // ── test harness helpers ──
 
     /// Call [`summarize`] with the harness's fixtures (the moved tests'
@@ -1564,7 +1972,7 @@ mod tests {
             instructions: None,
             compactor: &mut compactor,
         };
-        summarize(&ctx, older, &CancellationToken::new()).await
+        summarize(&ctx, older, 0, &CancellationToken::new()).await
     }
 
     /// The moved tests' fixture: the ctx's inputs + the mutable transcript

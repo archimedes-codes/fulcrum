@@ -154,6 +154,15 @@ pub enum RpcEvent {
         will_retry: bool,
         error_message: Option<String>,
     },
+    /// (ADR 0048) An Abandoned attempt's partial reply is RETRACTED: every row
+    /// keyed by the message id the harness is on is discarded — the persisted
+    /// display rows, the live transcript, and the subagent capture alike.
+    /// Emitted when a model call is abandoned mid-stream (a retryable retry, an
+    /// overflow recovery) AFTER it streamed text or thinking; the retried call
+    /// reuses the same id (one `message_start` per message), so without this
+    /// event the two attempts' text welds into one reply. No payload:
+    /// `normalize` resolves the id, the only place that knows it.
+    message_retracted,
     #[serde(rename_all = "camelCase")]
     auto_retry_start {
         attempt: u64,
@@ -237,6 +246,7 @@ impl RpcEvent {
             }
             RpcEvent::compaction_start { .. } => std::borrow::Cow::Borrowed("compaction_start"),
             RpcEvent::compaction_end { .. } => std::borrow::Cow::Borrowed("compaction_end"),
+            RpcEvent::message_retracted => std::borrow::Cow::Borrowed("message_retracted"),
             RpcEvent::auto_retry_start { .. } => std::borrow::Cow::Borrowed("auto_retry_start"),
             RpcEvent::auto_retry_end { .. } => std::borrow::Cow::Borrowed("auto_retry_end"),
             RpcEvent::summarization_retry_scheduled { .. } => {

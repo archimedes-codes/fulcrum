@@ -33,6 +33,13 @@ pub(crate) struct ThoughtState {
     current: String,
     open_key: Option<String>,
     next: u32,
+    /// The segment indices each messageId actually used, in order. A message's
+    /// thought rows are `{id}#{n}` for these `n` — and they do NOT start at 1
+    /// for any message but the first, because `next` counts segments for the
+    /// life of the loop. A Retraction erases exactly this list: the display
+    /// store UPSERTs and has no DELETE, so erasing a key that never existed
+    /// writes a row that can never be removed.
+    segments: HashMap<String, Vec<u32>>,
 }
 
 /// Per-session turn state for the event normalizer.
@@ -61,6 +68,31 @@ pub struct TurnState {
     pub current_message_id: Option<String>,
     pub toolcall_args: HashMap<String, String>,
     pub announced_tool_calls: HashSet<String>,
+    /// How many Retractions this turn has announced. The discard line needs a
+    /// messageId UNIQUE per discard (ADR 0048) — two lines sharing `"system"`
+    /// would weld into one bubble.
+    pub retract_seq: u64,
+}
+
+/// A one-line `agent_message_chunk` carrying a UNIQUE messageId — for a line
+/// that must survive being adjacent to another line. `system_chunk`'s shared
+/// `"system"` key APPENDS (that is its point), so a second line on it welds.
+fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
+    let text = text.into();
+    json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": text },
+        "messageId": message_id,
+    })
+}
+
+/// Is this messageId a harness bookkeeping line rather than model output?
+/// `"system"` is the shared one-liner key; `"retract:N"` is a discard line
+/// (ADR 0048). Anything that must capture ONLY what the model said — the
+/// subagent capture, whose text becomes the PARENT's tool result — asks this
+/// instead of re-deciding the convention.
+pub fn is_bookkeeping_message_id(id: &str) -> bool {
+    id == "system" || id.starts_with("retract:")
 }
 
 /// A one-line `agent_message_chunk` with the dedicated `"system"` messageId
@@ -378,6 +410,26 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                 "reason": reason,
             }),
         ],
+        // (ADR 0048) An Abandoned attempt's reply is retracted. The id is the one
+        // the harness is ON — the retried call REUSES it (`message_start` fires
+        // once per assistant message), which is precisely why the discard is a
+        // protocol event and not something the reader may infer. Then the line
+        // says so, on its own id: reusing `"system"` would weld it onto the
+        // "Retrying (attempt 1/3…)" line this path emits immediately before.
+        RpcEvent::message_retracted => {
+            let mid = st
+                .current_message_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            st.retract_seq += 1;
+            vec![
+                json!({ "sessionUpdate": "message_retracted", "messageId": mid }),
+                unique_system_chunk(
+                    &format!("retract:{}", st.retract_seq),
+                    "Discarded an incomplete reply",
+                ),
+            ]
+        }
         RpcEvent::auto_retry_start {
             attempt,
             max_attempts,
@@ -440,8 +492,9 @@ pub fn normalize_capabilities(raw: &str) -> Value {
 /// gone with the crate types). `pub(crate)` so the native `AgentLoop`
 /// (Task 6) computes through the SAME function.
 ///
-/// Returns 0 or 1 rows (the `_` arm — an update kind without a display
-/// row — yields none). `created_at` is the current time (the write half's
+/// Returns 0 or more rows (the `_` arm — an update kind without a display
+/// row — yields none, and a Retraction returns one row per row it erases).
+/// `created_at` is the current time (the write half's
 /// `now_ms` stamp — the `SqliteStore`'s `db.record_message` re-stamps it
 /// at write time; the `IpcStore` frames it for the Supervisor's writer).
 pub(crate) fn compute_display_rows(
@@ -473,6 +526,9 @@ pub(crate) fn compute_display_rows(
                 // New thinking segment: a new messageId, or an intervening
                 // segmenting update (see the rule above) cleared `open_key`.
                 state.next += 1;
+                // (Read before the entry's mutable borrow of `state`.)
+                let segment = state.next;
+                state.segments.entry(key.clone()).or_default().push(segment);
                 state.open_key = Some(key);
                 state.current = String::new();
             }
@@ -518,6 +574,48 @@ pub(crate) fn compute_display_rows(
                 payload_json: payload,
                 created_at: now_ms(),
             }]
+        }
+        // (ADR 0048) An Abandoned attempt's reply is erased. The display store has
+        // no DELETE, so the rows are OVERWRITTEN with empty text and the reader
+        // hydrates an empty row as nothing; the accumulators go with the rows,
+        // because the retried call REUSES this message id.
+        Some("message_retracted") => {
+            let Some(id) = update.get("messageId").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let mut rows = Vec::new();
+            let streamed_text = {
+                let mut acc = agent_text_acc
+                    .lock()
+                    .expect("agent-text accumulator poisoned");
+                acc.remove(id).map(|t| !t.is_empty()).unwrap_or(false)
+            };
+            if streamed_text {
+                rows.push(DisplayRow {
+                    kind: "agent-text".to_string(),
+                    message_key: id.to_string(),
+                    payload_json: json!({ "text": "" }),
+                    created_at: now_ms(),
+                });
+            }
+            let segments = {
+                let mut state = thought_state.lock().expect("thought state poisoned");
+                // The abandoned message's thoughts are CLOSED: the retry opens a
+                // FRESH segment (a new row key) rather than continuing text that was
+                // just discarded.
+                state.open_key = None;
+                state.current = String::new();
+                state.segments.remove(id)
+            };
+            if let Some(used) = segments {
+                rows.extend(used.into_iter().map(|n| DisplayRow {
+                    kind: "agent-thought".to_string(),
+                    message_key: format!("{id}#{n}"),
+                    payload_json: json!({ "text": "" }),
+                    created_at: now_ms(),
+                }));
+            }
+            rows
         }
         Some("tool_call") => {
             let Some(key) = update
@@ -1078,6 +1176,65 @@ mod normalize_tests {
             aborted[0]["content"]["text"]
         );
     }
+
+    /// (ADR 0048) A real discard is both the erase AND a line saying so, and
+    /// the line carries its OWN messageId — the shared `"system"` key would weld
+    /// it onto the retry line emitted immediately before it.
+    #[test]
+    fn a_retraction_erases_the_current_message_and_says_so() {
+        let mut st = TurnState::default();
+        normalize(
+            &RpcEvent::message_start {
+                message: json!({ "role": "assistant" }),
+            },
+            &mut st,
+        );
+        let frames = normalize(&RpcEvent::message_retracted, &mut st);
+        assert_eq!(
+            frames,
+            vec![
+                json!({ "sessionUpdate": "message_retracted", "messageId": "m1" }),
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Discarded an incomplete reply" },
+                    "messageId": "retract:1",
+                }),
+            ]
+        );
+        assert_eq!(
+            st.current_message_id.as_deref(),
+            Some("m1"),
+            "the retried call REUSES the id: a Retraction is not a new message"
+        );
+    }
+
+    /// Two discards in one turn must not weld (ADR 0048), so the line's id
+    /// increments per Retraction — the ids are unique, not shared.
+    #[test]
+    fn a_second_retraction_gets_its_own_line_id() {
+        let mut st = TurnState::default();
+        normalize(
+            &RpcEvent::message_start {
+                message: json!({ "role": "assistant" }),
+            },
+            &mut st,
+        );
+        let first = normalize(&RpcEvent::message_retracted, &mut st);
+        let second = normalize(&RpcEvent::message_retracted, &mut st);
+        assert_eq!(first[1]["messageId"], "retract:1");
+        assert_eq!(second[1]["messageId"], "retract:2");
+    }
+
+    /// A Retraction with no message announced yet is still well-formed (the
+    /// `default` id every other chunk falls back to).
+    #[test]
+    fn a_retraction_before_any_message_start_says_default() {
+        let mut st = TurnState::default();
+        let frames = normalize(&RpcEvent::message_retracted, &mut st);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["sessionUpdate"], "message_retracted");
+        assert_eq!(frames[0]["messageId"], "default");
+    }
 }
 
 #[cfg(test)]
@@ -1278,5 +1435,172 @@ mod compute_display_rows_tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_key, "m1#1", "the segment was not split");
         assert_eq!(after[0].payload_json, json!({ "text": "thinking" }));
+    }
+
+    /// (ADR 0048) A Retraction empties the abandoned message's rows — text AND
+    /// thoughts — and empties the accumulators, so the retried call that REUSES
+    /// the id starts from nothing instead of welding on. The display store has
+    /// no DELETE, so "erased" means OVERWRITTEN with empty text.
+    #[test]
+    fn a_retraction_empties_the_abandoned_rows() {
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
+
+        // The abandoned attempt: text, a thought segment, a tool-call
+        // announcement (which CLOSES that segment), then a second segment.
+        let drive = [
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": { "text": "parti" } }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "th" } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "run" }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "second" } }),
+        ];
+        for u in &drive {
+            compute_display_rows(u, &text_acc, &tool_state, &thought_state);
+        }
+
+        let rows = compute_display_rows(
+            &json!({ "sessionUpdate": "message_retracted", "messageId": "m1" }),
+            &text_acc,
+            &tool_state,
+            &thought_state,
+        );
+        let erased: std::collections::BTreeSet<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.kind.as_str(), r.message_key.as_str()))
+            .collect();
+        assert_eq!(
+            erased,
+            [
+                ("agent-text", "m1"),
+                ("agent-thought", "m1#1"),
+                ("agent-thought", "m1#2"),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+            "the erased key set is EXACTLY the rows the abandoned message wrote, got {rows:?}"
+        );
+        for row in &rows {
+            assert_eq!(
+                row.payload_json,
+                json!({ "text": "" }),
+                "{} row {} is overwritten empty, not deleted",
+                row.kind,
+                row.message_key
+            );
+        }
+
+        assert!(
+            !text_acc
+                .lock()
+                .expect("accumulator poisoned")
+                .contains_key("m1"),
+            "the text accumulator no longer holds the abandoned id"
+        );
+        let state = thought_state.lock().expect("thought state poisoned");
+        assert_eq!(
+            state.open_key.as_deref(),
+            None,
+            "the abandoned message's thoughts are CLOSED"
+        );
+        assert_eq!(
+            state.current, "",
+            "the open-segment buffer does not carry the discarded text"
+        );
+        drop(state);
+
+        // The retried call REUSES the id, and now writes its own text alone:
+        // `done`, never `partidone` (the weld ADR 0048 exists to stop).
+        let retried = compute_display_rows(
+            &json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": { "text": "done" } }),
+            &text_acc,
+            &tool_state,
+            &thought_state,
+        );
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].kind, "agent-text");
+        assert_eq!(retried[0].message_key, "m1");
+        assert_eq!(
+            retried[0].payload_json,
+            json!({ "text": "done" }),
+            "the retry streams into the cleared id from nothing"
+        );
+    }
+
+    /// (ADR 0048) The thought run does NOT start at `#1`: `next` counts
+    /// segments for the life of the loop, so a second message's thoughts are
+    /// `m2#2`, `m2#3`. Erasing a range from `#1` would UPSERT rows that never
+    /// existed, and the UPSERT has no undo — so the erased set is exactly the
+    /// keys this message actually used.
+    #[test]
+    fn a_retraction_erases_exactly_the_keys_that_exist() {
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
+
+        let drive = [
+            // The loop's FIRST segment belongs to the FIRST message.
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "first" } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "run" }),
+            // m2's thoughts therefore open at #2, not #1.
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m2", "content": { "text": "second" } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t2", "title": "again" }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m2", "content": { "text": "third" } }),
+        ];
+        let driven: Vec<String> = drive
+            .iter()
+            .flat_map(|u| compute_display_rows(u, &text_acc, &tool_state, &thought_state))
+            .map(|r| format!("{}@{}", r.kind, r.message_key))
+            .collect();
+        assert_eq!(
+            driven,
+            vec![
+                "agent-thought@m1#1",
+                "tool-call@t1",
+                "agent-thought@m2#2",
+                "tool-call@t2",
+                "agent-thought@m2#3",
+            ],
+            "m2's run is #2..#3 — it does NOT start at #1"
+        );
+
+        let rows = compute_display_rows(
+            &json!({ "sessionUpdate": "message_retracted", "messageId": "m2" }),
+            &text_acc,
+            &tool_state,
+            &thought_state,
+        );
+        let erased: std::collections::BTreeSet<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.kind.as_str(), r.message_key.as_str()))
+            .collect();
+        assert_eq!(
+            erased,
+            [("agent-thought", "m2#2"), ("agent-thought", "m2#3")]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "exactly the keys that existed are erased (no `m2#1`, no other \
+             message's row), got {rows:?}"
+        );
+    }
+
+    /// (ADR 0048) Nothing streamed under this id, so nothing is written: an
+    /// empty Retraction must not litter a table the UPSERT can never clean.
+    #[test]
+    fn a_retraction_of_a_message_that_never_streamed_writes_nothing() {
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
+
+        let rows = compute_display_rows(
+            &json!({ "sessionUpdate": "message_retracted", "messageId": "m7" }),
+            &text_acc,
+            &tool_state,
+            &thought_state,
+        );
+        assert!(
+            rows.is_empty(),
+            "a Retraction for an id that streamed nothing writes no row, got {rows:?}"
+        );
     }
 }
