@@ -360,18 +360,13 @@ pub async fn authenticate_server(server_name: &str, def: &ServerDef) -> Result<S
     Ok(format!("{server_name}: authenticated"))
 }
 
-/// The production `open_browser` (the platform default browser,
-/// fire-and-forget; a failure is non-fatal — the URL is in the result).
+/// The production `open_browser` (the platform default browser, fire-and-forget;
+/// a failure is non-fatal — the URL is in the result). `crate::open` is the ONE
+/// External-open policy, so the per-OS `open`/`cmd /c start`/`xdg-open` block
+/// that used to live here is gone: `tauri-plugin-opener` is the only place in
+/// this repo that knows what each platform's opener is.
 fn production_open_browser(url: &str) {
-    if cfg!(target_os = "macos") {
-        let _ = std::process::Command::new("open").arg(url).spawn();
-    } else if cfg!(target_os = "windows") {
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .spawn();
-    } else {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
+    let _ = crate::open::open(url, None);
 }
 
 #[cfg(test)]
