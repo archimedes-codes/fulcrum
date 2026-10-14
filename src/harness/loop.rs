@@ -320,6 +320,10 @@ impl AgentLoop {
         // The settings dir (the `settings.json` home — ADR 0019: the MCP
         // manager's desktop layer; `None` = no desktop layer).
         config_dir: Option<PathBuf>,
+        // The stamp for this Worker's life (ADR 0049): EVERY id the harness
+        // mints is prefixed with it, so a Resume's new loop — whose counters
+        // restart at 0 — cannot mint an id its predecessor already used.
+        incarnation: String,
     ) -> Self {
         let compactor = Compactor::new(catalog.compaction, model.context_window);
         let (control_tx, control_queue) = mpsc::channel(8);
@@ -365,7 +369,7 @@ impl AgentLoop {
             retry,
             enabled_tools: None,
             thinking_level: None,
-            turn_state: std::sync::Mutex::new(TurnState::default()),
+            turn_state: std::sync::Mutex::new(TurnState::stamped(incarnation)),
             text_acc: std::sync::Mutex::new(HashMap::new()),
             tool_state: std::sync::Mutex::new(HashMap::new()),
             thought_state: std::sync::Mutex::new(ThoughtState::default()),
@@ -2739,6 +2743,7 @@ mod tests {
             SudoDeps::default(),
             retry,
             config_dir.map(|p| p.to_path_buf()),
+            "t".to_string(),
         );
         (loop_, db)
     }
@@ -6424,6 +6429,7 @@ mod tests {
             SudoDeps::default(),
             retry,
             config_dir.map(|p| p.to_path_buf()),
+            "t".to_string(),
         )
     }
 

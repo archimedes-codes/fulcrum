@@ -49,7 +49,9 @@ pub(crate) struct ThoughtState {
 /// `message_start` carries ANY `AgentMessage` — user and tool-result
 /// messages included — so a role-blind counter would number the first
 /// assistant chunk `m2` and make the `get_messages` replay numbering
-/// irreproducible). `current_message_id` is `format!("m{}", counter)`.
+/// irreproducible). `current_message_id` is
+/// `format!("{incarnation}:m{counter}")` (ADR 0049 — the stamp is what keeps
+/// a resumed Worker's counter restart out of its predecessor's rows).
 ///
 /// `toolcall_args` is the accumulating partial-args buffer per tool-call id
 /// (the `toolcall_delta` frames are JSON fragments; `toolcall_end` carries
@@ -69,14 +71,34 @@ pub struct TurnState {
     pub toolcall_args: HashMap<String, String>,
     pub announced_tool_calls: HashSet<String>,
     /// How many Retractions this turn has announced. The discard line needs a
-    /// messageId UNIQUE per discard (ADR 0048) — two lines sharing `"system"`
-    /// would weld into one bubble.
+    /// messageId UNIQUE per discard (ADR 0048) — two lines on the shared
+    /// `system` key (today `{stamp}:system`) would weld into one bubble.
     pub retract_seq: u64,
+    /// The stamp for this Worker's life (ADR 0049), prefixed onto every id
+    /// this state mints. An EMPTY stamp is a test artifact — production can
+    /// only build a `TurnState` through `AgentLoop::new`, which requires one.
+    pub incarnation: String,
+}
+
+impl TurnState {
+    /// A state whose ids are namespaced by `incarnation` (ADR 0049).
+    pub fn stamped(incarnation: impl Into<String>) -> Self {
+        Self {
+            incarnation: incarnation.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Namespace one of this state's ids: `a3f9c1:m1`, `a3f9c1:system`.
+    fn id(&self, suffix: &str) -> String {
+        format!("{}:{}", self.incarnation, suffix)
+    }
 }
 
 /// A one-line `agent_message_chunk` carrying a UNIQUE messageId — for a line
 /// that must survive being adjacent to another line. `system_chunk`'s shared
-/// `"system"` key APPENDS (that is its point), so a second line on it welds.
+/// key (the stamped `system` key, `{stamp}:system`) APPENDS (that is its
+/// point), so a second line on it welds.
 fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
     let text = text.into();
     json!({
@@ -87,23 +109,37 @@ fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
 }
 
 /// Is this messageId a harness bookkeeping line rather than model output?
-/// `"system"` is the shared one-liner key; `"retract:N"` is a discard line
-/// (ADR 0048). Anything that must capture ONLY what the model said — the
-/// subagent capture, whose text becomes the PARENT's tool result — asks this
-/// instead of re-deciding the convention.
+/// The bookkeeping WORDS are `system` (the shared one-liner key) and `retract`
+/// (a discard line, ADR 0048). The predicate matches either as a `:`-separated
+/// word ANYWHERE in the id — deliberately a word-set, not a position: the id
+/// `normalize` mints today is `{stamp}:system` / `{stamp}:retract:N` (ADR
+/// 0049), and the BARE shape (`system`, `retract:1`) is accepted as well
+/// because that is the id shape WITH NO stamp — the test fixtures that
+/// hand-write these ids, and `TurnState::default()`, whose EMPTY stamp mints
+/// `:system` / `:retract:1` (a "strip a leading 6-hex field, then match" rule
+/// would misclassify those). A stamp is SIX HEX CHARS
+/// (`types::mint_incarnation`), and neither word is spelled from the hex
+/// alphabet (`system` carries `s`/`y`/`t`/`m`; `retract` is seven chars and
+/// carries `r`/`t`), so a stamp can never EQUAL one. `default` is deliberately NOT here: it is the
+/// no-id-open fallback over REAL model text, and the subagent capture must
+/// still hand it to the parent. Anything that must capture ONLY what the model
+/// said — the subagent capture, whose text becomes the PARENT's tool result —
+/// asks this instead of re-deciding the convention.
 pub fn is_bookkeeping_message_id(id: &str) -> bool {
-    id == "system" || id.starts_with("retract:")
+    id.split(':')
+        .any(|field| field == "system" || field == "retract")
 }
 
-/// A one-line `agent_message_chunk` with the dedicated `"system"` messageId
+/// A one-line `agent_message_chunk` with the dedicated `system` messageId
 /// (the bookkeeping one-liners — never mixed into a real message's
-/// accumulated text).
-fn system_chunk(text: impl Into<String>) -> Value {
+/// accumulated text). The id is the stamped shared key (`{stamp}:system`) so a
+/// resumed Worker's one-liner does not overwrite its predecessor's (ADR 0049).
+fn system_chunk(message_id: &str, text: impl Into<String>) -> Value {
     let text = text.into();
     json!({
         "sessionUpdate": "agent_message_chunk",
         "content": { "type": "text", "text": text },
-        "messageId": "system",
+        "messageId": message_id,
     })
 }
 
@@ -142,7 +178,7 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
         RpcEvent::message_start { message } => {
             if message.get("role").and_then(Value::as_str) == Some("assistant") {
                 st.msg_counter += 1;
-                st.current_message_id = Some(format!("m{}", st.msg_counter));
+                st.current_message_id = Some(st.id(&format!("m{}", st.msg_counter)));
             }
             Vec::new()
         }
@@ -150,10 +186,15 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             assistant_message_event: ev,
             ..
         } => {
-            let mid = st
-                .current_message_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            // LAZY on purpose (ADR 0049's id stamp makes the fallback a
+            // `format!`): this arm runs for EVERY streamed token, and the
+            // `default` id is built ONLY when no assistant `message_start` has
+            // opened a message yet — hoisting it above the `match` would pay
+            // one allocation per token for the id of that one edge case.
+            let mid = match st.current_message_id.clone() {
+                Some(id) => id,
+                None => st.id("default"),
+            };
             match ev.get("type").and_then(Value::as_str) {
                 Some("text_delta") => vec![json!({
                     "sessionUpdate": "agent_message_chunk",
@@ -368,9 +409,9 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             "title": name,
         })],
         // Bookkeeping / de-structured one-liners (the adapter's parity; the
-        // strings are stable for tests). They carry a `messageId` of
-        // `"system"` (a dedicated key — never mixed into a real message's
-        // accumulated text).
+        // strings are stable for tests). They carry the SHARED
+        // `{incarnation}:system` messageId (a dedicated key — never mixed into
+        // a real message's accumulated text).
         //
         // A compaction emits a SECOND frame beside the one-liner: the
         // `compaction_update` STATE frame ("a compaction is running", and the
@@ -380,7 +421,7 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
         // durable transcript trace — the summary itself is a `native_messages`
         // `System` row, never a display row.
         RpcEvent::compaction_start { reason } => vec![
-            system_chunk("Compacting context…"),
+            system_chunk(&st.id("system"), "Compacting context…"),
             json!({
                 "sessionUpdate": "compaction_update",
                 "active": true,
@@ -391,8 +432,9 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
         // overflow recovery's actionable line — "not enough older context to
         // compact" / "the summary call failed") prints THAT instead of the
         // success line, never both: these one-liners all share
-        // `messageId: "system"`, and the frontend appends same-`messageId`
-        // chunks with no separator, so two in one batch weld into one bubble.
+        // `messageId: "{stamp}:system"`, and the frontend appends
+        // same-`messageId` chunks with no separator, so two in one batch weld
+        // into one bubble.
         // A successful compaction has no `error_message`, so the pinned
         // "Compaction finished" still ships on the success path.
         RpcEvent::compaction_end {
@@ -401,8 +443,8 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             ..
         } => vec![
             match error_message {
-                Some(m) => system_chunk(format!("Compaction failed: {m}")),
-                None => system_chunk("Compaction finished"),
+                Some(m) => system_chunk(&st.id("system"), format!("Compaction failed: {m}")),
+                None => system_chunk(&st.id("system"), "Compaction finished"),
             },
             json!({
                 "sessionUpdate": "compaction_update",
@@ -414,18 +456,21 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
         // the harness is ON — the retried call REUSES it (`message_start` fires
         // once per assistant message), which is precisely why the discard is a
         // protocol event and not something the reader may infer. Then the line
-        // says so, on its own id: reusing `"system"` would weld it onto the
-        // "Retrying (attempt 1/3…)" line this path emits immediately before.
+        // says so, on its own id: reusing the shared `system` key would weld it
+        // onto the "Retrying (attempt 1/3…)" line this path emits immediately
+        // before.
         RpcEvent::message_retracted => {
-            let mid = st
-                .current_message_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            // The SAME lazy form as the `message_update` arm (symmetry, not a
+            // hot path — this runs once per discarded attempt).
+            let mid = match st.current_message_id.clone() {
+                Some(id) => id,
+                None => st.id("default"),
+            };
             st.retract_seq += 1;
             vec![
                 json!({ "sessionUpdate": "message_retracted", "messageId": mid }),
                 unique_system_chunk(
-                    &format!("retract:{}", st.retract_seq),
+                    &st.id(&format!("retract:{}", st.retract_seq)),
                     "Discarded an incomplete reply",
                 ),
             ]
@@ -434,18 +479,22 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             attempt,
             max_attempts,
             ..
-        } => vec![system_chunk(format!(
-            "Retrying (attempt {attempt}/{max_attempts}…)"
-        ))],
+        } => vec![system_chunk(
+            &st.id("system"),
+            format!("Retrying (attempt {attempt}/{max_attempts}…)"),
+        )],
         RpcEvent::auto_retry_end { success, .. } => {
             vec![if *success {
-                system_chunk("Retry succeeded")
+                system_chunk(&st.id("system"), "Retry succeeded")
             } else {
-                system_chunk("Retry failed")
+                system_chunk(&st.id("system"), "Retry failed")
             }]
         }
         RpcEvent::extension_error { error, .. } => {
-            vec![system_chunk(format!("Extension error: {error}"))]
+            vec![system_chunk(
+                &st.id("system"),
+                format!("Extension error: {error}"),
+            )]
         }
         // Bookkeeping (no frame): the turn's resolution signal
         // (`agent_settled` — the driver resolves the pending turn), the
@@ -685,14 +734,73 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
-mod normalize_tests {
-    use serde_json::json;
+use std::sync::Arc;
 
-    use super::{normalize, TurnState};
+#[cfg(test)]
+use crate::storage::Db;
+
+/// A temp-dir `Db` with a recorded `sessions` row (the `messages` rows FK to
+/// `sessions`) — the fixture BOTH of this module's test suites need (one
+/// `session_id`, one table, the display rows written through `SessionStore`).
+///
+/// The `TempDir` GUARD travels back with the `Db` and the caller keeps it
+/// alive for the whole test (`let (db, _dir) = temp_db();` — the `mcp` tool
+/// tests' `(T, tempfile::TempDir)` pattern). It used to be a hand-rolled
+/// `temp_dir()/harness-display-test-<uuid>` that NOTHING ever removed, so every
+/// run of either suite left two directories behind; `TempDir` deletes its dir on
+/// drop, which only happens if a binding still holds it when the test ends.
+#[cfg(test)]
+fn temp_db() -> (Arc<Db>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = Arc::new(Db::open(&dir.path().join("t.db")).expect("db should open"));
+    db.record_session(&crate::types::SessionInfo {
+        session_id: "s1".to_string(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        capabilities: serde_json::json!({}),
+        config_options: None,
+        archived: false,
+        title: None,
+        context_usage: None,
+        is_subagent: false,
+    })
+    .expect("record_session");
+    (db, dir)
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use serde_json::{json, Value};
+
+    use super::temp_db;
+    use super::{
+        compute_display_rows, is_bookkeeping_message_id, normalize, ThoughtState, TurnState,
+    };
     use crate::agent::events::RpcEvent;
+    use crate::agent::harness::store::{SessionStore, Store};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
 
     fn ev(v: serde_json::Value) -> RpcEvent {
         serde_json::from_value(v).expect("event should parse")
+    }
+
+    /// One frame's whole downstream pipeline: `compute_display_rows` + the
+    /// write half (`SessionStore::persist_display` → `db.record_message`) —
+    /// what the loop's driver does per frame (ADR 0025's split).
+    fn persist_frames(
+        store: &SessionStore,
+        session_id: &str,
+        frames: Vec<Value>,
+        text_acc: &StdMutex<HashMap<String, String>>,
+        tool_state: &StdMutex<HashMap<String, Value>>,
+        thought_state: &StdMutex<ThoughtState>,
+    ) {
+        for frame in frames {
+            let rows = compute_display_rows(&frame, text_acc, tool_state, thought_state);
+            store
+                .persist_display(session_id, &rows)
+                .expect("display rows persist");
+        }
     }
 
     /// The `messageId` role rule: a USER `message_start` does NOT advance
@@ -701,7 +809,7 @@ mod normalize_tests {
     /// `m2` and break the replay numbering).
     #[test]
     fn message_id_advances_only_for_assistant_messages() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         let user = ev(json!({
             "type": "message_start",
             "message": { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
@@ -719,7 +827,7 @@ mod normalize_tests {
         }));
         assert!(normalize(&assistant, &mut st).is_empty());
         assert_eq!(st.msg_counter, 1);
-        assert_eq!(st.current_message_id.as_deref(), Some("m1"));
+        assert_eq!(st.current_message_id.as_deref(), Some("t:m1"));
 
         let delta = ev(json!({
             "type": "message_update",
@@ -730,8 +838,8 @@ mod normalize_tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["sessionUpdate"], "agent_message_chunk");
         assert_eq!(
-            frames[0]["messageId"], "m1",
-            "the first assistant chunk keys m1"
+            frames[0]["messageId"], "t:m1",
+            "the first assistant chunk keys the stamped m1"
         );
         assert_eq!(frames[0]["content"]["text"], "Hel");
     }
@@ -741,7 +849,7 @@ mod normalize_tests {
     /// delivered the content — re-emitting would double the text).
     #[test]
     fn end_and_start_frames_emit_nothing() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         let _ = normalize(
             &ev(json!({ "type": "message_start", "message": { "role": "assistant" } })),
             &mut st,
@@ -750,7 +858,7 @@ mod normalize_tests {
             &ev(json!({ "type": "message_start", "message": { "role": "assistant" } })),
             &mut st,
         );
-        assert_eq!(st.current_message_id.as_deref(), Some("m2"));
+        assert_eq!(st.current_message_id.as_deref(), Some("t:m2"));
 
         for t in ["text_end", "thinking_end", "text_start", "thinking_start"] {
             let frames = normalize(
@@ -769,7 +877,7 @@ mod normalize_tests {
     /// as text deltas).
     #[test]
     fn thinking_delta_maps_to_agent_thought_chunk() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         let _ = normalize(
             &ev(json!({ "type": "message_start", "message": { "role": "assistant" } })),
             &mut st,
@@ -785,7 +893,7 @@ mod normalize_tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["sessionUpdate"], "agent_thought_chunk");
         assert_eq!(frames[0]["content"]["text"], "hmm");
-        assert_eq!(frames[0]["messageId"], "m1");
+        assert_eq!(frames[0]["messageId"], "t:m1");
     }
 
     /// The tool-call frame sequence: `toolcall_start` → `tool_call` (empty
@@ -1047,7 +1155,7 @@ mod normalize_tests {
     /// the renderer's indicator reads and which persists no display row.
     #[test]
     fn bookkeeping_events_and_one_liners() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         let compacting = normalize(
             &ev(json!({ "type": "compaction_start", "reason": "manual" })),
             &mut st,
@@ -1055,8 +1163,8 @@ mod normalize_tests {
         assert_eq!(compacting.len(), 2, "the one-liner + the state frame");
         assert_eq!(compacting[0]["content"]["text"], "Compacting context…");
         assert_eq!(
-            compacting[0]["messageId"], "system",
-            "the one-liners key the dedicated system id"
+            compacting[0]["messageId"], "t:system",
+            "the one-liners key the stamped dedicated system id"
         );
         assert_eq!(
             compacting[1],
@@ -1109,7 +1217,7 @@ mod normalize_tests {
     }
     /// A `compaction_end` that CARRIES an `error_message` prints it INSTEAD
     /// of the success line — and not in addition to it. Both lines are
-    /// `system_chunk`s, i.e. they share `messageId: "system"`, and the
+    /// `system_chunk`s, i.e. they share `messageId: "{stamp}:system"`, and the
     /// frontend's `applySessionUpdate` APPENDS same-`messageId` chunks with NO
     /// separator: two of them in one batch weld into one bubble reading
     /// `Compaction finishedCompaction failed: …` (pinned at the store level in
@@ -1122,7 +1230,7 @@ mod normalize_tests {
     /// at all (see `a_failed_summary_does_not_rewrite_the_transcript`).
     #[test]
     fn a_compaction_error_message_replaces_the_success_line() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         let failed = normalize(
             &ev(json!({
                 "type": "compaction_end",
@@ -1147,7 +1255,7 @@ mod normalize_tests {
             "the success line is REPLACED, not followed (the weld)"
         );
         assert_eq!(
-            failed[0]["messageId"], "system",
+            failed[0]["messageId"], "t:system",
             "the failure line keeps the system id"
         );
         assert_eq!(
@@ -1178,11 +1286,11 @@ mod normalize_tests {
     }
 
     /// (ADR 0048) A real discard is both the erase AND a line saying so, and
-    /// the line carries its OWN messageId — the shared `"system"` key would weld
+    /// the line carries its OWN messageId — the shared `system` key would weld
     /// it onto the retry line emitted immediately before it.
     #[test]
     fn a_retraction_erases_the_current_message_and_says_so() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         normalize(
             &RpcEvent::message_start {
                 message: json!({ "role": "assistant" }),
@@ -1193,17 +1301,17 @@ mod normalize_tests {
         assert_eq!(
             frames,
             vec![
-                json!({ "sessionUpdate": "message_retracted", "messageId": "m1" }),
+                json!({ "sessionUpdate": "message_retracted", "messageId": "t:m1" }),
                 json!({
                     "sessionUpdate": "agent_message_chunk",
                     "content": { "type": "text", "text": "Discarded an incomplete reply" },
-                    "messageId": "retract:1",
+                    "messageId": "t:retract:1",
                 }),
             ]
         );
         assert_eq!(
             st.current_message_id.as_deref(),
-            Some("m1"),
+            Some("t:m1"),
             "the retried call REUSES the id: a Retraction is not a new message"
         );
     }
@@ -1212,7 +1320,7 @@ mod normalize_tests {
     /// increments per Retraction — the ids are unique, not shared.
     #[test]
     fn a_second_retraction_gets_its_own_line_id() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         normalize(
             &RpcEvent::message_start {
                 message: json!({ "role": "assistant" }),
@@ -1221,19 +1329,280 @@ mod normalize_tests {
         );
         let first = normalize(&RpcEvent::message_retracted, &mut st);
         let second = normalize(&RpcEvent::message_retracted, &mut st);
-        assert_eq!(first[1]["messageId"], "retract:1");
-        assert_eq!(second[1]["messageId"], "retract:2");
+        assert_eq!(first[1]["messageId"], "t:retract:1");
+        assert_eq!(second[1]["messageId"], "t:retract:2");
     }
 
     /// A Retraction with no message announced yet is still well-formed (the
     /// `default` id every other chunk falls back to).
     #[test]
     fn a_retraction_before_any_message_start_says_default() {
-        let mut st = TurnState::default();
+        let mut st = TurnState::stamped("t");
         let frames = normalize(&RpcEvent::message_retracted, &mut st);
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["sessionUpdate"], "message_retracted");
-        assert_eq!(frames[0]["messageId"], "default");
+        assert_eq!(frames[0]["messageId"], "t:default");
+    }
+
+    /// A stamp is a NAMESPACE, not a suffix to sort by: the same counter value
+    /// in two incarnations must produce two different ids, or a resumed Worker
+    /// is back in its predecessor's rows (ADR 0049 — the Resume restarts the
+    /// loop's counters, so an unstamped `m1` overwrites the first Worker's
+    /// `m1`).
+    #[test]
+    fn two_incarnations_mint_disjoint_ids_for_the_same_counter() {
+        let mut st_a = TurnState::stamped("aaaaaa");
+        let mut st_b = TurnState::stamped("bbbbbb");
+        let start = || {
+            ev(json!({
+                "type": "message_start",
+                "message": { "role": "assistant", "content": [] },
+            }))
+        };
+        assert!(normalize(&start(), &mut st_a).is_empty());
+        assert!(normalize(&start(), &mut st_b).is_empty());
+        assert_eq!(
+            st_a.current_message_id.as_deref(),
+            Some("aaaaaa:m1"),
+            "the counter is NAMED by the stamp, not sequenced by it"
+        );
+        assert_eq!(st_b.current_message_id.as_deref(), Some("bbbbbb:m1"));
+        assert_eq!(
+            st_a.msg_counter, st_b.msg_counter,
+            "both incarnations are on counter 1 — the collision is the point"
+        );
+        assert_ne!(
+            st_a.current_message_id, st_b.current_message_id,
+            "the same counter value in two incarnations must not collide"
+        );
+    }
+
+    /// (ADR 0049) TWO Worker lives for ONE session — the Resume case, and the
+    /// defect this exists to stop. A Resume spawns a new Worker with a new
+    /// `AgentLoop`, so `TurnState`'s counters restart at 0 and the resumed
+    /// session's first reply is the `m1` its first Worker already used. The
+    /// display store UPSERTs on `UNIQUE(session_id, kind, message_key)` and has
+    /// no DELETE, so an unstamped second `m1` silently overwrote the first
+    /// incarnation's rows, and ADR 0048's Retraction — which erases BY
+    /// `messageId` — could erase history that is not its own.
+    ///
+    /// The claim, in words: for ONE `session_id` and ONE `Db`, every id the
+    /// harness mints is namespaced by its incarnation stamp, so the same
+    /// counter value in two incarnations is two display rows. A Retraction in
+    /// incarnation B erases B's OWN text and thought rows and leaves
+    /// incarnation A's text, thought AND system rows untouched — and nothing
+    /// unstamped (`m1`, `m1#1`, `system`) is ever written.
+    ///
+    /// This is the seam where two Worker lives meet: two `TurnState`s with
+    /// different stamps, two FRESH accumulator sets (a new Worker has new ones),
+    /// one session id, one database.
+    #[test]
+    fn two_incarnations_of_one_session_never_share_a_display_row() {
+        let (db, _dir) = temp_db();
+        let store = SessionStore::new(db.clone());
+
+        // ── incarnation A: the first Worker ────────────────────────────────
+        let mut st_a = TurnState::stamped("aaaaaa");
+        let a_text = StdMutex::new(HashMap::new());
+        let a_tools = StdMutex::new(HashMap::new());
+        let a_thoughts = StdMutex::new(ThoughtState::default());
+        let events_a = [
+            // Opens `aaaaaa:m1` (the counter's FIRST value).
+            ev(json!({
+                "type": "message_start",
+                "message": { "role": "assistant", "content": [] },
+            })),
+            ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "history" },
+            })),
+            ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "thinking_delta", "contentIndex": 0, "delta": "think" },
+            })),
+            // The retry one-liner — the id family with NO counter to seed
+            // (`system`), which a counter-seeding design would have left
+            // unstamped and therefore shared.
+            ev(json!({
+                "type": "auto_retry_start",
+                "attempt": 1,
+                "maxAttempts": 3,
+                "delayMs": 100,
+                "errorMessage": "boom",
+            })),
+        ];
+        for e in &events_a {
+            persist_frames(
+                &store,
+                "s1",
+                normalize(e, &mut st_a),
+                &a_text,
+                &a_tools,
+                &a_thoughts,
+            );
+        }
+
+        // ── incarnation B: the resumed Worker ──────────────────────────────
+        // A SECOND, FRESH set of accumulators (what a new process has), the
+        // SAME session id, the SAME database.
+        let mut st_b = TurnState::stamped("bbbbbb");
+        let b_text = StdMutex::new(HashMap::new());
+        let b_tools = StdMutex::new(HashMap::new());
+        let b_thoughts = StdMutex::new(ThoughtState::default());
+        let events_b = [
+            // The SAME counter value A used — the collision is the point.
+            ev(json!({
+                "type": "message_start",
+                "message": { "role": "assistant", "content": [] },
+            })),
+            ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "parti" },
+            })),
+            // REQUIRED: the retraction arm erases only the segments recorded in
+            // `ThoughtState.segments`, so without a thought there is no
+            // `bbbbbb:m1#1` row to assert.
+            ev(json!({
+                "type": "message_update",
+                "usage": null,
+                "assistantMessageEvent": { "type": "thinking_delta", "contentIndex": 0, "delta": "partthink" },
+            })),
+            ev(json!({ "type": "message_retracted" })),
+        ];
+        for e in &events_b {
+            persist_frames(
+                &store,
+                "s1",
+                normalize(e, &mut st_b),
+                &b_text,
+                &b_tools,
+                &b_thoughts,
+            );
+        }
+
+        // ── what the one table actually holds ─────────────────────────────
+        let rows: Vec<(String, String, String)> = db
+            .messages_for("s1")
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.kind, m.message_key.unwrap_or_default(), m.payload_json))
+            .collect();
+        let row = |kind: &str, key: &str| -> (String, String, String) {
+            rows.iter()
+                .find(|(k, m, _)| k == kind && m == key)
+                .cloned()
+                .unwrap_or_else(|| panic!("no ({kind}, {key}) display row; the table is {rows:?}"))
+        };
+
+        // A's rows survived B's arrival entirely.
+        assert!(
+            row("agent-text", "aaaaaa:m1").2.contains("history")
+                && row("agent-thought", "aaaaaa:m1#1").2.contains("think"),
+            "incarnation A's text and thought rows are intact, the table is {rows:?}"
+        );
+        assert!(
+            row("agent-text", "aaaaaa:system").2.contains("Retrying"),
+            "the shared one-liner key is stamped too (it has no counter to \
+             seed, so it is the family a counter-only design would leave \
+             shared), the table is {rows:?}"
+        );
+
+        // B erased its OWN rows — and nothing else.
+        assert_eq!(
+            row("agent-text", "bbbbbb:m1").2,
+            r#"{"text":""}"#,
+            "B's Retraction emptied B's own text row"
+        );
+        assert_eq!(
+            row("agent-thought", "bbbbbb:m1#1").2,
+            r#"{"text":""}"#,
+            "B's Retraction emptied B's own thought row"
+        );
+        // The discard line is a display row too — asserted so nobody later
+        // "cleans it up".
+        assert!(
+            row("agent-text", "bbbbbb:retract:1")
+                .2
+                .contains("Discarded"),
+            "the discard line is persisted under B's own stamp, the table is {rows:?}"
+        );
+
+        // Nothing unstamped was ever written.
+        for unstamped in ["m1", "m1#1", "system"] {
+            assert!(
+                !rows.iter().any(|(_, k, _)| k == unstamped),
+                "an unstamped id reached the display store: {unstamped}"
+            );
+        }
+
+        // The two first-assistant-message rows COEXIST as TWO rows: both
+        // incarnations counted to `m1` for one `session_id`, so the stamp is
+        // the only thing keeping them apart.
+        //
+        // The EXACT TOTAL is the proof. Drop the stamp and `m1` / `m1#1`
+        // collapse into ONE row each, leaving FOUR rows (`m1`, `m1#1`,
+        // `system`, `retract:1`) where these SIX live side by side. Order of
+        // failure when the stamp is dropped: the
+        // `row("agent-text", "aaaaaa:m1")` LOOKUP above is the FIRST thing to
+        // fail (`row` panics on an absent key), this count is the second.
+        //
+        // And deliberately NO `assert_ne!(A's payload, B's payload)` beside
+        // it: rows are keyed by `(kind, message_key)`, so two rows carrying
+        // `aaaaaa:m1` and `bbbbbb:m1` CANNOT be one overwritten row — the
+        // count already states that claim — and these two payloads differ
+        // only incidentally (A streamed `history`; B streamed `parti` and then
+        // erased itself), so the assertion could not fire for the overwrite it
+        // advertises. What each life's payload has to BE is asserted per key
+        // ABOVE (`aaaaaa:m1` holds A's text, `bbbbbb:m1` is emptied by B's own
+        // Retraction), which is the assertion that can actually fail.
+        assert_eq!(
+            rows.len(),
+            6,
+            "A's `m1` + `m1#1` + `system` PLUS B's `m1` + `m1#1` + `retract:1` \
+             — six coexisting rows, two Worker lives that never touched each \
+             other's keys; the table is {rows:?}"
+        );
+    }
+
+    /// The bookkeeping set is `system` and `retract`, in either id shape — and
+    /// `default` is NOT in it: that id carries real model text (a
+    /// `message_update` before any assistant `message_start`), and the subagent
+    /// capture must still hand it to the parent (ADR 0048's fourth consumer).
+    #[test]
+    fn the_bookkeeping_predicate_reads_both_id_shapes() {
+        for id in ["system", "retract:1", "a3f9c1:system", "a3f9c1:retract:1"] {
+            assert!(is_bookkeeping_message_id(id), "{id} is bookkeeping");
+        }
+        for id in ["a3f9c1:m1", "a3f9c1:m2#3", "default", "a3f9c1:default"] {
+            assert!(
+                !is_bookkeeping_message_id(id),
+                "{id} carries model output, not bookkeeping"
+            );
+        }
+        // The LOOSENESS is chosen, not accidental: the predicate scans the id's
+        // `:`-separated fields for a WORD, it does not decode a POSITION. No
+        // reachable id tells the two readings apart (`normalize` is the only
+        // `messageId` writer and every id it mints is `{6 hex}:…`, and a stamp
+        // can never BE one of the words — they contain non-hex characters), and
+        // a stricter "strip a leading 6-hex field, then match" rule would
+        // MISCLASSIFY the EMPTY-stamp ids `TurnState::default()` still mints
+        // (`:system`, `:retract:1`). The pins below say so.
+        assert!(
+            is_bookkeeping_message_id("retract"),
+            "the bare pre-stamp discard id is bookkeeping"
+        );
+        assert!(
+            is_bookkeeping_message_id("anything:retract:9"),
+            "the predicate matches a WORD, not a position"
+        );
+        assert!(
+            is_bookkeeping_message_id(":retract:1"),
+            "the EMPTY-stamp shape (`TurnState::default()`) is bookkeeping too \
+             — a position-based rule would miss it"
+        );
     }
 }
 
@@ -1241,33 +1610,11 @@ mod normalize_tests {
 mod compute_display_rows_tests {
     use serde_json::json;
 
+    use super::temp_db;
     use super::{compute_display_rows, ThoughtState};
     use crate::agent::harness::store::{SessionStore, Store};
-    use crate::storage::Db;
-    use crate::types::SessionInfo;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex as StdMutex};
-
-    /// A temp-dir `Db` with a recorded `sessions` row (the `messages`
-    /// rows FK to `sessions`).
-    fn temp_db() -> Arc<Db> {
-        let dir =
-            std::env::temp_dir().join(format!("harness-display-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
-        db.record_session(&SessionInfo {
-            session_id: "s1".to_string(),
-            cwd: std::path::PathBuf::from("/tmp"),
-            capabilities: serde_json::json!({}),
-            config_options: None,
-            archived: false,
-            title: None,
-            context_usage: None,
-            is_subagent: false,
-        })
-        .expect("record_session");
-        db
-    }
+    use std::sync::Mutex as StdMutex;
 
     /// The `persist_update` split (ADR 0025) GOLDEN test:
     /// `compute_display_rows` on a canned normalized update + canned
@@ -1277,7 +1624,7 @@ mod compute_display_rows_tests {
     /// `db.record_message`, so the `messages` rows are identical).
     #[test]
     fn compute_display_rows_matches_the_legacy_persist_update_writes() {
-        let db = temp_db();
+        let (db, _dir) = temp_db();
         let store = SessionStore::new(db.clone());
         let text_acc = StdMutex::new(HashMap::new());
         let tool_state = StdMutex::new(HashMap::new());
