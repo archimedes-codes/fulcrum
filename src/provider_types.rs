@@ -28,6 +28,48 @@ pub struct ModelRequest {
     pub session_id: Option<String>,
 }
 
+impl ModelRequest {
+    /// The `System` messages' text, FOLDED into ONE string: each message
+    /// verbatim for [`Text`](MessageContent::Text), its `Text` block texts
+    /// joined for [`Blocks`](MessageContent::Blocks) (an `Image` block has
+    /// no text to fold — it is dropped, as on every wire), and the messages
+    /// joined with `"\n\n"` in transcript order. Empty when the request has
+    /// no `System` message.
+    ///
+    /// All three wires need this fold, for different reasons. The harness
+    /// keeps `System` messages wherever they belong in the transcript, and
+    /// index 1 is a legal home: the compaction summary is a `System` message
+    /// sitting right after the preserved leading system prompt
+    /// (`compact::run_compaction`). Anthropic has a top-level `system` field
+    /// and Responses a top-level `instructions` field, so both send the fold
+    /// THERE and keep `System` out of `messages` / `input`. Chat-completions
+    /// has no such field, so it sends the fold as a single LEADING `system`
+    /// message — the ChatML-family templates vLLM / SGLang serve for Qwen,
+    /// DeepSeek and Hermes assert that a `system` message appears ONLY at
+    /// index 0 (`raise_exception('System message must be at the beginning.')`),
+    /// and because vLLM executes the template to auto-generate its response
+    /// parser that assertion is a 400 BEFORE the model runs, reported as a
+    /// template error rather than a message error.
+    pub fn system_text(&self) -> String {
+        self.messages
+            .iter()
+            .filter(|m| m.role == ChatRole::System)
+            .map(|m| match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        ContentBlock::Image { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
 /// A message's content: plain text, or a list of content blocks (mirrors
 /// the Task 1 [`ContentBlock`] shape — text or a base64 image).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

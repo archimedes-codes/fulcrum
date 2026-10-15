@@ -698,11 +698,18 @@ mod tests {
         let handler: Arc<Mutex<TestHandler>> = Arc::new(Mutex::new(slow_handler()));
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let server = http_server(listener, handler, recorded.clone());
-        // A short `read_timeout` (200 ms) — the dribble (50 ms/byte) is
-        // well under it, so the stream completes.
+        // A short `read_timeout` (1 s) — the dribble (50 ms/byte) is well
+        // under it, so the stream completes. 1 s, not the original 200 ms:
+        // CI runners under full-suite load produced a single scheduling gap
+        // over 200 ms (macOS, run 38750373114 — "error decoding response
+        // body" = the read idle bound firing on a healthy stream), and the
+        // test's POINT is only that the dribble stays under the bound —
+        // 20× headroom proves it as well as 4× did, and stops the coin
+        // flip. The bound stays SMALL on purpose: it must stay far below
+        // what a genuinely hung stream would take to trip some OTHER test.
         let mut client = HttpClient::connect(
             &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
-            Duration::from_millis(200),
+            Duration::from_secs(1),
             &cancel(),
             None,
         )

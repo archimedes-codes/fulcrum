@@ -580,27 +580,9 @@ pub struct OpenAiResponsesProvider {
 /// `Text`, an array of Responses content parts for `Blocks` —
 /// [`responses_input`]).
 fn responses_request_body(req: &ModelRequest) -> Value {
-    // `instructions`: the `System` messages' text (the same collection as
-    // Anthropic's `system` — `Text` verbatim; `Blocks` → the `Text`
-    // block texts joined with `"\n\n"`; the messages joined with
-    // `"\n\n"`).
-    let instructions = req
-        .messages
-        .iter()
-        .filter(|m| m.role == ChatRole::System)
-        .map(|m| match &m.content {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    ContentBlock::Image { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    // `instructions`: the `System` messages' text, folded — the same
+    // collection as Anthropic's `system` ([`ModelRequest::system_text`]).
+    let instructions = req.system_text();
     let mut body = json!({
         "model": req.model,
         "input": Value::Array(responses_input(req)),

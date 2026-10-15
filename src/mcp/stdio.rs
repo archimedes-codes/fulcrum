@@ -338,11 +338,25 @@ mod tests {
         CancellationToken::new()
     }
 
+    /// The `cwd` the client spawns the fake server in — the argument the
+    /// product fills with the SESSION's cwd, i.e. a directory that exists.
+    ///
+    /// `temp_dir()`, NOT a literal `/tmp`: a literal has no meaning on
+    /// Windows, so `CreateProcess` rejects the `current_dir` before the
+    /// child starts and every test here died at `connect` with "spawn
+    /// failed: The directory name is invalid. (os error 267)". These tests
+    /// are about the JSON-RPC transport, not about any one platform's
+    /// temp-dir NAME, so the fixture names the platform's own temp dir and
+    /// stays a real test on all three.
+    fn session_cwd() -> PathBuf {
+        std::env::temp_dir()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn connect_list_and_call_round_trip() {
         let mut client = StdioClient::connect(
             &fake_def(),
-            Path::new("/tmp"),
+            &session_cwd(),
             Duration::from_secs(5),
             &cancel(),
         )
@@ -378,7 +392,7 @@ mod tests {
     async fn a_hanging_tool_call_times_out() {
         let mut client = StdioClient::connect(
             &fake_def(),
-            Path::new("/tmp"),
+            &session_cwd(),
             Duration::from_secs(5),
             &cancel(),
         )
@@ -400,7 +414,7 @@ mod tests {
     async fn a_cancel_cancels_the_call() {
         let mut client = StdioClient::connect(
             &fake_def(),
-            Path::new("/tmp"),
+            &session_cwd(),
             Duration::from_secs(5),
             &cancel(),
         )
@@ -428,7 +442,7 @@ mod tests {
     async fn a_json_rpc_error_is_an_error() {
         let mut client = StdioClient::connect(
             &fake_def(),
-            Path::new("/tmp"),
+            &session_cwd(),
             Duration::from_secs(5),
             &cancel(),
         )
@@ -450,7 +464,7 @@ mod tests {
     async fn a_dead_process_fails_pending_calls() {
         let mut client = StdioClient::connect(
             &fake_def(),
-            Path::new("/tmp"),
+            &session_cwd(),
             Duration::from_secs(5),
             &cancel(),
         )

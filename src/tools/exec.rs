@@ -224,12 +224,97 @@ fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> Option<Strin
 /// protected write in EXACTLY the executor's words — two copies of that
 /// sentence would drift, and a gate-level deny that reads differently from
 /// the executor-level one is indistinguishable from a bug to a user.
+///
+/// # The comparison is CANONICAL on both sides
+///
+/// `resolved` arrives canonical from the EXECUTOR callers (both go through
+/// [`FsBackend::resolve`], which canonicalizes). A deny-list entry is NOT
+/// necessarily canonical: production fills `ctx.protected` from
+/// `boundary::protected_dirs()` — which canonicalizes — but nothing in the
+/// type system enforces that, and any other caller (a test, a future session
+/// bootstrap, a plugin seam) may hand raw paths. Comparing a canonical
+/// `resolved` against a raw entry with a plain `starts_with` therefore silently
+/// NO-OPS the deny-list, and "refused in EVERY policy" is exactly the property
+/// that must not depend on the caller's hygiene. This is a real, observed
+/// bypass, not a hypothetical: on macOS CI the temp dir sits under `/var`,
+/// which is a symlink to `/private/var`, so `resolved` = `/private/var/…` never
+/// prefixed the raw `/var/…` entry and the protected write SUCCEEDED (the same
+/// tests reddened macOS and Windows CI, where a canonical `\\?\C:\…` verbatim
+/// path never matched a raw `C:\…`).
+///
+/// So each entry is canonicalized at comparison time. An entry that cannot be
+/// canonicalized (it does not exist) matches NOTHING — the same semantics
+/// `boundary::canon` / `push_roots` already give the production list, where a
+/// missing dir is simply not part of the deny-list. Already-canonical entries
+/// canonicalize to themselves, so the production path (and Linux CI) is
+/// unchanged. The REFUSAL still names the ORIGINAL entry: the message must
+/// show the caller the directory it actually registered, not a rewritten one.
+///
+/// # The COMPARED path is canonicalized the same way
+///
+/// The mirror case is just as much a mismatch: the GATE caller
+/// (`harness/loop.rs::deny_tool_result`) hands the model's RAW argument here,
+/// while its `protected` entries arrive CANONICAL from
+/// [`crate::agent::boundary::protected_dirs`]. Canonicalizing the entries
+/// cannot reach that at all — the mismatch is now on the other side, and a raw
+/// `/var/…` never prefix-matches the canonical `/private/var/…` entry (macOS),
+/// and a raw `C:\…` never matches the verbatim `\\?\C:\…` one (Windows).
+///
+/// What that mismatch costs is worth stating exactly, because the obvious story
+/// is wrong. The DENY-LIST is not one of the things the policy moves: both
+/// executors call [`protected_refusal`] unconditionally, straight after
+/// `validate` and with no test of `ctx.file_policy.writes`, so a protected write
+/// is refused by the EXECUTOR in every mode — `writes: Allow` included. What the
+/// widening moves is the BOUNDARY check and nothing else: `write_backend` builds
+/// its `roots` from `ctx.file_policy.writes`, so under `Allow` the roots go
+/// unrestricted and `validate` stops refusing, while the deny-list (independent
+/// of `roots`) keeps refusing. And under `Allow` the gate's copy of this
+/// function is not even reached — the verdict is `Allow`, so `dispatch_tool`
+/// runs and `deny_tool_result`, which only answers a `Deny`, never fires.
+///
+/// The gate's copy exists for the DENY path, where it decides WHICH refusal the
+/// model reads (the deny-list sentence, or "escapes the sandbox"). So a raw
+/// protected path reaching that seam slipped the deny-list MATCH and came back
+/// worded as a boundary escape — the model sent hunting for a boundary that is
+/// not the problem, which is precisely the drift the shared text exists to
+/// prevent. That is the bug this canonicalization closes from the gate side; the
+/// executor-side refusal itself has been policy-independent since 3fd702f.
+///
+/// So the compared path goes through
+/// [`crate::agent::fs_backend::canonicalize_lenient`] — the peel-to-deepest-
+/// existing-ancestor seam [`FsBackend::resolve`] itself uses, NOT a second
+/// canonicalizer, because the gate must agree with the executor about where a
+/// path lands. A not-yet-existing write target is exactly the shape the gate
+/// sees, which is why a plain `canonicalize` was never going to work here.
+///
+/// Two directions of the remaining slop are worth naming:
+/// * The re-appended components (below the deepest existing ancestor) are
+///   compared as plain strings, so they cannot hide a symlink hop. At THIS
+///   seam that only ever errs toward a FALSE POSITIVE — an over-refusal —
+///   because the comparison's only power is to DENY (a deny-list match
+///   refuses; nothing here can grant anything). Fail-closed in the safe
+///   direction, and the symlink-at-an-existing-component case that `resolve`
+///   rejects outright cannot make this seam ALLOW: it can only make a path
+///   compare differently, and comparing differently here means missing the
+///   entry, which is what the canonicalization just fixed.
+/// * A path that cannot be resolved at all comes back unchanged, i.e. the raw
+///   spelling is compared — the pre-fix behaviour for that (rare, unresolvable)
+///   shape, never worse.
+///
+/// The EXECUTOR callers hand paths that `FsBackend::resolve` already
+/// canonicalized: lenient-canonicalizing them again is IDEMPOTENT (a canonical
+/// path canonicalizes to itself, so the peel stops on its first step and the
+/// comparison is unchanged). Their behaviour, and Linux CI, are byte-identical.
 pub(crate) fn protected_refusal_text(
     protected: &[PathBuf],
     tool: &str,
     resolved: &Path,
 ) -> Option<String> {
-    let hit = protected.iter().find(|dir| resolved.starts_with(dir))?;
+    let resolved = crate::agent::fs_backend::canonicalize_lenient(resolved);
+    let hit = protected.iter().find(|dir| {
+        dir.canonicalize()
+            .is_ok_and(|canon| resolved.starts_with(canon))
+    })?;
     Some(format!(
         "{tool}: {} is a protected agent-definition directory ({}) — writing there is refused in every policy",
         resolved.display(),
@@ -1565,7 +1650,11 @@ mod tests {
         let r = execute_tool(&ctx(&cwd), "bash", &json!({ "command": "echo hi" })).await;
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["content"][0]["type"], "text");
-        assert_eq!(v["content"][0]["text"], "hi\n");
+        // The NEWLINE is the shell's, not the product's (`sh` writes `hi\n`,
+        // the Windows `cmd /C` branch writes `hi\r\n`), so the claim here is
+        // the TEXT and nothing else — trailing whitespace belongs to whichever
+        // shell the product picked for this OS.
+        assert_eq!(v["content"][0]["text"].as_str().unwrap().trim_end(), "hi");
         assert_eq!(v["details"]["exitCode"], 0);
         assert_eq!(v["details"]["truncated"], false);
         assert_eq!(v["details"]["cancelled"], false);
@@ -1646,6 +1735,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// The fixture is a POSIX-SHELL fixture, so it runs where a POSIX shell
+    /// is the one the product picks: `1>&2` + `;` sequencing + `exit 3` are
+    /// `sh` syntax, and the Windows branch of `exec_bash` spawns `cmd /C`,
+    /// which reads the same string as one `echo` with a bogus redirect — it
+    /// exits 0, so `is_error` was false on the Windows runner. The exit-code
+    /// DECISION is not unix-specific and stays covered everywhere by
+    /// `bash_exit_report_nonzero_exit_is_an_error_with_its_real_code`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_nonzero_exit_is_error() {
         let cwd = temp_cwd("bash-err");
@@ -1709,6 +1806,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// The fixture is POSIX through and through: `( … ) &` backgrounding and
+    /// the process-group kill it exists to prove (`kill_bash_process_group`
+    /// SIGKILLs `-pid`, and on Windows there IS no process group — the
+    /// product's own Windows branch kills the direct child only). Under
+    /// `cmd /C` the command line does not even parse as written, so the
+    /// marker got written by a survivor and the assertion inverted.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_backgrounded_grandchild_killed_with_group() {
         // Regression test for the unbounded-hang / orphaned-grandchild hole:
@@ -1753,6 +1857,13 @@ mod tests {
     /// process-group kill entirely, so `exec_bash` returned while the child
     /// was still running — with a note claiming it "was killed at its
     /// deadline". The marker is written only by a SURVIVING child.
+    /// `exec >&- 2>&-` is the fixture — POSIX fd redirection with no `cmd`
+    /// equivalent (`cmd` rejected the whole line: ">& was unexpected at this
+    /// time."), so there is no closed-pipe child to reap on Windows and the
+    /// run reported a parse error instead of a deadline. The Windows kill
+    /// path itself is covered by `bash_timeout_kills_child`, which passes
+    /// there with a shell-neutral `sleep 5`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_timeout_kills_a_child_that_closed_its_pipes() {
         let cwd = temp_cwd("bash-closed-pipes-timeout");
@@ -1797,6 +1908,12 @@ mod tests {
     /// The cancel path applies the same rule: a cancelled child that had
     /// already closed its pipes is still alive (pipe EOF is not an exit)
     /// and must be killed with its group, not left running.
+    /// The cancel half of the same `exec >&- 2>&-` fixture (see
+    /// `bash_timeout_kills_a_child_that_closed_its_pipes`): `cmd /C` refuses
+    /// the redirection, so the child exited at once with `cancelled: false`
+    /// and the cancel never had a live process to race. The cancel path is
+    /// covered on Windows by `bash_cancel_kills_child` (`sleep 5`).
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
         let cwd = temp_cwd("bash-closed-pipes-cancel");
@@ -1990,6 +2107,13 @@ mod tests {
     /// EXPLICITLY (`>&-`) and then stays alive briefly, which is that same
     /// window made deterministic: the output is complete, the pipes are
     /// closed, and the process has NOT exited yet.
+    /// Same `exec >&- 2>&-` fixture (the POSIX fd-close whose EOF-before-exit
+    /// window the test makes deterministic); `cmd` parses it as a malformed
+    /// redirect and exits 1, so the run never reached the exit-status path
+    /// under test. The DECISION — a child already exited 0 is a success, no
+    /// fabricated -1 — is platform-neutral and stays covered everywhere by
+    /// `bash_exit_report_success_is_not_an_error`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_success_after_closing_its_pipes_is_not_an_error() {
         let cwd = temp_cwd("bash-closed-pipes");
@@ -2033,6 +2157,14 @@ mod tests {
     /// read loop's OWN EOF break: it must wait for the exit status itself
     /// instead of leaning on the post-loop reap, which expires under CPU
     /// contention and reports a run that really exited 7 as "unknown".
+    /// Both shapes here are `exec >&- 2>&-; sleep 0.2`-style POSIX (the
+    /// fd-close, and a fractional `sleep` `cmd` cannot run either) — under
+    /// `cmd /C` the child exited 1 on its parse error, which is exactly the
+    /// fabricated-code confusion this test exists to forbid, reported as a
+    /// real 7-vs-1 mismatch. The real-code rule itself is covered on every
+    /// platform by
+    /// `bash_exit_report_nonzero_exit_is_an_error_with_its_real_code`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_nonzero_exit_after_closing_its_pipes_reports_its_real_code() {
         let cwd = temp_cwd("bash-closed-pipes-nz");
@@ -2359,7 +2491,10 @@ mod tests {
 
     // ── find ─────────────────────────────────────────────────────────────
 
-    /// `fd` is available (spawn `fd --version`).
+    /// `fd` is available (spawn `fd --version`). Only the gated
+    /// POSIX-shape fixture below reads it — hence the same `cfg`, or it is
+    /// dead code on a Windows build.
+    #[cfg(unix)]
     fn fd_available() -> bool {
         std::process::Command::new("fd")
             .arg("--version")
@@ -2367,6 +2502,14 @@ mod tests {
             .is_ok()
     }
 
+    /// The fixture asserts POSIX PATH SHAPE on both halves: the expected
+    /// result is the literal `"sub/c.txt"`, and the `**/c.txt` pattern's `/`
+    /// is what `glob_match` compares against the walkdir fallback's
+    /// platform-relative path — on Windows that is `sub\c.txt`, so `**/…`
+    /// matches nothing and the run reported `matches: 0`. The separator is
+    /// `find`'s product behavior, not a fixture bug: gating keeps it honest
+    /// rather than asserting a shape the tool does not produce on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn find_matches_fixture() {
         let cwd = temp_cwd("find");
@@ -2763,6 +2906,173 @@ mod tests {
         assert!(r.is_error, "a new file under a protected dir is refused");
         assert!(!protected.join("new").exists(), "nothing is created");
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The deny-list compares CANONICALLY, so a RAW (never-canonicalized)
+    /// protected entry still refuses a write whose `resolved` path reaches it
+    /// through a symlink.
+    ///
+    /// CI evidence for the bug this pins: on macOS `std::env::temp_dir()` lives
+    /// under `/var`, which is a symlink to `/private/var`, and on Windows
+    /// `canonicalize` returns the `\\?\C:\…` VERBATIM form while a
+    /// `temp_dir()`-joined entry is the plain `C:\…` form. Either way the raw
+    /// entry no longer prefixed the canonical `resolved`, `starts_with` missed,
+    /// and the protected write SUCCEEDED — i.e. the "refused in EVERY policy"
+    /// floor silently no-opped for any caller that filled `ctx.protected` from
+    /// a non-canonicalized source. Linux temp dirs carry no such symlink, so
+    /// the mismatch is MANUFACTURED here with a symlinked dir (unix); the
+    /// non-unix leg leans on the platform's own raw-vs-canonical spelling.
+    #[tokio::test]
+    async fn a_raw_protected_entry_still_refuses_a_canonical_path_under_it() {
+        use crate::agent::policy::{AccessPolicy, FilePolicy};
+        let base = temp_cwd("protect-sym");
+        let real = base.join("real");
+        let skills = real.join(".agents/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("SKILL.md"), "OLD").unwrap();
+
+        // The protected entry stays RAW, and the session `cwd` is the path the
+        // model would join from — on unix that is the SYMLINK, so the
+        // executor's canonical `resolved` comes back through `real` and shares
+        // no textual prefix with the `link`-spelled entry.
+        #[cfg(unix)]
+        let (cwd, protected) = {
+            std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+            let link = base.join("link");
+            let protected = link.join(".agents/skills");
+            (link, protected)
+        };
+        #[cfg(not(unix))]
+        let (cwd, protected) = {
+            // No symlink privileges: `temp_dir()`'s own spelling is already
+            // the raw one that `canonicalize` rewrites on Windows.
+            (real.clone(), real.join(".agents/skills"))
+        };
+
+        // The fixture's PREMISE (so a platform where the two spellings agree
+        // says so loudly instead of testing nothing): the entry handed to
+        // `ctx.protected` is genuinely NOT canonical.
+        assert_ne!(
+            protected.canonicalize().unwrap(),
+            protected,
+            "the fixture must hand the deny-list a RAW entry, got {}",
+            protected.display()
+        );
+
+        let c = ToolCtx {
+            protected: vec![protected.clone()],
+            file_policy: FilePolicy {
+                writes: AccessPolicy::Allow,
+                ..FilePolicy::default()
+            },
+            ..ctx(&cwd)
+        };
+        let r = execute_tool(
+            &c,
+            "write",
+            &json!({ "path": ".agents/skills/SKILL.md", "content": "PWNED" }),
+        )
+        .await;
+        assert!(
+            r.is_error,
+            "a raw protected entry must still refuse the write"
+        );
+        let text = text_of(&r).to_string();
+        assert!(text.contains("protected"), "{text}");
+        // The refusal stays HONEST about which entry it matched: the ORIGINAL
+        // (raw) entry, not the canonicalized form the comparison used.
+        assert!(
+            text.contains(&protected.to_string_lossy().into_owned()),
+            "the refusal must name the entry as the caller spelled it: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(skills.join("SKILL.md")).unwrap(),
+            "OLD",
+            "the file behind the symlink must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The MIRROR of `a_raw_protected_entry_still_refuses_a_canonical_path_under_it`:
+    /// the ENTRIES are canonical (what production hands over, via
+    /// `boundary::protected_dirs`) and the COMPARED path is RAW. That is exactly
+    /// what the GATE does — `loop.rs::deny_tool_result` passes the model's `path`
+    /// argument verbatim — so this seam must canonicalize its ARGUMENT side too.
+    ///
+    /// CI evidence (branch run 38702103063, the `f9b5c17`/`3fd702f` family):
+    /// macOS `a_gate_denial_of_a_protected_dir_uses_the_protected_wording` failed
+    /// with `got "write: path escapes the session sandbox: …"` (Windows the same
+    /// with the `\\?\C:\…` verbatim spelling): the gate's raw argument shared no
+    /// prefix with its canonical entry, so the deny-list branch never fired and
+    /// the refusal fell through to the boundary's wording.
+    ///
+    /// The target does NOT exist (a gate refusal is usually a brand-new write),
+    /// so a plain `canonicalize` on the argument fails — this is the shape
+    /// `canonicalize_lenient` (the peel `FsBackend::resolve` uses) exists for.
+    /// Linux `temp_dir()` is already canonical, so the mismatch is MANUFACTURED
+    /// with a `link -> real` symlink exactly as 3fd702f did: entries spelled
+    /// through `real` (canonical), the argument through `link` (raw).
+    #[cfg(unix)]
+    #[test]
+    fn a_raw_argument_still_refuses_against_canonical_protected_entries() {
+        let base = temp_cwd("protect-gate-arg");
+        let real = base.join("real");
+        let skills = real.join(".agents/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let link = base.join("link");
+
+        // The fixture's PREMISE (so a platform where the two spellings agree
+        // fails loudly instead of testing nothing): the path the model would
+        // send is genuinely NOT canonical.
+        assert_ne!(
+            link.canonicalize().unwrap(),
+            link,
+            "the argument must be spelled through a symlink, got {}",
+            link.display()
+        );
+
+        // The ENTRIES as production builds them: canonical.
+        let entries = vec![skills.clone()];
+        // The ARGUMENT as the model sends it: the RAW spelling, under a
+        // directory that does not exist yet (the gate's usual case).
+        let raw = link.join(".agents/skills/pwn/SKILL.md");
+
+        let refusal = protected_refusal_text(&entries, "write", &raw)
+            .expect("a raw argument under a canonical protected entry must refuse");
+        assert!(
+            refusal.contains("protected agent-definition directory"),
+            "{refusal}"
+        );
+        // The refusal names the entry the caller registered (canonical here) —
+        // the SAME sentence the executor produces.
+        assert!(
+            refusal.contains(&skills.to_string_lossy().into_owned()),
+            "the refusal must name the protected entry: {refusal}"
+        );
+
+        // IDEMPOTENCE (the executor callers): handing the already-canonical
+        // form of the same path answers identically — canonical input
+        // canonicalizes to itself, so nothing about that seam changed.
+        let canon = skills.join("pwn/SKILL.md");
+        let again = protected_refusal_text(&entries, "write", &canon)
+            .expect("the canonical spelling refuses too (unchanged behaviour)");
+        assert!(
+            again.contains("protected agent-definition directory"),
+            "{again}"
+        );
+
+        // And the fix does not turn the deny-list into a blanket refusal: a raw
+        // path that resolves OUTSIDE the entries is still `None`.
+        let outside = link.join("notes/todo.md");
+        assert_eq!(
+            protected_refusal_text(&entries, "write", &outside),
+            None,
+            "a non-protected raw path must not be refused"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `bash` IGNORES the boundary (its `Sandboxed` tier is Landlock, Task 5):

@@ -20,8 +20,8 @@ use serde_json::Value;
 
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
-    FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta,
-    Usage, WireToolCall,
+    ChatRole, FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent, ToolCall,
+    ToolCallDelta, Usage, WireToolCall,
 };
 /// A client for the OpenAI-compatible chat-completions API (OpenAI,
 /// OpenRouter, `tama`, …).
@@ -495,45 +495,58 @@ fn is_stream_options_rejection(err: &ProviderError) -> bool {
 /// provider's latch — see `send_model_request`), on TOP of the request's
 /// own `stream` flag.
 fn request_body(req: &ModelRequest, ask_usage: bool) -> Value {
-    let messages: Vec<Value> = req
-        .messages
-        .iter()
-        .map(|m| {
-            // The content is the OpenAI WIRE form (`MessageContent::to_wire`
-            // — `Text` → a string, `Blocks` → an array of OpenAI content
-            // parts with `image_url` data-URIs), NOT the `ContentBlock`'s
-            // own pi-shaped serialization (the DB / transcript / tool-result
-            // shape). The remaining fields keep their wire shape.
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "role".to_string(),
-                serde_json::to_value(m.role).expect("role serialization cannot fail"),
-            );
-            obj.insert("content".to_string(), m.content.to_wire());
-            if let Some(id) = &m.tool_call_id {
-                obj.insert("tool_call_id".to_string(), Value::String(id.clone()));
-            }
-            if let Some(calls) = &m.tool_calls {
+    // The `System` messages NEVER travel in the position the transcript put
+    // them: they fold into ONE leading `system` message (see
+    // [`ModelRequest::system_text`]), because the ChatML-family templates
+    // many OpenAI-compatible servers run reject a `system` message anywhere
+    // else outright. Everything else keeps its order — a `System` message is
+    // never a link in a `tool_calls` / `tool_call_id` pair, so hoisting it
+    // cannot break a tool turn.
+    let system = req.system_text();
+    let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
+    if !system.is_empty() {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    messages.extend(
+        req.messages
+            .iter()
+            .filter(|m| m.role != ChatRole::System)
+            .map(|m| {
+                // The content is the OpenAI WIRE form (`MessageContent::to_wire`
+                // — `Text` → a string, `Blocks` → an array of OpenAI content
+                // parts with `image_url` data-URIs), NOT the `ContentBlock`'s
+                // own pi-shaped serialization (the DB / transcript / tool-result
+                // shape). The remaining fields keep their wire shape.
+                let mut obj = serde_json::Map::new();
                 obj.insert(
-                    "tool_calls".to_string(),
-                    Value::Array(
-                        calls
-                            .iter()
-                            .map(|tc| {
-                                serde_json::to_value(WireToolCall {
-                                    id: &tc.id,
-                                    name: &tc.name,
-                                    arguments: &tc.arguments,
-                                })
-                                .expect("JSON serialization cannot fail")
-                            })
-                            .collect(),
-                    ),
+                    "role".to_string(),
+                    serde_json::to_value(m.role).expect("role serialization cannot fail"),
                 );
-            }
-            Value::Object(obj)
-        })
-        .collect();
+                obj.insert("content".to_string(), m.content.to_wire());
+                if let Some(id) = &m.tool_call_id {
+                    obj.insert("tool_call_id".to_string(), Value::String(id.clone()));
+                }
+                if let Some(calls) = &m.tool_calls {
+                    obj.insert(
+                        "tool_calls".to_string(),
+                        Value::Array(
+                            calls
+                                .iter()
+                                .map(|tc| {
+                                    serde_json::to_value(WireToolCall {
+                                        id: &tc.id,
+                                        name: &tc.name,
+                                        arguments: &tc.arguments,
+                                    })
+                                    .expect("JSON serialization cannot fail")
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                Value::Object(obj)
+            }),
+    );
     let mut body = json!({
         "model": req.model,
         "messages": Value::Array(messages),
@@ -1003,6 +1016,101 @@ mod tests {
         // usage-less session freezes the context bar and NEVER trips the
         // compaction threshold.
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    /// A `Text`-content `ChatMessage` test literal (the request-body
+    /// tests' shape; `naming.rs`'s helper of the same name).
+    fn text(role: ChatRole, t: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: MessageContent::Text(t.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    /// A request whose messages put a `System` message ANYWHERE BUT index 0
+    /// still gets ONE leading `system` message on the wire.
+    ///
+    /// This is not cosmetic. The harness's compaction summary is a `System`
+    /// message and it sits at index 1 — right after the preserved leading
+    /// system prompt (`compact::run_compaction`) — so every compacted
+    /// session's SECOND-plus request has a non-leading `system` message. The
+    /// ChatML-family chat templates vLLM / SGLang serve for Qwen, DeepSeek
+    /// and Hermes models ASSERT against that shape:
+    /// `{%- if not loop.first %}{{- raise_exception('System message must be
+    /// at the beginning.') }}` — and because vLLM EXECUTES the template to
+    /// auto-generate its response parser, the refusal is a 400
+    /// `invalid_request_error` naming the TEMPLATE, not the messages, before
+    /// the model ever runs. The completions wire therefore folds every
+    /// `System` message into one `system` message at index 0, exactly as the
+    /// Anthropic (`system`) and Responses (`instructions`) wires already do
+    /// — the transcript keeps its shape, only the request is re-shaped.
+    #[test]
+    fn request_body_folds_every_system_message_into_one_leading_message() {
+        let req = ModelRequest {
+            model: "m".to_string(),
+            messages: vec![
+                text(ChatRole::System, "sys"),
+                // The real shape: index 1 is a compaction summary.
+                text(ChatRole::System, "Summary of previous conversation:\nabc"),
+                text(ChatRole::User, "hi"),
+                text(ChatRole::Assistant, "yo"),
+                // A `System` message that arrives mid-conversation is
+                // hoisted into the fold, never left where it was.
+                text(ChatRole::System, "late"),
+            ],
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: true,
+            },
+            session_id: None,
+        };
+        let body = request_body(&req, false);
+        let msgs = body["messages"].as_array().expect("messages is an array");
+        // The three conversation messages + ONE folded system message.
+        assert_eq!(msgs.len(), 3, "the three System messages fold to one");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(
+            msgs[0]["content"], "sys\n\nSummary of previous conversation:\nabc\n\nlate",
+            "the system texts keep their order, joined the way the other two wires join them"
+        );
+        // The conversation itself is UNTOUCHED, in order.
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "yo");
+        // THE invariant every strict ChatML template asserts.
+        assert!(
+            msgs[1..].iter().all(|m| m["role"] != json!("system")),
+            "no `system` message anywhere but index 0: {msgs:?}"
+        );
+    }
+
+    /// The fold never INVENTS a `system` message: with no `System` messages
+    /// (a child session with no system prompt, a summary at index 0) the
+    /// first wire message is the first conversation message.
+    #[test]
+    fn request_body_adds_no_system_message_when_the_request_has_none() {
+        let req = ModelRequest {
+            model: "m".to_string(),
+            messages: vec![text(ChatRole::User, "hi")],
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: false,
+            },
+            session_id: None,
+        };
+        let body = request_body(&req, false);
+        let msgs = body["messages"].as_array().expect("messages is an array");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
     }
 
     /// A NON-streaming request carries no `stream_options` (the field is

@@ -20,11 +20,75 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::policy::AccessPolicy;
 
-/// The single root-entry meaning "no containment" (the `Ask`/`Allow`
-/// floor): every canonical absolute path is under `/`. Harness is
-/// Linux-only (exec.rs:9); on other targets the code compiles but the
-/// harness never runs there.
+/// The root-entry meaning "no containment" on UNIX (one floor of the
+/// `Ask`/`Allow` widening): every canonical absolute path is under `/`.
+///
+/// This is NOT a portable floor, and the "harness is Linux-only, so it
+/// never matters" claim that used to live here is RETIRED: the harness runs
+/// on Windows and macOS now (CI runs it there). On Windows a canonical path
+/// is always under a DRIVE root in the verbatim form `canonicalize()`
+/// produces (`\\?\C:\…`), while `canonicalize("/")` resolves to the CURRENT
+/// drive's root only — so a lone `/` mismatches any path on another drive
+/// (CI's evidence: `read: path escapes the session sandbox:
+/// \\?\C:\Users\runneradmin\AppData\Local\Temp\…\secret.txt`). Use
+/// [`unrestricted_floor`] for the floor; this const is its unix half, and is
+/// kept because it names the concept the ADR text and `fs_backend` docs use.
 pub const UNRESTRICTED: &str = "/";
+
+/// The `Ask`/`Allow` floor as a ROOT SET: "no containment", honestly, on
+/// every target the harness runs on.
+///
+/// * unix — `["/"]` ([`UNRESTRICTED`]): one root contains every path.
+/// * Windows — one entry per MOUNTED DRIVE ROOT (`C:\`, `D:\`, …), each
+///   canonicalized, so every entry is in the verbatim `\\?\C:\` form and
+///   `FsBackend::check_under_roots`'s `starts_with` compares like-for-like
+///   against a canonicalized candidate. `FsBackend` treats an EMPTY root set
+///   as an error rather than as "no limits", so a floor has to name real,
+///   existing dirs: an unmounted drive fails its stat and is dropped.
+///
+/// Why this shape, and not the two alternatives:
+/// * `std::fs::roots()` is the obvious single-call source of exactly these
+///   roots and is often cited as "stable since 1.80" — it is NOT callable
+///   here: on the pinned 1.99.0 toolchain it is still feature-gated (`std::fs`
+///   has no `roots`). If it stabilizes on a future pinned toolchain this
+///   function is a one-line swap.
+/// * deriving the drive root from the CANDIDATE path's `Prefix` component at
+///   check time would need no enumeration, but it means teaching
+///   `FsBackend::check_under_roots` about floors — that is the containment
+///   code the ADR 0030 attack matrix pins, and loosening it is exactly what
+///   must not happen. Keeping the widening here means the floor stays "just
+///   another root" and the `Sandboxed` path is untouched by construction.
+///
+/// Cost: up to 24 `metadata` probes + one canonicalize per mounted drive, on
+/// the widened (`Ask`/`Allow`) path only. Not cached on purpose — a cached
+/// list would go stale the moment a user mounts a drive and silently
+/// re-break the floor.
+///
+/// Known gap, stated rather than papered over: a UNC share (`\\host\share\…`)
+/// is under no drive root, so an `Ask`-approved access to a UNC path still
+/// hits this floor and is refused on Windows. A share-level root list is out
+/// of scope here.
+fn unrestricted_floor() -> Vec<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        vec![PathBuf::from(UNRESTRICTED)]
+    }
+    #[cfg(windows)]
+    {
+        // `A:`/`B:` are skipped: legacy floppy designations no supported
+        // Windows install mounts, and the probes with a history of stalling.
+        (b'C'..=b'Z')
+            .filter_map(|letter| {
+                let drive = PathBuf::from(format!("{}:\\", letter as char));
+                // Probe before canonicalizing: `metadata` is the cheap
+                // attribute query, and only drives that answer get a handle
+                // opened for the verbatim path.
+                drive.metadata().ok().map(|_| drive)
+            })
+            .filter_map(|drive| canon(&drive))
+            .collect()
+    }
+}
 
 /// Canonicalize `p`, dropping it when it fails (a missing dir is simply not
 /// part of the boundary — the boundary is allowed to name dirs that do not
@@ -92,19 +156,25 @@ pub fn protected_dirs() -> Vec<PathBuf> {
 /// The executor's root set for one direction, derived from the policy.
 /// `Sandboxed` → the direction's boundary (the gate already denied
 /// beyond-boundary accesses; the executor is the fail-closed backstop).
-/// `Ask`/`Allow` → `[cwd, UNRESTRICTED]`: the gate is the only decision
-/// point, and an approved `Ask` must be able to land. `roots[0]` is the
-/// relative-path join base in both cases.
+/// `Ask`/`Allow` → `[cwd, unrestricted_floor()]`: the gate is the only
+/// decision point, and an approved `Ask` must be able to land. `roots[0]` is
+/// the relative-path join base in both cases.
 pub fn executor_roots(cwd: &Path, boundary: &[PathBuf], policy: AccessPolicy) -> Vec<PathBuf> {
     match policy {
         AccessPolicy::Sandboxed => boundary.to_vec(),
         // The widening: the gate has already decided, so the executor must
-        // not re-decide. `/` is a root like any other — the canonicalization
-        // and the symlink / `..` slow paths still run, they just never
-        // reject on containment.
+        // not re-decide. The floor roots are roots like any other — the
+        // canonicalization and the symlink / `..` slow paths still run, they
+        // just never reject on containment. On unix the floor is one `/`; on
+        // Windows it is the mounted drive roots, because a lone `/` there is
+        // only the current drive (see [`unrestricted_floor`]). ONLY this arm
+        // widens — the `Sandboxed` arm hands back the caller's real boundary
+        // untouched, so the ADR 0030 containment strictness is unchanged.
         AccessPolicy::Ask | AccessPolicy::Allow => {
             let base = canon(cwd).unwrap_or_else(|| cwd.to_path_buf());
-            vec![base, PathBuf::from(UNRESTRICTED)]
+            let mut roots = vec![base];
+            roots.extend(unrestricted_floor());
+            roots
         }
     }
 }
@@ -320,22 +390,28 @@ mod tests {
         // `Sandboxed` → exactly the boundary (the fail-closed backstop).
         assert_eq!(executor_roots(cwd.path(), &boundary, Sandboxed), boundary);
 
-        // `Ask` / `Allow` → `[cwd, "/"]`: the gate is the only decision
-        // point and `roots[0]` stays the join base.
+        // `Ask` / `Allow` → `[cwd, <the floor>]`: the gate is the only
+        // decision point and `roots[0]` stays the join base. The floor's
+        // CONTENT is platform-shaped by design (one `/` on unix, the mounted
+        // drive roots on Windows), so the pin is: the base, plus exactly
+        // whatever [`unrestricted_floor`] contributes — nothing else.
         for policy in [Ask, Allow] {
             let roots = executor_roots(cwd.path(), &boundary, policy);
-            assert_eq!(
-                roots,
-                vec![base.clone(), PathBuf::from(UNRESTRICTED)],
-                "{policy:?}"
+            assert_eq!(roots[0], base, "{policy:?}: roots[0] is the join base");
+            assert_eq!(&roots[1..], unrestricted_floor().as_slice(), "{policy:?}");
+            assert!(
+                roots.len() >= 2,
+                "{policy:?}: the floor is explicit, never an empty set"
             );
         }
     }
 
     /// The unrestricted floor really is unrestricted: every canonical
-    /// absolute path is under `/`, so an approved `Ask` can land — while the
+    /// absolute path is under it, so an approved `Ask` can land — while the
     /// SAME path is rejected by the `Sandboxed` boundary (the contrast that
-    /// keeps this test from passing vacuously).
+    /// keeps this test from passing vacuously). The floor comes from
+    /// [`unrestricted_floor`], so this asserts the CLAIM cross-platform
+    /// rather than a hardcoded unix `/`.
     #[test]
     fn the_unrestricted_root_contains_every_absolute_path() {
         use crate::agent::fs_backend::FsBackend;
@@ -351,13 +427,66 @@ mod tests {
             sandboxed.validate(&target).is_err(),
             "premise: `b` is outside `a`"
         );
-        let unrestricted = FsBackend {
-            roots: vec![a.path().to_path_buf(), PathBuf::from(UNRESTRICTED)],
-        };
+        let mut floor_roots = vec![a.path().to_path_buf()];
+        floor_roots.extend(unrestricted_floor());
+        let unrestricted = FsBackend { roots: floor_roots };
         assert_eq!(
             unrestricted.validate(&target).unwrap(),
             target.canonicalize().unwrap(),
-            "`/` must contain every absolute path"
+            "the floor must contain every absolute path"
         );
+    }
+
+    /// The Windows half of that claim, pinned at the seam that broke: CI's
+    /// `read: path escapes the session sandbox:
+    /// \\?\C:\Users\runneradmin\AppData\Local\Temp\…\secret.txt`. The temp
+    /// dir lives under a drive root, and the `Ask` floor must contain it —
+    /// in the VERBATIM form `canonicalize()` produces, so `starts_with`
+    /// compares like-for-like. `#[cfg(windows)]` because a Linux CI must not
+    /// even compile a claim about drive letters (the unix floor is `/` and is
+    /// covered by the tests above).
+    #[cfg(windows)]
+    #[test]
+    fn the_ask_floor_contains_the_temp_dirs_drive_root() {
+        use crate::agent::fs_backend::FsBackend;
+        let cwd = Tmp::new("floor-drive-cwd");
+        // Where CI's refused file lived: a file under the temp dir.
+        let secret = std::env::temp_dir().join(format!("boundary-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&secret, "s").unwrap();
+        let secret_canon = secret.canonicalize().unwrap();
+
+        let roots = executor_roots(cwd.path(), &[], Ask);
+        let floor = &roots[1..];
+        assert!(
+            floor.iter().any(|r| secret_canon.starts_with(r)),
+            "the Ask floor must contain the temp dir's drive root: {floor:?}"
+        );
+        // And each floor entry is already canonical (the `\\?\C:\` form) — a
+        // bare `C:\` here would silently never match a canonicalized path.
+        for root in floor {
+            assert_eq!(
+                root,
+                &root.canonicalize().unwrap(),
+                "floor roots must be verbatim-canonical"
+            );
+        }
+        // The regression itself: an approved `Ask` read of that file lands,
+        // while the same path is refused by the `Sandboxed` boundary that is
+        // `roots[0]` alone (the non-vacuity contrast).
+        assert_eq!(
+            FsBackend {
+                roots: roots.clone()
+            }
+            .validate(&secret)
+            .unwrap(),
+            secret_canon,
+            "an approved read beyond the cwd must land on Windows"
+        );
+        assert!(FsBackend {
+            roots: vec![roots[0].clone()]
+        }
+        .validate(&secret)
+        .is_err());
+        let _ = std::fs::remove_file(&secret);
     }
 }

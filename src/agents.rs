@@ -662,8 +662,11 @@ mod tests {
         let b = scratch();
         #[cfg(unix)]
         std::os::unix::fs::symlink(a.join("scout.md"), b.join("scout.md")).unwrap();
+        // Windows has no `std::os::windows::fs::symlink` — the two-arity split
+        // is `symlink_file` / `symlink_dir`, and `scout.md` is a file. (The
+        // first Windows build made the missing name a compile error.)
         #[cfg(windows)]
-        std::os::windows::fs::symlink(a.join("scout.md"), b.join("scout.md")).unwrap();
+        std::os::windows::fs::symlink_file(a.join("scout.md"), b.join("scout.md")).unwrap();
         let out = discover_in_roots(&[
             (a.clone(), AgentScope::Space),
             (b.clone(), AgentScope::User),

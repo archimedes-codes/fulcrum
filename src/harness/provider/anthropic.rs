@@ -673,26 +673,9 @@ fn anthropic_thinking(level: &str) -> Value {
 /// WIRE form (a plain string for `Text`, an array of Anthropic content
 /// parts for `Blocks` — [`anthropic_messages`]).
 fn anthropic_request_body(req: &ModelRequest) -> Value {
-    // `system`: the `System` messages' text (`Text` verbatim; `Blocks` →
-    // the `Text` block texts joined with `"\n\n"`), the messages joined
-    // with `"\n\n"`.
-    let system = req
-        .messages
-        .iter()
-        .filter(|m| m.role == ChatRole::System)
-        .map(|m| match &m.content {
-            MessageContent::Text(t) => t.clone(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    ContentBlock::Image { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    // `system`: the `System` messages' text, folded —
+    // [`ModelRequest::system_text`].
+    let system = req.system_text();
     let mut body = json!({
         "model": req.model,
         "messages": Value::Array(anthropic_messages(req)),
