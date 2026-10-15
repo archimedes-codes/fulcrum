@@ -368,7 +368,9 @@ struct AnthropicDiscoveredModel {
 /// The LiteLLM `GET {base_url}/model/info` (ADR 0026): `model_name` → the
 /// map key; `model_info.max_input_tokens` (fallback `max_output_tokens`) →
 /// `context_window`; `reasoning_effort_levels` → `thinking_levels`
-/// (VERBATIM); `supports_reasoning` → `supports_thinking`.
+/// (VERBATIM, with fallback to individual `supports_*_reasoning_effort`
+/// booleans if absent or empty); `supports_reasoning` → `supports_thinking`
+/// (inferred true when thinking levels are discovered).
 /// `default_reasoning_effort` / `supports_function_calling` / the cost
 /// fields are parsed-by-omission (ignored for v1 — see the ADR's
 /// Considered Options). Bearer auth when the key is non-empty (empty key →
@@ -403,16 +405,20 @@ async fn discover_litellm_models(
                 entry.model_name,
                 entry
                     .model_info
-                    .map(|mi| DiscoveredMeta {
-                        // `max_input_tokens` → the context window (the
-                        // `max_output_tokens` fallback keeps a
-                        // `max_output_tokens`-only entry from losing its
-                        // window entirely). An OUTPUT cap, not a total window
-                        // — so it UNDER-sizes the budget (safe; over-sizing
-                        // risks provider 400s), for the rare absent shape.
-                        context_window: mi.max_input_tokens.or(mi.max_output_tokens),
-                        thinking_levels: mi.reasoning_effort_levels,
-                        supports_thinking: mi.supports_reasoning,
+                    .map(|mi| {
+                        let thinking_levels = mi.thinking_levels();
+                        let supports_thinking = mi.supports_thinking(&thinking_levels);
+                        DiscoveredMeta {
+                            // `max_input_tokens` → the context window (the
+                            // `max_output_tokens` fallback keeps a
+                            // `max_output_tokens`-only entry from losing its
+                            // window entirely). An OUTPUT cap, not a total window
+                            // — so it UNDER-sizes the budget (safe; over-sizing
+                            // risks provider 400s), for the rare absent shape.
+                            context_window: mi.max_input_tokens.or(mi.max_output_tokens),
+                            thinking_levels,
+                            supports_thinking,
+                        }
                     })
                     .unwrap_or_default(),
             )
@@ -449,6 +455,67 @@ struct LiteLLMModelInfo {
     reasoning_effort_levels: Option<Vec<String>>,
     #[serde(rename = "supports_reasoning")]
     supports_reasoning: Option<bool>,
+    #[serde(rename = "supports_none_reasoning_effort")]
+    supports_none_reasoning_effort: Option<bool>,
+    #[serde(rename = "supports_minimal_reasoning_effort")]
+    supports_minimal_reasoning_effort: Option<bool>,
+    #[serde(rename = "supports_low_reasoning_effort")]
+    supports_low_reasoning_effort: Option<bool>,
+    #[serde(rename = "supports_medium_reasoning_effort")]
+    supports_medium_reasoning_effort: Option<bool>,
+    #[serde(rename = "supports_high_reasoning_effort")]
+    supports_high_reasoning_effort: Option<bool>,
+    #[serde(rename = "supports_xhigh_reasoning_effort")]
+    supports_xhigh_reasoning_effort: Option<bool>,
+    #[serde(rename = "supports_max_reasoning_effort")]
+    supports_max_reasoning_effort: Option<bool>,
+}
+
+impl LiteLLMModelInfo {
+    fn thinking_levels(&self) -> Option<Vec<String>> {
+        if let Some(ref levels) = self.reasoning_effort_levels {
+            if !levels.is_empty() {
+                return Some(levels.clone());
+            }
+        }
+        let mut synthesized = Vec::new();
+        if self.supports_none_reasoning_effort == Some(true) {
+            synthesized.push("none".to_string());
+        }
+        if self.supports_minimal_reasoning_effort == Some(true) {
+            synthesized.push("minimal".to_string());
+        }
+        if self.supports_low_reasoning_effort == Some(true) {
+            synthesized.push("low".to_string());
+        }
+        if self.supports_medium_reasoning_effort == Some(true) {
+            synthesized.push("medium".to_string());
+        }
+        if self.supports_high_reasoning_effort == Some(true) {
+            synthesized.push("high".to_string());
+        }
+        if self.supports_xhigh_reasoning_effort == Some(true) {
+            synthesized.push("xhigh".to_string());
+        }
+        if self.supports_max_reasoning_effort == Some(true) {
+            synthesized.push("max".to_string());
+        }
+        if synthesized.is_empty() {
+            None
+        } else {
+            Some(synthesized)
+        }
+    }
+
+    fn supports_thinking(&self, thinking_levels: &Option<Vec<String>>) -> Option<bool> {
+        self.supports_reasoning.or_else(|| {
+            if thinking_levels.is_some() {
+                Some(true)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -747,6 +814,92 @@ mod tests {
         // No reasoning fields advertised → all `None`.
         assert_eq!(models["lit/o"].thinking_levels, None);
         assert_eq!(models["lit/o"].supports_thinking, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discover_models_litellm_falls_back_to_reasoning_effort_booleans() {
+        // When `reasoning_effort_levels` is null/absent, but individual
+        // `supports_*_reasoning_effort` booleans are set, synthesize the
+        // levels in canonical order and infer `supports_thinking: true`.
+        // Also test:
+        // - explicit non-empty `reasoning_effort_levels` takes precedence
+        // - empty `reasoning_effort_levels: []` falls back to booleans
+        // - explicit `supports_reasoning: false` is preserved
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"data":[
+            {"model_name":"lit/b","model_info":{
+                "supports_none_reasoning_effort": null,
+                "supports_minimal_reasoning_effort": null,
+                "supports_low_reasoning_effort": null,
+                "supports_xhigh_reasoning_effort": true,
+                "supports_max_reasoning_effort": true,
+                "reasoning_effort_levels": null,
+                "default_reasoning_effort": null
+            }},
+            {"model_name":"lit/all","model_info":{
+                "supports_none_reasoning_effort": true,
+                "supports_minimal_reasoning_effort": true,
+                "supports_low_reasoning_effort": true,
+                "supports_medium_reasoning_effort": true,
+                "supports_high_reasoning_effort": true,
+                "supports_xhigh_reasoning_effort": true,
+                "supports_max_reasoning_effort": true,
+                "reasoning_effort_levels": []
+            }},
+            {"model_name":"lit/precedence","model_info":{
+                "supports_none_reasoning_effort": true,
+                "supports_xhigh_reasoning_effort": true,
+                "reasoning_effort_levels": ["low", "high"]
+            }},
+            {"model_name":"lit/disabled","model_info":{
+                "supports_high_reasoning_effort": true,
+                "supports_reasoning": false
+            }}
+        ]}"#;
+        let server = raw_json_server(listener, 200, body).await;
+        let models = discover_models(&format!("http://{addr}/v1"), "test-key", "litellm")
+            .await
+            .unwrap();
+
+        // lit/b: subset of booleans
+        let meta_b = &models["lit/b"];
+        assert_eq!(
+            meta_b.thinking_levels,
+            Some(vec!["xhigh".to_string(), "max".to_string()])
+        );
+        assert_eq!(meta_b.supports_thinking, Some(true));
+
+        // lit/all: all 7 booleans in canonical progression, empty array fallback
+        let meta_all = &models["lit/all"];
+        assert_eq!(
+            meta_all.thinking_levels,
+            Some(vec![
+                "none".to_string(),
+                "minimal".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+                "max".to_string(),
+            ])
+        );
+        assert_eq!(meta_all.supports_thinking, Some(true));
+
+        // lit/precedence: explicit array wins
+        let meta_prec = &models["lit/precedence"];
+        assert_eq!(
+            meta_prec.thinking_levels,
+            Some(vec!["low".to_string(), "high".to_string()])
+        );
+        assert_eq!(meta_prec.supports_thinking, Some(true));
+
+        // lit/disabled: supports_reasoning: false preserved
+        let meta_dis = &models["lit/disabled"];
+        assert_eq!(meta_dis.thinking_levels, Some(vec!["high".to_string()]));
+        assert_eq!(meta_dis.supports_thinking, Some(false));
+
         server.abort();
     }
 
