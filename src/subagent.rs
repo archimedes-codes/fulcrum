@@ -55,7 +55,7 @@ pub struct LaunchConfig {
 /// `dispatch_subagent` flow — a subagent Worker per dispatch; the
 /// model / `thinking` resolution is SUPERVISOR-side, the three-way
 /// `enabled_tools` rule + the `system_prompt` envelope field + the
-/// `SubagentCapture` + the `settle_timeout` + the
+/// `SubagentCapture` + the **Dead bound** + the
 /// `subagent-session-started` / `subagent-closed` UI lifecycle events
 /// live in the flow). The `WorkerManager` is set ONCE at the
 /// `SessionManager` wiring time (`set_worker_manager` — the
@@ -104,8 +104,8 @@ impl SubagentSessionManager {
     /// flow (a subagent Worker per dispatch — the model / `thinking`
     /// resolution is SUPERVISOR-side, the `SubagentCapture`'s final text
     /// → `Completed`, a crash → `Failed { error: "subagent worker
-    /// exited unexpectedly (code N)" }`, the `settle_timeout` → the
-    /// timeout outcome, a `SubagentCancel` → `send_abort` + reap). The
+    /// exited unexpectedly (code N)" }`, the **Dead bound** → `Failed`
+    /// (`reason: Unresponsive`), a `SubagentCancel` → `send_abort` + reap). The
     /// child's transcript persists as a hidden ephemeral row (the
     /// `TranscriptPersister`'s `is_subagent` flag — the child's seq-0
     /// system-message row is the `system_prompt` envelope field).
@@ -138,7 +138,13 @@ impl SubagentSessionManager {
         let Some(wm) = self.worker_manager.get().cloned() else {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(SubagentOutcome::Failed {
+                // A preflight failure — the child NEVER started, so the empty
+                // `output` / default `metrics` are deliberate: nothing was
+                // ever produced.
+                reason: SubagentFailureReason::Other,
                 error: "native subagent dispatch is not configured".to_string(),
+                output: String::new(),
+                metrics: SubagentMetrics::default(),
             });
             return (rx, SubagentCancel::none());
         };
@@ -245,6 +251,23 @@ pub struct SubagentMetrics {
     pub duration_ms: u64,
 }
 
+/// Why a **Subagent session** ended without settling (ADR 0055). DATA, not
+/// prose — the `subagent-closed` payload's `reason` field and the card's short
+/// line read this; NOTHING may string-match `error` to find out what happened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentFailureReason {
+    /// The **Dead bound** won — silent with nothing in flight.
+    Unresponsive,
+    /// The **Worker process** exited unexpectedly.
+    Crashed,
+    /// A Stop on the parent (or an app-exit teardown).
+    Cancelled,
+    /// Anything else (a preflight failure — the child never started).
+    #[default]
+    Other,
+}
+
 /// The outcome of a subagent dispatch. `Serialize` / `Deserialize` /
 /// `Clone` (ADR 0025 Task 2): the `SubagentResult` wire frame carries it
 /// verbatim (the Supervisor → Worker resolution), and the client-side
@@ -258,7 +281,23 @@ pub enum SubagentOutcome {
         metrics: SubagentMetrics,
     },
     /// The task failed (or was cancelled — `error` includes `"cancelled"`).
-    Failed { error: String },
+    /// A **Dead Subagent** is NEVER `Completed`: it never decided it was
+    /// finished. The status stays `failed`; the SALVAGE rides alongside.
+    Failed {
+        /// Why it ended (the machine-readable answer — never parsed out of
+        /// `error`). `#[serde(default)]` so a stale Worker's payload decodes.
+        #[serde(default)]
+        reason: SubagentFailureReason,
+        error: String,
+        /// Whatever the child had produced (the `SubagentCapture`'s text) — `""`
+        /// when there was nothing. Never a substitute for `Completed`.
+        #[serde(default)]
+        output: String,
+        /// REAL accumulated usage + wall clock (the failed path used to report
+        /// `SubagentMetrics::default()` — 0 tokens for work that really cost money).
+        #[serde(default)]
+        metrics: SubagentMetrics,
+    },
 }
 
 #[cfg(test)]
@@ -272,7 +311,8 @@ mod tests {
     use crate::agent::events::EventSink;
     use crate::agent::harness::catalog::{Model, ModelCatalog};
     use crate::agent::subagent::{
-        LaunchConfig, SubagentCancel, SubagentOutcome, SubagentSessionManager,
+        LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentOutcome,
+        SubagentSessionManager,
     };
     use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
     use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
@@ -386,7 +426,7 @@ mod tests {
     /// parent-scope sink is registered (the
     /// `subagent-session-started` / `subagent-closed` lifecycle events).
     async fn make_manager(
-        settle_timeout: Option<Duration>,
+        dead_bound: Option<Duration>,
         parent_env: StartEnv,
     ) -> (
         Arc<SubagentSessionManager>,
@@ -423,8 +463,8 @@ mod tests {
                     .map(|s| s as Arc<dyn EventSink>)
             }),
         );
-        let manager = match settle_timeout {
-            Some(t) => manager.with_settle_timeout(t),
+        let manager = match dead_bound {
+            Some(t) => manager.with_dead_bound(t),
             None => manager,
         };
         let wm = Arc::new(manager);
@@ -596,7 +636,7 @@ mod tests {
         );
         let outcome = outcome(dispatch_rx, Duration::from_secs(30)).await;
         match outcome {
-            SubagentOutcome::Failed { error } => {
+            SubagentOutcome::Failed { error, .. } => {
                 assert_eq!(
                     error, "subagent worker exited unexpectedly (code 137)",
                     "the crash carries the EXIT CODE in the error"
@@ -632,13 +672,14 @@ mod tests {
         wm.detach("p1");
     }
 
-    /// (3) **`settle_timeout`**: a subagent WORKER whose turn HANGS (a
-    /// `__slow__` task — the `fake_worker` sleeps 10 s before settling)
-    /// is torn down by the flow's `settle_timeout` (the bound is SHORTER
-    /// than the 10 s sleep): `Failed { "timed out" }` +
+    /// (3) **`dead_bound`**: a subagent WORKER whose turn HANGS (a
+    /// `__slow__` task — the `fake_worker` sleeps 10 s before settling) is
+    /// SILENT with NOTHING in flight, so the flow's **Dead bound** reaps it
+    /// (the bound is SHORTER than the 10 s sleep):
+    /// `Failed { reason: Unresponsive, error: "unresponsive" }` +
     /// `subagent-closed { status: "failed" }`, WITHIN THE BOUND.
     #[tokio::test]
-    async fn dispatch_native_a_slow_child_hits_the_settle_timeout() {
+    async fn dispatch_native_a_slow_child_hits_the_dead_bound() {
         let (manager, wm, _sink_events, _events) = make_manager(
             Some(Duration::from_secs(1)),
             test_env("p1", vec![test_model("m1", Vec::new())], None, true),
@@ -655,9 +696,13 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                SubagentOutcome::Failed { ref error } if error == "timed out"
+                SubagentOutcome::Failed {
+                    reason: SubagentFailureReason::Unresponsive,
+                    ref error,
+                    ..
+                } if error == "unresponsive"
             ),
-            "a hanging child settles `Failed` (timed out) — got {outcome:?}"
+            "a silent child is reaped as `Failed` (unresponsive) — got {outcome:?}"
         );
         wm.detach("p1");
     }
@@ -669,8 +714,8 @@ mod tests {
     /// `send_abort` + the drive's `Cancelled` outcome + the reap):
     /// `Failed { "cancelled" }` + `subagent-closed { error: "cancelled"
     /// }`, WITHIN THE BOUND (a `__slow__` child would otherwise run out
-    /// the `settle_timeout` — the 30 s bound proves the CANCEL arm, not
-    /// the timeout, wins).
+    /// the `dead_bound` — the 30 s bound proves the CANCEL arm, not
+    /// the **Dead bound**, wins).
     #[tokio::test]
     async fn dispatch_native_cancel_aborts_the_dispatch() {
         let (manager, wm, _sink_events, _events) = make_manager(
@@ -694,7 +739,7 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                SubagentOutcome::Failed { ref error } if error == "cancelled"
+                SubagentOutcome::Failed { ref error, .. } if error == "cancelled"
             ),
             "a cancel settles `Failed` (cancelled) — got {outcome:?}"
         );
@@ -729,7 +774,7 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                SubagentOutcome::Failed { ref error }
+                SubagentOutcome::Failed { ref error, .. }
                     if error == "native subagent dispatch is not configured"
             ),
             "a `None` `WorkerManager` is an already-resolved `Failed` — got {outcome:?}"
@@ -757,7 +802,7 @@ mod tests {
                 Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
                 Arc::new(|_id: &str| None),
             )
-            .with_settle_timeout(Duration::from_secs(30 * 60)),
+            .with_dead_bound(Duration::from_secs(30 * 60)),
         );
         manager.set_worker_manager(first.clone());
         // The first `set_worker_manager` stored the manager (readable
@@ -774,7 +819,7 @@ mod tests {
                 Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
                 Arc::new(|_id: &str| None),
             )
-            .with_settle_timeout(Duration::from_secs(1)),
+            .with_dead_bound(Duration::from_secs(1)),
         );
         manager.set_worker_manager(second);
         assert!(

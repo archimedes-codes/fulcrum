@@ -15,7 +15,8 @@ use crate::agent::events::EventSink;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
 use crate::agent::harness::provider::ToolCall;
 use crate::agent::subagent::{
-    LaunchConfig, SubagentCancel, SubagentOutcome, SubagentSessionManager,
+    LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentMetrics, SubagentOutcome,
+    SubagentSessionManager,
 };
 use crate::agent::tools::{ContentBlock, ToolResult};
 
@@ -218,8 +219,20 @@ pub(crate) struct SubagentParent<'a> {
 
 /// The `subagent` dispatch's outcome (the `SubagentOutcome` mapping).
 enum SubagentWait {
-    Completed { output: String },
-    Failed { error: String },
+    Completed {
+        output: String,
+    },
+    /// A **Dead Subagent** (ADR 0055): the three fields the `Failed` outcome
+    /// gained, plus the human `error`. `output` is the salvage the parent
+    /// reads (rendered by `salvage_text` — the ONE place); `reason` /
+    /// `metrics` are carried for completeness and deliberately NOT put in the
+    /// parent's prompt (the Client reads them off `subagent-closed`).
+    Failed {
+        reason: SubagentFailureReason,
+        error: String,
+        output: String,
+        metrics: SubagentMetrics,
+    },
     Cancelled,
 }
 
@@ -282,9 +295,21 @@ pub(crate) async fn dispatch_subagent(
     let outcome = tokio::select! {
         r = dispatch_rx => match r {
             Ok(SubagentOutcome::Completed { output, .. }) => SubagentWait::Completed { output },
-            Ok(SubagentOutcome::Failed { error }) => SubagentWait::Failed { error },
+            Ok(SubagentOutcome::Failed {
+                reason,
+                error,
+                output,
+                metrics,
+            }) => SubagentWait::Failed {
+                reason,
+                error,
+                output,
+                metrics,
+            },
             // The worker task vanished without resolving (app exit) —
-            // the dispatch is gone: cancel.
+            // the dispatch is gone: cancel. NO outcome was in scope, so
+            // there is nothing to salvage here (ADR 0055): the `Cancelled`
+            // arm below stays exactly as terse as it was.
             Err(_) => SubagentWait::Cancelled,
         },
         _ = turn.cancelled() => {
@@ -298,13 +323,25 @@ pub(crate) async fn dispatch_subagent(
             details: None,
             is_error: false,
         },
-        SubagentWait::Failed { error } => ToolResult {
-            content: vec![ContentBlock::Text {
-                text: format!("subagent failed: {error}"),
-            }],
-            details: None,
-            is_error: true,
-        },
+        SubagentWait::Failed {
+            reason,
+            error,
+            output,
+            metrics,
+        } => {
+            // The `reason` and the child's REAL usage are NOT part of the
+            // parent's prompt — the Client reads them off the `subagent-closed`
+            // payload (the sole hand-off of a child's usage). They are carried
+            // here so the dispatch layer has the full truth in scope.
+            let _ = (reason, metrics);
+            ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: salvage_text(&error, &output),
+                }],
+                details: None,
+                is_error: true,
+            }
+        }
         SubagentWait::Cancelled => ToolResult {
             content: vec![ContentBlock::Text {
                 text: "cancelled".to_string(),
@@ -313,6 +350,28 @@ pub(crate) async fn dispatch_subagent(
             is_error: true,
         },
     }
+}
+
+/// The parent-facing text for a **Dead Subagent** (ADR 0055) — the ONE place
+/// the salvage is rendered. A reaped / crashed child's partial answer is the
+/// most valuable thing the parent can get, so it follows the error instead of
+/// being thrown away; the banner says plainly that the child did NOT finish,
+/// so the parent neither mistakes the text for a settled answer nor re-does
+/// work the child already did.
+///
+/// With NOTHING captured, the banner would be a lie ("its partial output
+/// follows" — followed by nothing), so the bare error line is all it gets.
+fn salvage_text(error: &str, output: &str) -> String {
+    if output.is_empty() {
+        return format!("subagent failed: {error}");
+    }
+    format!(
+        "subagent failed: {error}\n\
+         It may have been making progress; its partial output follows. Its full \
+         transcript is still open in the Subagents panel.\n\
+         ─── partial output ───\n\
+         {output}"
+    )
 }
 
 #[cfg(test)]
@@ -384,7 +443,7 @@ mod tests {
                 ),
                 Arc::new(|_id: &str| None),
             )
-            .with_settle_timeout(Duration::from_secs(30)),
+            .with_dead_bound(Duration::from_secs(30)),
         );
         let env = crate::agent::worker::protocol::StartEnv::from_parts(
             "parent-1".to_string(),
@@ -451,6 +510,92 @@ mod tests {
         cancel.cancel();
     }
 
+    /// (ADR 0055 — the salvage) A `Failed` outcome WITH partial output gets
+    /// the banner: the parent is told the child did NOT finish, that the text
+    /// below it is unfinished work, and where to read the full transcript.
+    /// Before this the parent got the bare `subagent failed: <outcome>` line
+    /// and 29 minutes of findings were thrown away.
+    #[tokio::test]
+    async fn a_failed_dispatch_with_output_includes_the_partial_output_banner() {
+        let text = dispatch_failed_with_output("Finding one. Finding two.").await;
+        assert!(
+            text.starts_with("subagent failed: unresponsive\n"),
+            "the error line still leads (the failure is never hidden), got: {text}"
+        );
+        assert!(
+            text.contains("It may have been making progress; its partial output follows."),
+            "the parent is told the text below is unfinished, got: {text}"
+        );
+        assert!(
+            text.contains("Its full transcript is still open in the Subagents panel."),
+            "the parent is pointed at the transcript, got: {text}"
+        );
+        assert!(
+            text.contains("─── partial output ───\nFinding one. Finding two."),
+            "the banner is followed by the captured text verbatim, got: {text}"
+        );
+    }
+
+    /// (ADR 0055) A `Failed` outcome with NOTHING captured emits ONLY the
+    /// error line. A banner promising "its partial output follows" over an
+    /// empty block would be a lie the parent has to parse around, so the
+    /// pre-existing terse text is exactly what a truly-empty child gets.
+    #[tokio::test]
+    async fn a_failed_dispatch_with_no_output_omits_the_partial_output_banner() {
+        let text = dispatch_failed_with_output("").await;
+        assert_eq!(
+            text, "subagent failed: unresponsive",
+            "no output → no banner, and no trailing separator"
+        );
+        assert!(
+            !text.contains("partial output"),
+            "the banner must not appear, got: {text}"
+        );
+    }
+
+    /// The harness for both salvage tests: `dispatch_subagent` (the real flow
+    /// — the params parse, the launch resolve, the `SubagentWait` `select!`)
+    /// on a `MockDispatcher` resolving a `Failed` whose `output` is `output`.
+    async fn dispatch_failed_with_output(output: &str) -> String {
+        let dispatcher = MockDispatcher::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<SubagentOutcome>();
+        dispatcher.queue(rx, SubagentCancel::none());
+        tx.send(SubagentOutcome::Failed {
+            reason: SubagentFailureReason::Unresponsive,
+            error: "unresponsive".to_string(),
+            output: output.to_string(),
+            metrics: crate::agent::subagent::SubagentMetrics::default(),
+        })
+        .unwrap();
+        let dispatcher: Arc<dyn SubagentDispatcher> = Arc::new(dispatcher);
+        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
+        let catalog = ModelCatalog::default();
+        let model = test_model();
+        let result = dispatch_subagent(
+            Some(&dispatcher),
+            &SubagentParent {
+                session_id: "p1",
+                space_cwd: std::path::Path::new("/tmp/space"),
+                model: &model,
+                enabled_tools: None,
+                sink: &sink,
+                catalog: &catalog,
+                config_dir: None,
+            },
+            &serde_json::json!({ "task": "the task" }),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            result.is_error,
+            "a `Failed` outcome is an ERROR tool result"
+        );
+        let ContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected a text block, got {:?}", result.content);
+        };
+        text.clone()
+    }
+
     /// `MockDispatcher` — the test resolves the QUEUED oneshot (the test
     /// keeps the SENDER; the `dispatch`'s receiver — the queued oneshot's
     /// receiver — gets the outcome) and the `SubagentCancel` is a no-op
@@ -476,7 +621,10 @@ mod tests {
         // The test resolves the QUEUED oneshot (the `dispatch` returned
         // its receiver — the loop's `select!` sees the outcome).
         tx.send(SubagentOutcome::Failed {
+            reason: crate::agent::subagent::SubagentFailureReason::Other,
             error: "canned".to_string(),
+            output: String::new(),
+            metrics: crate::agent::subagent::SubagentMetrics::default(),
         })
         .unwrap();
         let outcome = tokio::time::timeout(Duration::from_secs(2), dispatch_rx)
@@ -484,7 +632,7 @@ mod tests {
             .expect("the queued oneshot resolved")
             .expect("the oneshot was not dropped");
         match outcome {
-            SubagentOutcome::Failed { error } => assert_eq!(error, "canned"),
+            SubagentOutcome::Failed { error, .. } => assert_eq!(error, "canned"),
             other => panic!("expected `Failed`, got {other:?}"),
         }
         // The `SubagentCancel` is a no-op (idempotent — never panics).

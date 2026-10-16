@@ -391,7 +391,9 @@ mod tests {
     use crate::agent::harness::catalog::{Model, ModelCatalog};
     use crate::agent::harness::provider::{ChatMessage, ChatRole, MessageContent};
     use crate::agent::permission::PermissionOutcome;
-    use crate::agent::subagent::{LaunchConfig, SubagentMetrics, SubagentOutcome};
+    use crate::agent::subagent::{
+        LaunchConfig, SubagentFailureReason, SubagentMetrics, SubagentOutcome,
+    };
 
     /// A fake OpenAI-compatible model (the wire shapes ride verbatim).
     fn test_model() -> Model {
@@ -521,7 +523,16 @@ mod tests {
             Inbound::SubagentResult {
                 id: "sub2".to_string(),
                 outcome: SubagentOutcome::Failed {
+                    reason: SubagentFailureReason::Crashed,
                     error: "boom".to_string(),
+                    output: "partial".to_string(),
+                    metrics: SubagentMetrics {
+                        output: "partial".to_string(),
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        cost: 0.0,
+                        duration_ms: 99,
+                    },
                 },
             },
         ];
@@ -531,6 +542,66 @@ mod tests {
             let decoded = decode_inbound(&line).expect("the frame decodes");
             assert_eq!(case, decoded, "the frame round-trips verbatim");
         }
+    }
+
+    /// (Cross-version guard) An OLD-shape `Failed` payload — the pre-salvage
+    /// `{"Failed":{"error":"x"}}`, with NO `reason` / `output` / `metrics` —
+    /// still DECODES. This is not a nicety: `subagent-result` is in
+    /// `decode_inbound`'s explicit allow-list, so a missing field is a hard
+    /// `ProtoError::Json` and NOT the permissive `Unknown` fallback — a stale
+    /// Worker binary (one that survived an app update) would fail every
+    /// subagent result it delivered. The `#[serde(default)]`s on the new fields
+    /// are what keep an old Worker working.
+    #[test]
+    fn a_failed_subagent_result_in_the_old_shape_still_decodes() {
+        let line = concat!(
+            "{\"type\":\"subagent-result\",\"id\":\"sub1\",",
+            "\"outcome\":{\"Failed\":{\"error\":\"x\"}}}\n"
+        );
+        let decoded = decode_inbound(line).expect("an OLD-shape `Failed` decodes");
+        assert_eq!(
+            decoded,
+            Inbound::SubagentResult {
+                id: "sub1".to_string(),
+                outcome: SubagentOutcome::Failed {
+                    reason: SubagentFailureReason::Other,
+                    error: "x".to_string(),
+                    output: String::new(),
+                    metrics: SubagentMetrics::default(),
+                },
+            },
+            "the missing fields fall back to the `serde(default)`s"
+        );
+    }
+
+    /// The `SubagentFailureReason`'s wire spelling (the `subagent-closed`
+    /// payload's `reason` field and the card's short line read it). A nested
+    /// serde enum does NOT inherit an outer `rename_all`, so the enum carries
+    /// its own `snake_case` attribute — this test is what pins it.
+    #[test]
+    fn the_failure_reason_serialises_in_snake_case() {
+        let encode = |r| serde_json::to_value(r).unwrap();
+        assert_eq!(
+            encode(SubagentFailureReason::Unresponsive),
+            serde_json::json!("unresponsive")
+        );
+        assert_eq!(
+            encode(SubagentFailureReason::Crashed),
+            serde_json::json!("crashed")
+        );
+        assert_eq!(
+            encode(SubagentFailureReason::Cancelled),
+            serde_json::json!("cancelled")
+        );
+        assert_eq!(
+            encode(SubagentFailureReason::Other),
+            serde_json::json!("other")
+        );
+        assert_eq!(
+            SubagentFailureReason::default(),
+            SubagentFailureReason::Other,
+            "an unknown / absent reason is `Other`, never a wrong specific cause"
+        );
     }
 
     /// Every `Outbound` variant round-trips through `encode_outbound` +

@@ -204,7 +204,10 @@ mod tests {
                     .expect("the waiter is registered under the frame id");
                 waiter
                     .send(SubagentOutcome::Failed {
+                        reason: crate::agent::subagent::SubagentFailureReason::Other,
                         error: "boom".to_string(),
+                        output: String::new(),
+                        metrics: crate::agent::subagent::SubagentMetrics::default(),
                     })
                     .expect("the waiter is live");
             }
@@ -217,7 +220,10 @@ mod tests {
         assert_eq!(
             outcome,
             SubagentOutcome::Failed {
-                error: "boom".to_string()
+                reason: crate::agent::subagent::SubagentFailureReason::Other,
+                error: "boom".to_string(),
+                output: String::new(),
+                metrics: crate::agent::subagent::SubagentMetrics::default(),
             },
             "resolving the registered waiter resolves the returned oneshot"
         );
