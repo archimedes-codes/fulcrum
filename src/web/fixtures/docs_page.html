@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>API Documentation - Safe Fetch Client</title>
+</head>
+<body>
+  <nav class="sidebar">
+    <a href="#intro">Introduction</a>
+    <a href="#methods">Methods</a>
+  </nav>
+  <div class="content">
+    <h1>Safe Fetch Client API</h1>
+    <p>The safe fetch client provides defense in depth against Server-Side Request Forgery (SSRF) attacks, DNS rebinding vulnerabilities, and unbounded redirect loops by validating IP addresses before making HTTP socket connections.</p>
+    <h2>Methods</h2>
+    <p>The core API consists of a single asynchronous function that accepts a URL and request options, resolving DNS and verifying network destinations.</p>
+    <pre><code>let outcome = safe_fetch("https://example.com", &opts, &cancel).await?;</code></pre>
+    <p>All private and reserved IPv4 and IPv6 blocks are blocked by default, with loopback addresses permitted for local development servers.</p>
+  </div>
+</body>
+</html>

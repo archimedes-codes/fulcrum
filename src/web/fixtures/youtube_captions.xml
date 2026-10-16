@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<transcript>
+  <text start="0.5" dur="3.2">Hello &amp; welcome to this tutorial.</text>
+  <text start="3.8" dur="4.1">In this video we will explore how Rust web search extraction works.</text>
+  <text start="8.0" dur="2.5">Thank you for watching!</text>
+</transcript>

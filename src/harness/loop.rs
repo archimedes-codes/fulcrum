@@ -66,7 +66,9 @@ use crate::agent::tools::{execute_tool, ContentBlock, ImageRef, ToolCtx, ToolRes
 ///
 /// Deliberately absent: `read_skill` / `list_skills` (their own per-skill
 /// containment, ADR 0029 — a skill may never read a sibling skill, so the
-/// session boundary is not their judge), `subagent` / `mcp` /
+/// session boundary is not their judge), `web_search` / `fetch_content` /
+/// `get_search_content` (network calls and cache reads are not filesystem
+/// operations and are not policy-gated, ADR 0056), `subagent` / `mcp` /
 /// `manage_todo_list` / the interactive flows (no argument of theirs reaches
 /// the filesystem in a way this policy describes).
 const POLICIED_TOOLS: &[(&str, PolicyDirection)] = &[
@@ -292,6 +294,12 @@ pub struct AgentLoop {
     /// Handed to every `ToolCtx` so the executor enforces the SAME tier the
     /// gate decided, and read by the gate itself.
     file_policy: FilePolicy,
+    /// The web tools' configuration IN FORCE for the current turn —
+    /// refreshed from `settings.json` + env at the top of every
+    /// `handle_prompt` alongside `file_policy` (one read per turn).
+    web: crate::agent::web::config::WebConfig,
+    /// Render requester for escalated web fetches (Task 7).
+    pub render_requester: Option<Arc<dyn crate::agent::web::RenderRequester>>,
 }
 
 impl AgentLoop {
@@ -383,7 +391,16 @@ impl AgentLoop {
             // construction value only covers a tool call made BEFORE the
             // first prompt, of which there are none.
             file_policy: FilePolicy::default(),
+            web: crate::agent::web::config::WebConfig::default(),
+            render_requester: None,
         }
+    }
+
+    pub fn set_render_requester(
+        &mut self,
+        requester: Option<Arc<dyn crate::agent::web::RenderRequester>>,
+    ) {
+        self.render_requester = requester;
     }
 
     /// Emit the `context_usage_update` frame (the frontend's
@@ -643,20 +660,19 @@ impl AgentLoop {
     /// blocks — when images are present; a text-only prompt keeps the
     /// `Text` shape).
     pub async fn handle_prompt(&mut self, prompt: &Prompt) {
-        // (ADR 0030 Task 3, Deviation 4) The policy is re-read from
-        // `settings.json` ONCE per turn — the same in-process read
+        // (ADR 0030 Task 3, Deviation 4) The policy and web config are
+        // re-read from `settings.json` ONCE per turn — the same in-process read
         // `launch.rs` does per dispatch, so a user who flips a select in
         // Settings affects an ALREADY-RUNNING session at its next prompt
         // (no restart, no relaunch). ONE read per turn (not per tool call):
         // every tool call in a turn must agree, or a half-asked batch would
         // be a policy the user never chose. `config_dir: None` → the
-        // all-`Allow` default (no settings layer).
-        self.file_policy = self
-            .config_dir
-            .as_deref()
-            .map(crate::config::load_settings)
-            .map(|s| s.file_policy)
-            .unwrap_or_default();
+        // all-`Allow` default (no settings layer) + env-only web config.
+        let settings = self.config_dir.as_deref().map(crate::config::load_settings);
+        self.file_policy = settings.as_ref().map(|s| s.file_policy).unwrap_or_default();
+        self.web = crate::agent::web::config::WebConfig::from_web_settings(
+            settings.as_ref().map(|s| &s.web),
+        );
         // A Stop is pending (the turn token is cancelled — `NativeHandle::cancel`
         // cancelled it): a queued prompt must not start a FRESH turn after the
         // user pressed Stop. Drain the queue + skip this prompt (the token is
@@ -1642,7 +1658,7 @@ impl AgentLoop {
         }
         match tc.name.as_str() {
             "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
-            | "read_skill" => {
+            | "read_skill" | "web_search" | "fetch_content" | "get_search_content" => {
                 execute_tool(
                     &ToolCtx {
                         cwd: self.space_cwd.clone(),
@@ -1658,6 +1674,8 @@ impl AgentLoop {
                         // re-decide differently from the gate (it enforces
                         // the `Sandboxed` floor and confines `bash`).
                         file_policy: self.file_policy,
+                        web: self.web.clone(),
+                        render_requester: self.render_requester.clone(),
                     },
                     &tc.name,
                     &tc.arguments,
@@ -2414,6 +2432,63 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                     "server": { "type": "string", "description": "Filter to a specific server (for list, search, or disambiguating calls)" },
                     "action": { "type": "string", "description": "Action string ('status' or 'auth')" }
                 }
+            }),
+        },
+        ToolSpec {
+            name: "web_search".into(),
+            description: "Search the web using DuckDuckGo or configured search providers.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Single search query string" },
+                    "queries": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple search queries executed concurrently"
+                    },
+                    "num_results": { "type": "number", "description": "Maximum number of results to return (1-20, default 5)" },
+                    "provider": { "type": "string", "description": "Search provider to use (default: auto)" },
+                    "recency_filter": { "type": "string", "description": "Time filter for results" },
+                    "domain_filter": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of domains to restrict results to"
+                    }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "fetch_content".into(),
+            description: "Fetch web content from a URL and extract readable markdown or raw content.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL to fetch and extract content from" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["readable", "raw"],
+                        "description": "Extraction mode: readable (default, converted to Markdown) or raw (original body)"
+                    },
+                    "max_chars": {
+                        "type": "number",
+                        "description": "Maximum characters to return in head (default 20,000, clamp 200..=200,000)"
+                    }
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolSpec {
+            name: "get_search_content".into(),
+            description: "Get cached search content or full document from a previous fetch/search by responseId.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "response_id": { "type": "string", "description": "Response ID returned by web_search or fetch_content" },
+                    "offset": { "type": "number", "description": "Character offset to start reading from (default 0)" },
+                    "limit": { "type": "number", "description": "Maximum characters to read (capped at 20,000)" },
+                    "find_text": { "type": "string", "description": "Substring to search for in cached content" }
+                },
+                "required": ["response_id"]
             }),
         },
     ]
@@ -5998,7 +6073,7 @@ mod tests {
     /// schema must match this EXACTLY: a drift makes the model send
     /// params the executor never reads (a dead tool) or omit ones it
     /// does (an undiscoverable feature).
-    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 9] {
+    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 12] {
         [
             ("bash", &["command", "timeout_ms"]),
             ("read", &["path", "offset", "limit"]),
@@ -6009,7 +6084,46 @@ mod tests {
             ("ls", &["path", "long"]),
             ("list_skills", &[]),
             ("read_skill", &["name", "path"]),
+            (
+                "web_search",
+                &[
+                    "query",
+                    "queries",
+                    "num_results",
+                    "provider",
+                    "recency_filter",
+                    "domain_filter",
+                ],
+            ),
+            ("fetch_content", &["url", "mode", "max_chars"]),
+            (
+                "get_search_content",
+                &["response_id", "offset", "limit", "find_text"],
+            ),
         ]
+    }
+
+    #[test]
+    fn every_tool_spec_is_in_the_param_key_table() {
+        const LOOP_INTERNAL_TOOLS: &[&str] = &[
+            "ask",
+            "sudo_exec",
+            "manage_todo_list",
+            "subagent",
+            "list_agents",
+            "mcp",
+        ];
+        let param_keys = exec_param_keys();
+        for spec in tool_specs() {
+            if LOOP_INTERNAL_TOOLS.contains(&spec.name.as_str()) {
+                continue;
+            }
+            assert!(
+                param_keys.iter().any(|(name, _)| *name == spec.name),
+                "tool `{}` from `tool_specs()` is missing from `exec_param_keys()`",
+                spec.name
+            );
+        }
     }
 
     #[test]

@@ -103,6 +103,8 @@ pub enum WorkerInboundEvent {
     /// in-flight dispatch — the Supervisor aborts + reaps the
     /// subagent Worker).
     SubagentCancel { id: String },
+    /// A Supervisor-side fetch render request forwarded from the worker.
+    FetchRenderRequest { id: String, payload: Value },
     /// The CATCH-ALL for every other `EventSink` emission — the ENTIRE
     /// UI contract (the `interactive-event` todo frames,
     /// `interactive-request-close` modal cleanup, the `session-update`
@@ -564,6 +566,25 @@ impl WorkerHandle {
         Ok(())
     }
 
+    /// A fetch render response (the `Value` verbatim — the `result`
+    /// with no wrapper; resolves the `round_trips` oneshot of the
+    /// request `id`).
+    pub fn send_fetch_render_response(&self, id: &str, value: &Value) -> Result<(), WorkerError> {
+        self.send_inbound_frame(Inbound::FetchRenderResponse {
+            id: id.to_string(),
+            value: value.clone(),
+        })?;
+        if let Some(tx) = self
+            .round_trips
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(id)
+        {
+            let _ = tx.send(value.clone());
+        }
+        Ok(())
+    }
+
     /// Register a response round-trip (the request `id` → oneshot
     /// resolved when the matching response is sent — the delivery
     /// proof; the test observation point).
@@ -703,6 +724,9 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
             model_key,
         }),
         Outbound::SubagentCancel { id } => WorkerInboundEvent::SubagentCancel { id },
+        Outbound::FetchRenderRequest { id, payload } => {
+            WorkerInboundEvent::FetchRenderRequest { id, payload }
+        }
         Outbound::SinkFrame { event, payload } => WorkerInboundEvent::SinkFrame { event, payload },
         Outbound::WorkerError {
             code,
@@ -1120,5 +1144,27 @@ mod tests {
             handle.send_prompt("late", &[]).is_err(),
             "a send on a dead worker's stdin is an error"
         );
+    }
+
+    /// A `fetch-render-response` resolves the registered round-trip oneshot.
+    #[tokio::test]
+    async fn a_fetch_render_response_round_trip_resolves_the_round_trip() {
+        let handle = spawn_fixture().expect("the fixture binary exists");
+        handle
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("ready");
+        let mut rt = handle.register_round_trip("r1");
+        let value = serde_json::json!({
+            "html": "<html><body>rendered</body></html>",
+            "status": 200,
+            "finalUrl": "https://example.com"
+        });
+        handle
+            .send_fetch_render_response("r1", &value)
+            .expect("fetch-render-response encodes");
+        let delivered = rt.try_recv().expect("round trip resolves");
+        assert_eq!(delivered["status"], 200);
+        handle.send_close().expect("close encodes");
     }
 }

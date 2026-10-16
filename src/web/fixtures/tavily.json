@@ -1,0 +1,17 @@
+{
+  "query": "rust",
+  "results": [
+    {
+      "title": "Rust Programming Language",
+      "url": "https://www.rust-lang.org/",
+      "content": "A language empowering everyone to build reliable and efficient software.",
+      "published_date": "2023-05-10"
+    },
+    {
+      "title": "Rust Crates",
+      "url": "https://crates.io/",
+      "content": "The Rust package registry",
+      "published_date": null
+    }
+  ]
+}

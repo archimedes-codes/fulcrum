@@ -85,6 +85,8 @@ pub enum Inbound {
         id: String,
         outcome: crate::agent::subagent::SubagentOutcome,
     },
+    #[serde(rename = "fetch-render-response", rename_all = "camelCase")]
+    FetchRenderResponse { id: String, value: Value },
     /// An inbound `type` this version of the Worker doesn't know
     /// (permissive — the raw line is preserved; never an error).
     #[serde(rename = "unknown", rename_all = "camelCase")]
@@ -176,6 +178,8 @@ pub enum Outbound {
     /// same-named Tauri event verbatim).
     #[serde(rename = "sink-frame", rename_all = "camelCase")]
     SinkFrame { event: String, payload: Value },
+    #[serde(rename = "fetch-render-request", rename_all = "camelCase")]
+    FetchRenderRequest { id: String, payload: Value },
     #[serde(rename = "worker-error", rename_all = "camelCase")]
     WorkerError {
         code: String,
@@ -348,7 +352,8 @@ pub fn decode_inbound(line: &str) -> Result<Inbound, ProtoError> {
         | "close"
         | "permission-response"
         | "interactive-response"
-        | "subagent-result" => {
+        | "subagent-result"
+        | "fetch-render-response" => {
             serde_json::from_value(value).map_err(|e| ProtoError::Json(e.to_string()))
         }
         // Unknown `type` (and the literal `unknown`) — permissive.
@@ -377,6 +382,7 @@ pub fn decode_outbound(line: &str) -> Result<Outbound, ProtoError> {
         | "subagent-dispatch"
         | "subagent-cancel"
         | "sink-frame"
+        | "fetch-render-request"
         | "worker-error" => {
             serde_json::from_value(value).map_err(|e| ProtoError::Json(e.to_string()))
         }
@@ -770,6 +776,43 @@ mod tests {
         match decode_inbound(r#"{"type": "compact"}"#).expect("a bare `compact` decodes") {
             Inbound::Compact { instructions } => assert_eq!(instructions, None),
             other => panic!("expected `Compact`, got {other:?}"),
+        }
+    }
+
+    /// `decode_outbound` routes a `fetch-render-request` line to its variant.
+    #[test]
+    fn decode_outbound_routes_a_fetch_render_request_line_to_its_variant() {
+        let line = r#"{"type": "fetch-render-request", "id": "req-1", "payload": {"sessionId": "s1", "requestId": "req-1", "url": "https://example.com", "timeoutMs": 30000}}"#;
+        match decode_outbound(line).expect("the `fetch-render-request` line decodes") {
+            Outbound::FetchRenderRequest { id, payload } => {
+                assert_eq!(id, "req-1");
+                assert_eq!(payload["sessionId"], "s1");
+                assert_eq!(payload["requestId"], "req-1");
+                assert_eq!(payload["url"], "https://example.com");
+                assert_eq!(payload["timeoutMs"], 30000);
+            }
+            other => panic!(
+                "`fetch-render-request` must decode to `Outbound::FetchRenderRequest`, got {other:?} \
+                 (the `decode_outbound` type allow-list is missing `fetch-render-request`)"
+            ),
+        }
+    }
+
+    /// `decode_inbound` routes a `fetch-render-response` line to its variant.
+    #[test]
+    fn decode_inbound_routes_a_fetch_render_response_line_to_its_variant() {
+        let line = r#"{"type": "fetch-render-response", "id": "req-1", "value": {"html": "<html></html>", "status": 200, "finalUrl": "https://example.com"}}"#;
+        match decode_inbound(line).expect("the `fetch-render-response` line decodes") {
+            Inbound::FetchRenderResponse { id, value } => {
+                assert_eq!(id, "req-1");
+                assert_eq!(value["html"], "<html></html>");
+                assert_eq!(value["status"], 200);
+                assert_eq!(value["finalUrl"], "https://example.com");
+            }
+            other => panic!(
+                "`fetch-render-response` must decode to `Inbound::FetchRenderResponse`, got {other:?} \
+                 (the `decode_inbound` type allow-list is missing `fetch-render-response`)"
+            ),
         }
     }
 

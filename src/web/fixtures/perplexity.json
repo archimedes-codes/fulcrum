@@ -1,0 +1,17 @@
+{
+  "id": "chatcmpl-123",
+  "model": "sonar",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Rust is a multi-paradigm, general-purpose programming language designed for performance and safety."
+      }
+    }
+  ],
+  "citations": [
+    "https://www.rust-lang.org/",
+    "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+  ]
+}

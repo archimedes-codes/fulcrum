@@ -181,6 +181,13 @@ pub struct ToolCtx {
     /// (ADR 0030) The write deny-list (`boundary::protected_dirs()`, frozen
     /// at session start; `vec![]` in tests).
     pub protected: Vec<PathBuf>,
+    /// The web tools' configuration for this turn (Task 1). Read once per turn
+    /// from `settings.json` + the environment — NOT re-read per call, so a
+    /// key added mid-turn lands next turn. `WebConfig::default()` in tests
+    /// (HERMETIC: never read `$HOME` here — the same rule as `boundary`).
+    pub web: crate::agent::web::config::WebConfig,
+    /// Render requester for escalated headless webview fetches (Task 7).
+    pub render_requester: Option<std::sync::Arc<dyn crate::agent::web::RenderRequester>>,
 }
 
 /// The read-direction backend for this context (ADR 0030): the executor's
@@ -1477,6 +1484,11 @@ pub async fn execute_tool(ctx: &ToolCtx, tool: &str, params: &Value) -> ToolResu
         "ls" => exec_ls(ctx, params).await,
         "list_skills" => exec_list_skills(ctx, params).await,
         "read_skill" => exec_read_skill(ctx, params).await,
+        "web_search" => crate::agent::web::tools::exec_web_search(ctx, params).await,
+        "fetch_content" => crate::agent::web::tools::exec_fetch_content(ctx, params).await,
+        "get_search_content" => {
+            crate::agent::web::tools::exec_get_search_content(ctx, params).await
+        }
         other => ToolResult::fail(format!("unknown tool: {other}"), None),
     }
 }
@@ -1514,6 +1526,8 @@ mod tests {
                 shell: crate::agent::policy::AccessPolicy::Allow,
             },
             protected: Vec::new(),
+            web: Default::default(),
+            render_requester: None,
         }
     }
 
@@ -1769,6 +1783,8 @@ mod tests {
             boundary: vec![cwd.clone()],
             file_policy: crate::agent::policy::FilePolicy::default(),
             protected: Vec::new(),
+            web: Default::default(),
+            render_requester: None,
         };
         let handle = tokio::spawn(async move {
             let start = std::time::Instant::now();
@@ -1925,6 +1941,8 @@ mod tests {
             boundary: vec![cwd.clone()],
             file_policy: crate::agent::policy::FilePolicy::default(),
             protected: Vec::new(),
+            web: Default::default(),
+            render_requester: None,
         };
         let handle = tokio::spawn(async move {
             execute_tool(
@@ -3735,6 +3753,29 @@ mod tests {
         let r = execute_tool(&ctx(&cwd), "nope", &json!({})).await;
         assert!(r.is_error);
         assert_eq!(text_of(&r), "unknown tool: nope");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn web_search_dispatches_via_execute_tool() {
+        let cwd = temp_cwd("web-search");
+        let r = execute_tool(&ctx(&cwd), "web_search", &json!({})).await;
+        // Missing query returns error result from exec_web_search, not "unknown tool"
+        assert!(r.is_error);
+        assert!(text_of(&r).contains("web_search requires 'query' or 'queries'"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn fetch_content_and_get_search_content_dispatch_via_execute_tool() {
+        let cwd = temp_cwd("web-fetch");
+        let r1 = execute_tool(&ctx(&cwd), "fetch_content", &json!({})).await;
+        assert!(r1.is_error);
+        assert!(text_of(&r1).contains("fetch_content: missing `url` parameter"));
+
+        let r2 = execute_tool(&ctx(&cwd), "get_search_content", &json!({})).await;
+        assert!(r2.is_error);
+        assert!(text_of(&r2).contains("get_search_content: missing `response_id` parameter"));
         let _ = std::fs::remove_dir_all(&cwd);
     }
 }

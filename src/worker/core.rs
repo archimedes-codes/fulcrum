@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::events::EventSink;
@@ -96,6 +97,7 @@ pub struct WorkerCore {
     pub(crate) pending_permissions: PendingPermissions,
     pub(crate) pending_bridge: PendingInteractive,
     pub(crate) pending_sudo: PendingSudo,
+    pub(crate) pending_render: PendingRender,
     /// The `IpcDispatcher`'s waiter map (shared — the `SubagentResult`
     /// handler resolves it).
     pub(crate) subagent_waiters: SubagentWaiters,
@@ -121,6 +123,108 @@ pub struct WorkerCore {
     build_loop: Box<dyn Fn(&StartEnv) -> LoopHandles + Send>,
 }
 
+pub type PendingRender = Arc<TokioMutex<HashMap<String, oneshot::Sender<Value>>>>;
+
+pub fn render_key(session_id: &str, request_id: &str) -> String {
+    format!("{session_id}/{request_id}")
+}
+
+/// The IPC render requester: forwards render requests across worker stdio
+/// to the Supervisor via `Outbound::FetchRenderRequest`.
+pub struct IpcRenderRequester {
+    session_id: String,
+    outbound: mpsc::UnboundedSender<Outbound>,
+    pending_render: PendingRender,
+}
+
+impl IpcRenderRequester {
+    pub fn new(
+        session_id: String,
+        outbound: mpsc::UnboundedSender<Outbound>,
+        pending_render: PendingRender,
+    ) -> Self {
+        Self {
+            session_id,
+            outbound,
+            pending_render,
+        }
+    }
+}
+
+impl crate::agent::web::RenderRequester for IpcRenderRequester {
+    fn request_render(
+        &self,
+        url: &str,
+        timeout_ms: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<crate::agent::web::RenderedPage, String>>
+                + Send,
+        >,
+    > {
+        let session_id = self.session_id.clone();
+        let outbound = self.outbound.clone();
+        let pending = self.pending_render.clone();
+        let url = url.to_string();
+
+        Box::pin(async move {
+            let request_id = format!("render-{}", uuid::Uuid::new_v4());
+            let key = render_key(&session_id, &request_id);
+            let (tx, rx) = oneshot::channel();
+            pending.lock().await.insert(key.clone(), tx);
+
+            let payload = serde_json::json!({
+                "sessionId": session_id,
+                "requestId": request_id,
+                "url": url,
+                "timeoutMs": timeout_ms,
+            });
+
+            if outbound
+                .send(Outbound::FetchRenderRequest {
+                    id: request_id.clone(),
+                    payload,
+                })
+                .is_err()
+            {
+                pending.lock().await.remove(&key);
+                return Err("worker outbound channel closed".to_string());
+            }
+
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+                Ok(Ok(val)) => {
+                    if let Some(err) = val.get("error").and_then(Value::as_str) {
+                        Err(err.to_string())
+                    } else {
+                        let html = val
+                            .get("html")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let status =
+                            val.get("status").and_then(Value::as_u64).unwrap_or(200) as u16;
+                        let final_url = val
+                            .get("finalUrl")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&url)
+                            .to_string();
+                        Ok(crate::agent::web::RenderedPage {
+                            html,
+                            status,
+                            final_url,
+                        })
+                    }
+                }
+                Ok(Err(_)) => Err("render response channel dropped".to_string()),
+                Err(_) => {
+                    pending.lock().await.remove(&key);
+                    Err("render request timed out".to_string())
+                }
+            }
+        })
+    }
+}
+
 /// The `build_loop` seam's DEFAULT (the production path): the session
 /// initialization moved from `session.rs`'s start path — (1) construct
 /// the channels/tokens (the events `unbounded_channel`, the prompt
@@ -142,6 +246,7 @@ pub fn default_build_loop(
     pending_permissions: PendingPermissions,
     pending_bridge: PendingInteractive,
     pending_sudo: PendingSudo,
+    pending_render: PendingRender,
     trust: Option<Arc<StaticTrustSource>>,
 ) -> Box<dyn Fn(&StartEnv) -> LoopHandles + Send> {
     Box::new(move |env: &StartEnv| {
@@ -199,6 +304,13 @@ pub fn default_build_loop(
             // real: a Resume's loop mints ids its predecessor never used.
             env.incarnation.clone(),
         );
+        let render_req: Arc<dyn crate::agent::web::RenderRequester> =
+            Arc::new(IpcRenderRequester::new(
+                env.session_id.clone(),
+                outbound.clone(),
+                pending_render.clone(),
+            ));
+        loop_.set_render_requester(Some(render_req));
         // (3) The wire field IS the harness convention (`None` = all,
         // `Some(v)` = exactly `v`, `Some(vec![])` = NO tools) — applied
         // VERBATIM, NO mapping (the settings `[]` = all convention is
@@ -287,6 +399,7 @@ impl WorkerCore {
         let pending_permissions: PendingPermissions = Arc::new(TokioMutex::new(HashMap::new()));
         let pending_bridge: PendingInteractive = Arc::new(TokioMutex::new(HashMap::new()));
         let pending_sudo: PendingSudo = Arc::new(TokioMutex::new(HashMap::new()));
+        let pending_render: PendingRender = Arc::new(TokioMutex::new(HashMap::new()));
         let trust = Some(Arc::new(StaticTrustSource::new(false)));
         let core = Self {
             outbound: outbound.clone(),
@@ -294,6 +407,7 @@ impl WorkerCore {
             pending_permissions: pending_permissions.clone(),
             pending_bridge: pending_bridge.clone(),
             pending_sudo: pending_sudo.clone(),
+            pending_render: pending_render.clone(),
             subagent_waiters: subagent_waiters.clone(),
             trust: trust.clone(),
             loop_control: None,
@@ -306,6 +420,7 @@ impl WorkerCore {
                 pending_permissions,
                 pending_bridge,
                 pending_sudo,
+                pending_render,
                 trust,
             ),
         };
@@ -535,6 +650,15 @@ impl WorkerCore {
                     .unwrap_or_else(|p| p.into_inner());
                 if let Some(tx) = waiters.remove(&id) {
                     let _ = tx.send(outcome);
+                }
+                Vec::new()
+            }
+            Inbound::FetchRenderResponse { id, value } => {
+                if let Some(sid) = &self.session_id {
+                    let key = render_key(sid, &id);
+                    if let Some(tx) = self.pending_render.lock().await.remove(&key) {
+                        let _ = tx.send(value);
+                    }
                 }
                 Vec::new()
             }
@@ -975,6 +1099,83 @@ mod tests {
             trust.is_trusted(std::path::Path::new("/x")),
             "the trust-space outcome flips the StaticTrustSource"
         );
+    }
+
+    /// A `FetchRenderResponse` resolves the matching `pending_render` oneshot.
+    #[tokio::test]
+    async fn fetch_render_response_resolves_the_pending_oneshot() {
+        let (mut core, _out_rx, _in_tx) = stub_core();
+        let env = test_env(StartMode::Fresh, None, None);
+        core.handle(Inbound::from(&env)).await;
+        let (rtx, mut rrx) = oneshot::channel::<Value>();
+        {
+            let map = core.pending_render.clone();
+            map.lock().await.insert(render_key("s1", "req-1"), rtx);
+        }
+        let reply_val = serde_json::json!({
+            "html": "<html><body>Hello</body></html>",
+            "status": 200,
+            "finalUrl": "https://example.com"
+        });
+        core.handle(Inbound::FetchRenderResponse {
+            id: "req-1".to_string(),
+            value: reply_val.clone(),
+        })
+        .await;
+        let val = rrx
+            .try_recv()
+            .expect("the oneshot resolved with the render reply");
+        assert_eq!(val["status"], 200);
+        assert_eq!(val["html"], "<html><body>Hello</body></html>");
+        assert!(
+            !core
+                .pending_render
+                .lock()
+                .await
+                .contains_key(&render_key("s1", "req-1")),
+            "the entry is removed after the answer"
+        );
+    }
+
+    /// `IpcRenderRequester` emits `Outbound::FetchRenderRequest` and resolves on response.
+    #[tokio::test]
+    async fn ipc_render_requester_sends_outbound_and_resolves() {
+        use crate::agent::web::RenderRequester;
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let pending_render: PendingRender = Arc::new(TokioMutex::new(HashMap::new()));
+        let requester = IpcRenderRequester::new("s1".to_string(), out_tx, pending_render.clone());
+
+        let req_fut = requester.request_render("https://example.com", 5000);
+
+        let worker_task = tokio::spawn(async move {
+            let frame = out_rx.recv().await.expect("outbound frame received");
+            match frame {
+                Outbound::FetchRenderRequest { id, payload } => {
+                    assert_eq!(payload["sessionId"], "s1");
+                    assert_eq!(payload["url"], "https://example.com");
+                    let key = render_key("s1", &id);
+                    let tx = pending_render
+                        .lock()
+                        .await
+                        .remove(&key)
+                        .expect("pending entry exists");
+                    let _ = tx.send(serde_json::json!({
+                        "html": "<html><body>Hello Rendered</body></html>",
+                        "status": 200,
+                        "finalUrl": "https://example.com/final"
+                    }));
+                }
+                other => panic!("expected FetchRenderRequest, got {other:?}"),
+            }
+        });
+
+        let res = req_fut.await.expect("render succeeds");
+        worker_task.await.expect("worker task succeeds");
+
+        assert_eq!(res.status, 200);
+        assert_eq!(res.html, "<html><body>Hello Rendered</body></html>");
+        assert_eq!(res.final_url, "https://example.com/final");
     }
 
     /// `Config { trusted: Some(true) }` flips the `StaticTrustSource`

@@ -901,6 +901,8 @@ mod tests {
                 shell: AccessPolicy::Sandboxed,
             },
             protected: Vec::new(),
+            web: Default::default(),
+            render_requester: None,
         }
     }
 
