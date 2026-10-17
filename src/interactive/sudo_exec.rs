@@ -75,8 +75,12 @@ fn build_command(cmd0: &str, rest: &[String]) -> tokio::process::Command {
 /// [`for_child`](crate::agent::hostenv::for_child); the parameter exists
 /// because that cached patch is EMPTY under `cargo test` — its gate needs this
 /// exe under `$APPDIR`, and under cargo it is `target/debug/deps/<hash>`).
+///
+/// The constructor is `crate::agent::childproc`'s — it owns the child's Windows
+/// console window policy (`CREATE_NO_WINDOW`); the password stdin is a Runtime
+/// pipe and stays untouched.
 fn build_command_with(cmd0: &str, rest: &[String], patch: &EnvPatch) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(cmd0);
+    let mut cmd = crate::agent::childproc::command(cmd0);
     cmd.args(rest);
     // THE HIGHEST-SEVERITY SITE of the four (`docs/research/
     // appimage-child-process-env-leak.md`): an attacker-influenced loader path

@@ -315,8 +315,12 @@ fn build_command(def: &StdioDef, cwd: &Path) -> Command {
 /// (its gate needs this exe under `$APPDIR`; under cargo it is
 /// `target/debug/deps/<hash>`), so a test driven through `build_command` could
 /// not observe the ordering at all and could not fail.
+///
+/// The constructor is `crate::agent::childproc`'s — it owns the child's Windows
+/// console window policy (`CREATE_NO_WINDOW`); stdin stays our pipe (this is a
+/// Runtime child).
 fn build_command_with(def: &StdioDef, cwd: &Path, patch: &EnvPatch) -> Command {
-    let mut cmd = Command::new(&def.command);
+    let mut cmd = crate::agent::childproc::command(&def.command);
     cmd.args(&def.args);
     // The inherited env is SCRUBBED of the AppImage's own mount paths first
     // (`crate::agent::hostenv`; evidence:

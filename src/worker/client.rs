@@ -254,8 +254,12 @@ fn build_command(exe: &std::path::Path) -> tokio::process::Command {
 /// the MCP site, the `sudo` site and the `bash`/`fd`/`rg` sites in place. The
 /// pollution then stays INSIDE the Worker and never reaches the user's
 /// commands, because those sites scrub again on their own.
+///
+/// The constructor is `crate::agent::childproc`'s — it owns the child's Windows
+/// console window policy (`CREATE_NO_WINDOW`); the Worker's JSONL stdin is a
+/// Runtime pipe and stays untouched.
 fn build_command_with(exe: &std::path::Path, patch: &EnvPatch) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(exe);
+    let mut cmd = crate::agent::childproc::command(exe);
     cmd.arg("--worker");
     // The self-exec inherits the GUI process' tainted env IN FULL: inside an
     // AppImage `current_exe()` resolves THROUGH the mount (`/proc/<pid>/exe` →
