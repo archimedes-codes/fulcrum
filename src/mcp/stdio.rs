@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::rpc::{parse_notification, parse_response, RpcRequest, RpcResponse};
 use super::types::{extract_tool_call_result, StdioDef, ToolCallResult, ToolInfo};
+use crate::agent::hostenv::EnvPatch;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -43,8 +44,9 @@ pub struct StdioClient {
 }
 
 impl StdioClient {
-    /// Connect: spawn the process (the def's `env` ADDITIVE over the
-    /// inherited env; the def's `cwd` over the session `cwd`), run the
+    /// Connect: spawn the process (the inherited env SCRUBBED of the
+    /// AppImage's own paths, then the def's `env` ADDITIVE over that — see
+    /// [`build_command`]; the def's `cwd` over the session `cwd`), run the
     /// `initialize` handshake (with `timeout`, raced against `cancel`),
     /// then send `notifications/initialized` (no response expected).
     /// A handshake failure KILLS the process (the child is dropped).
@@ -54,13 +56,12 @@ impl StdioClient {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(&def.command);
-        cmd.args(&def.args);
-        // The def's `env` is ADDITIVE (the inherited env + the extras —
-        // the suite's spawn behavior; `std::process::Command::envs`
-        // ADDs, it does not replace).
-        cmd.envs(&def.env);
-        cmd.current_dir(def.cwd.as_deref().unwrap_or(cwd));
+        let mut cmd = build_command(def, cwd);
+        // The transport's own three decisions, deliberately NOT in the seam:
+        // piped stdin / piped stdout / NULL stderr (a server's chatter is not
+        // the agent's) and `kill_on_drop` (the child dies with the client) —
+        // the env policy is [`build_command`]'s, and the order between the two
+        // halves of the env is pinned there.
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
@@ -295,6 +296,50 @@ impl Drop for StdioClient {
     }
 }
 
+/// Build the `Command` a stdio MCP server is spawned with — everything except
+/// the `Stdio` trio and `kill_on_drop(true)`, which stay in
+/// [`StdioClient::connect`].
+///
+/// The seam exists because the assertion that matters here — the scrub landed
+/// BEFORE the def's `env` — can only be made on a `Command` that was never
+/// spawned. It is called by production `connect`, so it needs no `cfg` and no
+/// `allow`.
+fn build_command(def: &StdioDef, cwd: &Path) -> Command {
+    build_command_with(def, cwd, crate::agent::hostenv::for_child())
+}
+
+/// [`build_command`] with the patch as an argument.
+///
+/// Production passes exactly [`for_child`](crate::agent::hostenv::for_child) —
+/// the parameter is there because that cached patch is EMPTY under `cargo test`
+/// (its gate needs this exe under `$APPDIR`; under cargo it is
+/// `target/debug/deps/<hash>`), so a test driven through `build_command` could
+/// not observe the ordering at all and could not fail.
+fn build_command_with(def: &StdioDef, cwd: &Path, patch: &EnvPatch) -> Command {
+    let mut cmd = Command::new(&def.command);
+    cmd.args(&def.args);
+    // The inherited env is SCRUBBED of the AppImage's own mount paths first
+    // (`crate::agent::hostenv`; evidence:
+    // `docs/research/appimage-child-process-env-leak.md`). This is the most
+    // damaging site after `bash`: a stdio server is overwhelmingly
+    // `npx` / `uvx` / `node` / `python` — the frozen-interpreter shapes that
+    // `PYTHONHOME`, `PYTHONPATH` and a `libssl` resolved out of the mount kill
+    // outright.
+    //
+    // Both halves of the env decision, and the ORDER between them is the
+    // load-bearing one: the def's `env` is ADDITIVE over the SCRUBBED
+    // inheritance — `std::process::Command::envs` ADDs, it does not replace —
+    // and it runs AFTER the patch, so a variable the user wrote into
+    // `mcpServers.env` still wins over the scrub even where the scrub would
+    // `env_remove` that name. Move this `apply` below the `envs` and the
+    // user's entry is silently discarded (measured against a real `execve`);
+    // `an_mcp_server_env_wins_over_the_scrub` is the test that catches it.
+    patch.apply(&mut cmd);
+    cmd.envs(&def.env);
+    cmd.current_dir(def.cwd.as_deref().unwrap_or(cwd));
+    cmd
+}
+
 /// The reader's EOF failure response (a response with an `error` — the
 /// `request_inner` maps it to the `error.message`).
 fn err_resp() -> RpcResponse {
@@ -484,6 +529,151 @@ mod tests {
         assert!(
             matches!(r, Err(ref e) if e.contains("exited") || e.contains("channel")),
             "a call on a dead process errors, got {r:?}"
+        );
+    }
+
+    // ── the AppImage child-env scrub, at the MCP spawn site ──────────────
+    //
+    // `crate::agent::hostenv` pins the RULE (what a scrubbed child env looks
+    // like) and `tools/exec.rs`'s module pins that call site; this section
+    // pins the stdio MCP site, which is the most damaging one after `bash`:
+    // stdio servers are overwhelmingly `npx` / `uvx` / `node` / `python` —
+    // exactly the frozen-interpreter shapes that `PYTHONHOME`, `PYTHONPATH`
+    // and a shadowed `libssl` kill (evidence:
+    // `docs/research/appimage-child-process-env-leak.md`).
+    //
+    // ⚠ A seam-built `Command` is NOT the command that spawns. These tests
+    // prove the ENV/ARGV policy of [`build_command_with`]; the `Stdio` trio
+    // and `kill_on_drop(true)` stay in `connect()` (this site has no
+    // `pre_exec`), and they are deliberately NOT asserted here — no child is
+    // spawned, so nothing here proves the end-to-end spawn.
+    //
+    // Both tests are `#[cfg(target_os = "linux")]`: off Linux `scrub` is
+    // DEFINED to return the empty patch, so the same assertions would pass
+    // VACUOUSLY on macOS and Windows. Compile-time gating is the honest form
+    // of "not applicable here" (the `hostenv.rs` / `sandbox.rs` convention).
+
+    #[cfg(target_os = "linux")]
+    use std::ffi::{OsStr, OsString};
+
+    /// The value a `StdioDef` sets `LD_LIBRARY_PATH` to: the thing that must
+    /// survive a scrub applied BEFORE `envs(&def.env)` and be destroyed by one
+    /// applied AFTER it.
+    #[cfg(target_os = "linux")]
+    const SENTINEL: &str = "/opt/user-said-this/lib";
+
+    /// The ordering test: a user's MCP `env` entry still wins over the scrub.
+    ///
+    /// Why the order is load-bearing: the patch holds an `env_remove` for a
+    /// variable whose every entry was the bundle's, and an `env_remove` issued
+    /// AFTER `envs(&def.env)` DISCARDS the user's entry (measured against a
+    /// real `execve` — see the note on
+    /// [`EnvPatch::apply`](crate::agent::hostenv::EnvPatch::apply)). A
+    /// transport that silently drops the environment a user wrote into their
+    /// `mcpServers` config is worse than one that never scrubbed.
+    ///
+    /// The patch is injected through the seam rather than read from
+    /// [`for_child`](crate::agent::hostenv::for_child), which is EMPTY under
+    /// `cargo test` — its gate needs this exe under `$APPDIR`, and under cargo
+    /// it is `target/debug/deps/<hash>`. So a test built on `for_child()`
+    /// asserts nothing; the fabricated host in
+    /// [`fixtures`](crate::agent::hostenv::fixtures) is what makes the patch
+    /// (and therefore the ordering) observable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_mcp_server_env_wins_over_the_scrub() {
+        use crate::agent::hostenv::fixtures;
+
+        let patch = fixtures::tainted_patch();
+        let mut def = fake_def();
+        def.env
+            .insert("LD_LIBRARY_PATH".to_string(), SENTINEL.to_string());
+
+        let cmd = build_command_with(&def, &session_cwd(), &patch);
+        let got = fixtures::configured_env(&cmd);
+
+        assert_eq!(
+            got.get(&OsString::from("LD_LIBRARY_PATH")),
+            Some(&Some(OsString::from(SENTINEL))),
+            "the def's `env` must win over the scrub (a scrub applied after \
+             `envs` overwrites it, and its `env_remove` would discard it)"
+        );
+        // …and the scrub IS applied, for the keys the def does not name.
+        // Without this conjunct the assertion above passes on a command that
+        // never scrubbed at all (an empty env also has no `LD_LIBRARY_PATH` to
+        // clobber).
+        assert_eq!(
+            got.get(&OsString::from("PYTHONHOME")),
+            Some(&None),
+            "a tainted variable the def does not name must be scrubbed by the \
+             same seam — `None` is `env_remove`, NOT an empty value"
+        );
+        // The ordering, pinned as one equality: scrub FIRST, then the def's
+        // `env`. A seam that swaps the two differs HERE, and the difference is
+        // the user's config.
+        let mut expected = fixtures::reference_env(&patch);
+        expected.insert(
+            OsString::from("LD_LIBRARY_PATH"),
+            Some(OsString::from(SENTINEL)),
+        );
+        assert_eq!(
+            got, expected,
+            "the spawn env must be exactly scrub-then-def"
+        );
+    }
+
+    /// The inheritance test: with no `env` of its own, the server gets the
+    /// inherited env MINUS the mount paths — and the user's own entries are
+    /// what is left, not an empty or absent variable.
+    ///
+    /// Same seam caveat as [`an_mcp_server_env_wins_over_the_scrub`]: this is
+    /// the command builder, not the spawn.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_mcp_server_inherits_a_scrubbed_library_path() {
+        use crate::agent::hostenv::fixtures;
+
+        let patch = fixtures::tainted_patch();
+        // `fake_def()`'s `env` is EMPTY — nothing overrides the scrub.
+        let cmd = build_command_with(&fake_def(), &session_cwd(), &patch);
+        let got = fixtures::configured_env(&cmd);
+
+        let ld = got
+            .get(&OsString::from("LD_LIBRARY_PATH"))
+            .and_then(|value| value.as_ref())
+            .expect(
+                "the user's `/usr/lib` survives, so the variable is re-SET, \
+                     not removed — its absence would be a `PATH`-style silent \
+                     regression for every `npx`/`uvx` server",
+            );
+        assert_eq!(
+            ld.as_os_str(),
+            OsStr::new(fixtures::SCRUBBED_LD_LIBRARY_PATH),
+            "the surviving entry must be exactly the user's, in order"
+        );
+        assert_eq!(
+            got.get(&OsString::from("PATH")),
+            Some(&Some(OsString::from(fixtures::USER_BIN))),
+            "the user's own bin dir survives the mount entry's removal"
+        );
+        assert_eq!(
+            got.get(&OsString::from("PYTHONHOME")),
+            Some(&None),
+            "`PYTHONHOME` pointed ONLY at the mount, so it is removed — an empty \
+             value is not an absent one to CPython"
+        );
+        for (key, value) in &got {
+            if let Some(value) = value {
+                assert!(
+                    !fixtures::lists_a_mount_path(value),
+                    "{key:?} still names a mount path: {value:?}"
+                );
+            }
+        }
+        assert_eq!(
+            got,
+            fixtures::reference_env(&patch),
+            "with an empty `def.env` the command's env is exactly the patch"
         );
     }
 }

@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::agent::debuglog;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::catalog::Model;
+use crate::agent::hostenv::EnvPatch;
 use crate::agent::permission::PermissionOutcome;
 use crate::agent::tools::ImageRef;
 use crate::agent::worker::protocol::{
@@ -226,16 +227,57 @@ where
     })
 }
 
+/// Build the `Command` the Worker self-spawn runs — everything except the
+/// `Stdio` trio and the `#[cfg(unix)]` `pre_exec` process-group block, which
+/// stay in [`WorkerHandle::spawn`].
+///
+/// The seam exists so the env/argv policy can be asserted on a `Command` that
+/// was never spawned; it is called by production `spawn`, so it needs no `cfg`
+/// and no `allow`.
+fn build_command(exe: &std::path::Path) -> tokio::process::Command {
+    build_command_with(exe, crate::agent::hostenv::for_child())
+}
+
+/// [`build_command`] with the patch as an argument (production passes exactly
+/// [`for_child`](crate::agent::hostenv::for_child); the parameter exists
+/// because that cached patch is EMPTY under `cargo test` — its gate needs this
+/// exe under `$APPDIR`, and under cargo it is `target/debug/deps/<hash>`).
+///
+/// THE ONE JUDGEMENT CALL IN THIS CHANGE, stated where it can be undone: the
+/// Worker is the SAME ELF as the GUI process, so if it ever `dlopen`s a
+/// bundled library through a path ONLY `LD_LIBRARY_PATH` resolves, scrubbing
+/// breaks the Worker. The expectation is that it does not — the Worker renders
+/// nothing and owns no window — but that is an expectation, not a proof, and it
+/// is field-tested on a real bundle rather than here.
+///
+/// The escape hatch is this one call: delete the `patch.apply` below and leave
+/// the MCP site, the `sudo` site and the `bash`/`fd`/`rg` sites in place. The
+/// pollution then stays INSIDE the Worker and never reaches the user's
+/// commands, because those sites scrub again on their own.
+fn build_command_with(exe: &std::path::Path, patch: &EnvPatch) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("--worker");
+    // The self-exec inherits the GUI process' tainted env IN FULL: inside an
+    // AppImage `current_exe()` resolves THROUGH the mount (`/proc/<pid>/exe` →
+    // `/tmp/.mount_archim*/usr/bin/archimedes`), so without this patch the
+    // Worker — the process that spawns the user's commands — starts polluted
+    // and generation N's garbage propagates down
+    // (`docs/research/appimage-child-process-env-leak.md`).
+    patch.apply(&mut cmd);
+    cmd
+}
+
 impl WorkerHandle {
-    /// Spawn `<exe> --worker` (piped stdio). The `exe` PATH is a
-    /// PARAMETER: production callers pass
+    /// Spawn `<exe> --worker` (piped stdio, and with the inherited env
+    /// SCRUBBED of the AppImage's own paths — the decision and its risk are
+    /// in [`build_command`], next to the argv it must not disturb). The
+    /// `exe` PATH is a PARAMETER: production callers pass
     /// `std::env::current_exe()` (the self-exec); tests/e2e pass the
     /// `fake_worker` fixture path. On Unix the child owns its process
     /// group (`setpgid(0, 0)` — the `RealSudoRunner` pattern) so
     /// `kill` SIGKILLs the whole group.
     pub fn spawn(exe: &std::path::Path) -> Result<Self, WorkerError> {
-        let mut cmd = tokio::process::Command::new(exe);
-        cmd.arg("--worker");
+        let mut cmd = build_command(exe);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         // STDERR IS PIPE-D, NOT `/dev/null`: a Worker's own diagnostics
@@ -249,7 +291,9 @@ impl WorkerHandle {
         // The child owns its process group (a single async-signal-safe
         // libc call — the `RealSudoRunner` pattern): `kill` SIGKILLs
         // the whole group (a Worker that forked further does not
-        // survive a bare kill of the direct child).
+        // survive a bare kill of the direct child). The ENV decision is NOT
+        // here — it is applied in [`build_command`], before this block and
+        // before `spawn`.
         #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
@@ -1166,5 +1210,91 @@ mod tests {
         let delivered = rt.try_recv().expect("round trip resolves");
         assert_eq!(delivered["status"], 200);
         handle.send_close().expect("close encodes");
+    }
+
+    // ── the AppImage child-env scrub, at the Worker self-spawn ──────────
+    //
+    // The Agent runtime is a SELF-EXEC of this same binary (`<exe> --worker`,
+    // ADR 0022), and inside an AppImage `current_exe()` resolves THROUGH the
+    // mount (`/proc/<pid>/exe` → `/tmp/.mount_archim*/usr/bin/archimedes`), so
+    // the Worker inherits the GUI process' entire tainted stack — and the
+    // Worker is the process that spawns the user's commands, so this is the
+    // hop where generation N's pollution reaches generation N+1.
+    //
+    // ⚠ A seam-built `Command` is NOT the command that spawns: the `Stdio`
+    // trio and the `#[cfg(unix)]` `pre_exec` (`setpgid`) block stay in `spawn()`
+    // and are NOT asserted here. What this proves is the env/argv POLICY of
+    // the builder; the end-to-end spawn under a real mount is field-tested
+    // separately.
+    //
+    // `#[cfg(target_os = "linux")]` for the `hostenv` reason: off Linux `scrub`
+    // is DEFINED to return the empty patch, so the same assertions would pass
+    // VACUOUSLY on macOS and Windows.
+
+    /// The self-spawn carries the patch's removals and re-sets, and its argv is
+    /// untouched.
+    ///
+    /// The patch is injected through the seam instead of read from
+    /// [`for_child`](crate::agent::hostenv::for_child): under `cargo test`
+    /// `current_exe()` is `target/debug/deps/<hash>`, the production gate is
+    /// closed, and that patch is EMPTY on every host — a test built on it
+    /// could not fail. The fabricated host in
+    /// [`fixtures`](crate::agent::hostenv::fixtures) is what makes a real patch
+    /// flow through this seam.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_worker_self_spawn_gets_a_scrubbed_command() {
+        use crate::agent::hostenv::fixtures;
+        use std::ffi::{OsStr, OsString};
+
+        let patch = fixtures::tainted_patch();
+        // Production passes `std::env::current_exe()`; the seam takes the same
+        // `&Path`, so any path serves — nothing is spawned here.
+        let cmd = build_command_with(std::path::Path::new("/usr/bin/archimedes"), &patch);
+
+        assert_eq!(
+            cmd.as_std().get_program(),
+            OsStr::new("/usr/bin/archimedes"),
+            "the seam must not disturb the program"
+        );
+        // `get_args()` EXCLUDES argv0, so the Worker's argv is exactly this.
+        let args: Vec<&OsStr> = cmd.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            [OsStr::new("--worker")],
+            "the self-spawn flag must still be argv[1]"
+        );
+
+        let got = fixtures::configured_env(&cmd);
+        assert_eq!(
+            got,
+            fixtures::reference_env(&patch),
+            "the Worker's env must be exactly what the patch says"
+        );
+        // The same fact key-by-key, so a failure names the key.
+        assert_eq!(
+            got.get(&OsString::from("LD_LIBRARY_PATH")),
+            Some(&Some(OsString::from(fixtures::SCRUBBED_LD_LIBRARY_PATH))),
+            "the loader path is re-set to the user's entries"
+        );
+        assert_eq!(
+            got.get(&OsString::from("PATH")),
+            Some(&Some(OsString::from(fixtures::USER_BIN))),
+            "the Worker's own `PATH` keeps the user's entry (a Worker with no \
+             `PATH` would fail to find `git`/`rg` and still exit 0)"
+        );
+        assert_eq!(
+            got.get(&OsString::from("PYTHONHOME")),
+            Some(&None),
+            "a removal appears as a None-valued entry, NOT as an absent key"
+        );
+        for (key, value) in &got {
+            if let Some(value) = value {
+                assert!(
+                    !fixtures::lists_a_mount_path(value),
+                    "the Worker would hand {key:?} to every command it spawns: {value:?}"
+                );
+            }
+        }
     }
 }

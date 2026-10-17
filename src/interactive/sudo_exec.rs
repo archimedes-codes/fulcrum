@@ -15,6 +15,7 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::agent::events::EventSink;
+use crate::agent::hostenv::EnvPatch;
 use crate::agent::interactive::{PendingSudo, SudoRun};
 
 /// The `sudo_exec` execution seam (mirrors the suite's `SudoSpawner` seam,
@@ -56,6 +57,46 @@ impl SudoRunner for RealSudoRunner {
     }
 }
 
+/// Build the `Command` the elevated process runs — everything except the
+/// `Stdio` trio (the password travels that stdin pipe), `kill_on_drop(true)`
+/// and the `#[cfg(unix)]` `pre_exec` process-group block, which stay in
+/// [`run_sudo_real`], in that order.
+///
+/// The seam exists so the env/argv policy can be asserted on a `Command` that
+/// was never spawned; it is called by production `run_sudo_real`, so it needs
+/// no `cfg` and no `allow`. The two halves of the argv arrive as the
+/// `argv.split_first()` pair the caller already computed — the seam takes the
+/// same inputs the old two lines did, nothing more.
+fn build_command(cmd0: &str, rest: &[String]) -> tokio::process::Command {
+    build_command_with(cmd0, rest, crate::agent::hostenv::for_child())
+}
+
+/// [`build_command`] with the patch as an argument (production passes exactly
+/// [`for_child`](crate::agent::hostenv::for_child); the parameter exists
+/// because that cached patch is EMPTY under `cargo test` — its gate needs this
+/// exe under `$APPDIR`, and under cargo it is `target/debug/deps/<hash>`).
+fn build_command_with(cmd0: &str, rest: &[String], patch: &EnvPatch) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(cmd0);
+    cmd.args(rest);
+    // THE HIGHEST-SEVERITY SITE of the four (`docs/research/
+    // appimage-child-process-env-leak.md`): an attacker-influenced loader path
+    // reaching a ROOT `git` / `apt` / `dnf` is a library-hijack SURFACE, not
+    // merely a broken command. Two halves, both true:
+    //
+    // * the bundle's `LD_LIBRARY_PATH` points INSIDE the user-writable
+    //   `/tmp/.mount_archim*` mount, so the elevated child resolves SONAMEs
+    //   against directories that anything able to write there controls;
+    // * `sudo`'s own `env_reset` / `env_check` policy REFUSES to run on some
+    //   `LD_*` names, so scrubbing can turn a refusal into a success rather
+    //   than only removing the hazard.
+    //
+    // argv is untouched, which is the point: the same command runs, with a
+    // loader path the user's system owns (`tests/sudo_argv.rs` pins the argv
+    // itself).
+    patch.apply(&mut cmd);
+    cmd
+}
+
 /// The real sudo run (see [`RealSudoRunner`]).
 async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -> SudoRun {
     let Some((cmd0, rest)) = argv.split_first() else {
@@ -67,8 +108,7 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
             error: Some("no command in argv".to_string()),
         };
     };
-    let mut cmd = tokio::process::Command::new(cmd0);
-    cmd.args(rest);
+    let mut cmd = build_command(cmd0, rest);
     // Pipe ALL THREE streams: the password travels the stdin pipe, and
     // stdout / stderr are captured into the shared buffers below. The
     // tokio default is INHERIT — without the explicit `piped()`,
@@ -81,7 +121,9 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
     // (finding 3 — a `tokio::select!` dropping the future would otherwise
     // leave the elevated command running detached; `kill_on_drop` alone
     // kills the DIRECT child — the `SudoGroupGuard` below kills the whole
-    // group, so a root command that forked further does not survive).
+    // group, so a root command that forked further does not survive). The
+    // ENV decision is in [`build_command`] above, applied before these lines:
+    // the lifecycle decisions stay here, in this order.
     cmd.kill_on_drop(true);
     // The child owns its process group (the suite's `detached: true`):
     // `setpgid(0, 0)` in the child (a single async-signal-safe libc call
@@ -766,5 +808,77 @@ mod tests {
             elapsed < Duration::from_secs(8),
             "the write was bounded, took {elapsed:?}"
         );
+    }
+
+    // ── the AppImage child-env scrub, at the ELEVATED spawn ────────────
+    //
+    // The highest-severity site of the four: a hijacked loader path reaching a
+    // ROOT `git` / `apt` / `dnf` is a library-hijack surface, not merely a
+    // broken command (`docs/research/appimage-child-process-env-leak.md`).
+    //
+    // ⚠ A seam-built `Command` is NOT the command that spawns: the `Stdio`
+    // trio (the password travels that stdin pipe), `kill_on_drop(true)` and the
+    // `#[cfg(unix)]` `pre_exec` (`setpgid`) block all stay in `run_sudo_real`
+    // and are NOT asserted here. This proves the env/argv policy of the
+    // builder; `tests/sudo_argv.rs` pins the argv itself.
+    //
+    // `#[cfg(target_os = "linux")]`: off Linux `scrub` is DEFINED to return the
+    // empty patch, so the assertions would pass VACUOUSLY on macOS/Windows.
+
+    /// The elevated spawn gets a mount-free loader path, and its argv is
+    /// byte-identical to the caller's (scrubbing must never change WHAT runs).
+    ///
+    /// The patch is injected through the seam rather than read from
+    /// [`for_child`](crate::agent::hostenv::for_child), which is EMPTY under
+    /// `cargo test` (`current_exe()` is `target/debug/deps/<hash>`, so the
+    /// production gate is closed) — such a test could not fail. The fabricated
+    /// host in [`fixtures`](crate::agent::hostenv::fixtures) supplies a patch
+    /// that is genuinely non-empty.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sudo_runner_scrubs_before_elevating() {
+        use crate::agent::hostenv::fixtures;
+        use std::ffi::{OsStr, OsString};
+
+        let patch = fixtures::tainted_patch();
+        // The shape `build_sudo_argv` produces (`sudo -S <command…>`); the
+        // seam takes the `argv.split_first()` halves.
+        let rest = vec!["-S".to_string(), "git".to_string(), "status".to_string()];
+        let cmd = super::build_command_with("/usr/bin/sudo", &rest, &patch);
+
+        // The argv is UNTOUCHED — an env fix that changed what runs would be a
+        // functional regression, not a hardening.
+        assert_eq!(
+            cmd.as_std().get_program(),
+            OsStr::new("/usr/bin/sudo"),
+            "the seam must not disturb the program"
+        );
+        let args: Vec<&OsStr> = cmd.as_std().get_args().collect();
+        assert_eq!(args, ["-S", "git", "status"], "argv is verbatim");
+
+        let got = fixtures::configured_env(&cmd);
+        assert_eq!(
+            got,
+            fixtures::reference_env(&patch),
+            "the elevated child's env must be exactly what the patch says"
+        );
+        assert_eq!(
+            got.get(&OsString::from("LD_LIBRARY_PATH")),
+            Some(&Some(OsString::from(fixtures::SCRUBBED_LD_LIBRARY_PATH))),
+            "`root` must not be handed a loader path this process' mount owns"
+        );
+        assert_eq!(
+            got.get(&OsString::from("PYTHONHOME")),
+            Some(&None),
+            "a removal appears as a None-valued entry, NOT as an absent key"
+        );
+        for (key, value) in &got {
+            if let Some(value) = value {
+                assert!(
+                    !fixtures::lists_a_mount_path(value),
+                    "{key:?} names a mount path in a ROOT process: {value:?}"
+                );
+            }
+        }
     }
 }
