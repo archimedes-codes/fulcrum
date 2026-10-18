@@ -141,10 +141,11 @@ impl WorkerInboundEvent {
 ///
 /// `Clone` (the manager stores + pumps + reaps clones): the `broadcast`
 /// `Sender` / the `watch` `Sender`s / the `UnboundedSender` are all
-/// `Clone`; a `events()` call is a FRESH `broadcast` receiver (a new
-/// cursor — it sees every frame sent AFTER the subscription; the
-/// `Ready` frame is observed via the `ready` watch instead, so the
-/// `wait_ready` race is gone).
+/// `Clone`; the `pid` is a `Copy` field copied verbatim (every clone of a
+/// handle names the same child); a `events()` call is a FRESH `broadcast`
+/// receiver (a new cursor — it sees every frame sent AFTER the
+/// subscription; the `Ready` frame is observed via the `ready` watch
+/// instead, so the `wait_ready` race is gone).
 pub struct WorkerHandle {
     /// The child process (interior-mutable — `kill` needs `&mut`
     /// (`Child::kill` / `Child::wait` are `&mut`); the read task holds
@@ -152,6 +153,13 @@ pub struct WorkerHandle {
     /// instantly — no contention with `kill`). `Arc`-wrapped so the
     /// handle is `Clone` (the manager stores + pumps + reaps clones).
     child: std::sync::Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    /// The child's pid, captured at spawn (`Child::id()` right after
+    /// `cmd.spawn()` succeeded) and NEVER re-read: `Child::id()` returns
+    /// `None` once tokio has reaped the child (`FusedChild::Done`) — the
+    /// exact state a crash leaves behind — so the LAST KNOWN value is what
+    /// a crashed Worker's attribution has to work from. `None` only when the
+    /// platform gave no pid at spawn.
+    pid: Option<u32>,
     /// The stdin writer task's input (one line per message — the
     /// `encode_inbound` output, `\n`-terminated).
     stdin_tx: mpsc::UnboundedSender<String>,
@@ -180,6 +188,7 @@ impl Clone for WorkerHandle {
     fn clone(&self) -> Self {
         Self {
             child: self.child.clone(),
+            pid: self.pid,
             stdin_tx: self.stdin_tx.clone(),
             events_tx: self.events_tx.clone(),
             ready: self.ready.clone(),
@@ -310,6 +319,12 @@ impl WorkerHandle {
         let mut child = cmd.spawn().map_err(|e| WorkerError {
             kind: WorkerErrorKind::Io(format!("spawn the worker: {e}")),
         })?;
+        // The pid is read HERE — while `child` is still a live process and
+        // `&mut` (the `Arc` wrap and the stdio `take`s come below). It is
+        // captured once and carried on the handle: `Child::id()` goes `None`
+        // once the child is reaped, which is the state a crash leaves, so a
+        // later reader (the crash-log attribution) has nothing else to read.
+        let pid = child.id();
         // The lifecycle transition (the `ARCHIMEDES_DEBUG` log — a
         // no-op when the var is unset).
         debuglog::log(&format!("worker spawn: {}", exe.display()));
@@ -453,6 +468,7 @@ impl WorkerHandle {
 
         Ok(Self {
             child,
+            pid,
             stdin_tx,
             events_tx,
             ready: ready_tx,
@@ -683,6 +699,15 @@ impl WorkerHandle {
             Err(_) => None,
         };
         code
+    }
+
+    /// The child's pid (`None` only when the platform gave none at spawn).
+    /// The value is the one captured in [`WorkerHandle::spawn`], NOT a live
+    /// read of `Child::id()` — that goes `None` once the child has been
+    /// reaped, which is the state a crash leaves, and the caller that needs
+    /// the pid most is precisely the one looking at a dead child.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// Kill the Worker: on Unix the WHOLE process group SIGKILL (the
@@ -1101,6 +1126,44 @@ mod tests {
             "the process exited 0: {events:?}"
         );
         assert_eq!(handle.exited().await, Some(0));
+    }
+
+    /// The handle reports the child's pid, and still reports it AFTER the
+    /// reap. `Child::id()` goes `None` once tokio has reaped the child (the
+    /// `FusedChild::Done` state) — which is exactly what a crash leaves
+    /// behind — so the value has to be captured at spawn and carried on the
+    /// handle, not read from the child at the moment of interest.
+    ///
+    /// The reap is reached with `send_close()` + `exited().await`, NOT with
+    /// `kill()`: a signal death publishes exit code `None` and `exited()`
+    /// waits for `Some`, so `kill()` + `exited()` would hang forever. The
+    /// read task publishes the code only AFTER `child.wait()` returns, so
+    /// `exited()` returning IS the proof the child has been reaped — without
+    /// that step a naive accessor delegating to `Child::id()` would pass this
+    /// test.
+    #[tokio::test]
+    async fn the_handle_reports_the_child_pid_and_keeps_it_after_the_reap() {
+        let handle = spawn_fixture().expect("the fixture binary exists (cargo test built it)");
+        let pid = handle.pid();
+        assert!(pid.is_some(), "a live child has a pid (captured at spawn)");
+        assert_ne!(
+            pid,
+            Some(std::process::id()),
+            "the pid is the CHILD's, not our own"
+        );
+        // The graceful close (the fixture self-exits 0) + the reap.
+        handle.send_close().expect("close encodes");
+        let _ = handle.exited().await;
+        assert!(
+            handle.pid().is_some(),
+            "the pid survives the reap — `Child::id()` is `None` once the child is reaped, \
+             which is the state a crash leaves"
+        );
+        assert_eq!(
+            handle.pid(),
+            pid,
+            "the value after the reap is the one captured at spawn"
+        );
     }
 
     /// A `permission-response` round-trip completes the canned

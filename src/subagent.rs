@@ -445,7 +445,7 @@ mod tests {
         let events_c = events.clone();
         let manager = WorkerManager::new(
             factory,
-            Arc::new(|_id: String, _code: Option<i32>| {}),
+            Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
             Arc::new(
                 move |id: String, is_subagent: bool, evt: WorkerInboundEvent| {
                     events_c
@@ -798,7 +798,7 @@ mod tests {
         let first = Arc::new(
             WorkerManager::new(
                 Arc::new(FakeWorkerFactory),
-                Arc::new(|_id: String, _code: Option<i32>| {}),
+                Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
                 Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
                 Arc::new(|_id: &str| None),
             )
@@ -815,7 +815,7 @@ mod tests {
         let second = Arc::new(
             WorkerManager::new(
                 Arc::new(FakeWorkerFactory),
-                Arc::new(|_id: String, _code: Option<i32>| {}),
+                Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
                 Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
                 Arc::new(|_id: &str| None),
             )
@@ -851,7 +851,7 @@ mod tests {
         // misses — a no-op, never panics).
         let wm = Arc::new(WorkerManager::new(
             Arc::new(FakeWorkerFactory),
-            Arc::new(|_id: String, _code: Option<i32>| {}),
+            Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
             Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
             Arc::new(|_id: &str| None),
         ));

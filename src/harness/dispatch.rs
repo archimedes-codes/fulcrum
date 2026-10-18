@@ -435,7 +435,7 @@ mod tests {
         let wm = Arc::new(
             WorkerManager::new(
                 factory,
-                Arc::new(|_id: String, _code: Option<i32>| {}),
+                Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
                 Arc::new(
                     |_id: String,
                      _is_subagent: bool,

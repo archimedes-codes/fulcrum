@@ -459,4 +459,99 @@ mod tests {
             );
         }
     }
+
+    /// The crash-log module's path, `/`-normalised and relative to `src/` like
+    /// [`SELF`], so the violation report reads the same on Windows.
+    const CRASHLOG: &str = "agent/crashlog.rs";
+
+    /// Invariant D — `agent/crashlog.rs` may not resolve a data dir.
+    ///
+    /// A crash-log resolver in that file's PRODUCTION region is the bug this
+    /// whole branch exists to kill: the panic hook would decide where the
+    /// user's crash logs go *during the panic*, and because `std::panic` has
+    /// ONE process-global hook slot that the `--lib` suite shares across
+    /// threads, whichever closure occupies the slot then decides where EVERY
+    /// thread's crash log lands — including a test thread's, into the real
+    /// `~/.local/share/archimedes`. That is how 862 test panics reached a
+    /// user's directory. The hook is handed its directory instead
+    /// (`install_panic_hook(tag, dir)`), so this file must never call
+    /// `dirs::data_dir()` again — and nothing but this test stops someone
+    /// re-adding the perfectly reasonable-looking `let dir = dirs::data_dir();`.
+    ///
+    /// **Scope is that ONE file, and deliberately so.** A whole-tree version of
+    /// this rule would be red on arrival: `lib.rs`, `session/router.rs`,
+    /// `mcp/oauth.rs` and `commands/mcp.rs` all resolve directories, correctly,
+    /// outside any panic path. The invariant is about the crash-log module
+    /// because that is the module that runs while the process is dying.
+    ///
+    /// **Why the region and not the file.** [`is_comment`] is what makes this
+    /// rule usable: `crashlog.rs` contains the literal string
+    /// `dirs::data_dir()` THREE times and not one of them is code — twice in
+    /// the module `//!` doc, which sits INSIDE the scanned region (so only the
+    /// comment filter saves them), and once in a `///` doc comment inside
+    /// `mod tests`, which the region boundary excludes before the filter is
+    /// even consulted. A naive "the file contains the string" rule would
+    /// therefore be a PERMANENT false positive — the kind that gets the test
+    /// deleted rather than the code fixed — and a naive "everything above
+    /// `mod tests`" rule would scan the module-doc prose and trip on it too.
+    /// The region stops at the first non-comment line starting with
+    /// `#[cfg(test)]`, which is also why the test-side mentions can never leak
+    /// in.
+    ///
+    /// **No line numbers are quoted here, on purpose.** `crashlog.rs` shifts
+    /// with every edit, and a drifted number is a worse guide than none —
+    /// locate the occurrences with
+    /// `grep -n 'dirs::data_dir()' src/agent/crashlog.rs` when you need them.
+    ///
+    /// **Inherited blind spot:** this is [`is_comment`] with all its limits, so
+    /// the `*`-prefix rule silently drops any line whose trimmed text starts
+    /// with `*` (see its docs) — a `dirs::data_dir()` written as the target of
+    /// a deref-assignment on its own line would slip through. Name it, do not
+    /// imply the region is exact.
+    #[test]
+    fn production_crashlog_never_resolves_a_data_dir() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // One file is the whole scope of this invariant — no tree walk. The
+        // call panics rather than skipping if the file is unreadable, so a
+        // wrong root fails loudly here instead of silently emptying the region.
+        let region = production_region(&src_root.join(CRASHLOG));
+
+        // ── Vacuity guard FIRST, in the census's own style: it proves the
+        // scanner's EYESIGHT by requiring a token it knows is there, not by
+        // counting lines. `pub fn write_crash_log_from_info` is the module's
+        // production entry point, so finding it proves we opened the right file
+        // AND that the region survived the `#[cfg(test)]` boundary; a region
+        // that was empty, truncated at a stray `#[cfg(test)]` in prose, or
+        // pointed at some other file would report "no resolvers found" forever.
+        let seen = region
+            .iter()
+            .filter(|l| l.text.contains("pub fn write_crash_log_from_info"))
+            .count();
+        assert_eq!(
+            seen,
+            1,
+            "the crash-log invariant is BLIND: the production region of `{CRASHLOG}` \
+             ({} surviving lines, last at line {}) holds {seen} copy(ies) of \
+             `pub fn write_crash_log_from_info`, expected exactly 1 — either the root \
+             resolved somewhere else ({}), the file lost its hook adapter, or the region \
+             was cut short, and the check below would pass having read nothing",
+            region.len(),
+            region.last().map_or(0, |l| l.line),
+            src_root.join(CRASHLOG).display(),
+        );
+
+        let resolvers: Vec<String> = region
+            .iter()
+            .filter(|l| l.text.contains("dirs::data_dir()"))
+            .map(|l| format!("{CRASHLOG}:{}", l.line))
+            .collect();
+        assert!(
+            resolvers.is_empty(),
+            "Invariant D (the crash-log module resolves nothing): `{CRASHLOG}` resolves a \
+             data dir in its production region at {resolvers:?} — a resolver inside the \
+             panic path means the hook slot decides where the user's crash logs go, so a \
+             test panic on ANY thread writes into the real data dir (the 862-file bug); \
+             the directory must come from the caller — `install_panic_hook(tag, dir)`",
+        );
+    }
 }

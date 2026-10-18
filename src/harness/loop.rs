@@ -6620,7 +6620,7 @@ mod tests {
         let on_event_sink = sink.clone();
         let wm = WorkerManager::new(
             factory,
-            Arc::new(|_id: String, _code: Option<i32>| {}),
+            Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
             Arc::new(
                 move |_id: String, is_subagent: bool, evt: WorkerInboundEvent| {
                     if is_subagent {
