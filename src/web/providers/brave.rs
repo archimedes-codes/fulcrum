@@ -5,6 +5,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::web::config::WebConfig;
 use crate::agent::web::net::{safe_fetch, FetchOpts};
+use crate::agent::web::providers::common::{
+    check_http_status, clean_snippet, format_provider_error, resolve_num_results, truncate_results,
+    validate_query,
+};
 use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
 #[derive(Deserialize)]
@@ -53,7 +57,7 @@ impl BraveProvider {
 
 pub fn parse_brave(body: &str) -> Result<Vec<SearchResultItem>, String> {
     let parsed: BraveResponse = serde_json::from_str(body)
-        .map_err(|e| format!("[brave] error: failed to parse response: {e}"))?;
+        .map_err(|e| format_provider_error("brave", format!("failed to parse response: {e}")))?;
 
     let results = parsed
         .web
@@ -63,7 +67,7 @@ pub fn parse_brave(body: &str) -> Result<Vec<SearchResultItem>, String> {
         .map(|item| SearchResultItem {
             title: item.title,
             url: item.url,
-            snippet: item.description,
+            snippet: clean_snippet(&item.description),
             published_date: item.age.filter(|s| !s.trim().is_empty()),
         })
         .collect();
@@ -92,18 +96,16 @@ impl SearchProvider for BraveProvider {
         config: &WebConfig,
         cancel: &CancellationToken,
     ) -> Result<Vec<SearchResultItem>, String> {
+        let valid_query = validate_query(query).map_err(|e| format_provider_error("brave", e))?;
+
         let api_key = config
             .brave_api_key
             .as_deref()
-            .ok_or_else(|| "[brave] error: Brave API Key not configured".to_string())?;
+            .ok_or_else(|| format_provider_error("brave", "Brave API Key not configured"))?;
 
-        let count = if opts.num_results > 0 {
-            opts.num_results
-        } else {
-            5
-        };
+        let count = resolve_num_results(opts.num_results, 5);
         let encoded_query =
-            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+            url::form_urlencoded::byte_serialize(valid_query.as_bytes()).collect::<String>();
         let base = self
             .base_url
             .as_deref()
@@ -117,8 +119,9 @@ impl SearchProvider for BraveProvider {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Subscription-Token",
-            HeaderValue::from_str(api_key)
-                .map_err(|e| format!("[brave] error: invalid header value: {e}"))?,
+            HeaderValue::from_str(api_key).map_err(|e| {
+                format_provider_error("brave", format!("invalid header value: {e}"))
+            })?,
         );
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
@@ -131,17 +134,13 @@ impl SearchProvider for BraveProvider {
 
         let outcome = safe_fetch(&target_url, &fetch_opts, cancel)
             .await
-            .map_err(|e| format!("[brave] error: {e}"))?;
+            .map_err(|e| format_provider_error("brave", e))?;
 
-        if outcome.status < 200 || outcome.status >= 300 {
-            return Err(format!("[brave] error: HTTP {}", outcome.status));
-        }
+        check_http_status("brave", outcome.status)?;
 
         let body_str = String::from_utf8_lossy(&outcome.body);
         let mut results = parse_brave(&body_str)?;
-        if opts.num_results > 0 && results.len() > opts.num_results {
-            results.truncate(opts.num_results);
-        }
+        truncate_results(&mut results, opts.num_results);
 
         Ok(results)
     }

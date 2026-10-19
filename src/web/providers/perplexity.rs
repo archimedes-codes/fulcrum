@@ -5,6 +5,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::web::config::WebConfig;
 use crate::agent::web::net::{safe_fetch, FetchOpts};
+use crate::agent::web::providers::common::{
+    check_http_status, format_provider_error, truncate_results, validate_query,
+};
 use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
 #[derive(Deserialize)]
@@ -54,8 +57,9 @@ impl PerplexityProvider {
 /// search index results. We extract citations as individual source links and include
 /// the assistant response text as the snippet for the overall Perplexity answer.
 pub fn parse_perplexity(body: &str) -> Result<Vec<SearchResultItem>, String> {
-    let parsed: PerplexityResponse = serde_json::from_str(body)
-        .map_err(|e| format!("[perplexity] error: failed to parse response: {e}"))?;
+    let parsed: PerplexityResponse = serde_json::from_str(body).map_err(|e| {
+        format_provider_error("perplexity", format!("failed to parse response: {e}"))
+    })?;
 
     let mut results = Vec::new();
     for (i, url) in parsed.citations.into_iter().enumerate() {
@@ -103,10 +107,12 @@ impl SearchProvider for PerplexityProvider {
         config: &WebConfig,
         cancel: &CancellationToken,
     ) -> Result<Vec<SearchResultItem>, String> {
-        let api_key = config
-            .perplexity_api_key
-            .as_deref()
-            .ok_or_else(|| "[perplexity] error: Perplexity API Key not configured".to_string())?;
+        let valid_query =
+            validate_query(query).map_err(|e| format_provider_error("perplexity", e))?;
+
+        let api_key = config.perplexity_api_key.as_deref().ok_or_else(|| {
+            format_provider_error("perplexity", "Perplexity API Key not configured")
+        })?;
 
         let target_url = self
             .base_url
@@ -115,16 +121,17 @@ impl SearchProvider for PerplexityProvider {
 
         let json_body = serde_json::json!({
             "model": "sonar",
-            "messages": [{ "role": "user", "content": query }],
+            "messages": [{ "role": "user", "content": valid_query }],
         });
         let body_bytes =
-            serde_json::to_vec(&json_body).map_err(|e| format!("[perplexity] error: {e}"))?;
+            serde_json::to_vec(&json_body).map_err(|e| format_provider_error("perplexity", e))?;
 
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .map_err(|e| format!("[perplexity] error: invalid header value: {e}"))?,
+            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                format_provider_error("perplexity", format!("invalid header value: {e}"))
+            })?,
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -137,17 +144,13 @@ impl SearchProvider for PerplexityProvider {
 
         let outcome = safe_fetch(target_url, &fetch_opts, cancel)
             .await
-            .map_err(|e| format!("[perplexity] error: {e}"))?;
+            .map_err(|e| format_provider_error("perplexity", e))?;
 
-        if outcome.status < 200 || outcome.status >= 300 {
-            return Err(format!("[perplexity] error: HTTP {}", outcome.status));
-        }
+        check_http_status("perplexity", outcome.status)?;
 
         let body_str = String::from_utf8_lossy(&outcome.body);
         let mut results = parse_perplexity(&body_str)?;
-        if opts.num_results > 0 && results.len() > opts.num_results {
-            results.truncate(opts.num_results);
-        }
+        truncate_results(&mut results, opts.num_results);
 
         Ok(results)
     }
@@ -273,6 +276,26 @@ mod tests {
         let results =
             parse_perplexity(json_empty_obj).expect("empty object should parse to empty vec");
         assert_eq!(results, vec![]);
+    }
+
+    #[test]
+    fn test_parse_perplexity_preserves_literal_angle_brackets() {
+        let json = r#"{
+            "citations": [],
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Rust provides Vec<T> and requires x < 5 for validation."
+                }
+            }]
+        }"#;
+        let results = parse_perplexity(json).expect("should parse");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Perplexity Answer");
+        assert_eq!(
+            results[0].snippet,
+            "Rust provides Vec<T> and requires x < 5 for validation."
+        );
     }
 
     #[test]

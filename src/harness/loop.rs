@@ -58,10 +58,14 @@ use crate::agent::tools::{ContentBlock, ToolResult};
 /// maps the wire `ImagePayload` onto it). An empty `images` is a
 /// text-only prompt (the common case).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Prompt {
+pub struct PromptTurn {
     pub text: String,
     pub images: Vec<ImageRef>,
 }
+
+/// Disambiguation alias for `PromptTurn` (see CONTEXT.md: bare `prompt`
+/// refers to permission prompts). Kept for backward compatibility.
+pub type Prompt = PromptTurn;
 
 /// A control command to the loop (the `control_queue` item — the
 /// `set_config_option` native branch routes the model / thinking-level
@@ -157,8 +161,8 @@ pub struct AgentLoop {
     /// `build_loop` seam can clone it before `tokio::spawn` (ADR 0025
     /// Task 2); the bounded channel's backpressure is the intended
     /// `send().await` stall).
-    pub prompt_tx: mpsc::Sender<Prompt>,
-    prompt_queue: mpsc::Receiver<Prompt>,
+    pub prompt_tx: mpsc::Sender<PromptTurn>,
+    prompt_queue: mpsc::Receiver<PromptTurn>,
     /// The control channel (the `set_config_option` native branch — the
     /// sender is `pub` so the session's `NativeHandle` can clone it; the
     /// receiver is consumed by `run()`). Created here (NOT a `new`
@@ -265,8 +269,8 @@ impl AgentLoop {
         cancel: CancellationToken,
         turn_cancel: Arc<StdMutex<CancellationToken>>,
         settle_tx: watch::Sender<u64>,
-        prompt_tx: mpsc::Sender<Prompt>,
-        prompt_queue: mpsc::Receiver<Prompt>,
+        prompt_tx: mpsc::Sender<PromptTurn>,
+        prompt_queue: mpsc::Receiver<PromptTurn>,
         pending_permissions: PendingPermissions,
         pending_bridge: PendingInteractive,
         trust: Option<Arc<dyn TrustSource>>,
@@ -355,7 +359,7 @@ impl AgentLoop {
 
     /// Queue a prompt (best-effort — a full / closed queue is dropped).
     pub fn send_prompt(&self, text: &str, images: &[ImageRef]) {
-        let _ = self.prompt_tx.try_send(Prompt {
+        let _ = self.prompt_tx.try_send(PromptTurn {
             text: text.to_string(),
             images: images.to_vec(),
         });
@@ -572,7 +576,7 @@ impl AgentLoop {
     /// message the turn pushes is `Blocks` — text first, then the image
     /// blocks — when images are present; a text-only prompt keeps the
     /// `Text` shape).
-    pub async fn handle_prompt(&mut self, prompt: &Prompt) {
+    pub async fn handle_prompt(&mut self, prompt: &PromptTurn) {
         // (ADR 0030 Task 3, Deviation 4) The policy and web config are
         // re-read from `settings.json` ONCE per turn — the same in-process read
         // `launch.rs` does per dispatch, so a user who flips a select in

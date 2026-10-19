@@ -31,7 +31,7 @@ impl AgentLoop {
         // A queued compaction belongs to the turn that queued it, and this turn
         // has queued none: drop whatever a PREVIOUS turn left behind (see the
         // field — a Stop racing an overflow recovery exits BEFORE the trigger is
-        // consumed). Without this the fresh prompt inherits the dead turn's
+        // consumed). Without this the fresh prompt turn inherits the dead turn's
         // `overflow` trigger, compacts for a reason it never hit, and — `run_compaction`
         // having shrunk nothing — settles as an error without a model call.
         self.force_compact = None;
@@ -61,10 +61,10 @@ impl AgentLoop {
         // The turn's own opening event FIRST — the context frame below is
         // session-scoped bookkeeping, so it must not lead the turn it belongs to.
         self.emit(RpcEvent::turn_start);
-        // The prompt is in the transcript: measure it NOW. `should_compact()`
+        // The prompt turn is in the transcript: measure it NOW. `should_compact()`
         // is read at the TOP of the loop below, so a push that left the
         // `Compactor` untouched was invisible to the turn's FIRST threshold
-        // check — a large pasted prompt therefore deferred a compaction that
+        // check — a large pasted prompt turn therefore deferred a compaction that
         // was already due by a whole model call (the call that had to send
         // the oversized context to the provider). Cheap: `refresh` sums only
         // the trailing slice. Measured AFTER `turn_start` (the frame is
@@ -89,7 +89,7 @@ impl AgentLoop {
                 .run_compaction(t.reason, t.will_retry, None, turn)
                 .await;
             if t.reason == "overflow" && !shrank {
-                // No doomed second request: the oversized prompt is exactly
+                // No doomed second request: the oversized prompt turn is exactly
                 // what just failed, and a request that cannot succeed costs
                 // a round trip. `run_compaction` has already emitted the
                 // single `compaction_end` carrying the actionable

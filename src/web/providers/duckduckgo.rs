@@ -5,10 +5,12 @@ use url::Url;
 
 use crate::agent::web::config::WebConfig;
 use crate::agent::web::net::{safe_fetch, FetchOpts};
+use crate::agent::web::providers::common::{
+    build_browser_headers, collapse_whitespace, format_http_error, format_provider_error,
+    truncate_results, validate_query, DEFAULT_USER_AGENT,
+};
 use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
-const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36";
 const DEFAULT_DDG_URL: &str = "https://html.duckduckgo.com/html/?q=";
 
 #[cfg(test)]
@@ -140,13 +142,11 @@ async fn run_ddgs_fallback(
                 .map(|item| SearchResultItem {
                     title: item.title,
                     url: item.href,
-                    snippet: item.body,
+                    snippet: collapse_whitespace(&item.body),
                     published_date: None,
                 })
                 .collect();
-            if opts.num_results > 0 && results.len() > opts.num_results {
-                results.truncate(opts.num_results);
-            }
+            truncate_results(&mut results, opts.num_results);
             Ok(results)
         }
     }
@@ -250,7 +250,7 @@ pub fn parse_ddg_document(doc: &dom_query::Document) -> Vec<SearchResultItem> {
         };
 
         let title = a.text().trim().to_string();
-        let snippet = snippet_el.text().trim().to_string();
+        let snippet = collapse_whitespace(&snippet_el.text());
 
         if !title.is_empty() {
             results.push(SearchResultItem {
@@ -274,7 +274,7 @@ pub fn parse_ddg_document(doc: &dom_query::Document) -> Vec<SearchResultItem> {
 
             let title = link.text().trim().to_string();
             let snippet = if i < snippets.length() {
-                snippets.get(i).unwrap().text().trim().to_string()
+                collapse_whitespace(&snippets.get(i).unwrap().text())
             } else {
                 String::new()
             };
@@ -318,8 +318,11 @@ impl SearchProvider for DuckDuckGoProvider {
             return Err("[duckduckgo] operation cancelled".to_string());
         }
 
+        let valid_query =
+            validate_query(query).map_err(|e| format_provider_error("duckduckgo", e))?;
+
         let encoded_query =
-            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+            url::form_urlencoded::byte_serialize(valid_query.as_bytes()).collect::<String>();
         let target_url = match &self.base_url {
             Some(base) if base.ends_with('?') || base.ends_with('=') => {
                 format!("{base}{encoded_query}")
@@ -329,15 +332,7 @@ impl SearchProvider for DuckDuckGoProvider {
             None => format!("{DEFAULT_DDG_URL}{encoded_query}"),
         };
 
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static(
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            ),
-        );
-        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+        let headers = build_browser_headers();
 
         let fetch_opts = FetchOpts {
             method: reqwest::Method::GET,
@@ -359,17 +354,15 @@ impl SearchProvider for DuckDuckGoProvider {
                         "[duckduckgo] error: bot detection or rate limit challenge (anomaly challenge)".to_string()
                     } else {
                         let mut results = parse_ddg_document(&doc);
-                        if opts.num_results > 0 && results.len() > opts.num_results {
-                            results.truncate(opts.num_results);
-                        }
+                        truncate_results(&mut results, opts.num_results);
                         return Ok(results);
                     }
                 } else {
-                    format!("[duckduckgo] error: HTTP {}", outcome.status)
+                    format_http_error("duckduckgo", outcome.status)
                 }
             }
             Err(e) => {
-                let err_str = format!("[duckduckgo] error: {e}");
+                let err_str = format_provider_error("duckduckgo", e);
                 if err_str.contains("blocked IP")
                     || err_str.contains("denied scheme")
                     || cancel.is_cancelled()
@@ -760,6 +753,31 @@ mod tests {
         assert!(
             err.contains("bot detection") || err.contains("anomaly"),
             "Expected bot detection challenge error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_ddg_document_preserves_literal_angle_brackets() {
+        let html = r#"
+        <div class="result results_links results_links_deep web-result">
+            <div class="links_main result__body">
+                <h2 class="result__title">
+                    <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Frust">Rust Generics</a>
+                </h2>
+                <div class="result__snippet">
+                    Rust provides Vec&lt;T&gt; and x &lt; 5 is required for validation.
+                </div>
+            </div>
+        </div>
+        "#;
+        let doc = dom_query::Document::fragment(html);
+        let results = parse_ddg_document(&doc);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Rust Generics");
+        assert_eq!(results[0].url, "https://example.com/rust");
+        assert_eq!(
+            results[0].snippet,
+            "Rust provides Vec<T> and x < 5 is required for validation."
         );
     }
 

@@ -789,7 +789,7 @@ async fn a_prompt_with_images_pushes_a_blocks_user_message() {
     // A prompt with text + an image → `Blocks` (text first, image
     // after).
     loop_
-        .handle_prompt(&Prompt {
+        .handle_prompt(&PromptTurn {
             text: "describe".to_string(),
             images: vec![crate::agent::tools::ImageRef {
                 data: "BASE64DATA".to_string(),
@@ -820,7 +820,7 @@ async fn a_prompt_with_images_pushes_a_blocks_user_message() {
     // An EMPTY text + an image → an image-only `Blocks` (no empty
     // text block).
     loop_
-        .handle_prompt(&Prompt {
+        .handle_prompt(&PromptTurn {
             text: String::new(),
             images: vec![crate::agent::tools::ImageRef {
                 data: "D".to_string(),

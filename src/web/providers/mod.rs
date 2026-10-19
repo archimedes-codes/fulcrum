@@ -1,4 +1,5 @@
 pub mod brave;
+pub mod common;
 pub mod duckduckgo;
 pub mod perplexity;
 pub mod registry;

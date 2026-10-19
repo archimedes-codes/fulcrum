@@ -5,6 +5,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::web::config::WebConfig;
 use crate::agent::web::net::{safe_fetch, FetchOpts};
+use crate::agent::web::providers::common::{
+    check_http_status, clean_snippet, format_provider_error, resolve_num_results, truncate_results,
+    validate_query,
+};
 use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
 #[derive(Deserialize)]
@@ -48,7 +52,7 @@ impl TavilyProvider {
 
 pub fn parse_tavily(body: &str) -> Result<Vec<SearchResultItem>, String> {
     let parsed: TavilyResponse = serde_json::from_str(body)
-        .map_err(|e| format!("[tavily] error: failed to parse response: {e}"))?;
+        .map_err(|e| format_provider_error("tavily", format!("failed to parse response: {e}")))?;
 
     let results = parsed
         .results
@@ -57,7 +61,7 @@ pub fn parse_tavily(body: &str) -> Result<Vec<SearchResultItem>, String> {
         .map(|item| SearchResultItem {
             title: item.title,
             url: item.url,
-            snippet: item.content,
+            snippet: clean_snippet(&item.content),
             published_date: item.published_date.filter(|s| !s.trim().is_empty()),
         })
         .collect();
@@ -86,16 +90,14 @@ impl SearchProvider for TavilyProvider {
         config: &WebConfig,
         cancel: &CancellationToken,
     ) -> Result<Vec<SearchResultItem>, String> {
+        let valid_query = validate_query(query).map_err(|e| format_provider_error("tavily", e))?;
+
         let api_key = config
             .tavily_api_key
             .as_deref()
-            .ok_or_else(|| "[tavily] error: Tavily API Key not configured".to_string())?;
+            .ok_or_else(|| format_provider_error("tavily", "Tavily API Key not configured"))?;
 
-        let count = if opts.num_results > 0 {
-            opts.num_results
-        } else {
-            5
-        };
+        let count = resolve_num_results(opts.num_results, 5);
         let target_url = self
             .base_url
             .as_deref()
@@ -103,7 +105,7 @@ impl SearchProvider for TavilyProvider {
 
         let mut json_body = serde_json::json!({
             "api_key": api_key,
-            "query": query,
+            "query": valid_query,
             "max_results": count,
             "include_answer": false,
         });
@@ -122,7 +124,7 @@ impl SearchProvider for TavilyProvider {
         }
 
         let body_bytes =
-            serde_json::to_vec(&json_body).map_err(|e| format!("[tavily] error: {e}"))?;
+            serde_json::to_vec(&json_body).map_err(|e| format_provider_error("tavily", e))?;
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -136,17 +138,13 @@ impl SearchProvider for TavilyProvider {
 
         let outcome = safe_fetch(target_url, &fetch_opts, cancel)
             .await
-            .map_err(|e| format!("[tavily] error: {e}"))?;
+            .map_err(|e| format_provider_error("tavily", e))?;
 
-        if outcome.status < 200 || outcome.status >= 300 {
-            return Err(format!("[tavily] error: HTTP {}", outcome.status));
-        }
+        check_http_status("tavily", outcome.status)?;
 
         let body_str = String::from_utf8_lossy(&outcome.body);
         let mut results = parse_tavily(&body_str)?;
-        if opts.num_results > 0 && results.len() > opts.num_results {
-            results.truncate(opts.num_results);
-        }
+        truncate_results(&mut results, opts.num_results);
 
         Ok(results)
     }

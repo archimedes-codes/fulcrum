@@ -544,7 +544,7 @@ impl WorkerHandle {
         self.send_inbound_frame(Inbound::Start(Box::new(env.clone())))
     }
 
-    /// A prompt (the existing `Prompt` type's fields verbatim).
+    /// A prompt (the `PromptTurn` type's fields verbatim).
     pub fn send_prompt(&self, text: &str, images: &[ImageRef]) -> Result<(), WorkerError> {
         self.send_inbound_frame(Inbound::Prompt {
             text: text.to_string(),

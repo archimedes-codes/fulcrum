@@ -5,6 +5,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::web::config::WebConfig;
 use crate::agent::web::net::{safe_fetch, FetchOpts};
+use crate::agent::web::providers::common::{
+    clean_snippet, format_http_error_with_body, format_provider_error, truncate_results,
+    validate_query,
+};
 use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
 #[derive(Deserialize)]
@@ -50,7 +54,7 @@ impl SearXNGProvider {
 
 pub fn parse_searxng(body: &str) -> Result<Vec<SearchResultItem>, String> {
     let parsed: SearXNGResponse = serde_json::from_str(body)
-        .map_err(|e| format!("[searxng] error: failed to parse response: {e}"))?;
+        .map_err(|e| format_provider_error("searxng", format!("failed to parse response: {e}")))?;
 
     let results = parsed
         .results
@@ -59,7 +63,7 @@ pub fn parse_searxng(body: &str) -> Result<Vec<SearchResultItem>, String> {
         .map(|item| SearchResultItem {
             title: item.title,
             url: item.url,
-            snippet: item.content.or(item.engine).unwrap_or_default(),
+            snippet: clean_snippet(&item.content.or(item.engine).unwrap_or_default()),
             published_date: item.published_date.filter(|s| !s.trim().is_empty()),
         })
         .collect();
@@ -88,15 +92,17 @@ impl SearchProvider for SearXNGProvider {
         config: &WebConfig,
         cancel: &CancellationToken,
     ) -> Result<Vec<SearchResultItem>, String> {
+        let valid_query = validate_query(query).map_err(|e| format_provider_error("searxng", e))?;
+
         let base = self
             .base_url
             .as_deref()
             .or(config.searxng_url.as_deref())
-            .ok_or_else(|| "[searxng] error: SearXNG URL not configured".to_string())?;
+            .ok_or_else(|| format_provider_error("searxng", "SearXNG URL not configured"))?;
 
         let clean_base = base.trim_end_matches('/');
         let encoded_query =
-            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+            url::form_urlencoded::byte_serialize(valid_query.as_bytes()).collect::<String>();
         let sep = if clean_base.contains('?') { '&' } else { '?' };
         let target_url = format!("{clean_base}{sep}q={encoded_query}&format=json");
 
@@ -109,29 +115,26 @@ impl SearchProvider for SearXNGProvider {
 
         let outcome = safe_fetch(&target_url, &fetch_opts, cancel)
             .await
-            .map_err(|e| format!("[searxng] error: {e}"))?;
+            .map_err(|e| format_provider_error("searxng", e))?;
 
         if outcome.status < 200 || outcome.status >= 300 {
-            let text = String::from_utf8_lossy(&outcome.body).trim().to_string();
-            if !text.is_empty() {
-                return Err(format!("[searxng] error: HTTP {}: {text}", outcome.status));
-            } else {
-                return Err(format!("[searxng] error: HTTP {}", outcome.status));
-            }
+            return Err(format_http_error_with_body(
+                "searxng",
+                outcome.status,
+                &outcome.body,
+            ));
         }
 
         let body_str = String::from_utf8_lossy(&outcome.body);
         match parse_searxng(&body_str) {
             Ok(mut results) => {
-                if opts.num_results > 0 && results.len() > opts.num_results {
-                    results.truncate(opts.num_results);
-                }
+                truncate_results(&mut results, opts.num_results);
                 Ok(results)
             }
             Err(e) => {
                 let trimmed = body_str.trim();
                 if !trimmed.starts_with('{') && !trimmed.starts_with('[') && !trimmed.is_empty() {
-                    Err(format!("[searxng] error: {trimmed}"))
+                    Err(format_provider_error("searxng", trimmed))
                 } else {
                     Err(e)
                 }

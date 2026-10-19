@@ -383,10 +383,10 @@ pub(super) fn build_loop(
     .0
 }
 
-/// A text-only `Prompt` (the test's common case — no image
+/// A text-only `PromptTurn` (the test's common case — no image
 /// attachments).
-pub(super) fn text_prompt(text: &str) -> Prompt {
-    Prompt {
+pub(super) fn text_prompt(text: &str) -> PromptTurn {
+    PromptTurn {
         text: text.to_string(),
         images: Vec::new(),
     }

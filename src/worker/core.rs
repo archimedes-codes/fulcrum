@@ -22,7 +22,7 @@ use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::prompt::{build_main_prompt, PromptContext};
 use crate::agent::harness::provider::build_provider;
-use crate::agent::harness::r#loop::{AgentLoop, ControlCmd, Prompt, SudoDeps};
+use crate::agent::harness::r#loop::{AgentLoop, ControlCmd, PromptTurn, SudoDeps};
 use crate::agent::harness::retry::RetryPolicy;
 use crate::agent::harness::store::Store;
 use crate::agent::harness::trust::{StaticTrustSource, TrustSource};
@@ -54,7 +54,7 @@ pub struct LoopHandles {
     /// clone — `Sender::send` takes `&self`, one clone suffices; the
     /// bounded channel's backpressure is the intended `send().await`
     /// stall).
-    pub prompt_tx: mpsc::Sender<Prompt>,
+    pub prompt_tx: mpsc::Sender<PromptTurn>,
     /// The `pump_events` consumer (moved out of the core by the
     /// `run_worker` pump task).
     pub events_rx: mpsc::UnboundedReceiver<RpcEvent>,
@@ -75,7 +75,7 @@ pub struct LoopHandles {
 /// `JoinHandle` is not `Clone` and the `run_worker` tasks MOVE it).
 #[derive(Clone)]
 pub struct LoopControl {
-    pub prompt_tx: mpsc::Sender<Prompt>,
+    pub prompt_tx: mpsc::Sender<PromptTurn>,
     pub control_tx: mpsc::Sender<ControlCmd>,
     pub turn_cancel: Arc<StdMutex<CancellationToken>>,
     pub cancel: CancellationToken,
@@ -516,7 +516,7 @@ impl WorkerCore {
             Inbound::Prompt { text, images } => {
                 if let Some(ctl) = &self.loop_control {
                     // Backpressure = the bounded channel's natural stall.
-                    if let Err(e) = ctl.prompt_tx.send(Prompt { text, images }).await {
+                    if let Err(e) = ctl.prompt_tx.send(PromptTurn { text, images }).await {
                         eprintln!("worker: prompt send failed (the loop is gone?): {e}");
                     }
                 }
