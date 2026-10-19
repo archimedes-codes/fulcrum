@@ -4,6 +4,7 @@
 //! file; there is deliberately NO `tools/mod.rs`).
 
 pub mod exec;
+pub mod types;
 // (ADR 0030 Task 5) The Landlock sandbox behind `Shell=Sandboxed`. Linux
 // ONLY: `libc` is a `cfg(unix)` dependency and the Landlock syscall numbers
 // exist on no other target, so an unconditional declaration breaks the
@@ -26,4 +27,5 @@ pub fn shell_sandbox_available() -> bool {
     }
 }
 
-pub use exec::{execute_tool, ContentBlock, ImageRef, ToolCtx, ToolResult};
+pub use exec::execute_tool;
+pub use types::{ContentBlock, ImageRef, ToolCtx, ToolResult};

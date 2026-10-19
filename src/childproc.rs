@@ -224,11 +224,17 @@ mod tests {
     /// whose trimmed text STARTS WITH `#[cfg(test)]` (an attribute in item
     /// position — a boundary that merely *contains* the token is prose, and
     /// must also survive [`is_comment`]), with comment lines already dropped.
+    /// Returns an empty `Vec` for paths matching `**/tests.rs` or containing
+    /// `/tests/`.
     ///
     /// Panics rather than skipping an unreadable/unparseable file: a census
     /// that quietly stops at the first odd file is a census that passes for the
     /// wrong reason.
     fn production_region(path: &std::path::Path) -> Vec<SourceLine> {
+        let norm = path.to_string_lossy().replace('\\', "/");
+        if norm.ends_with("/tests.rs") || norm == "tests.rs" || norm.contains("/tests/") {
+            return Vec::new();
+        }
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("census cannot read {}: {e}", path.display()));
         let mut region = Vec::new();
@@ -405,41 +411,51 @@ mod tests {
                 .map(|(_, region)| region.as_slice())
                 .unwrap_or_else(|| panic!("the census never saw {want} — its walk is broken"))
         };
-        let exec = region_of("agent/tools/exec.rs");
         let mentions = |region: &[SourceLine], needle: &str| {
             region.iter().filter(|l| l.text.contains(needle)).count()
         };
 
         let mut starved: Vec<String> = Vec::new();
-        let mut tool_ctors = 0usize;
-        for (idx, line) in exec.iter().enumerate() {
-            if !line.text.contains("childproc::command(") {
+        let mut total_tool_ctors = 0usize;
+        let mut total_closed = 0usize;
+
+        for (rel, region) in &regions {
+            if !rel.starts_with("agent/tools/exec") {
                 continue;
             }
-            tool_ctors += 1;
-            let stop = exec[idx + 1..]
-                .iter()
-                .position(|l| l.text.contains("spawn()") || l.text.contains("output()"));
-            let end = stop
-                .map(|offset| idx + 1 + offset)
-                .unwrap_or(exec.len() - 1);
-            if !exec[idx..=end]
-                .iter()
-                .any(|l| l.text.contains("closed_stdin"))
-            {
-                starved.push(format!(
-                    "agent/tools/exec.rs:{} (its `spawn()`/`output()` is at line {})",
-                    line.line, exec[end].line
-                ));
+            if rel.contains("/tests/") || rel.ends_with("/tests.rs") || rel.ends_with("tests.rs") {
+                continue;
             }
+            for (idx, line) in region.iter().enumerate() {
+                if !line.text.contains("childproc::command(") {
+                    continue;
+                }
+                total_tool_ctors += 1;
+                let stop = region[idx + 1..]
+                    .iter()
+                    .position(|l| l.text.contains("spawn()") || l.text.contains("output()"));
+                let end = stop
+                    .map(|offset| idx + 1 + offset)
+                    .unwrap_or(region.len() - 1);
+                if !region[idx..=end]
+                    .iter()
+                    .any(|l| l.text.contains("closed_stdin"))
+                {
+                    starved.push(format!(
+                        "{}:{} (its `spawn()`/`output()` is at line {})",
+                        rel, line.line, region[end].line
+                    ));
+                }
+            }
+            total_closed += mentions(region, "closed_stdin");
         }
-        let closed = mentions(exec, "closed_stdin");
+
         assert!(
-            starved.is_empty() && tool_ctors == 4 && closed >= 3,
+            starved.is_empty() && total_tool_ctors == 4 && total_closed >= 3,
             "Invariant C (Tool children start at EOF): {starved:?} — every \
-             `childproc::command(` in `exec.rs` must reach `childproc::closed_stdin` before \
-             its `spawn()`/`output()`, and `exec.rs` must hold exactly 4 constructors (found \
-             {tool_ctors}) with >= 3 `closed_stdin` calls (found {closed}) — 4 not 3 because \
+             `childproc::command(` under `agent/tools/exec*` must reach `childproc::closed_stdin` before \
+             its `spawn()`/`output()`, and `agent/tools/exec*` must hold exactly 4 constructors (found \
+             {total_tool_ctors}) with >= 3 `closed_stdin` calls (found {total_closed}) — 4 not 3 because \
              `exec_bash`'s two `cfg` arms share one `spawn()`. A Tool child that inherits \
              stdin instead hangs on it until the 300 s bash timeout; see the module docs.",
         );
