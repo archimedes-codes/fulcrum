@@ -8,7 +8,7 @@
 
 /// Mint a fresh unique session ID with the `arch_` prefix.
 pub fn mint_session_id() -> String {
-    format!("arch_{}", uuid::Uuid::new_v4())
+    crate::agent::ids::SessionId::mint().into_string()
 }
 
 /// Mint the id stamp for ONE Worker's life within a Session (a **Session
@@ -22,4 +22,16 @@ pub fn mint_session_id() -> String {
 pub fn mint_incarnation() -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     id[..6].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mint_session_id_delegates_to_session_id_mint() {
+        let s = mint_session_id();
+        assert!(s.starts_with("arch_"));
+        assert_eq!(s.len(), 5 + 36); // "arch_" + uuid v4 (36 chars)
+    }
 }
