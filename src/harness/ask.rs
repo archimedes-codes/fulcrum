@@ -42,6 +42,28 @@ pub(crate) async fn ask_flow(
     // unanswerable rows), and a question with no `id` collapses every
     // per-question draft into one `drafts[undefined]` bucket.
     let params = normalize_ask_params(params);
+    // NOTHING to ask → no gate. Arguments that normalize to zero questions
+    // (`questions` sent as a STRING, missing, empty, or not a list) used to
+    // fall through and open a gate the Client cannot draw — its card renders
+    // nothing for an empty list — so the turn blocked on a question nobody
+    // could see or answer until the user hit Esc. A tool error the model can
+    // read and correct costs it one round trip instead.
+    let has_questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .is_some_and(|q| !q.is_empty());
+    if !has_questions {
+        return ToolResult {
+            content: vec![ContentBlock::Text {
+                text: "ask: no usable questions were provided. `questions` must be an array \
+                       of objects, each with a `question` string and an `options` array \
+                       (not a JSON string). Call ask again with a valid `questions` array."
+                    .to_string(),
+            }],
+            details: None,
+            is_error: true,
+        };
+    }
     let key = interactive_key(session_id, request_id);
     let (tx, rx) = oneshot::channel();
     {
@@ -493,6 +515,69 @@ mod tests {
                 .expect("the interactive-request was emitted")
         };
         (emitted_params, r)
+    }
+
+    /// Run `ask_flow` on arguments and return what happened WITHOUT answering:
+    /// the result if the flow settled on its own within the timeout (`None` if
+    /// it is still blocked — an open gate), the events it emitted, and whether
+    /// a gate was left registered.
+    async fn run_unanswered(params: Value) -> (Option<ToolResult>, Vec<String>, bool) {
+        let pending: PendingInteractive = Arc::new(TokioMutex::new(HashMap::new()));
+        let emitted = Arc::new(StdMutex::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(CapturingSink {
+            emitted: emitted.clone(),
+        });
+        let turn = CancellationToken::new();
+        let (p, s) = (pending.clone(), sink.clone());
+        let t = turn.clone();
+        let flow = tokio::spawn(async move { ask_flow(&p, &s, "s1", &params, "r1", &t).await });
+        let settled = tokio::time::timeout(Duration::from_millis(300), flow)
+            .await
+            .ok()
+            .map(|r| r.expect("the flow did not panic"));
+        let gate_open = !pending.lock().await.is_empty();
+        turn.cancel(); // release a blocked flow so the test never leaks it
+        let events = emitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(e, _)| e.clone())
+            .collect();
+        (settled, events, gate_open)
+    }
+
+    /// REGRESSION (stuck "Asking" pill): arguments that normalize to ZERO
+    /// questions — `questions` sent as a STRING (a model stringifying a nested
+    /// array), missing, empty, or not an array at all — used to open a gate
+    /// anyway. The Client's card renders nothing for an empty list, so the
+    /// session sat on `?` with the turn blocked until the user pressed Esc.
+    /// Nobody can answer a question that has no questions: the flow must hand
+    /// the model an ERROR it can correct, and open no gate.
+    #[tokio::test]
+    async fn an_ask_with_no_usable_questions_errors_instead_of_opening_a_gate() {
+        let stringified = json!({ "questions": "[{\"question\":\"Which?\",\"options\":[\"a\"]}]" });
+        for params in [
+            stringified,
+            json!({}),
+            json!({ "questions": [] }),
+            json!({ "questions": ["a bare string question"] }),
+            json!({ "questions": { "question": "not a list" } }),
+            Value::Null,
+        ] {
+            let (settled, events, gate_open) = run_unanswered(params.clone()).await;
+            let result = settled.unwrap_or_else(|| panic!("{params} left the flow blocked"));
+            assert!(result.is_error, "{params}: an unusable ask is a tool error");
+            let text = result_text(&result);
+            assert!(
+                text.contains("questions"),
+                "{params}: the error tells the model what to fix, got {text:?}"
+            );
+            assert!(!gate_open, "{params}: no gate may be left registered");
+            assert!(
+                !events.iter().any(|e| e == "interactive-request"),
+                "{params}: no interactive-request may reach the UI, got {events:?}"
+            );
+        }
     }
 
     /// The `questions` array of an emitted payload, as an array.
