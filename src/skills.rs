@@ -39,6 +39,17 @@ pub struct SkillInfo {
     /// Frontmatter `disable-model-invocation: true` — the Skill is
     /// MODEL-HIDDEN: unadvertised and unresolvable by name (ADR 0036).
     pub disable_model_invocation: bool,
+    /// The Skills this name collision EXCLUDED, reported here on the winner
+    /// (ADR 0065: a shadow is a REPORT, not an entry — the losers stay
+    /// unaddressable by name). Additive, so every existing consumer of this
+    /// struct is unaffected.
+    ///
+    /// **UI-only**: the Skills dialog renders it; it is NEVER interpolated into
+    /// a prompt tag, so the advertised name sets cannot drift. Empty unless a
+    /// genuinely different `SKILL.md` lost the name (a byte-identical or
+    /// CRLF-only copy is a Duplicate and stays silent, and a candidate that
+    /// fails a validity check was never eligible, so it is not reported).
+    pub shadowed: Vec<Shadowed<SkillScope>>,
 }
 
 impl SkillInfo {
@@ -46,6 +57,20 @@ impl SkillInfo {
     pub fn model_visible(&self) -> bool {
         !self.disable_model_invocation
     }
+}
+
+/// One Skill (or Agent definition) excluded by **Shadowing**: another root
+/// contributed the same name first and this file is genuinely different.
+/// Generic over the scope enum because `skills.rs` and `agents.rs` share the
+/// rule with different tags — the shape `boundary::push_roots<T>` uses.
+/// ADR 0065. UI-only: never interpolated into a prompt tag.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Shadowed<T> {
+    pub name: String,
+    /// Canonical path to the shadowed `SKILL.md`.
+    pub path: String,
+    pub scope: T,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -83,9 +108,20 @@ pub fn discover_skills(space_path: Option<&Path>) -> Vec<SkillInfo> {
 /// roots. `roots` order defines first-wins dedupe precedence.
 pub fn discover_in_roots(roots: &[(PathBuf, SkillScope)]) -> Vec<SkillInfo> {
     // Shared across ALL roots: a symlink in a later root pointing at an
-    // earlier root's `SKILL.md` collapses by PATH, not just by name.
+    // earlier root's `SKILL.md` collapses by PATH, not just by name. (That is
+    // one of TWO link cases — `find_skill_files` also follows symlinked Skill
+    // DIRECTORIES, deduped per root by canonical dir; this set stays the
+    // canonical-FILE dedupe and must stay shared.)
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut by_name: HashMap<String, SkillInfo> = HashMap::new();
+    // Run-local, alongside `by_name` and dropped with it: lowercased name ->
+    // the WINNER's NORMALIZED RAW content, so a collision can be told apart
+    // from a Duplicate. Compared against the whole file, NOT against
+    // `SkillInfo.body` — `body` is frontmatter-stripped AND trimmed, so a
+    // body-only comparison calls two Skills duplicates when they differ ONLY in
+    // frontmatter (e.g. a model-visible winner and a model-hidden loser with
+    // the same body: a real shadow, swallowed).
+    let mut content_by_name: HashMap<String, String> = HashMap::new();
 
     for (root, scope) in roots {
         if !root.is_dir() {
@@ -105,13 +141,6 @@ pub fn discover_in_roots(roots: &[(PathBuf, SkillScope)]) -> Vec<SkillInfo> {
             else {
                 continue;
             };
-            // First-wins across the whole run (a Space root shadows a
-            // same-named user skill; an innermost ancestor shadows an
-            // outer one).
-            let key = name.to_lowercase();
-            if by_name.contains_key(&key) {
-                continue;
-            }
             // BOTH canonical: `file` is already canonical (the walk
             // canonicalized it); canonicalize the dir too (a `tempdir()`
             // path can be a symlink prefix on some platforms).
@@ -126,6 +155,43 @@ pub fn discover_in_roots(roots: &[(PathBuf, SkillScope)]) -> Vec<SkillInfo> {
             if !is_tag_safe_name(&path) || !is_tag_safe_name(&dir) {
                 continue;
             }
+            // First-wins across the whole run (a Space root shadows a
+            // same-named user skill; an innermost ancestor shadows an
+            // outer one) — and the collision is RECORDED on the winner as a
+            // `shadowed` report (ADR 0065).
+            //
+            // THE ORDER MATTERS: this check sits BELOW the validity guards on
+            // purpose. A loser that was never eligible to be listed is not
+            // "hidden by" anything, and recording it would surface a path
+            // discovery deliberately refuses to surface. Verified against this
+            // loop: the tag-safety guard above is the ONLY rejection that runs
+            // after the dedupe — every other one (unparseable frontmatter, a
+            // `description` over 1024 chars, an unsafe `name`) lives inside
+            // `parse_skill_file`, which already runs before this point.
+            let key = name.to_lowercase();
+            // Normalized for the Duplicate test ONLY — never compared to
+            // `body`, and never compared RAW (a CRLF-vs-LF copy is the same
+            // Skill, not a shadow).
+            let normalized = normalize_line_endings(&content);
+            if let Some(winner) = by_name.get_mut(&key) {
+                if content_by_name.get(&key).is_some_and(|w| *w == normalized) {
+                    // A Duplicate, not a shadow (CONTEXT.md): the same file
+                    // bytes under two roots. Silent.
+                    continue;
+                }
+                // A genuine shadow: the loser rides on the WINNER, keeping its
+                // own name, canonical path and REAL scope (a user Skill can
+                // lose to another user root — `user_roots()` returns two, and
+                // each Space level contributes two — so the dialog derives its
+                // wording from the winner's scope, not from an assumption).
+                winner.shadowed.push(Shadowed {
+                    name,
+                    path,
+                    scope: *scope,
+                });
+                continue;
+            }
+            content_by_name.insert(key.clone(), normalized);
             by_name.insert(
                 key,
                 SkillInfo {
@@ -136,6 +202,7 @@ pub fn discover_in_roots(roots: &[(PathBuf, SkillScope)]) -> Vec<SkillInfo> {
                     scope: *scope,
                     body,
                     disable_model_invocation,
+                    shadowed: Vec::new(),
                 },
             );
         }
@@ -223,32 +290,85 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 /// `node_modules`; skip files whose canonical (symlink-resolved) path
 /// was already seen — `seen` is SHARED across all roots; return in
 /// deterministic (lexicographic) order.
+///
+/// DIRECTORY-NESS IS DECIDED THROUGH LINKS: a symlinked Skill directory is
+/// descended like the real thing, because a symlink farm (`~/.pi/agent/
+/// skills/*` entries that link into `~/.agents/skills`, or a project wiring
+/// its Skills in by link) is how one Skill set gets shared across machines.
+/// A `SKILL.md` that resolves through a link is still ONE skill: `seen`
+/// dedupes it by canonical PATH, and the separate per-root `visited_dirs`
+/// set stops a directory reachable by two links from being re-walked.
 fn find_skill_files(root: &Path, seen: &mut HashSet<PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    // Canonical DIR -> shallowest `dir_depth` it was first walked at. Seeded
+    // with `root` at 0 so a link inside the tree pointing back at the root
+    // cannot re-walk it (which would otherwise hand a root-level `SKILL.md` —
+    // depth 0, not a skill by spec — a depth-1 read).
+    let mut visited_dirs: HashMap<PathBuf, u32> = HashMap::new();
+    if let Ok(canon) = fs::canonicalize(root) {
+        visited_dirs.insert(canon, 0);
+    }
     // `dir_depth` = the depth of the dir itself (root = 0); files
     // directly inside it are at depth `dir_depth` (a `SKILL.md` at the
     // root is depth 0 → NOT a skill; depth 1 = `<root>/<name>/SKILL.md`).
-    walk(root, 0, &mut out, seen);
+    walk(root, 0, &mut out, seen, &mut visited_dirs);
     out.sort();
     out
 }
 
-fn walk(dir: &Path, dir_depth: u32, out: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
+fn walk(
+    dir: &Path,
+    dir_depth: u32,
+    out: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    visited_dirs: &mut HashMap<PathBuf, u32>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // Pruned on the entry NAME, BEFORE any metadata call: a link NAMED
+        // `node_modules` is pruned exactly like a real one.
+        if entry.file_name() == "node_modules" {
+            continue;
+        }
+        // `entry.file_type()` reports `is_dir() == false` for a link-to-dir —
+        // and so does `entry.metadata()`, which does NOT follow links on unix
+        // (using it here would silently no-op this whole rule). `fs::metadata`
+        // (like `Path::is_dir`) DOES follow it.
+        let is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
         if is_dir {
-            if entry.file_name() == "node_modules" {
-                continue;
-            }
             // Subdirs are at `dir_depth + 1` — only worth walking while
             // that stays within the 1..=4 bound (a dir at depth 4 still
             // holds depth-4 files, but its subdirs' files are depth 5).
             if dir_depth < 4 {
-                walk(&path, dir_depth + 1, out, seen);
+                let child_depth = dir_depth + 1;
+                // SEPARATE from `seen` (which holds canonical FILE paths and
+                // is shared across roots by design — see `discover_in_roots`).
+                // Skip only when this dir was already walked at a depth ≤
+                // `child_depth`: walking a dir at its SHALLOWEST depth is
+                // strictly more capable (the 1..=4 file bound is measured from
+                // the walk root), so a deeper second visit is pure duplicate
+                // work. Blindly skipping a dir that was first seen DEEPER would
+                // drop the Skills whose only path to the root was this shallower
+                // link, and make discovery depend on `read_dir` order. So: skip
+                // iff the stored depth is shallower-or-equal, else record the
+                // minimum and descend.
+                //
+                // This prevents RE-WALKING a directory reached by two links
+                // (duplicate work, duplicate rows) — it is NOT a hang guard: a
+                // link cycle already terminated via the `dir_depth < 4` /
+                // file-depth `1..=4` bounds, and still does.
+                let canon_dir = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if visited_dirs
+                    .get(&canon_dir)
+                    .is_some_and(|seen_at| *seen_at <= child_depth)
+                {
+                    continue;
+                }
+                visited_dirs.insert(canon_dir, child_depth);
+                walk(&path, child_depth, out, seen, visited_dirs);
             }
             continue;
         }
@@ -256,12 +376,34 @@ fn walk(dir: &Path, dir_depth: u32, out: &mut Vec<PathBuf>, seen: &mut HashSet<P
             continue;
         }
         // Symlink-resolved; errors → skip.
+        //
+        // ACCEPTED RISK (pre-existing, ADR 0065): the canonical `SKILL.md`
+        // makes `SkillInfo.dir` — `fs::canonicalize(parent)` — the link's
+        // TARGET, and `exec_read_skill` installs that `dir` as its per-skill
+        // containment boundary, so `read_skill` on a linked Skill can reach
+        // files outside the project. Today's code already does this for a
+        // linked `SKILL.md` file (`root/alpha/SKILL.md -> <victim>/secret.txt`
+        // discovers as `name="victim"`, `dir="<victim>"`); what following
+        // directory links adds is a link to a DIRECTORY that itself holds a
+        // `SKILL.md` at depth 1..=4. Requiring links to resolve inside the
+        // root would kill the symlink-farm feature, so it is not done here.
         if let Ok(canon) = fs::canonicalize(&path) {
             if seen.insert(canon.clone()) {
                 out.push(canon);
             }
         }
     }
+}
+
+/// The ONE owner of the line-ending rule: `\r\n` and a lone `\r` become `\n`.
+///
+/// `pub(crate)` because two callers need the SAME normalization, and a
+/// copy-pasted second copy would diverge: `parse_skill_file` (frontmatter
+/// parsing) and the **Shadowing** comparison in `discover_in_roots`, which must
+/// see a CRLF checkout of an otherwise-identical `SKILL.md` as the Duplicate it
+/// is rather than as a shadow.
+pub(crate) fn normalize_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// The tolerant frontmatter reader (no YAML crate): any failure mode
@@ -275,8 +417,9 @@ fn walk(dir: &Path, dir_depth: u32, out: &mut Vec<PathBuf>, seen: &mut HashSet<P
 /// (no space after the colon) is a second such place — pi's `yaml` throws
 /// `MISSING_CHAR` and drops the file, where this prefix match reads the key.
 fn parse_skill_file(content: &str, fallback_name: &str) -> Option<(String, String, String, bool)> {
-    // 1. Normalize `\r\n` and lone `\r` to `\n`.
-    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    // 1. Normalize `\r\n` and lone `\r` to `\n` (the shared helper — the
+    //    shadow comparison in `discover_in_roots` normalizes identically).
+    let normalized = normalize_line_endings(content);
     let lines: Vec<&str> = normalized.split('\n').collect();
 
     // 2. Frontmatter = a block starting at the very beginning: line 1
@@ -585,7 +728,36 @@ fn parse_value(fm: &[&str], idx: usize, rest: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_mentionable_name, is_tag_safe_name};
+    use super::*;
+
+    /// A fresh scratch directory (one per call, so tests never share state).
+    ///
+    /// Deliberately NOT a copy of `agents.rs::scratch()`: that helper also
+    /// creates an empty `.git/` dir because `discover_agents` runs a context
+    /// walk that stops at a `.git`. `discover_in_roots` takes its roots as
+    /// given and never walks up (the upward search lives in `space_roots`),
+    /// so such a dir would be inert here and its comment a false claim.
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("archimedes-skills-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    /// Canonicalize for path comparisons (on macOS `std::env::temp_dir()` is a
+    /// symlinked PREFIX, so a raw `join` never string-equals the canonical
+    /// `path` `discover_in_roots` stores). Same helper `agents.rs` uses. Use it
+    /// ONLY on paths that EXIST — the fallback to the raw path is a silent
+    /// no-op otherwise.
+    fn canon(p: &Path) -> PathBuf {
+        fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
 
     #[test]
     fn is_tag_safe_name_rejects_quotes_and_control_chars_only() {
@@ -638,5 +810,526 @@ mod tests {
             assert!(is_mentionable_name(name) && is_tag_safe_name(name));
         }
         assert!(is_tag_safe_name("has space") && !is_mentionable_name("has space"));
+    }
+
+    // ---- symlinked Skill DIRECTORIES ------------------------------------
+    //
+    // Every test here is `#[cfg(unix)]`: creating a DIRECTORY symlink on
+    // Windows needs privileges CI does not grant, so a Windows arm would be
+    // vacuously green. The `walk` change itself is platform-neutral code and
+    // compiles on all three CI OSes. (`read_skill_rejected_symlink_does_not_
+    // disclose_its_target` can be dual-arity because it links a *file*.)
+    //
+    // Assertions are on COUNT / `name` / `scope` — never on a path string:
+    // `std::env::temp_dir()` is itself a symlinked prefix on macOS.
+
+    /// A symlinked Skill directory is a Skill farm (`~/.pi/agent/skills/*`
+    /// entries are commonly links into `~/.agents/skills`), so it must be
+    /// descended, not skipped as "neither a dir nor a `SKILL.md`".
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_skill_directory_is_discovered() {
+        let root = scratch();
+        let home = scratch();
+        let real_dir = home.join("real");
+        write_file(
+            &real_dir.join("SKILL.md"),
+            "---\nname: real\ndescription: D.\n---\nB.\n",
+        );
+        std::os::unix::fs::symlink(&real_dir, root.join("linked")).unwrap();
+
+        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        assert_eq!(out.len(), 1, "the linked Skill must be discovered: {out:?}");
+        assert_eq!(out[0].name, "real");
+        assert_eq!(out[0].scope, SkillScope::Space);
+    }
+
+    /// A link cycle must RETURN (the depth bounds already terminate the walk —
+    /// this is not a hang fix) and must not emit the same Skill twice (the
+    /// visited set prevents RE-WALKING a dir reached by two links).
+    #[test]
+    #[cfg(unix)]
+    fn a_link_cycle_yields_one_entry_and_terminates() {
+        let root = scratch();
+        let loopdir = root.join("loopdir");
+        write_file(
+            &loopdir.join("SKILL.md"),
+            "---\nname: looped\ndescription: D.\n---\nB.\n",
+        );
+        std::os::unix::fs::symlink(&loopdir, loopdir.join("self")).unwrap();
+
+        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        assert_eq!(
+            out.iter().filter(|s| s.name == "looped").count(),
+            1,
+            "a cycle must not duplicate rows: {out:?}"
+        );
+        assert_eq!(out.len(), 1, "one Skill expected: {out:?}");
+    }
+
+    /// The depth-aware rule: skipping a directory merely because it was seen
+    /// before is wrong — if it was first seen at a DEEPER walk depth, its
+    /// `SKILL.md`s can sit past the `1..=4` file bound on that path and would
+    /// be dropped, making discovery depend on `read_dir` order.
+    ///
+    /// The fixture is shaped so a PLAIN visited-set skip loses `deep_only`
+    /// whenever the deeper link is enumerated first: `nest/linked` reaches the
+    /// target at `dir_depth` 2, which puts the target's own `SKILL.md` at file
+    /// depth 2 and `a/SKILL.md` at 3 — both in bounds — but the `dir_depth < 4`
+    /// descent guard stops before `a/b/c`, so `a/b/c/SKILL.md` (file depth 4
+    /// through the root-level link) is reachable ONLY at the shallow depth.
+    ///
+    /// Order-independence is exactly what is being pinned — and `read_dir`
+    /// order is unspecified, so a fixture cannot simply be *assumed* to visit
+    /// the deep link first. It matters: skipping the DEEPER second visit loses
+    /// nothing (a deeper path can only push files past the bound, never bring
+    /// new ones in), so a plain visited-set skip is WRONG but only shows itself
+    /// when a deep link happens to be enumerated before the shallow one. The
+    /// fixture therefore swamps the ONE shallow link with 64 deep ones — the
+    /// link that reaches the target FIRST decides the outcome, so the losing
+    /// order occurs in 64 of 65 rounds under ANY `read_dir` ordering — and the
+    /// test asserts a such a round really happened, so it can never be
+    /// vacuously green.
+    ///
+    /// WHICH ROUND PROBES WHAT. "Enumeration order" is not one property; the
+    /// filesystems under CI derive it three different ways, and a round has to
+    /// beat the one under which the shallow link happens to come out first.
+    /// Varying ONLY creation order over one fixed name does not do that — it
+    /// gives 8 identical draws on BOTH hash-ordered runners. Each round
+    /// therefore varies BOTH shapes:
+    /// - CREATION-ORDERED (or reverse-ordered) filesystems — measured: this
+    ///   machine's tmpfs returns strict reverse creation order — are probed by
+    ///   `shallow_first`, which flips the creation order of the two link groups.
+    /// - NAME-SORTED filesystems (NTFS; and any unix fs that hands back a sorted
+    ///   readdir) ignore creation order entirely, so the shallow link's NAME is
+    ///   what has to move: `aaa_shallow` and `mid_shallow` sort BEFORE `nest0`,
+    ///   `shallow` and `zzz_shallow` sort AFTER it, so two of the four name
+    ///   variants put a deep link first no matter when anything was created.
+    /// - NAME-HASHED filesystems (ext4 with `dir_index` = the `ubuntu-latest`
+    ///   runner, and APFS = `macos-latest`) order by neither creation order nor
+    ///   name but by a per-name directory hash, so every round that reuses a
+    ///   name re-draws the SAME order. A name-only lottery is why the name is
+    ///   load-bearing: with one fixed name all 8 rounds were 8 copies of one
+    ///   ~1-in-65 draw (a fresh checkout could deterministically go
+    ///   non-vacuously-red, unfixable by rerun); across 4 distinct names the
+    ///   chance that every independent draw puts the shallow link first is
+    ///   ~(1/65)^4.
+    ///
+    /// ROUNDS = 4 names × 2 creation orders is the full cross-product, so every
+    /// filesystem property is probed under both creation orders, and the
+    /// non-vacuity assert at the bottom proves the losing order was really hit.
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_walked_twice_keeps_the_deeper_skills_reachable() {
+        const DEEP_LINKS: usize = 64;
+        /// 4 shallow-link names × 2 creation orders — see the round-shape table
+        /// on the test above: the name varies because hash-ordered and
+        /// name-sorted filesystems are blind to creation order.
+        const ROUNDS: usize = 8;
+        /// Two names sorting before `nest0`, two after it — so name-sorted
+        /// filesystems see a deep-first round regardless of creation order.
+        const SHALLOW_NAMES: [&str; 4] = ["shallow", "aaa_shallow", "zzz_shallow", "mid_shallow"];
+
+        /// The target holds `SKILL.md` (rel. 0), `a/SKILL.md` (rel. 1) and
+        /// `a/b/c/SKILL.md` (rel. 3). Reached at `dir_depth` 2 (through a `nest`
+        /// dir) the first two land at file depths 2 and 3 — in bounds — but the
+        /// `dir_depth < 4` descent guard stops before `a/b`, so `deep_only`
+        /// (file depth 4) is reachable ONLY through a root-level link at
+        /// `dir_depth` 1.
+        ///
+        /// The round returns whether a deep link was enumerated BEFORE the
+        /// shallow link, which is the order that a plain visited-set skip loses
+        /// `deep_only` in. `shallow_first` flips the CREATION order (probing
+        /// creation-ordered filesystems); `shallow_name` moves the shallow link
+        /// across the `nest*` block (probing name-sorted filesystems and — since
+        /// a hash-ordered fs derives its order from the name — drawing a fresh
+        /// order on those). Both vary because each scheme ignores the other.
+        fn fixture(shallow_name: &str, shallow_first: bool) -> (PathBuf, bool) {
+            let root = scratch();
+            let home = scratch();
+            let target = home.join("shared");
+            write_file(
+                &target.join("SKILL.md"),
+                "---\nname: shared\ndescription: D.\n---\nB.\n",
+            );
+            write_file(
+                &target.join("a").join("SKILL.md"),
+                "---\nname: mid\ndescription: D.\n---\nB.\n",
+            );
+            write_file(
+                &target.join("a").join("b").join("c").join("SKILL.md"),
+                "---\nname: deep_only\ndescription: D.\n---\nB.\n",
+            );
+            // … and ONE (`shallow`) that reaches it at `dir_depth` 1.
+            let mk_deep = |i: usize| {
+                let nest = format!("nest{i}");
+                fs::create_dir_all(root.join(&nest)).unwrap();
+                std::os::unix::fs::symlink(&target, root.join(&nest).join("link")).unwrap();
+                nest
+            };
+            let mk_shallow = || {
+                std::os::unix::fs::symlink(&target, root.join(shallow_name)).unwrap();
+            };
+            let mut deeps: Vec<String> = Vec::new();
+            if shallow_first {
+                mk_shallow();
+                for i in 0..DEEP_LINKS {
+                    deeps.push(mk_deep(i));
+                }
+            } else {
+                for i in 0..DEEP_LINKS {
+                    deeps.push(mk_deep(i));
+                }
+                mk_shallow();
+            }
+            // `read_dir` order is stable for a given directory, so probing it
+            // here is the order `walk` will see: whichever top-level entry comes
+            // first decides whether a PLAIN visited-set skip keeps `deep_only`.
+            let order: Vec<String> = fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let first_deep = order
+                .iter()
+                .position(|n| deeps.iter().any(|d| d == n))
+                .unwrap();
+            let first_shallow = order.iter().position(|n| n == shallow_name).unwrap();
+            (root, first_deep < first_shallow)
+        }
+
+        let mut deep_first_rounds = 0;
+        for round in 0..ROUNDS {
+            // Each name variant gets both creation orders (4 × 2 = ROUNDS).
+            let shallow_name = SHALLOW_NAMES[round % SHALLOW_NAMES.len()];
+            let shallow_first = (round / SHALLOW_NAMES.len()).is_multiple_of(2);
+            let (root, deep_first) = fixture(shallow_name, shallow_first);
+            if deep_first {
+                deep_first_rounds += 1;
+            }
+            let out = discover_in_roots(&[(root, SkillScope::Space)]);
+            for name in ["shared", "mid", "deep_only"] {
+                assert_eq!(
+                    out.iter().filter(|s| s.name == name).count(),
+                    1,
+                    "`{name}` must be found exactly once (round {round}, deep \
+                     link enumerated first = {deep_first}): {out:?}"
+                );
+            }
+            assert_eq!(
+                out.len(),
+                3,
+                "all three Skills expected (round {round}, deep link enumerated \
+                 first = {deep_first}): {out:?}"
+            );
+        }
+        // The round class that can expose a plain visited-set skip must really
+        // have been exercised.
+        assert!(
+            deep_first_rounds > 0,
+            "no round enumerated a deep link first — this test would prove nothing"
+        );
+    }
+
+    /// Depth rules are untouched by link following: plain nesting at depths 1
+    /// and 2 still yields both Skills, nothing more.
+    #[test]
+    fn following_links_does_not_change_plain_nesting() {
+        let root = scratch();
+        write_file(
+            &root.join("alpha").join("SKILL.md"),
+            "---\nname: alpha\ndescription: D.\n---\nB.\n",
+        );
+        write_file(
+            &root.join("group").join("beta").join("SKILL.md"),
+            "---\nname: beta\ndescription: D.\n---\nB.\n",
+        );
+
+        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        assert_eq!(out.len(), 2, "both nested Skills expected: {out:?}");
+    }
+
+    /// The `node_modules` prune is evaluated on the entry NAME before any
+    /// metadata call, so a link NAMED `node_modules` is still pruned.
+    #[test]
+    #[cfg(unix)]
+    fn a_link_named_node_modules_is_still_pruned() {
+        let root = scratch();
+        let home = scratch();
+        let hidden = home.join("hidden");
+        write_file(
+            &hidden.join("SKILL.md"),
+            "---\nname: hidden\ndescription: D.\n---\nB.\n",
+        );
+        std::os::unix::fs::symlink(&hidden, root.join("node_modules")).unwrap();
+
+        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        assert_eq!(out.len(), 0, "node_modules stays pruned: {out:?}");
+    }
+
+    // ---- Shadowing: the loser is a REPORT on the winner (ADR 0065) -----
+    //
+    // `discover_in_roots` already dropped a name collision silently; these pin
+    // the disclosure. Assertions are on `name` / `scope` and on `path` compared
+    // through `canon` — never on a raw path string (`temp_dir()` is a symlinked
+    // prefix on macOS).
+
+    /// A byte-identical `SKILL.md` in two roots is a **Duplicate**, not a
+    /// shadow (`CONTEXT.md`), and ADR 0065 keeps it silent: one row, empty
+    /// `shadowed`. Reducing this to "any name collision is a shadow" would fill
+    /// the dialog with a copy the user made on purpose.
+    #[test]
+    fn a_byte_identical_copy_across_roots_is_silent() {
+        let space = scratch();
+        let user = scratch();
+        let bytes = "---\nname: discuss\ndescription: D.\n---\nSame body.\n";
+        write_file(&space.join("discuss").join("SKILL.md"), bytes);
+        write_file(&user.join("discuss").join("SKILL.md"), bytes);
+
+        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        assert_eq!(out.len(), 1, "one row for a Duplicate: {out:?}");
+        assert!(
+            out[0].shadowed.is_empty(),
+            "a byte-identical copy is a Duplicate, not a shadow: {out:?}"
+        );
+    }
+
+    /// The comparison is on NORMALIZED content: a CRLF copy is the same Skill
+    /// with a different line ending, and reporting it would bury the real
+    /// shadows under Windows-checkout noise. Raw-bytes comparison fails this.
+    #[test]
+    fn a_crlf_copy_across_roots_is_silent() {
+        let space = scratch();
+        let user = scratch();
+        let lf = "---\nname: discuss\ndescription: D.\n---\nSame body.\n";
+        let crlf = lf.replace('\n', "\r\n");
+        write_file(&space.join("discuss").join("SKILL.md"), lf);
+        write_file(&user.join("discuss").join("SKILL.md"), &crlf);
+
+        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        assert_eq!(out.len(), 1, "one row for a CRLF copy: {out:?}");
+        assert!(
+            out[0].shadowed.is_empty(),
+            "a CRLF-only difference is not a shadow: {out:?}"
+        );
+    }
+
+    /// THE comparison-target pin. `SkillInfo.body` is frontmatter-stripped AND
+    /// trimmed, so comparing BODIES calls these two duplicates and swallows a
+    /// real shadow — here the loser is model-HIDDEN while the winner is
+    /// model-visible, so which file loads is a behavioural difference the user
+    /// must be able to see. Compare normalized WHOLE-FILE content, never
+    /// `body`. This test goes RED for exactly that substitution.
+    #[test]
+    fn same_body_with_a_different_disable_model_invocation_is_a_shadow() {
+        let space = scratch();
+        let user = scratch();
+        let visible = "---\nname: discuss\ndescription: D.\n---\nIdentical body.\n";
+        let hidden =
+            "---\nname: discuss\ndescription: D.\ndisable-model-invocation: true\n---\nIdentical body.\n";
+        write_file(&space.join("discuss").join("SKILL.md"), visible);
+        write_file(&user.join("discuss").join("SKILL.md"), hidden);
+
+        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            !out[0].disable_model_invocation,
+            "the Space winner stays model-visible: {out:?}"
+        );
+        assert_eq!(
+            out[0].shadowed.len(),
+            1,
+            "a frontmatter-only difference is a real shadow: {out:?}"
+        );
+    }
+
+    /// The headline contract: a genuinely different file under the same name is
+    /// reported ON THE WINNER, naming the loser with its own name, its
+    /// canonical path and its OWN scope — the winner and its scope are
+    /// unchanged.
+    #[test]
+    fn a_different_file_with_the_same_name_records_the_loser() {
+        let space = scratch();
+        let user = scratch();
+        let loser = user.join("discuss").join("SKILL.md");
+        write_file(
+            &space.join("discuss").join("SKILL.md"),
+            "---\nname: discuss\ndescription: space version\n---\nS.\n",
+        );
+        write_file(
+            &loser,
+            "---\nname: discuss\ndescription: user version\n---\nU.\n",
+        );
+
+        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        assert_eq!(out.len(), 1, "the collision stays ONE entry: {out:?}");
+        assert_eq!(out[0].name, "discuss");
+        assert_eq!(
+            out[0].scope,
+            SkillScope::Space,
+            "the winner's scope is unchanged: {out:?}"
+        );
+        assert_eq!(out[0].description, "space version", "first-wins: {out:?}");
+        assert_eq!(out[0].shadowed.len(), 1, "{out:?}");
+        assert_eq!(out[0].shadowed[0].name, "discuss");
+        assert_eq!(out[0].shadowed[0].scope, SkillScope::User);
+        assert_eq!(
+            Path::new(&out[0].shadowed[0].path),
+            canon(&loser).as_path(),
+            "the loser's path must be canonical (compare via `canon`): {out:?}"
+        );
+    }
+
+    /// A shadow is NOT necessarily "a project skill hiding your global one":
+    /// `user_roots()` returns TWO roots and both are tagged `User` (likewise
+    /// each Space level contributes `.agents/skills` then `.pi/skills`), so a
+    /// user-scoped Skill can lose to another user-scoped one. The dialog derives
+    /// its wording from the WINNER's scope, so this case must exist in the data
+    /// rather than being flattened into "space wins".
+    #[test]
+    fn a_user_skill_shadowed_by_another_user_root_is_recorded_with_a_user_winner() {
+        let agents = scratch();
+        let pi = scratch();
+        write_file(
+            &agents.join("discuss").join("SKILL.md"),
+            "---\nname: discuss\ndescription: from .agents\n---\nA.\n",
+        );
+        write_file(
+            &pi.join("discuss").join("SKILL.md"),
+            "---\nname: discuss\ndescription: from .pi\n---\nP.\n",
+        );
+
+        let out = discover_in_roots(&[(agents, SkillScope::User), (pi, SkillScope::User)]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].scope, SkillScope::User, "winner is a user skill");
+        assert_eq!(out[0].shadowed.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].shadowed[0].scope,
+            SkillScope::User,
+            "the loser's REAL scope must be carried, not assumed to be space: {out:?}"
+        );
+    }
+
+    /// A loser that is not ELIGIBLE to be listed is not reported as "hidden":
+    /// its path carries a `"` from the directory name, so discovery refuses to
+    /// surface that path at all. THIS is the test that exercises the reorder —
+    /// recording the shadow at the dedupe point (above the `is_tag_safe_name`
+    /// guard on `path`/`dir`) reports it and fails here.
+    ///
+    /// `name:` comes from frontmatter, so the directory name is NOT the rejection
+    /// reason: only the path/dir guard can reject this candidate.
+    #[test]
+    fn a_loser_with_an_unsafe_directory_name_is_not_reported() {
+        // The loser's DIRECTORY holds a `"`; its frontmatter name is clean, so
+        // `parse_skill_file` accepts it and only the path/dir guard can stop it.
+        //
+        // The two cfg blocks are ALTERNATIVES (exactly one compiles per
+        // platform, and no early `return` — the pattern, and the clippy reason,
+        // stated in `tests/skills.rs`): a `"` component is LEGAL on unix and
+        // REFUSED by NTFS, so on Windows the skip is unreachable-by-construction
+        // rather than skipped — and the guard RULE itself stays pinned there
+        // through the frontmatter route (`a_name_containing_a_quote_is_skipped`),
+        // which needs no illegal name.
+        #[cfg(windows)]
+        {
+            let user = scratch();
+            let built = fs::create_dir_all(user.join("we\"ird/SKILL.md"));
+            assert!(
+                built.is_err(),
+                "NTFS must REFUSE a `\"` component for this scenario to stay \
+                 unreachable — if this ever succeeds, drop the cfg branch and \
+                 run the real assertion"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let space = scratch();
+            let user = scratch();
+            write_file(
+                &space.join("discuss").join("SKILL.md"),
+                "---\nname: discuss\ndescription: space version\n---\nS.\n",
+            );
+            write_file(
+                &user.join("we\"ird").join("SKILL.md"),
+                "---\nname: discuss\ndescription: user version\n---\nU.\n",
+            );
+
+            let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(
+                out[0].shadowed.is_empty(),
+                "a loser that could never be listed is not a shadow: {out:?}"
+            );
+        }
+    }
+
+    /// A `description` over 1024 chars is rejected INSIDE `parse_skill_file`,
+    /// which runs before the dedupe either way — so unlike the tag-safety guard
+    /// above, this test passes on both sides of the reorder. It is kept as a
+    /// pin for the ORDER: if the description cap ever moves into the loop (next
+    /// to the tag-safety guard), a shadow recorded before it would fail here.
+    #[test]
+    fn a_loser_over_the_description_limit_is_not_reported() {
+        let space = scratch();
+        let user = scratch();
+        let long = "x".repeat(1025);
+        write_file(
+            &space.join("discuss").join("SKILL.md"),
+            "---\nname: discuss\ndescription: space version\n---\nS.\n",
+        );
+        write_file(
+            &user.join("discuss").join("SKILL.md"),
+            &format!("---\nname: discuss\ndescription: {long}\n---\nU.\n"),
+        );
+
+        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            out[0].shadowed.is_empty(),
+            "a parse-time rejection is not a shadow: {out:?}"
+        );
+    }
+
+    /// One winner can lose to several roots at once (ADR 0065 rejects the
+    /// "annotate the winning row" shape for exactly this reason), so the report
+    /// is a LIST, appended in root-precedence order.
+    #[test]
+    fn several_losers_from_several_roots_all_land_on_the_winner() {
+        let space = scratch();
+        let second = scratch();
+        let third = scratch();
+        let second_loser = second.join("discuss").join("SKILL.md");
+        let third_loser = third.join("discuss").join("SKILL.md");
+        write_file(
+            &space.join("discuss").join("SKILL.md"),
+            "---\nname: discuss\ndescription: one\n---\n1.\n",
+        );
+        write_file(
+            &second_loser,
+            "---\nname: discuss\ndescription: two\n---\n2.\n",
+        );
+        write_file(
+            &third_loser,
+            "---\nname: discuss\ndescription: three\n---\n3.\n",
+        );
+
+        let out = discover_in_roots(&[
+            (space, SkillScope::Space),
+            (second, SkillScope::Space),
+            (third, SkillScope::User),
+        ]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].shadowed.len(), 2, "both losers reported: {out:?}");
+        // Root-precedence order, so the dialog reads outermost-last.
+        assert_eq!(
+            Path::new(&out[0].shadowed[0].path),
+            canon(&second_loser).as_path()
+        );
+        assert_eq!(
+            Path::new(&out[0].shadowed[1].path),
+            canon(&third_loser).as_path()
+        );
+        assert_eq!(out[0].shadowed[0].scope, SkillScope::Space);
+        assert_eq!(out[0].shadowed[1].scope, SkillScope::User);
     }
 }

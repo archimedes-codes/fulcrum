@@ -55,6 +55,19 @@ pub struct AgentDefinition {
     pub scope: AgentScope,
     /// Absolute (canonical) path to the file.
     pub path: String,
+    /// The Agent definitions this name collision EXCLUDED, reported here on the
+    /// winner (ADR 0065: a shadow is a REPORT, not an entry — the losers stay
+    /// unaddressable by name). The SAME rule `skills.rs` applies, over the SAME
+    /// shared `Shadowed<T>` shape. Additive, so every existing consumer of this
+    /// struct is unaffected.
+    ///
+    /// **Computed, never rendered — and never crosses the wire**:
+    /// `commands::agents::AgentDefinitionDto` deliberately does not carry it (see
+    /// the note there). `discover_agents(None)` (the only caller behind Settings →
+    /// Subagents) reads user-level roots only, so the app-global Settings page
+    /// cannot see a Space-shadows-user collision at all; the surface is a
+    /// per-Space Agents popup modelled on the Skills dialog.
+    pub shadowed: Vec<crate::skills::Shadowed<AgentScope>>,
 }
 
 /// Discover Agent definitions for `space_path` (its roots + the user-level
@@ -75,6 +88,12 @@ pub fn discover_in_roots(roots: &[(PathBuf, AgentScope)]) -> Vec<AgentDefinition
     // earlier root's file collapses by PATH, not just by name.
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut by_name: HashMap<String, AgentDefinition> = HashMap::new();
+    // Run-local, alongside `by_name` and dropped with it: lowercased name ->
+    // the WINNER's NORMALIZED RAW content, so a collision can be told apart
+    // from a Duplicate. Same reason as in `skills.rs`: compare the whole file,
+    // NEVER `AgentDefinition.system_prompt` (frontmatter-stripped AND trimmed,
+    // so a frontmatter-only difference would be swallowed as a Duplicate).
+    let mut content_by_name: HashMap<String, String> = HashMap::new();
 
     for (root, scope) in roots {
         if !root.is_dir() {
@@ -121,11 +140,41 @@ pub fn discover_in_roots(roots: &[(PathBuf, AgentScope)]) -> Vec<AgentDefinition
             };
             // First-wins across the whole run (a Space root shadows a
             // same-named user agent; an innermost ancestor shadows an
-            // outer one).
+            // outer one) — and the collision is RECORDED on the winner as a
+            // `shadowed` report (ADR 0065, the same rule `skills.rs` runs).
+            //
+            // NO reorder is needed here, unlike `skills.rs`: this module has NO
+            // tag-safety skip on `path` (an agent file's path is never
+            // interpolated unescaped into a prompt tag), so the dedupe point is
+            // ALREADY the last validity gate the loop runs. Every other
+            // rejection (`parse_agent_file` returning `None`) is above this
+            // point, so a candidate that was never eligible is never recorded.
             let key = name.to_lowercase();
-            if by_name.contains_key(&key) {
+            // Normalized for the Duplicate test ONLY — never compared to
+            // `system_prompt`, and never compared RAW (a CRLF-vs-LF copy is the
+            // same definition, not a shadow). `skills::normalize_line_endings`
+            // is the ONE owner of that rule; a second copy here would diverge.
+            let normalized = crate::skills::normalize_line_endings(&content);
+            if let Some(winner) = by_name.get_mut(&key) {
+                if content_by_name.get(&key).is_some_and(|w| *w == normalized) {
+                    // A Duplicate, not a shadow (CONTEXT.md): the same file
+                    // bytes under two roots. Silent.
+                    continue;
+                }
+                // A genuine shadow: the loser rides on the WINNER, keeping its
+                // own name, canonical path and REAL scope (a user definition
+                // can lose to another user root — `user_roots()` returns two,
+                // and each Space level contributes two).
+                winner.shadowed.push(crate::skills::Shadowed {
+                    name,
+                    // Canonical, like the winner's own `path` (`path` is the raw
+                    // entry path — the pre-canonicalize input only).
+                    path: canon.to_string_lossy().into_owned(),
+                    scope: *scope,
+                });
                 continue;
             }
+            content_by_name.insert(key.clone(), normalized);
             by_name.insert(
                 key,
                 AgentDefinition {
@@ -137,6 +186,7 @@ pub fn discover_in_roots(roots: &[(PathBuf, AgentScope)]) -> Vec<AgentDefinition
                     system_prompt,
                     scope: *scope,
                     path: canon.to_string_lossy().into_owned(),
+                    shadowed: Vec::new(),
                 },
             );
         }
@@ -628,6 +678,10 @@ mod tests {
         assert_eq!(out.len(), 1, "first-wins dedupe: {out:?}");
         assert_eq!(out[0].description, "space version");
         assert_eq!(out[0].scope, AgentScope::Space);
+        // ADR 0065: the collision is also a REPORT on the winner (the dedupe
+        // decision above is unchanged — one entry, the Space description wins).
+        assert_eq!(out[0].shadowed.len(), 1, "{out:?}");
+        assert_eq!(out[0].shadowed[0].scope, AgentScope::User);
     }
 
     // 10 — find-by-name (NOT exact-vec equality): the user-level roots may
@@ -775,6 +829,90 @@ mod tests {
                 (root.join(".agents/agents"), AgentScope::Space),
                 (root.join(".pi/agents"), AgentScope::Space),
             ]
+        );
+    }
+
+    // ---- Shadowing: the loser is a REPORT on the winner (ADR 0065) -----
+    //
+    // The same rule `skills.rs` records, over the same shared
+    // `Shadowed<T>` shape. Assertions are on `name` / `scope` and on `path`
+    // compared through `canon` — never on a raw path string (`temp_dir()` is a
+    // symlinked prefix on macOS).
+
+    /// A byte-identical `*.md` in two roots is a **Duplicate**, not a shadow
+    /// (`CONTEXT.md`), and ADR 0065 keeps it silent: one entry, empty
+    /// `shadowed`. Reducing the rule to "any name collision is a shadow" would
+    /// fill the future Agents popup with a copy the user made on purpose.
+    #[test]
+    fn identical_agent_files_across_roots_are_silent() {
+        let space_root = scratch();
+        let user_root = scratch();
+        let bytes = "---\nname: scout\ndescription: D.\n---\nSame body.\n";
+        write_file(&space_root.join("scout.md"), bytes);
+        write_file(&user_root.join("scout.md"), bytes);
+        let out = discover_in_roots(&[
+            (space_root.clone(), AgentScope::Space),
+            (user_root.clone(), AgentScope::User),
+        ]);
+        assert_eq!(out.len(), 1, "one entry for a Duplicate: {out:?}");
+        assert!(
+            out[0].shadowed.is_empty(),
+            "a byte-identical copy is a Duplicate, not a shadow: {out:?}"
+        );
+    }
+
+    /// The Duplicate test compares NORMALIZED content, so a CRLF checkout of an
+    /// otherwise-identical file stays silent (reporting it would bury the real
+    /// shadows under Windows-checkout noise). Raw-bytes comparison goes RED
+    /// here. The normalization itself comes from the ONE owner of the rule,
+    /// `skills::normalize_line_endings` — not a second copy in this module.
+    #[test]
+    fn a_crlf_agent_copy_across_roots_is_silent() {
+        let space_root = scratch();
+        let user_root = scratch();
+        let lf = "---\nname: scout\ndescription: D.\n---\nSame body.\n";
+        let crlf = lf.replace('\n', "\r\n");
+        write_file(&space_root.join("scout.md"), lf);
+        write_file(&user_root.join("scout.md"), &crlf);
+        let out = discover_in_roots(&[
+            (space_root.clone(), AgentScope::Space),
+            (user_root.clone(), AgentScope::User),
+        ]);
+        assert_eq!(out.len(), 1, "one entry for a CRLF copy: {out:?}");
+        assert!(
+            out[0].shadowed.is_empty(),
+            "a CRLF-only difference is not a shadow: {out:?}"
+        );
+    }
+
+    /// The headline contract on the agent side: a genuinely different file under
+    /// the same name is reported ON THE WINNER, naming the loser with its own
+    /// name, its canonical path and its OWN scope.
+    #[test]
+    fn a_shadowed_agent_names_its_loser_path() {
+        let space_root = scratch();
+        let user_root = scratch();
+        let loser = user_root.join("scout.md");
+        write_file(
+            &space_root.join("scout.md"),
+            "---\nname: scout\ndescription: space version\n---\nS.\n",
+        );
+        write_file(
+            &loser,
+            "---\nname: scout\ndescription: user version\n---\nU.\n",
+        );
+        let out = discover_in_roots(&[
+            (space_root.clone(), AgentScope::Space),
+            (user_root.clone(), AgentScope::User),
+        ]);
+        assert_eq!(out.len(), 1, "the collision stays ONE entry: {out:?}");
+        assert_eq!(out[0].shadowed.len(), 1, "{out:?}");
+        assert_eq!(out[0].shadowed[0].name, "scout");
+        assert_eq!(out[0].shadowed[0].scope, AgentScope::User);
+        assert_eq!(
+            Path::new(&out[0].shadowed[0].path),
+            canon(&loser).as_path(),
+            "the loser's path must be canonical (compare via `canon`): {out:?}"
         );
     }
 }

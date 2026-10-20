@@ -165,6 +165,12 @@ fn spec(name: &str) -> crate::agent::harness::provider::ToolSpec {
 /// mixed visible/hidden × Space/User fixture is what gives the equality its
 /// teeth: a per-seam scope filter, or a seam that stops filtering on the
 /// flag, both break the set equality rather than passing silently.
+///
+/// It also holds the **Shadowing** case (ADR 0065): a same-named Space+User
+/// pair with different bytes, where the loser is model-VISIBLE. A shadow is a
+/// report on the winner and must stay out of BOTH catalogs, so this fixture
+/// fails if either seam ever advertises a shadowed loser — which is why
+/// extending THIS pin beats writing a parallel one.
 #[tokio::test]
 async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
     use crate::agent::harness::prompt::{build_main_prompt, PromptContext};
@@ -178,8 +184,13 @@ async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
     let cwd = temp_cwd("skills-catalog-drift");
     std::fs::create_dir_all(cwd.join(".git")).unwrap();
 
-    // One skill per root (`skill_root` makes exactly one), four roots:
-    // visible + hidden, each at BOTH scopes.
+    // One skill per root (`skill_root` makes exactly one), six roots:
+    // visible + hidden, each at BOTH scopes, PLUS a same-named Space/User pair
+    // whose bytes DIFFER — the **Shadowing** case (ADR 0065). Its name may
+    // appear in NEITHER advertised set below: a shadowed loser stays
+    // unaddressable, and the report rides on the winner as data the prompt
+    // never interpolates. If a future change advertised `shadowed` (or listed
+    // the loser), the `visible` set below stops matching and this fails.
     let roots: Vec<(PathBuf, SkillScope)> = vec![
         (
             skill_root(
@@ -213,6 +224,36 @@ async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
             ),
             SkillScope::User,
         ),
+        // The **Shadowing** pair: one name, two roots, DIFFERENT bytes, so the
+        // second is a shadowed loser and not a Duplicate. Both are
+        // model-HIDDEN, which is what makes this a zero-drift fixture: the
+        // winner is hidden and the loser is unaddressable, so `gamma` may appear
+        // in NEITHER advertised set — the two catalogs must stay byte-identical
+        // to the pre-shadow ones while `skills` grows by one row.
+        // The **Shadowing** pair: one name, two roots, DIFFERENT bytes, so the
+        // second is a shadowed loser and not a Duplicate. Shaped deliberately:
+        // the WINNER is model-HIDDEN and the LOSER is model-VISIBLE. The loser
+        // carries an advertisable `description`, so it is the case a naive
+        // "make the loser a row" implementation would advertise — and the
+        // `visible` set below (UNCHANGED: `gamma` joins neither catalog) is what
+        // reddens it, while the winner's own hiddenness keeps `gamma` out of
+        // both catalogs legitimately (ADR 0036 + ADR 0065).
+        (
+            skill_root(
+                "drift-shadow-space",
+                "gamma",
+                "---\nname: gamma\ndescription: Does gamma (space).\ndisable-model-invocation: true\n---\nG.\n",
+            ),
+            SkillScope::Space,
+        ),
+        (
+            skill_root(
+                "drift-shadow-user",
+                "gamma",
+                "---\nname: gamma\ndescription: Does gamma (user).\n---\nG other.\n",
+            ),
+            SkillScope::User,
+        ),
     ];
     // The SAME rows for both seams: the prompt builder is handed the
     // discovered set directly, and the tool ctx takes the SAME roots (the
@@ -220,10 +261,13 @@ async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
     // pinned-root seam, never a pre-filtered list, which is exactly what
     // this test is guarding).
     let skills = discover_in_roots(&roots);
+    // Five ROWS, not six: the shadowed loser is a report on the winner
+    // (ADR 0065), never an entry of its own.
     assert_eq!(
         skills.len(),
-        4,
-        "the fixture must discover all four skills (the premise)"
+        5,
+        "the fixture must discover all five rows (the premise): the four \
+         single-root skills plus ONE row for the shadowed pair"
     );
     let paths: Vec<PathBuf> = roots.iter().map(|(p, _)| p.clone()).collect();
 
@@ -259,12 +303,29 @@ async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
     );
     // And neither may name a model-hidden skill (ADR 0036): the equality
     // above alone would hold for two identically-WRONG catalogs.
+    //
+    // `gamma` is in NEITHER set on purpose (ADR 0065): its Space row is
+    // model-hidden, and the model-VISIBLE user row that lost the name is a
+    // shadowed REPORT, not an entry — so a shadow stays unaddressable. Adding
+    // `gamma` here would mean the report leaked into a model-facing seam.
     let visible: std::collections::BTreeSet<String> = ["alpha".to_string(), "beta".to_string()]
         .into_iter()
         .collect();
     assert_eq!(
         prompt_names, visible,
         "the advertised catalog is not exactly the model-visible set"
+    );
+    // The fixture must really contain a SHADOW (not two unrelated skills):
+    // otherwise the two assertions above would be pinning nothing about ADR
+    // 0065. One row, carrying the loser.
+    let gamma = skills
+        .iter()
+        .find(|s| s.name == "gamma")
+        .unwrap_or_else(|| panic!("the shadowed pair must leave one row: {skills:?}"));
+    assert_eq!(
+        gamma.shadowed.len(),
+        1,
+        "the user row must be reported on the Space winner: {skills:?}"
     );
 
     for root in paths {

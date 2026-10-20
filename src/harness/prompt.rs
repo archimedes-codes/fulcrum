@@ -335,6 +335,7 @@ mod tests {
             scope: SkillScope::User,
             body: "body".to_string(),
             disable_model_invocation: false,
+            shadowed: Vec::new(),
         }
     }
 
