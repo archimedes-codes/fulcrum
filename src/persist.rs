@@ -145,6 +145,40 @@ impl TranscriptPersister {
         }
     }
 
+    /// Apply an interactive event payload (e.g. `todos_update`, `todos_clear`)
+    /// to SQLite (ADR 0066). The Supervisor is the sole writer.
+    pub fn apply_interactive_event(&self, session_id: &str, payload: &serde_json::Value) {
+        let Some(event) = payload.get("event").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        match event {
+            "todos_update" => {
+                let todos = payload
+                    .get("payload")
+                    .and_then(|p| p.get("todos"))
+                    .filter(|t| t.is_array());
+                if let Some(todos) = todos {
+                    let serialized = match serde_json::to_string(todos) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("serialize todos: {e}");
+                            return;
+                        }
+                    };
+                    if let Err(e) = self.db.record_session_todos(session_id, Some(&serialized)) {
+                        eprintln!("persist todos_update: {e}");
+                    }
+                }
+            }
+            "todos_clear" => {
+                if let Err(e) = self.db.record_session_todos(session_id, None) {
+                    eprintln!("persist todos_clear: {e}");
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Ensure the `sessions` row exists (the `native_messages` FK). On
     /// the FIRST frame for an unknown session id, `record_session` with
     /// `SessionInfo { …, is_subagent: <the flag>, archived: false, … }`.
@@ -292,6 +326,96 @@ mod tests {
         );
         // Its transcript is loadable.
         assert_eq!(db.load_native_messages("sub-1").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_interactive_event_updates_and_clears_todos() {
+        let (db, dir) = temp_db();
+        let p = TranscriptPersister::new(db.clone());
+        let info = SessionInfo {
+            session_id: "s1".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            capabilities: Value::Null,
+            config_options: None,
+            archived: false,
+            title: None,
+            context_usage: None,
+            is_subagent: false,
+        };
+        db.record_session(&info).unwrap();
+
+        // (a) update todos
+        let update_payload = serde_json::json!({
+            "sessionId": "s1",
+            "seq": 0,
+            "event": "todos_update",
+            "payload": {
+                "source": "native",
+                "todos": [
+                    { "content": "t1", "status": "pending" }
+                ]
+            }
+        });
+        p.apply_interactive_event("s1", &update_payload);
+        let stored = db
+            .session_todos("s1")
+            .unwrap()
+            .expect("todos should be stored");
+        assert!(stored.contains("t1"));
+
+        // (b) call with second update -> replaced
+        let update2_payload = serde_json::json!({
+            "sessionId": "s1",
+            "seq": 1,
+            "event": "todos_update",
+            "payload": {
+                "source": "native",
+                "todos": [
+                    { "content": "t2", "status": "completed" }
+                ]
+            }
+        });
+        p.apply_interactive_event("s1", &update2_payload);
+        let stored2 = db
+            .session_todos("s1")
+            .unwrap()
+            .expect("todos should be stored");
+        assert!(stored2.contains("t2"));
+        assert!(!stored2.contains("t1"));
+
+        // (c) call with event: "todos_clear" -> sets None
+        let clear_payload = serde_json::json!({
+            "sessionId": "s1",
+            "seq": 2,
+            "event": "todos_clear",
+            "payload": {}
+        });
+        p.apply_interactive_event("s1", &clear_payload);
+        assert_eq!(db.session_todos("s1").unwrap(), None);
+
+        // (d) call with unrelated event (e.g. state) or bad payload -> does not crash or touch todos_json
+        let unrelated = serde_json::json!({
+            "sessionId": "s1",
+            "event": "state",
+            "payload": { "foo": "bar" }
+        });
+        p.apply_interactive_event("s1", &unrelated);
+        assert_eq!(db.session_todos("s1").unwrap(), None);
+
+        // Reset with t1, then test bad payload
+        p.apply_interactive_event("s1", &update_payload);
+        assert!(db.session_todos("s1").unwrap().is_some());
+
+        let bad_payload = serde_json::json!({
+            "sessionId": "s1",
+            "event": "todos_update",
+            "payload": { "todos": "not-an-array" }
+        });
+        p.apply_interactive_event("s1", &bad_payload);
+        // todos_json was not overwritten with invalid payload
+        assert!(db.session_todos("s1").unwrap().unwrap().contains("t1"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
