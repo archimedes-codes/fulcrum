@@ -201,46 +201,9 @@ impl AgentLoop {
         // `call_with_retry`, so a turn never makes more than
         // `max_attempts` model calls).
         if let ProviderError::Retryable(_) = &err {
-            if let Some(delay) = self.retry.next_retry_delay() {
-                self.emit(RpcEvent::auto_retry_start {
-                    attempt: self.retry.attempt(),
-                    max_attempts: self.retry.max_attempts(),
-                    delay_ms: delay.as_millis() as u64,
-                    error_message: err.to_string(),
-                });
-                // The backoff RACES the cancel (finding 8 / the
-                // backoff nit — a cancelled turn must not wait out
-                // the delay, up to 8 s).
-                tokio::select! {
-                    _ = turn.cancelled() => {
-                        self.settle_cancelled(std::mem::take(&mut state.turn_tool_results));
-                        return TurnFlow::Return;
-                    }
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                for tc in &acc.tool_calls {
-                    let result = Self::abandoned_tool_result();
-                    let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                    self.emit(RpcEvent::tool_execution_end {
-                        tool_call_id: tc.id.clone(),
-                        tool_name: tc.name.clone(),
-                        result: result_value,
-                        is_error: true,
-                    });
-                }
-                if !acc.text.is_empty() || !acc.thinking.is_empty() || !acc.tool_calls.is_empty() {
-                    self.emit(RpcEvent::message_retracted);
-                }
-                self.compactor.turn_abandoned(&self.messages);
-                return TurnFlow::Continue;
-            }
-            self.emit(RpcEvent::auto_retry_end {
-                success: false,
-                attempt: self.retry.attempt(),
-                final_error: Some(err.to_string()),
-            });
-            self.settle_error(std::mem::take(&mut state.turn_tool_results));
-            return TurnFlow::Return;
+            return self
+                .retry_abandoned_attempt(&err.to_string(), turn, state, acc)
+                .await;
         }
 
         // (ADR 0045) A mid-stream overflow:
@@ -270,6 +233,112 @@ impl AgentLoop {
         }
 
         eprintln!("harness: mid-stream model error: {err}");
+        self.settle_error(std::mem::take(&mut state.turn_tool_results));
+        TurnFlow::Return
+    }
+
+    /// (issue #64) The turn ended `Stop` having streamed NEITHER text NOR a
+    /// tool call. That is not a turn: it is the signature of a model that wrote
+    /// its tool call as literal `<invoke name="…">` text INTO the reasoning
+    /// channel, so the API answers `content: ""` / `tool_calls: null` and the
+    /// stream reads as a clean stop.
+    ///
+    /// The reasoning text is streamed to the UI but is NEVER persisted (the loop
+    /// persists `acc.text` alone), so what the model actually asked for is
+    /// invisible downstream: pre-fix the loop accepted this attempt, persisted
+    /// the identical 33-byte row `{"role":"assistant","content":"","tool_calls":[]}`
+    /// and settled as a clean stop — nothing executed, nothing reported, and the
+    /// user re-prompted every single time (13 such turns in 23 519 assistant
+    /// rows; ALL 13 followed by a `user` row, 6 of them ending the session).
+    ///
+    /// A `Retryable` condition like any other, merely detected AFTER the stream
+    /// instead of during it, so the recovery is the mid-stream one
+    /// ([`Self::retry_abandoned_attempt`]) — the same shared budget, the same
+    /// retraction, the same `Continue`; with the budget spent, a VISIBLE
+    /// failure. `thinking` deliberately does not gate the detection: non-empty
+    /// reasoning IS the shape of this failure, and it is exactly what the DB
+    /// cannot show, which is why the `eprintln` below is mandatory — it is the
+    /// only trace this turn ever leaves behind.
+    pub(super) async fn handle_empty_turn(
+        &mut self,
+        turn: &CancellationToken,
+        state: &mut TurnLoopState,
+        acc: &TurnAccumulator,
+    ) -> TurnFlow {
+        eprintln!(
+            "harness: empty model turn: `stop` with no text and no tool call \
+             (the signature of a tool call emitted as reasoning text — that text is \
+             never persisted, so this line is the only trace of the lost call)"
+        );
+        self.retry_abandoned_attempt(
+            "the model returned an empty reply with no tool call",
+            turn,
+            state,
+            acc,
+        )
+        .await
+    }
+
+    /// The ONE "abandon this attempt and re-run the turn" recovery, shared by
+    /// the two triggers that need it: a mid-stream `Retryable` error and a turn
+    /// that stopped empty. It checks the SHARED attempt budget
+    /// (`next_retry_delay` shares the counter with `call_with_retry`, so a turn
+    /// never makes more than `max_attempts` model calls — no second counter
+    /// exists for a reason), announces `auto_retry_start`, races the backoff
+    /// against the turn's cancel (finding 8 / the backoff nit — a cancelled turn
+    /// must not wait out the delay, up to 8 s), closes any tool call the
+    /// abandoned attempt had started, RETRACTS the partial reply when the
+    /// attempt streamed anything (ADR 0048: the retry reuses the `messageId`, so
+    /// without the retraction the dead attempt welds onto the retry), notes the
+    /// abandon with the compactor, and re-runs the turn.
+    ///
+    /// Budget exhausted: `auto_retry_end { success: false }` + the error settle
+    /// — the attempt is NOT replaced by a silently-empty message.
+    async fn retry_abandoned_attempt(
+        &mut self,
+        error_message: &str,
+        turn: &CancellationToken,
+        state: &mut TurnLoopState,
+        acc: &TurnAccumulator,
+    ) -> TurnFlow {
+        if let Some(delay) = self.retry.next_retry_delay() {
+            self.emit(RpcEvent::auto_retry_start {
+                attempt: self.retry.attempt(),
+                max_attempts: self.retry.max_attempts(),
+                delay_ms: delay.as_millis() as u64,
+                error_message: error_message.to_string(),
+            });
+            // The backoff RACES the cancel (finding 8 / the
+            // backoff nit — a cancelled turn must not wait out
+            // the delay, up to 8 s).
+            tokio::select! {
+                _ = turn.cancelled() => {
+                    self.settle_cancelled(std::mem::take(&mut state.turn_tool_results));
+                    return TurnFlow::Return;
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            for tc in &acc.tool_calls {
+                let result = Self::abandoned_tool_result();
+                let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
+                self.emit(RpcEvent::tool_execution_end {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    result: result_value,
+                    is_error: true,
+                });
+            }
+            if !acc.text.is_empty() || !acc.thinking.is_empty() || !acc.tool_calls.is_empty() {
+                self.emit(RpcEvent::message_retracted);
+            }
+            self.compactor.turn_abandoned(&self.messages);
+            return TurnFlow::Continue;
+        }
+        self.emit(RpcEvent::auto_retry_end {
+            success: false,
+            attempt: self.retry.attempt(),
+            final_error: Some(error_message.to_string()),
+        });
         self.settle_error(std::mem::take(&mut state.turn_tool_results));
         TurnFlow::Return
     }

@@ -35,8 +35,8 @@ use crate::agent::harness::catalog::{Model, ModelCatalog};
 use crate::agent::harness::compact::{self, Compactor};
 use crate::agent::harness::dispatch::SubagentDispatcher;
 use crate::agent::harness::provider::{
-    ChatMessage, ChatRole, MessageContent, ModelOptions, ModelRequest, Provider, ProviderError,
-    ToolSpec,
+    ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest, Provider,
+    ProviderError, ToolSpec,
 };
 use crate::agent::harness::retry::RetryPolicy;
 use crate::agent::harness::store::Store;
@@ -706,6 +706,40 @@ impl AgentLoop {
                     .handle_mid_stream_error(err, turn, &mut state, &acc)
                     .await
                 {
+                    turn::TurnFlow::Continue => continue,
+                    turn::TurnFlow::Return => return,
+                }
+            }
+
+            // A `stop` that streamed NEITHER text NOR a tool call is not a
+            // turn — it is the signature of a model that emitted its tool call
+            // as literal `<invoke name="…">` text INSIDE the reasoning channel,
+            // so the API reports `content: ""` / `tool_calls: null` and the
+            // stream reads as a clean stop. The reasoning text is streamed to
+            // the UI but NEVER persisted (this site persists `acc.text` alone),
+            // so the intended call is invisible everywhere downstream: pre-fix
+            // this arm accepted the attempt, wrote the 33-byte empty assistant
+            // row and settled as a clean stop, and the user re-prompted every
+            // time. It is therefore retried on the SHARED budget, and the empty
+            // message is never pushed / persisted; with the budget spent the
+            // turn settles as a VISIBLE failure. `acc.thinking` deliberately
+            // does NOT gate this — non-empty reasoning IS the shape of the
+            // failure — and `handle_empty_turn`'s `eprintln` is the only trace
+            // it leaves, since the reasoning text itself is lost.
+            //
+            // `Some(Stop)` keeps this disjoint from `consume_stream`, which has
+            // already turned a stream that ended with NO `finish_reason` into a
+            // `Retryable` error handled above.
+            //
+            // BEFORE `note_success` (and so before `message_end` / the push /
+            // the persist) for the same reason the mid-stream arm above is: an
+            // abandoned attempt is not a successful call, so it must not report
+            // `auto_retry_end { success: true }` a moment before retrying again.
+            if acc.finish == Some(FinishReason::Stop)
+                && acc.text.is_empty()
+                && acc.tool_calls.is_empty()
+            {
+                match self.handle_empty_turn(turn, &mut state, &acc).await {
                     turn::TurnFlow::Continue => continue,
                     turn::TurnFlow::Return => return,
                 }

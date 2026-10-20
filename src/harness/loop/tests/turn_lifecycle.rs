@@ -10,7 +10,7 @@ use super::super::*;
 use super::support::*;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::provider::{
-    ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
+    ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
 };
 use crate::agent::harness::retry::RetryPolicy;
 use crate::agent::tools::ContentBlock;
@@ -587,6 +587,546 @@ async fn a_cancel_during_the_retry_backoff_settles_fast() {
     })
     .await
     .expect("agent_settled after the cancel");
+}
+
+/// (issue #64) THE regression this exists for: a `Done(Stop)` that carried
+/// no text and no tool call is NOT a turn — it is the signature of a model
+/// that wrote its tool call as literal `<invoke name="…">` text INTO the
+/// reasoning channel, so the API answers `content: ""` / `tool_calls: null`
+/// and the stream looks like a clean stop. `thinking` is streamed to the UI
+/// but never persisted, so the intended tool call is invisible in the DB:
+/// pre-fix the loop accepted the attempt and persisted the 33-byte row
+/// `{"role":"assistant","content":"","tool_calls":[]}` — nothing ran, nothing
+/// was reported, and the user had to re-prompt (13 of these in 23 519
+/// assistant rows, ALL of them followed by a `user` row). It now reuses the
+/// mid-stream `Retryable` recovery: retract the abandoned attempt, spend the
+/// SHARED retry budget, re-run the turn, persist nothing.
+#[tokio::test]
+async fn an_empty_stop_turn_is_retried_and_never_persisted() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        // The production shape: reasoning text (the leaked `<invoke>`), no
+        // text, no tool call, a clean `stop`.
+        Some(vec![
+            ProviderEvent::ThinkingDelta(
+                "I will read the file now. <invoke name=\"read\">".to_string(),
+            ),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+        // The retry, which answers properly.
+        Some(vec![
+            ProviderEvent::TextDelta("here is the file".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("read the file")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    // The retry happened, on the SHARED budget (`attempt` is the RETRY's own
+    // number — the second model call — exactly as the mid-stream branch emits).
+    let start = events
+        .iter()
+        .find(|e| matches!(e, RpcEvent::auto_retry_start { .. }))
+        .expect("the empty stop retried");
+    assert!(
+        matches!(
+            start,
+            RpcEvent::auto_retry_start {
+                attempt: 2,
+                max_attempts: 5,
+                error_message,
+                ..
+            } if error_message.contains("empty")
+        ),
+        "the retry names the condition in user terms, got {start:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the empty attempt + the retry"
+    );
+    // The abandoned attempt streamed thinking, so it is RETRACTED (the same
+    // gate the mid-stream retry uses) — otherwise the leaked reasoning welds
+    // onto the retry's reply in every same-`messageId` consumer.
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "message_retracted").count(),
+        1,
+        "the thinking-only attempt was retracted, got {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "message_end").count(),
+        1,
+        "ONE message_end — the empty attempt never announced a message, got {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "message_start").count(),
+        1,
+        "ONE message_start — the retry reuses the announced message, got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "agent_settled"),
+        "the turn settled, got {kinds:?}"
+    );
+    // The abandoned attempt is NOT a successful call, so the retry it triggered
+    // is never reported `success: true` before the retry has even answered: the
+    // ONE `auto_retry_end` is the real success, and it comes after the retry's
+    // `message_end` would have been — i.e. the detection sits BEFORE
+    // `note_success`.
+    let ends: Vec<&RpcEvent> = events
+        .iter()
+        .filter(|e| matches!(e, RpcEvent::auto_retry_end { .. }))
+        .collect();
+    assert_eq!(
+        ends.len(),
+        1,
+        "ONE auto_retry_end — the abandoned attempt reported no success, got {kinds:?}"
+    );
+    assert!(
+        matches!(
+            ends[0],
+            RpcEvent::auto_retry_end {
+                success: true,
+                final_error: None,
+                ..
+            }
+        ),
+        "the single auto_retry_end is the retry's real success, got {:?}",
+        ends[0]
+    );
+
+    // THE bug: the 33-byte empty assistant row must not exist — neither in
+    // the model transcript nor in the store a reload reads back.
+    assert!(
+        !loop_.messages.iter().any(|m| {
+            matches!(&m.content, MessageContent::Text(t) if t.is_empty())
+                && matches!(m.role, ChatRole::Assistant)
+        }),
+        "the empty attempt was never pushed into the transcript, got {:?}",
+        loop_.messages
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    let assistants: Vec<&ChatMessage> = loaded
+        .iter()
+        .filter(|m| matches!(m.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        1,
+        "exactly ONE assistant row (the retry's), got {loaded:?}"
+    );
+    assert_eq!(
+        assistants[0].content,
+        MessageContent::Text("here is the file".to_string()),
+        "the only persisted assistant row is the retry's reply"
+    );
+}
+
+/// The same path with NOTHING streamed at all (`Done(Stop)` and no deltas):
+/// the turn is still empty, so it is still retried — and since nothing
+/// streamed there is nothing to retract (ADR 0048's silence rule).
+#[tokio::test]
+async fn a_stop_that_streamed_nothing_at_all_is_retried() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        Some(vec![ProviderEvent::Done(FinishReason::Stop)]),
+        Some(vec![
+            ProviderEvent::TextDelta("ok".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("hello")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RpcEvent::auto_retry_start { .. })),
+        "an empty turn with nothing streamed still retried, got {kinds:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the empty attempt + the retry"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "message_retracted"),
+        "nothing streamed, so nothing is retracted, got {kinds:?}"
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert_eq!(
+        loaded
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Assistant))
+            .count(),
+        1,
+        "no empty assistant row survived the retry, got {loaded:?}"
+    );
+}
+
+/// The budget spent: an empty turn settles as a VISIBLE failure
+/// (`auto_retry_end { success: false }` + the error settle) and still
+/// persists NO empty row. A loud failure is the correct outcome — the DB's
+/// silent 33-byte rows are the bug.
+#[tokio::test]
+async fn an_empty_stop_with_an_exhausted_budget_settles_as_an_error() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::ThinkingDelta("thinking <invoke name=\"read\">".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        // ONE attempt: the first call spends the budget, so the empty turn
+        // has nothing left to retry with.
+        RetryPolicy::new_with(1, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("hello")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    let end = events
+        .iter()
+        .find(|e| matches!(e, RpcEvent::auto_retry_end { .. }))
+        .expect("the exhausted budget reports the failure");
+    assert!(
+        matches!(
+            end,
+            RpcEvent::auto_retry_end {
+                success: false,
+                final_error: Some(_),
+                ..
+            }
+        ),
+        "the turn failed LOUDLY, got {end:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "auto_retry_start"),
+        "no budget, so no retry was announced, got {kinds:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a turn never makes more than `max_attempts` model calls"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "agent_end"),
+        "an exhausted empty turn is not a clean stop, got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "agent_settled"),
+        "the failed turn still settles, got {kinds:?}"
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert!(
+        !loaded.iter().any(|m| matches!(m.role, ChatRole::Assistant)),
+        "a failed turn persists NO assistant row, got {loaded:?}"
+    );
+}
+
+/// The guard rail for the detection condition: a reply WITH text and no tool
+/// call is the normal end of a turn — one `message_end`, one persisted row,
+/// no retry.
+#[tokio::test]
+async fn a_reply_with_text_and_no_tool_call_settles_normally() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("a normal reply".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("hello")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a normal reply costs one model call"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "message_end").count(),
+        1,
+        "the reply ended normally, got {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "auto_retry_start"),
+        "a non-empty reply is never retried, got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "agent_end"),
+        "the turn ended cleanly, got {kinds:?}"
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert_eq!(
+        loaded
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Assistant))
+            .count(),
+        1,
+        "the reply was persisted once, got {loaded:?}"
+    );
+}
+
+/// The OTHER guard rail, and the case the condition must NOT catch: empty
+/// text with a tool call is a perfectly legitimate turn (`finish` is
+/// `ToolCalls`, and the tool call is what the turn is made of). Detection
+/// keyed on `Some(Stop)` + no tool calls leaves it untouched.
+#[tokio::test]
+async fn an_empty_text_tool_calls_turn_is_not_treated_as_empty() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "ls".to_string(),
+                arguments: json!({ "path": "." }),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done with ls".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("list the dir")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the tool-call turn ran, then the model answered — no retry"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "auto_retry_start"),
+        "an empty-text `ToolCalls` turn is legitimate, got {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "agent_end"),
+        "the turn ended cleanly, got {kinds:?}"
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert!(
+        loaded
+            .iter()
+            .any(|m| matches!(m.role, ChatRole::Assistant) && m.tool_calls.is_some()),
+        "the tool-call row was persisted with its calls, got {loaded:?}"
+    );
+}
+
+/// Drain every event the (already-awaited, so finished) turn emitted.
+fn drain_events(rx: &mut mpsc::UnboundedReceiver<RpcEvent>) -> Vec<RpcEvent> {
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    events
+}
+
+/// The empty turn spends the SAME budget the retry ladder owns — there is no
+/// second counter, so a turn never makes more than `max_attempts` model calls
+/// however many distinct conditions fire inside it. Here a mid-stream
+/// `Retryable` error takes the first retry of a two-attempt budget, so the
+/// empty turn that follows has nothing left: it settles as a failure after
+/// exactly TWO model calls.
+#[tokio::test]
+async fn an_empty_turn_shares_the_retry_budget_with_the_ladder() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::TextDelta("part".to_string()),
+            ProviderEvent::Error(ProviderError::Retryable("transient".to_string())),
+        ]),
+        Some(vec![
+            ProviderEvent::ThinkingDelta("reasoning only".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+        // The reply this turn can never reach — the budget is spent.
+        Some(vec![
+            ProviderEvent::TextDelta("unreachable".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(2, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("hello")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "auto_retry_start").count(),
+        1,
+        "the ladder's retry consumed the budget, so the empty turn retried zero times, \
+         got {kinds:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a turn never exceeds `max_attempts` model calls, no matter which conditions fire"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            RpcEvent::auto_retry_end {
+                success: false,
+                final_error: Some(_),
+                ..
+            }
+        )),
+        "the exhausted empty turn failed LOUDLY, got {kinds:?}"
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert!(
+        !loaded.iter().any(|m| matches!(m.role, ChatRole::Assistant)),
+        "no empty assistant row was persisted for the abandoned turn, got {loaded:?}"
+    );
+}
+
+/// An abandoned attempt is not a successful call: the detection sits BEFORE
+/// `note_success` for the same reason the mid-stream arm does, so a turn that
+/// retries twice never announces `auto_retry_end { success: true }` between the
+/// two `auto_retry_start`s (a "success" for an attempt that produced nothing).
+#[tokio::test]
+async fn an_empty_turn_after_a_ladder_retry_reports_no_success() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::TextDelta("part".to_string()),
+            ProviderEvent::Error(ProviderError::Retryable("transient".to_string())),
+        ]),
+        Some(vec![
+            ProviderEvent::ThinkingDelta("reasoning only".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("finally".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("hello")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the dying call + the empty turn + the reply that settled"
+    );
+    let starts: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| *k == "auto_retry_start")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        starts.len(),
+        2,
+        "both conditions retried, on the shared budget, got {kinds:?}"
+    );
+    let end = kinds.iter().position(|k| *k == "auto_retry_end");
+    assert!(
+        matches!(end, Some(e) if e > starts[1]),
+        "no success is reported before the SECOND retry even starts, got {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "auto_retry_end").count(),
+        1,
+        "ONE auto_retry_end — the real success, got {kinds:?}"
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    let assistants: Vec<&ChatMessage> = loaded
+        .iter()
+        .filter(|m| matches!(m.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        1,
+        "only the settling reply was persisted, got {loaded:?}"
+    );
+    assert_eq!(
+        assistants[0].content,
+        MessageContent::Text("finally".to_string()),
+        "the persisted row is the real reply"
+    );
 }
 
 /// (ADR 0017) `prepend_system` PERSISTS the leading system message at
