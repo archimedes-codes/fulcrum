@@ -37,9 +37,19 @@ pub struct LaunchConfig {
     pub system_prompt: Option<String>,
     /// Resolved model ("provider/id" or "provider/id:<thinking>"); `None` = pi default.
     pub model: Option<String>,
-    /// Explicit thinking level from the tool call ONLY (the frontmatter's
-    /// `thinking` moved to `frontmatter_thinking` — the dispatch layers it
-    /// LAST).
+    /// The thinking level from the OVERRIDE layer or the explicit tool-call
+    /// param — NEVER the frontmatter's own value, and never the model key's
+    /// `:<level>` suffix.
+    ///
+    /// This field is the TOP rung of the dispatch's thinking chain
+    /// (`subagent_flow.rs`: this > the model key's suffix >
+    /// `frontmatter_thinking`), so whatever lands in it outranks the suffix.
+    /// ADR 0066 put the `agentOverrides` thinking level here — the only layer
+    /// below the explicit param allowed to — and `resolve_agent_launch` writes
+    /// it only when the model that just resolved advertises the level, so a
+    /// demoted override never reaches a child (nor gets reported as effective,
+    /// ADR 0068). The frontmatter's `thinking` stays in
+    /// `frontmatter_thinking`, the LAST rung.
     pub thinking: Option<String>,
     /// The frontmatter's `thinking` (the dispatch resolves the thinking in
     /// the doc-correct order: explicit > model-key `:<level>` suffix >

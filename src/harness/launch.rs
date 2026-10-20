@@ -1,22 +1,295 @@
-//! The launch-resolution layer (ADR 0020 / 0023 — extracted from
+//! The launch-resolution layer (ADR 0020 / 0023 / 0066 — extracted from
 //! `r#loop` in the loop.rs decomposition): resolve a subagent's
 //! `agentName` against the discovered Agent definitions and layer the
-//! frontmatter UNDER the explicit launch params. A PURE function of its
+//! frontmatter UNDER the explicit launch params, with the global
+//! `agentOverrides` layer (ADR 0066) between them. A PURE function of its
 //! inputs (the catalog, the settings dir, and the space cwd — no loop
 //! state), hence its own module.
+//!
+//! The chain is `explicit subagent param > override > frontmatter > parent
+//! defaults` (ADR 0067), and each layer supplies each of `model` / `thinking`
+//! / `tools` INDEPENDENTLY. `resolve_launch` is the dispatch's entry point;
+//! `resolve_agent_launch` is the seam the Agents modal's command shares
+//! (ADR 0068), so the modal cannot print a config the next dispatch will not
+//! run.
 
 use std::path::Path;
+
+use serde::Serialize;
 
 use crate::agent::harness::catalog::ModelCatalog;
 use crate::agent::harness::tool_specs;
 use crate::agent::harness::ModelRef;
 use crate::agent::subagent::LaunchConfig;
+use crate::agents::AgentDefinition;
+use crate::config::{AgentOverrideFields, Settings};
 
-/// Resolve `agentName` against the discovered Agent definitions and
-/// layer the frontmatter UNDER the explicit launch params (ADR 0020
-/// — explicit > frontmatter > parent defaults). `agentName` empty /
-/// no match → the `launch` is returned VERBATIM (the label-only,
+/// The override layer (ADR 0066: ONE global map in `settings.json`, so ONE
+/// rung — there is no per-Space layer to merge, and ADR 0066's *Deferred:
+/// per-Space* door is a second field on this struct plus one more `or_else`).
+///
+/// `global: None` covers three causes with one state — no settings file at all
+/// (the `config_dir: None` case: a layer that cannot speak, not an empty map),
+/// an empty map, and no entry under any casing of the name. All three mean
+/// "this layer has no opinion"; none of them may be confused with `Some(entry)`
+/// by a caller.
+pub(crate) struct OverrideLayer<'a> {
+    pub global: Option<&'a AgentOverrideFields>,
+}
+
+/// The resolver's output: the config to launch with, plus WHICH LAYER supplied
+/// each field (ADR 0068 — the Agents modal prints the source beside the value,
+/// so a user can ask "why is scout running that model").
+///
+/// The three `*_source` fields have TWO readers, and that sharing is the point:
+/// `commands::agents::agent_config` (the modal) and `resolve_launch` (the
+/// dispatch) both go through `resolve_agent_launch`, so a layer added to one
+/// and forgotten in the other is the drift this struct exists to prevent.
+pub(crate) struct ResolvedLaunch {
+    pub launch: LaunchConfig,
+    /// Which layer supplied `model`; `Parent` when none did.
+    pub model_source: OverrideSource,
+    /// Which layer supplied `thinking`; `Parent` when none did. A demoted
+    /// override level (one the resolved model does not advertise) is NEITHER
+    /// written NOR reported, so this never reads `Override` for a level the
+    /// child will not use.
+    pub thinking_source: OverrideSource,
+    /// Which layer supplied `tools`; `Parent` when none did.
+    pub tools_source: OverrideSource,
+}
+
+/// Which layer supplied a resolved field — the label space of the Agents modal
+/// (`override` / `file` / `parent`, ADR 0068) and NOTHING else. A fourth layer
+/// (ADR 0066's per-Space door) means adding a variant here, and the exhaustive
+/// match in Task 2's test is what makes that a compile error rather than a
+/// silent label.
+///
+/// `pub`, NOT `pub(crate)`: Task 2's `AgentConfigDto` is `pub` and carries a
+/// source struct, and clippy's `private_interfaces` fires transitively down
+/// that graph under CI's `-D warnings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverrideSource {
+    /// `settings.json`'s `agentOverrides` (ADR 0066).
+    Override,
+    /// The Agent definition's frontmatter.
+    File,
+    /// Nothing BELOW the explicit `subagent` param spoke, so the child
+    /// inherits — which is NOT a promise: a dispatch that passes `model:`
+    /// overrides what a `parent` row shows, hence the modal's
+    /// `Inherits parent` wording (ADR 0068). The label space has no word for
+    /// "the explicit param itself" (no live modal can observe one, and
+    /// `list_agent_config` passes an empty `LaunchConfig`), so a field the
+    /// explicit param supplied reports `Parent`.
+    Parent,
+}
+
+/// Pick the stored entry for `agent_name` out of the settings (ADR 0066).
+///
+/// THE one place that decides which stored entry applies — the dispatch and
+/// Task 2's `list_agent_config` both call it, so they cannot disagree about
+/// what the modal shows versus what runs. The scan is CASE-INSENSITIVE (ADR
+/// 0023's rule, moved out of the old `model` arm because it now has to find the
+/// entry ONCE for three fields) and the STORED KEY is never rewritten: the UI
+/// writes `def.name` verbatim, and a hand-edited mixed-case key still matches.
+///
+/// The named lifetime is REQUIRED, and `'_` does not substitute for it: with
+/// TWO elided reference inputs (the settings AND `agent_name`) rustc cannot
+/// tell which one the returned borrow comes from and refuses the signature with
+/// E0106 ("missing lifetime specifier") — verified on the pinned toolchain.
+pub fn override_layer<'a>(settings: Option<&'a Settings>, agent_name: &str) -> OverrideLayer<'a> {
+    OverrideLayer {
+        // `None` settings (no file) and "no entry" both give `global: None` —
+        // see `OverrideLayer`'s note on the three collapsed causes.
+        global: settings.and_then(|settings| {
+            settings
+                .agent_overrides
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(agent_name))
+                .map(|(_, entry)| entry)
+        }),
+    }
+}
+
+/// The FIRST rung that supplies a value, plus the name of the layer that
+/// supplied it (`Parent` when none did).
+///
+/// Every field of the chain runs through here, so the rungs of ONE field are
+/// listed in ONE expression — and a new layer (ADR 0066's *Deferred: per-Space*
+/// door: one more map folded at load time) joins that list in order, in the one
+/// place a reviewer can see it. A layer added to the dispatch and forgotten in
+/// the modal is the drift ADR 0068 exists to prevent; a shared list of rungs is
+/// the shape that makes it hard to do by accident.
+///
+/// A rung whose value needs no filtering (the explicit `subagent` params) is
+/// passed through UNFILTERED as the first rung; a filtered or soft-degraded
+/// candidate arrives as `None` when it does not survive, which is precisely
+/// "this layer does not speak" (ADR 0067).
+fn first_speaking<T>(
+    rungs: impl IntoIterator<Item = (OverrideSource, Option<T>)>,
+) -> (Option<T>, OverrideSource) {
+    rungs
+        .into_iter()
+        .find_map(|(source, value)| value.map(|value| (Some(value), source)))
+        .unwrap_or((None, OverrideSource::Parent))
+}
+
+/// Resolve a launch against the definition + the override layer: per field,
+/// the FIRST layer that supplies a value wins (`explicit > override >
+/// frontmatter > parent`), each field independently.
+///
+/// This is the shared seam ADR 0068 asks for — `resolve_launch` (the dispatch)
+/// and `list_agent_config` (the modal) call it, so filtering and soft
+/// degradation exist in exactly one place.
+pub(crate) fn resolve_agent_launch(
+    explicit: &LaunchConfig,
+    def: &AgentDefinition,
+    layer: &OverrideLayer<'_>,
+    catalog: &ModelCatalog,
+) -> ResolvedLaunch {
+    // ── model ───────────────────────────────────────────────────────────
+    // The explicit param is NEVER degraded (it is the model's current intent
+    // — `dispatch_native` still fails an unknown one, unchanged). Below it,
+    // the override and the frontmatter are SOFT: a value whose bare key is not
+    // in the catalog is SKIPPED, never a failed dispatch (ADR 0023, kept by
+    // ADR 0066). The `:<level>` suffix is stripped ONLY for the resolvability
+    // check (`ModelRef::parse` — the last-`:` strip, mirroring
+    // `dispatch_subagent`'s; a ref whose bare part has no `/` parses to `None`
+    // and can never be in the catalog, so it degrades identically to the old
+    // whole-string behaviour); the value that survives is the VERBATIM string,
+    // because the suffix is a thinking-level candidate handled downstream.
+    let resolve = |candidate: &str| {
+        let bare = ModelRef::parse(candidate)
+            .map(|r| r.key.to_string())
+            .unwrap_or_else(|| candidate.to_string());
+        crate::agent::session::resolve_composed_model(catalog, &bare)
+    };
+    let soft = |candidate: &str| resolve(candidate).is_some();
+    // The rungs, in order: the explicit param (NEVER degraded — see above), the
+    // override, the frontmatter.
+    let (model, model_source) = first_speaking([
+        (OverrideSource::Parent, explicit.model.clone()),
+        (
+            OverrideSource::Override,
+            layer
+                .global
+                .and_then(|o| o.model.as_ref())
+                .filter(|m| soft(m))
+                .cloned(),
+        ),
+        (
+            OverrideSource::File,
+            def.model.as_ref().filter(|m| soft(m)).cloned(),
+        ),
+    ]);
+    // ── thinking ────────────────────────────────────────────────────────
+    // WRITE and REPORT are one decision here, and only the OVERRIDE level may
+    // ever enter `LaunchConfig::thinking`: the dispatch's chain is
+    // `launch.thinking` > the model key's `:<level>` suffix >
+    // `frontmatter_thinking` (`subagent_flow.rs`), so writing the FILE's value
+    // or the suffix into that field would promote it to the TOP rung and change
+    // behaviour that exists today (`frontmatter_thinking` keeps carrying ONLY
+    // the frontmatter's own value, untouched).
+    //
+    // The candidate is validated against the model the MODEL layer JUST
+    // resolved, because the dispatch validates after its own chain and DROPS a
+    // level the model does not advertise — so writing/reporting an overridden
+    // level the child never uses is exactly the ADR 0068 lie. A DEMOTED level is
+    // neither written nor reported, which is why there is no `suppressed_
+    // thinking` field: the demotion is fully assertable as `thinking == None`
+    // plus `source != Override`. (An explicit param, when present, is never
+    // filtered — its own validation belongs to the dispatch.)
+    let advertises = |level: &str| {
+        // No model layer spoke → the child runs the PARENT's model, which this
+        // function cannot see. SOFT-PASS (write + report), exactly as
+        // `Model::supports_thinking_level` soft-passes an EMPTY advertised set
+        // (`catalog::supports_thinking_level_empty_set_soft_passes`): the
+        // dispatch still filters the level against the model it resolved, and
+        // demoting here would silently discard a level the parent model almost
+        // certainly does advertise.
+        model
+            .as_ref()
+            .and_then(|m| resolve(m))
+            .is_none_or(|m| m.supports_thinking_level(level))
+    };
+    let (thinking, thinking_source) = match explicit.thinking.clone() {
+        Some(level) => (Some(level), OverrideSource::Parent),
+        None => match layer.global.and_then(|o| o.thinking.as_ref()) {
+            Some(level) if advertises(level) => (Some(level.clone()), OverrideSource::Override),
+            // Absent, or demoted because the winning model lacks it.
+            _ => (None, OverrideSource::Parent),
+        },
+    };
+    // ── tools ───────────────────────────────────────────────────────────
+    // An explicit `tools` param is NEVER filtered here (its semantics —
+    // verbatim minus `subagent`/`list_agents`, `dispatch_native` — are
+    // unchanged, and it stays the ONLY layer that can hand a child zero tools).
+    // The override and the frontmatter share BOTH rules (ADR 0067): unknown
+    // names dropped, `subagent` / `list_agents` stripped so no layer grants a
+    // child a delegation route, and a list that empties out treated as ABSENT —
+    // so no override can zero out a child by a typo or a stale name.
+    let specs = tool_specs();
+    let narrow = |names: &[String]| {
+        let known: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                name.as_str() != "subagent"
+                    && name.as_str() != "list_agents"
+                    && specs.iter().any(|s| s.name == **name)
+            })
+            .cloned()
+            .collect();
+        (!known.is_empty()).then_some(known)
+    };
+    let (tools, tools_source) = first_speaking([
+        // The explicit list is passed VERBATIM — this layer is the only one
+        // that can hand a child zero tools (ADR 0067).
+        (OverrideSource::Parent, explicit.tools.clone()),
+        (
+            OverrideSource::Override,
+            layer
+                .global
+                .and_then(|o| o.tools.as_ref())
+                .and_then(|t| narrow(t)),
+        ),
+        (
+            OverrideSource::File,
+            def.tools.as_ref().and_then(|t| narrow(t)),
+        ),
+    ]);
+    // An EMPTY frontmatter body means "no system prompt" (the `or_else` must not
+    // turn it into `Some("")` — `dispatch_native` would prepend an empty
+    // message). The system-prompt layering is unchanged by ADR 0066 (an
+    // override cannot speak about prompts).
+    let system_prompt = explicit
+        .system_prompt
+        .clone()
+        .or_else(|| (!def.system_prompt.is_empty()).then(|| def.system_prompt.clone()));
+    ResolvedLaunch {
+        launch: LaunchConfig {
+            system_prompt,
+            model,
+            thinking,
+            frontmatter_thinking: def.thinking.clone(),
+            tools,
+        },
+        model_source,
+        thinking_source,
+        tools_source,
+    }
+}
+
+/// Resolve `agentName` against the discovered Agent definitions and layer the
+/// override + the frontmatter UNDER the explicit launch params (ADR 0020 /
+/// 0066 — explicit > override > frontmatter > parent defaults). `agentName`
+/// empty / no match → the `launch` is returned VERBATIM (the label-only,
 /// config-less behavior — never an error).
+///
+/// The signature is deliberately unchanged (one production caller,
+/// `dispatch.rs`, and a large inline suite) — the ADR 0066 layer is added by
+/// DELEGATING to the shared `resolve_agent_launch`, so the `config_dir: None`
+/// path goes through the same selector as the modal instead of hand-rolling
+/// "no layer".
 pub(crate) fn resolve_launch(
     launch: &LaunchConfig,
     agent_name: &str,
@@ -34,108 +307,19 @@ pub(crate) fn resolve_launch(
     else {
         return launch.clone();
     };
-    // A frontmatter `model` that resolves to NOTHING (not in the
-    // catalog — a stale file) degrades to the next layer (the
-    // explicit param, else the parent model) — a stale file must not
-    // fail the dispatch. The `:<level>` suffix is stripped ONLY for
-    // the resolvability check (via `ModelRef::parse` — the last-`:`
-    // strip, mirroring `dispatch_subagent`'s); the stored value is
-    // the VERBATIM
-    // frontmatter string (the suffix is a thinking-level candidate
-    // handled downstream). An explicit `model` param is NEVER
-    // degraded here (it is the model's current intent —
-    // `dispatch_native` still fails it when unknown, unchanged).
-    // (ADR 0023) The per-agent model override (the settings'
-    // `subagentModels` — read at dispatch time: a settings edit takes
-    // effect on the NEXT dispatch, no restart; a missing/corrupt file
-    // yields the defaults → no override). SOFT, like the frontmatter:
-    // a value whose bare key resolves to NOTHING degrades to the next
-    // layer (a stale override must not fail the dispatch). CASE-
-    // INSENSITIVE by name (a case-insensitive SCAN — the stored key is
-    // NOT rewritten: the UI saves `def.name` verbatim, and a hand-edited
-    // mixed-case key must still match the case-insensitive `agentName`
-    // resolution).
-    let override_model = config_dir.and_then(|dir| {
-        crate::config::load_settings(dir)
-            .subagent_models
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.clone())
-    });
-    // ADR 0023 chain — see `resolve_model_ref` (not yet unified).
-    // The `:<level>` suffix strip is `ModelRef::parse` (last `:`);
-    // a ref whose BARE part is not a valid key (no `/`) parses to
-    // `None` — the old code used the whole string as the bare key,
-    // which failed `resolve_composed_model` identically (a key
-    // without `/` can never be in the catalog) — same degrade.
-    let model = launch
-        .model
-        .clone()
-        .or_else(|| {
-            override_model.as_ref().and_then(|m| {
-                let bare = ModelRef::parse(m)
-                    .map(|r| r.key.to_string())
-                    .unwrap_or_else(|| m.clone());
-                crate::agent::session::resolve_composed_model(catalog, &bare)
-                    .is_some()
-                    .then_some(m.clone())
-            })
-        })
-        .or_else(|| {
-            def.model.as_ref().and_then(|m| {
-                let bare = ModelRef::parse(m)
-                    .map(|r| r.key.to_string())
-                    .unwrap_or_else(|| m.clone());
-                crate::agent::session::resolve_composed_model(catalog, &bare)
-                    .is_some()
-                    .then_some(m.clone())
-            })
-        });
-    // Unknown tool names in the frontmatter are DROPPED (a file
-    // hint, not precise intent), as are the parent-guarded
-    // `subagent` / `list_agents` (they can never reach the child —
-    // `dispatch_native_inner` strips them — so a file `tools:
-    // [subagent]` must degrade to ABSENT, not zero the child out).
-    // A list that empties out is treated as ABSENT (the child is
-    // never zeroed out by a stale file). An explicit `tools` param
-    // is NEVER filtered here (its semantics — verbatim,
-    // `dispatch_native` minus `subagent`/`list_agents` — are
-    // unchanged). `then_some` (NOT `then`) — an absent `tools`
-    // stays `None`.
-    let specs = tool_specs();
-    let tools = launch.tools.clone().or_else(|| {
-        def.tools.as_ref().and_then(|t| {
-            let known: Vec<String> = t
-                .iter()
-                .filter(|name| {
-                    name.as_str() != "subagent"
-                        && name.as_str() != "list_agents"
-                        && specs.iter().any(|s| s.name == **name)
-                })
-                .cloned()
-                .collect();
-            (!known.is_empty()).then_some(known)
-        })
-    });
-    // An EMPTY frontmatter body means "no system prompt" (the
-    // `or_else` must not turn it into `Some("")` — `dispatch_native`
-    // would prepend an empty message).
-    let system_prompt = launch
-        .system_prompt
-        .clone()
-        .or_else(|| (!def.system_prompt.is_empty()).then(|| def.system_prompt.clone()));
-    // The thinking split (the doc-correct order — the dispatch resolves
-    // explicit > model-key suffix > frontmatter `thinking`): `thinking`
-    // holds the EXPLICIT param only; the frontmatter's `thinking` moves
-    // to its own field.
-    let frontmatter_thinking = def.thinking.clone();
-    LaunchConfig {
-        system_prompt,
-        model,
-        thinking: launch.thinking.clone(),
-        frontmatter_thinking,
-        tools,
-    }
+    // TWO bindings, never one. The one-statement form
+    // `override_layer(config_dir.map(load_settings).as_ref(), name)` is E0716
+    // ("temporary value dropped while borrowed"): `map` yields an owned
+    // `Option<Settings>` temporary, `.as_ref()` borrows it, and the returned
+    // `OverrideLayer<'_>` still borrows it when the statement ends. Verified
+    // against the pinned toolchain.
+    //
+    // Read at dispatch time (ADR 0023's property, kept): a settings edit takes
+    // effect on the NEXT dispatch, no restart; a missing/corrupt file yields
+    // the defaults → no override.
+    let settings = config_dir.map(crate::config::load_settings);
+    let layer = override_layer(settings.as_ref(), name);
+    resolve_agent_launch(launch, &def, &layer, catalog).launch
 }
 
 #[cfg(test)]
@@ -986,5 +1170,716 @@ mod tests {
             Some("low".to_string()),
             "the frontmatter's `thinking` moves to its own field"
         );
+    }
+
+    // ── (ADR 0066/0067/0068) The override layer: `explicit > override >
+    //    frontmatter > parent`, each field resolved independently ──────────
+
+    /// (ADR 0066 thinking) A fixture model that ADVERTISES thinking levels.
+    /// `fake_model` sets `supports_thinking: false` with an empty
+    /// `thinking_levels` — and an empty set SOFT-PASSES
+    /// (`catalog::supports_thinking_level_empty_set_soft_passes`), which makes
+    /// the "the winning model does not advertise the pinned level → demote"
+    /// rule UNTESTABLE against it. Every thinking-level assertion below uses
+    /// this model instead.
+    fn levelled_model(id: &str) -> Model {
+        Model {
+            thinking_levels: vec!["low".to_string(), "high".to_string()],
+            supports_thinking: true,
+            ..fake_model(id)
+        }
+    }
+
+    /// The two HOME-isolation guards plus the `Ctx` over the settings dir —
+    /// returned TOGETHER, because the guards must outlive the helper: the
+    /// assertions run in the caller's body, and `discover_agents` reads `HOME`
+    /// there (via `user_roots`). Dropping them at the end of a helper would
+    /// restore the real `~/.agents/agents` mid-test.
+    struct World {
+        /// Declared FIRST so it drops FIRST — the same ordering the existing
+        /// tests get from their `let _lock` / `let _restore` sequence, which
+        /// `RestoreHome`'s SAFETY comment depends on (the restore happens while
+        /// the `ENV_LOCK` is still held).
+        _restore: RestoreHome,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        ctx: Ctx,
+    }
+
+    /// Write a `settings.json` holding `agentOverrides` for `scout` (ADR 0066)
+    /// and an isolated HOME holding the `scout.md` definition, and return the
+    /// `Ctx` over them. Keeps the ADR 0066 tests below from repeating the
+    /// `env_lock` / `RestoreHome` / scratch-dir dance.
+    fn write_override_world(settings_body: &str, definition: &str) -> World {
+        let config_dir = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-settings-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("settings.json"), settings_body).unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(home.join(".agents/agents/scout.md"), definition).unwrap();
+        let lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard the `World` carries); no other thread
+        // mutates HOME concurrently.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let ctx = build_ctx(
+            vec![fake_model("m1"), fake_model("m2"), levelled_model("m3")],
+            Some(&config_dir),
+        );
+        World {
+            _restore: restore,
+            _lock: lock,
+            ctx,
+        }
+    }
+
+    /// So a test can hold the guards and read the `Ctx` through one binding
+    /// (`let ctx = write_override_world(..); ctx.catalog`).
+    impl std::ops::Deref for World {
+        type Target = Ctx;
+        fn deref(&self) -> &Ctx {
+            &self.ctx
+        }
+    }
+
+    /// (ADR 0066) The override layer beats the frontmatter for ALL THREE
+    /// fields at once — the chain is `explicit > override > frontmatter >
+    /// parent`. Today only the `model` arm of the override exists (ADR 0023's
+    /// `subagentModels`), so the `thinking` and `tools` assertions are the
+    /// missing behaviour.
+    #[test]
+    fn resolve_launch_the_override_beats_the_frontmatter_for_every_field() {
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": { "scout": { "model": "fake/m3", "thinking": "high", "tools": ["read"] } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [bash]\n---\nYou are a scout.\n",
+        );
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(
+            resolved.model,
+            Some("fake/m3".to_string()),
+            "the override model beats the frontmatter's"
+        );
+        assert_eq!(
+            resolved.thinking,
+            Some("high".to_string()),
+            "the override thinking beats the frontmatter's (and lands in `thinking`, \
+             the TOP rung of the dispatch's chain, so it outranks the model key's suffix)"
+        );
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["read".to_string()]),
+            "the override tools beat the frontmatter's"
+        );
+    }
+
+    /// (ADR 0066) PER-FIELD INDEPENDENCE: an entry pinning ONLY `model` lets
+    /// thinking and tools keep coming from the file. Each layer supplies each
+    /// field on its own — the shape that makes an override that says one thing
+    /// not silently mute the other two.
+    #[test]
+    fn resolve_launch_an_override_pinning_only_model_leaves_the_others_with_the_file() {
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": { "scout": { "model": "fake/m3" } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [bash]\n---\nYou are a scout.\n",
+        );
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(resolved.model, Some("fake/m3".to_string()));
+        assert_eq!(
+            resolved.thinking, None,
+            "`thinking` holds only the explicit param / the override — a file value \
+             never moves into it"
+        );
+        assert_eq!(
+            resolved.frontmatter_thinking,
+            Some("low".to_string()),
+            "the file's thinking still travels in its OWN field"
+        );
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["bash".to_string()]),
+            "the file's tools apply — the override does not speak"
+        );
+    }
+
+    /// (ADR 0066) The EXPLICIT param still beats the override for all three
+    /// fields (the override is a layer UNDER the `subagent` tool params, never
+    /// over them), and the explicit `tools` stay VERBATIM — unfiltered.
+    #[test]
+    fn resolve_launch_the_explicit_param_beats_the_override_for_every_field() {
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": { "scout": { "model": "fake/m3", "thinking": "high", "tools": ["read"] } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\nYou are a scout.\n",
+        );
+        let launch = LaunchConfig {
+            model: Some("fake/m1".to_string()),
+            thinking: Some("low".to_string()),
+            tools: Some(vec!["subagent".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve_launch(
+            &launch,
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(resolved.model, Some("fake/m1".to_string()));
+        assert_eq!(resolved.thinking, Some("low".to_string()));
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["subagent".to_string()]),
+            "an explicit `tools` list is NEVER filtered here (its verbatim semantics \
+             belong to `subagent_flow.rs`)"
+        );
+    }
+
+    /// (ADR 0067) An override NEVER SPEAKS BY BEING EMPTY: `tools: []` and a
+    /// list that filters down to nothing both fall through to the file, so no
+    /// override can hand a **Subagent session** zero tools. `subagent` /
+    /// `list_agents` are stripped at the override layer too — the recursion
+    /// guard now applies to every layer, not only the frontmatter's.
+    #[test]
+    fn resolve_launch_an_empty_or_filtered_empty_override_tools_list_falls_through() {
+        for (label, body) in [
+            (
+                "an empty list",
+                r#"{ "agentOverrides": { "scout": { "tools": [] } } }"#,
+            ),
+            (
+                "a list of unknown names",
+                r#"{ "agentOverrides": { "scout": { "tools": ["no-such-tool"] } } }"#,
+            ),
+            (
+                "a list of only the guarded names",
+                r#"{ "agentOverrides": { "scout": { "tools": ["subagent", "list_agents"] } } }"#,
+            ),
+        ] {
+            let ctx = write_override_world(
+                body,
+                "---\nname: scout\ndescription: Fast recon.\ntools: [read, bash]\n---\n",
+            );
+            let resolved = resolve_launch(
+                &LaunchConfig::default(),
+                "scout",
+                &ctx.catalog,
+                ctx.config_dir.as_deref(),
+                &ctx.space_cwd,
+            );
+            assert_eq!(
+                resolved.tools,
+                Some(vec!["read".to_string(), "bash".to_string()]),
+                "{label} must fall through to the file, never zero the child out"
+            );
+        }
+    }
+
+    /// (ADR 0066) A valid NARROWING override wins (the point of the field), and
+    /// the guarded names are dropped from a list that survives the filter — so
+    /// an override can never grant a child a delegation route.
+    #[test]
+    fn resolve_launch_a_narrowing_override_wins_and_the_guarded_names_are_stripped() {
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": { "scout": { "tools": ["read", "subagent", "no-such-tool"] } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\ntools: [read, bash]\n---\n",
+        );
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["read".to_string()]),
+            "the surviving name wins; `subagent` and the unknown name are dropped"
+        );
+    }
+
+    /// (ADR 0066 + the dispatch's validation) An override `thinking` the
+    /// RESOLVED model does not advertise is not written into `thinking` — the
+    /// dispatch drops it (`subagent_flow.rs`: `if !model.supports_thinking_level
+    /// { thinking = None }`), so writing/reporting it would be the ADR 0068 lie.
+    /// `fake/m3` advertises `low`/`high` only (`levelled_model`), so `xhigh`
+    /// demotes; the demoted override leaves no trace in `thinking`.
+    #[test]
+    fn resolve_launch_an_override_thinking_the_model_lacks_is_demoted() {
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": { "scout": { "model": "fake/m3", "thinking": "xhigh" } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\n",
+        );
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(resolved.model, Some("fake/m3".to_string()));
+        assert_eq!(
+            resolved.thinking, None,
+            "the pinned level is not advertised by the winning model — the dispatch \
+             would drop it, so the resolver must not promote it either"
+        );
+    }
+
+    /// (ADR 0066) The CASE-INSENSITIVE lookup now happens ONCE for three
+    /// fields: a capital stored key still selects the whole entry (the ADR 0023
+    /// `resolve_launch_case_insensitive_override_key` guarantee, widened), and
+    /// the entry's OTHER fields come along with it.
+    #[test]
+    fn resolve_launch_a_capital_override_key_selects_the_whole_entry() {
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": { "Scout": { "model": "fake/m3", "tools": ["read"] } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [bash]\n---\n",
+        );
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "Scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(
+            resolved.model,
+            Some("fake/m3".to_string()),
+            "the capital settings key matches the lowercase agent name"
+        );
+        assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
+    }
+
+    /// (ADR 0066) `config_dir: None` — no settings file at all — is a layer
+    /// that CANNOT SPEAK (not an empty map), and an EMPTY `agentOverrides` map
+    /// behaves identically: both leave the frontmatter in charge.
+    #[test]
+    fn resolve_launch_no_settings_and_an_empty_map_are_both_a_silent_layer() {
+        // (a) no `config_dir` at all.
+        let home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
+        std::fs::write(
+            home.join(".agents/agents/scout.md"),
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [read]\n---\n",
+        )
+        .unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let ctx = build_ctx(vec![fake_model("m1")], None);
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(resolved.model, Some("fake/m1".to_string()));
+        assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
+        drop(_restore);
+        drop(_lock);
+        // (b) a file whose map is EMPTY — the same outcome.
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": {} }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [read]\n---\n",
+        );
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "an empty map is no layer — the frontmatter applies"
+        );
+        assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
+    }
+
+    /// (ADR 0023, kept) An override-pinned model missing from the catalog
+    /// degrades SOFT to the frontmatter (a stale override must never fail the
+    /// dispatch), while the entry's other fields keep applying — the fields are
+    /// resolved independently, so a stale model cannot mute a valid tools pin.
+    #[test]
+    fn resolve_launch_a_stale_override_model_degrades_and_the_other_fields_survive() {
+        let ctx = write_override_world(
+            r#"{ "agentOverrides": { "scout": { "model": "fake/nope", "tools": ["read"] } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [bash]\n---\n",
+        );
+        let resolved = resolve_launch(
+            &LaunchConfig::default(),
+            "scout",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(
+            resolved.model,
+            Some("fake/m1".to_string()),
+            "the stale override model degrades to the frontmatter (soft)"
+        );
+        assert_eq!(
+            resolved.tools,
+            Some(vec!["read".to_string()]),
+            "the override's tools still apply — per-field independence"
+        );
+    }
+
+    // ── The resolver seam itself (`resolve_agent_launch` / `override_layer`) ──
+    //
+    // ADR 0068: `list_agent_config` (Task 2) calls THIS function, so the
+    // `source` values are the modal's contract, not a debug extra. They are
+    // asserted here against `AgentDefinition` fixtures — no disk, no `HOME` —
+    // because the command holds definitions discovery handed it and must be able
+    // to feed them straight in.
+
+    /// A `scout` definition with the given frontmatter fields.
+    fn def_with(
+        model: Option<&str>,
+        thinking: Option<&str>,
+        tools: Option<&[&str]>,
+    ) -> AgentDefinition {
+        AgentDefinition {
+            name: "scout".to_string(),
+            description: "Fast recon.".to_string(),
+            model: model.map(str::to_string),
+            thinking: thinking.map(str::to_string),
+            tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+            system_prompt: "You are a scout.".to_string(),
+            scope: crate::agents::AgentScope::Space,
+            path: "/tmp/scout.md".to_string(),
+            shadowed: Vec::new(),
+        }
+    }
+
+    /// Settings carrying one `agentOverrides` entry for `scout`.
+    fn settings_with(entry: AgentOverrideFields) -> Settings {
+        Settings {
+            agent_overrides: std::collections::HashMap::from([("scout".to_string(), entry)]),
+            ..Settings::default()
+        }
+    }
+
+    /// `override_layer` keeps "no file", "no entry" and "entry present" as
+    /// THREE distinguishable states (a caller cannot collapse them): `None`
+    /// settings is a layer that cannot speak, exactly like an absent name — and
+    /// both are different from a present entry.
+    #[test]
+    fn override_layer_keeps_no_file_and_no_entry_and_an_entry_apart() {
+        // (a) no settings file at all.
+        assert!(
+            override_layer(None, "scout").global.is_none(),
+            "`config_dir: None` is a layer that cannot speak"
+        );
+        // (b) a file with no entry for the name.
+        let empty = Settings::default();
+        assert!(override_layer(Some(&empty), "scout").global.is_none());
+        // (c) an entry, found CASE-INSENSITIVELY (ADR 0023's scan, moved out of
+        // the `model` arm because it now has to find the entry ONCE for three
+        // fields), and the STORED KEY is not rewritten.
+        let settings = settings_with(AgentOverrideFields {
+            model: Some("fake/m1".to_string()),
+            thinking: None,
+            tools: None,
+        });
+        let layer = override_layer(Some(&settings), "ScOuT");
+        assert_eq!(
+            layer.global,
+            Some(&AgentOverrideFields {
+                model: Some("fake/m1".to_string()),
+                thinking: None,
+                tools: None,
+            }),
+            "the entry is returned verbatim for a differently-cased name"
+        );
+        assert_eq!(
+            settings.agent_overrides.keys().collect::<Vec<_>>(),
+            vec!["scout"],
+            "the selector never rewrites the stored key"
+        );
+    }
+
+    /// (ADR 0068) `source` per field names the layer that SUPPLIED it:
+    /// `override` for the store, `file` for the frontmatter, `parent` when
+    /// nothing below the explicit param spoke.
+    #[test]
+    fn resolve_agent_launch_reports_which_layer_supplied_each_field() {
+        let catalog = ModelCatalog {
+            models: vec![fake_model("m1"), fake_model("m2")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        // (a) the override supplies the model, the file supplies the tools.
+        let def = def_with(Some("fake/m1"), None, Some(&["read"]));
+        let layer = OverrideLayer {
+            global: Some(&AgentOverrideFields {
+                model: Some("fake/m2".to_string()),
+                thinking: None,
+                tools: None,
+            }),
+        };
+        let r = resolve_agent_launch(&LaunchConfig::default(), &def, &layer, &catalog);
+        assert_eq!(r.launch.model, Some("fake/m2".to_string()));
+        assert_eq!(r.model_source, OverrideSource::Override);
+        assert_eq!(r.launch.tools, Some(vec!["read".to_string()]));
+        assert_eq!(r.tools_source, OverrideSource::File);
+        // A demoted / absent thinking is NOT reported as the override's, and the
+        // file's value never moves into `thinking` — so `thinking_source` is
+        // `Parent` here even though `frontmatter_thinking` carries `low`.
+        assert_eq!(r.launch.thinking, None);
+        assert_eq!(r.thinking_source, OverrideSource::Parent);
+        // (b) NOTHING speaks (no layer, no frontmatter values) → every field is
+        // `Parent` = "no layer below the explicit param spoke" (ADR 0068 — the
+        // modal labels it `Inherits parent`, and a dispatch that passes the
+        // param still overrides it).
+        let bare = def_with(None, None, None);
+        let r = resolve_agent_launch(
+            &LaunchConfig::default(),
+            &bare,
+            &OverrideLayer { global: None },
+            &catalog,
+        );
+        assert_eq!(r.launch.model, None);
+        assert_eq!(r.model_source, OverrideSource::Parent);
+        assert_eq!(r.thinking_source, OverrideSource::Parent);
+        assert_eq!(r.tools_source, OverrideSource::Parent);
+    }
+
+    /// (the second half of "only the OVERRIDE value may be written into
+    /// `thinking`") A `:<level>` SUFFIX on the winning model key is not written
+    /// into `thinking` either — writing it would promote it above the override
+    /// and the suffix's own documented position in the dispatch's chain. The
+    /// suffix stays inside the VERBATIM model string, where `subagent_flow.rs`
+    /// reads it as the MIDDLE rung.
+    #[test]
+    fn resolve_agent_launch_never_writes_the_model_key_suffix_into_thinking() {
+        let catalog = ModelCatalog {
+            models: vec![levelled_model("m3")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        // The override speaks about the MODEL only; the file carries no
+        // thinking; the key carries a `:low` suffix.
+        let def = def_with(None, None, None);
+        let layer = OverrideLayer {
+            global: Some(&AgentOverrideFields {
+                model: Some("fake/m3:low".to_string()),
+                thinking: None,
+                tools: None,
+            }),
+        };
+        let r = resolve_agent_launch(&LaunchConfig::default(), &def, &layer, &catalog);
+        assert_eq!(r.launch.model, Some("fake/m3:low".to_string()));
+        assert_eq!(
+            r.launch.thinking, None,
+            "the suffix is a downstream candidate, not `LaunchConfig::thinking`"
+        );
+        assert_eq!(
+            r.thinking_source,
+            OverrideSource::Parent,
+            "…and not reported as any layer's effective level"
+        );
+    }
+
+    /// (ADR 0068, the lie this feature exists to prevent) An override thinking
+    /// the winning model does NOT advertise is neither written nor REPORTED —
+    /// `source` must never read `override` for a value the dispatch drops. No
+    /// `suppressed_thinking` field exists to carry it: the demotion is fully
+    /// assertable as `thinking == None` + `source != Override`.
+    #[test]
+    fn resolve_agent_launch_never_reports_a_demoted_thinking_as_the_override() {
+        // `m3` advertises `low`/`high` only; the pinned `xhigh` is dropped
+        // downstream, so it must not appear as effective.
+        let catalog = ModelCatalog {
+            models: vec![levelled_model("m3")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let def = def_with(None, None, None);
+        let layer = OverrideLayer {
+            global: Some(&AgentOverrideFields {
+                model: Some("fake/m3".to_string()),
+                thinking: Some("xhigh".to_string()),
+                tools: None,
+            }),
+        };
+        let r = resolve_agent_launch(&LaunchConfig::default(), &def, &layer, &catalog);
+        assert_eq!(r.launch.model, Some("fake/m3".to_string()));
+        assert_eq!(r.launch.thinking, None, "the dropped level is not written");
+        assert_ne!(
+            r.thinking_source,
+            OverrideSource::Override,
+            "…and never reported as effective"
+        );
+        assert_eq!(r.thinking_source, OverrideSource::Parent);
+    }
+
+    /// An advertised override thinking DOES win, and it wins over the model
+    /// key's `:<level>` SUFFIX — asserted by it landing in `LaunchConfig::
+    /// thinking`, the TOP rung of the dispatch's chain (`launch.thinking` >
+    /// suffix > `frontmatter_thinking`, `subagent_flow.rs`). The suffix is left
+    /// in the VERBATIM model string, untouched.
+    #[test]
+    fn resolve_agent_launch_an_advertised_override_thinking_outranks_the_key_suffix() {
+        let catalog = ModelCatalog {
+            models: vec![levelled_model("m3")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let def = def_with(Some("fake/m3:low"), Some("low"), None);
+        let layer = OverrideLayer {
+            global: Some(&AgentOverrideFields {
+                model: Some("fake/m3:low".to_string()),
+                thinking: Some("high".to_string()),
+                tools: None,
+            }),
+        };
+        let r = resolve_agent_launch(&LaunchConfig::default(), &def, &layer, &catalog);
+        assert_eq!(
+            r.launch.model,
+            Some("fake/m3:low".to_string()),
+            "the VERBATIM ref is kept (the suffix is a downstream thinking candidate)"
+        );
+        assert_eq!(
+            r.launch.thinking,
+            Some("high".to_string()),
+            "`launch.thinking` outranks the suffix in the dispatch's chain"
+        );
+        assert_eq!(r.thinking_source, OverrideSource::Override);
+        assert_eq!(
+            r.launch.frontmatter_thinking,
+            Some("low".to_string()),
+            "`frontmatter_thinking` carries ONLY the frontmatter's own value"
+        );
+    }
+
+    /// The explicit param's thinking is NEVER filtered (its verbatim semantics
+    /// belong to the dispatch) and always outranks the override — and the
+    /// override's model still applies beside it.
+    #[test]
+    fn resolve_agent_launch_an_explicit_thinking_beats_the_override_and_is_unfiltered() {
+        let catalog = ModelCatalog {
+            models: vec![levelled_model("m3")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let def = def_with(None, Some("low"), None);
+        let layer = OverrideLayer {
+            global: Some(&AgentOverrideFields {
+                model: Some("fake/m3".to_string()),
+                thinking: Some("high".to_string()),
+                tools: None,
+            }),
+        };
+        let launch = LaunchConfig {
+            thinking: Some("bogus".to_string()),
+            ..Default::default()
+        };
+        let r = resolve_agent_launch(&launch, &def, &layer, &catalog);
+        assert_eq!(
+            r.launch.thinking,
+            Some("bogus".to_string()),
+            "an explicit level is passed through unfiltered — the dispatch's own \
+             validation owns it, not the resolver"
+        );
+        assert_eq!(
+            r.thinking_source,
+            OverrideSource::Parent,
+            "ADR 0068's label space has NO word for the explicit param (no modal can \
+             observe a live `subagent` call), so a field the explicit param supplied \
+             reports `Parent` — which reads, truthfully, as 'nothing BELOW the explicit \
+             param spoke'. Task 2's rows pass an EMPTY `LaunchConfig`, so this case \
+             never arises on the wire; the pin exists so a future fourth label cannot \
+             be invented for it."
+        );
+        assert_eq!(
+            r.model_source,
+            OverrideSource::Override,
+            "the other fields resolve independently"
+        );
+    }
+
+    /// (ADR 0067) `tools: []` speaks not — asserted at the resolver seam too,
+    /// where the `source` matters: the row must say `file` / `parent`, never
+    /// `override`, for a stored-but-empty list.
+    #[test]
+    fn resolve_agent_launch_an_empty_override_tools_list_reports_the_layer_that_spoke() {
+        let catalog = ModelCatalog {
+            models: vec![fake_model("m1")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let def = def_with(None, None, Some(&["read"]));
+        let layer = OverrideLayer {
+            global: Some(&AgentOverrideFields {
+                model: None,
+                thinking: None,
+                tools: Some(Vec::new()),
+            }),
+        };
+        let r = resolve_agent_launch(&LaunchConfig::default(), &def, &layer, &catalog);
+        assert_eq!(r.launch.tools, Some(vec!["read".to_string()]));
+        assert_eq!(
+            r.tools_source,
+            OverrideSource::File,
+            "an empty stored list is ABSENT (ADR 0067) — the file's list runs"
+        );
+    }
+
+    /// An EMPTY `agent_name` short-circuits `resolve_launch` BEFORE any layer
+    /// or resolver is built — the label-only, config-less case returns the
+    /// `launch` verbatim, so this test pins that return and NOTHING else.
+    ///
+    /// Delegation to the shared `resolve_agent_launch` is NOT pinned here (an
+    /// empty name never reaches it, so this body would stay green with the
+    /// delegation deleted); it is pinned by the cross-module
+    /// `commands::agents::tests::agent_config_and_the_dispatch_resolve_the_same_row`,
+    /// which calls this real `resolve_launch` and compares its row against the
+    /// modal's. A same-seam test could not catch seam-internal drift, which is
+    /// why that pin lives where it does.
+    #[test]
+    fn resolve_launch_with_an_empty_agent_name_short_circuits() {
+        let ctx = build_ctx(vec![fake_model("m1")], None);
+        let launch = LaunchConfig {
+            system_prompt: Some("explicit".to_string()),
+            ..Default::default()
+        };
+        // The verbatim return is the SHORT-CIRCUIT's doing, not the resolver's.
+        let resolved = resolve_launch(
+            &launch,
+            "",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(resolved, launch);
     }
 }

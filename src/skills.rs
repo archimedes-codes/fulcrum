@@ -64,7 +64,13 @@ impl SkillInfo {
 /// Generic over the scope enum because `skills.rs` and `agents.rs` share the
 /// rule with different tags — the shape `boundary::push_roots<T>` uses.
 /// ADR 0065. UI-only: never interpolated into a prompt tag.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `PartialEq` is derived so a DTO CARRYING this can be compared as a whole
+/// (`commands::agents::AgentConfigDto` needs it for its tests) — derived HERE
+/// rather than mirroring this struct into a second Rust shape, which is the
+/// Rust↔Rust twin ADR 0065 exists to forbid. Both users of `Shadowed<T>`
+/// benefit from the one derivation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Shadowed<T> {
     pub name: String,

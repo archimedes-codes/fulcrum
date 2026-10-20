@@ -258,8 +258,8 @@ impl WorkerManager {
     /// The Supervisor-side subagent-dispatch flow (a main-session
     /// Worker's `subagent` tool → its `IpcDispatcher` →
     /// `Outbound::SubagentDispatch` → here): resolve the `model_key`
-    /// against the effective catalog (the ADR 0020/0023 resolution —
-    /// the `subagentModels` override is already folded into
+    /// against the effective catalog (the ADR 0020/0066 resolution — the
+    /// `agentOverrides` entry is already folded into
     /// `launch.model` by the Worker's `resolve_launch`, soft-degraded),
     /// build the child `StartEnv` (the resolved `Model` with its
     /// provider config, the catalog, `cwd` = `parent_cwd`, `trusted` =

@@ -127,9 +127,9 @@ pub struct AgentLoop {
     pub model: Model,
     pub provider: Box<dyn Provider>,
     pub catalog: ModelCatalog,
-    /// The settings dir (the `settings.json` home — ADR 0023:
-    /// `resolve_launch` reads the `subagentModels` override from here at
-    /// dispatch time; `None` = no override layer).
+    /// The settings dir (the `settings.json` home — ADR 0066:
+    /// `resolve_launch` reads the `agentOverrides` entry for the agent's name
+    /// from here at dispatch time; `None` = no override layer).
     config_dir: Option<PathBuf>,
     pub store: Arc<dyn Store>,
     /// The `RpcEvent`-shaped values (the SAME vocabulary an external

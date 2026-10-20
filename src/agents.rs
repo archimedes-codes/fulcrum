@@ -61,12 +61,14 @@ pub struct AgentDefinition {
     /// shared `Shadowed<T>` shape. Additive, so every existing consumer of this
     /// struct is unaffected.
     ///
-    /// **Computed, never rendered — and never crosses the wire**:
-    /// `commands::agents::AgentDefinitionDto` deliberately does not carry it (see
-    /// the note there). `discover_agents(None)` (the only caller behind Settings →
-    /// Subagents) reads user-level roots only, so the app-global Settings page
-    /// cannot see a Space-shadows-user collision at all; the surface is a
-    /// per-Space Agents popup modelled on the Skills dialog.
+    /// **A REPORT, rendered on the winning row — never a row of its own.** It
+    /// crosses the wire: `commands::agents::AgentConfigDto` carries this very
+    /// `Shadowed<AgentScope>` (ADR 0068), so the sidebar **Agents** modal can
+    /// name the loser a collision excluded. `AgentDefinitionDto` still does NOT
+    /// carry it — and `discover_agents(None)` reads user-level roots only, so
+    /// the old app-global Settings page could never have seen a
+    /// Space-shadows-user collision anyway. The modal runs discovery with the
+    /// active Space's `cwd`, which is the surface that CAN.
     pub shadowed: Vec<crate::skills::Shadowed<AgentScope>>,
 }
 
