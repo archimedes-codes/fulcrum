@@ -146,7 +146,7 @@ impl TranscriptPersister {
     }
 
     /// Apply an interactive event payload (e.g. `todos_update`, `todos_clear`)
-    /// to SQLite (ADR 0066). The Supervisor is the sole writer.
+    /// to SQLite (ADR 0073). The Supervisor is the sole writer.
     pub fn apply_interactive_event(&self, session_id: &str, payload: &serde_json::Value) {
         let Some(event) = payload.get("event").and_then(serde_json::Value::as_str) else {
             return;
