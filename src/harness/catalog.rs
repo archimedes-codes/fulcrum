@@ -181,13 +181,24 @@ pub fn merge_catalog(
     }
 }
 
-/// The per-provider discovery cache entry: `attempted` (a failed /
-/// unreachable endpoint is NOT re-fetched every session) + the discovered
-/// models (model id → fresh metadata; empty when the fetch failed or the
-/// model is absent from the response).
+/// The per-provider discovery cache entry: whether the last fetch SUCCEEDED
+/// (a successful result is reused; a FAILED one is retried on the next read —
+/// #85, so one transient outage cannot blacklist a provider for the process's
+/// life) + the discovered models (model id → fresh metadata; empty when the
+/// fetch failed or the model is absent from the response).
 #[derive(Debug, Clone, Default)]
 pub struct ProviderDiscovery {
-    pub attempted: bool,
+    /// Whether the last attempt SUCCEEDED — the single cache gate (#85).
+    /// Whether the last fetch and whether its result may be reused are one
+    /// question: a FAILED fetch must be retried on the next read, or one
+    /// transient outage (the app launched before the network was up, a gateway
+    /// restarting) blacklists the provider for the process's life —
+    /// 0 models, an `unreachable` row, and no recovery but a restart. A SUCCESS
+    /// is what the cache exists to reuse; a failure is not an answer.
+    ///
+    /// A SUCCESSFUL fetch that returned zero models still sets this: "the
+    /// endpoint answered and had nothing" is a real answer and caches normally.
+    pub succeeded: bool,
     pub models: HashMap<String, DiscoveredMeta>,
 }
 
