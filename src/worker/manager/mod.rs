@@ -54,11 +54,19 @@ use crate::agent::subagent::SubagentOutcome;
 use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
 use crate::agent::worker::protocol::{StartEnv, SubagentDispatchWire};
 
-/// The default **Dead bound** (ADR 0055): 30 min of UNEXPLAINED SILENCE. It is
-/// the most a **Subagent session** may go WITHOUT producing a frame AND with no
-/// `tool_call_id` outstanding — it is NOT a ceiling on the length of the
-/// delegation (an **Active Subagent** has no timeout of any kind). Overridden
-/// in production by `settings.json`'s `subagentDeadBoundSecs`.
+/// The default **Dead bound** (ADR 0055): 30 min of UNEXPLAINED SILENCE **as the
+/// Supervisor OBSERVES it**. It is the most a **Subagent session** may go with no
+/// frame OBSERVED by the pump AND no `tool_call_id` outstanding — it is NOT a
+/// ceiling on the length of the delegation (an **Active Subagent** has no timeout
+/// of any kind), and it is NOT a measurement of the child: the clock is rearmed by
+/// the frames that actually reach the drive's `liveness_rx`
+/// (`subagent_flow.rs`), so a parent starved of CPU can OBSERVE a gap the child
+/// never stopped producing into and reap it `Unresponsive` with its partial
+/// output. The default is 30 min rather than one second because of exactly that:
+/// the observation lag implied by the one recorded CI failure was ~700 ms on a
+/// loaded runner (issue #34), 0.04% of this bound, against a provider layer that
+/// already self-bounds a stalled stream at 5 min. Overridden in production by
+/// `settings.json`'s `subagentDeadBoundSecs`.
 pub const DEFAULT_SUBAGENT_DEAD_BOUND: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
 
@@ -145,7 +153,9 @@ pub type OnCrash = Arc<dyn Fn(String, Option<i32>, Option<u32>) + Send + Sync>;
 pub struct WorkerManager {
     state: Arc<ManagerState>,
     hooks: Arc<dyn WorkerHooks>,
-    /// The **Dead bound** (default 30 min of unexplained silence; production
+    /// The **Dead bound** (default 30 min of unexplained silence AS THE
+    /// SUPERVISOR OBSERVES IT — the gap between frames the pump actually read,
+    /// not the child's own; see [`DEFAULT_SUBAGENT_DEAD_BOUND`]; production
     /// reads it from `settings.json`'s `subagentDeadBoundSecs` via
     /// `with_dead_bound_secs`, tests shorten it via `with_dead_bound`).
     dead_bound: Duration,
@@ -197,10 +207,10 @@ impl WorkerManager {
 
     /// The production seam for the ADR 0055 **Dead bound** (the `settings.json`
     /// `subagentDeadBoundSecs` key, applied at the one `lib.rs` construction
-    /// site): SECONDS of unexplained silence after which a **Subagent session**
-    /// is reaped as Dead. Tests inject their bound in `Duration`s via
-    /// [`Self::with_dead_bound`]; the unit here is seconds because that is
-    /// the unit the setting is written in.
+    /// site): SECONDS of unexplained silence AS THE SUPERVISOR OBSERVES IT after
+    /// which a **Subagent session** is reaped as Dead. Tests inject their bound in
+    /// `Duration`s via [`Self::with_dead_bound`]; the unit here is seconds because
+    /// that is the unit the setting is written in.
     pub fn with_dead_bound_secs(self, secs: u64) -> Self {
         self.with_dead_bound(Duration::from_secs(secs))
     }
@@ -266,7 +276,10 @@ impl WorkerManager {
     /// the parent Space's trust — the Supervisor owns the `spaces`
     /// table, `system_prompt` =
     /// `build_child_system_message(launch.system_prompt,
-    /// has_todo_tool)`, `enabled_tools` = the FULL three-way rule
+    /// has_todo_tool)` — a `None` there means the child gets NO system
+    /// message at all and NO seq-0 row, `mode: FreshChild` (the start
+    /// signal that keeps a child out of the main-prompt arm — issue #9),
+    /// `enabled_tools` = the FULL three-way rule
     /// VERBATIM, `subagent_enabled: false` — the recursion guard),
     /// spawn the subagent Worker (a fresh ephemeral session —
     /// `mint_session_id`), `wait_ready` + `send_start` + the initial

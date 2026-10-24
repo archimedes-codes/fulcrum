@@ -11,9 +11,14 @@ use super::support::*;
 use crate::agent::events::{EventSink, RpcEvent};
 use crate::agent::harness::catalog::{CompactionConfig, Model, ModelCatalog};
 use crate::agent::harness::dispatch::{InProcessDispatcher, SubagentDispatcher};
-use crate::agent::harness::provider::{FinishReason, ProviderEvent, ToolCall};
+use crate::agent::harness::provider::{
+    ChatRole, FinishReason, MessageContent, ProviderEvent, ToolCall,
+};
 use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::subagent::{LaunchConfig, SubagentOutcome, SubagentSessionManager};
+use crate::agent::subagent::{
+    AgentNameResolution, LaunchConfig, SubagentOutcome, SubagentSessionManager,
+};
+use crate::agent::tools::ContentBlock;
 use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
 use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
 use crate::agent::worker::protocol::{StartEnv, StartMode};
@@ -448,6 +453,10 @@ async fn a_native_subagent_with_a_matching_agent_name_runs_the_frontmatter_confi
         started.1["thinkingLevel"], "low",
         "the child's thinking level is the frontmatter's"
     );
+    assert_eq!(
+        started.1["nameResolution"], "matched",
+        "a discovered definition reports MATCHED end to end"
+    );
     // The child's `Start` envelope (the `fake_worker`'s `session_info`
     // echo — re-emitted on the parent's scope by the `on_event`
     // router): the frontmatter body is the `systemPrompt` (the
@@ -473,6 +482,208 @@ async fn a_native_subagent_with_a_matching_agent_name_runs_the_frontmatter_confi
         child_info.1["update"]["enabledTools"],
         json!(["read"]),
         "the child gets exactly the frontmatter's tool"
+    );
+}
+
+/// (issue #47) The exact scenario: `subagent({ agentName: "reviewr" })` — a
+/// typo in a CORRECTLY-spelled key, so T9's unknown-KEY checker cannot see it.
+///
+/// Two halves, and the first is the one that matters: the miss NEVER blocks.
+/// The `subagent` tool result is still the child's real captured output with
+/// `is_error == false`, and the parent turn settles — ADR 0020's deliberate
+/// config-less dispatch, unchanged, and the same non-blocking doctrine as T9's
+/// warning and ADR 0055's metrics. The second half is what this task adds: the
+/// `subagent-session-started` payload says `unmatched` while still carrying the
+/// name the model asked for, so the UI can stop presenting a confident label
+/// for a child that loaded no persona, no tool allowlist and no model.
+///
+/// Runs the REAL `resolve_launch` → `dispatch_native` → `subagent_flow` path.
+/// NO agent file is written at all, so the name can only miss.
+///
+/// No `env_lock()` (the neighbour's note applies verbatim): the space-level
+/// roots are scanned first and this Space holds no agent file, and the
+/// mutators' scratch homes hold none either — and nothing here asserts on a
+/// USER-level definition.
+#[tokio::test]
+async fn a_subagent_named_after_no_definition_still_runs_and_says_so() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "subagent".to_string(),
+                arguments: json!({ "task": "recon the auth code", "agentName": "reviewr" }),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let models = vec![fake_model("m1")];
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
+        events: sink_events.clone(),
+    });
+    let manager =
+        make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
+    let mut loop_ = build_loop_with_dispatcher(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        sink,
+        Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
+        models,
+        None,
+    );
+    // NO agent file: `"reviewr"` can only miss.
+    loop_.handle_prompt(&text_prompt("go")).await;
+    // 1. NON-BLOCKING: the tool result is the child's real output, not an error.
+    let end = wait_for_event(
+        &mut events_rx,
+        SPAWN_MS,
+        |e| matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1"),
+    )
+    .await
+    .expect("the `subagent`'s tool_execution_end");
+    let RpcEvent::tool_execution_end {
+        result, is_error, ..
+    } = end
+    else {
+        unreachable!()
+    };
+    assert!(
+        !is_error,
+        "a resolve miss never fails the dispatch — got {result}"
+    );
+    assert_eq!(
+        result["content"][0]["text"], "canned answer",
+        "the tool result is the child's captured final text (the child RAN)"
+    );
+    // 2. The parent turn settled.
+    wait_for_event(&mut events_rx, SPAWN_MS, |e| {
+        matches!(e, RpcEvent::agent_settled)
+    })
+    .await
+    .expect("the parent turn settled");
+    // 3. The report: `unmatched`, and the name is still there (additive).
+    let events = sink_events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let started = events
+        .iter()
+        .find(|(name, _)| name == "subagent-session-started")
+        .expect("the `subagent-session-started` frame was emitted");
+    assert_eq!(
+        started.1["nameResolution"], "unmatched",
+        "a name that matched no definition is visible on the payload"
+    );
+    assert_eq!(
+        started.1["agentName"], "reviewr",
+        "the marker never replaces the label — the row keeps the name"
+    );
+}
+
+/// (issue #47 follow-up) A PADDED `agentName` puts the TRIMMED name on the
+/// payload. `resolve_launch` trims before it selects, so `"  scout  "` is a
+/// genuine `Matched` — but the label travelled down a separate path, so the
+/// wire (and therefore the payload) carried the RAW string while the marker
+/// described the trimmed one: the UI printed `"  scout  "` and its row and its
+/// badge were about two different names.
+///
+/// A PAYLOAD-level pin, deliberately not a resolver-level one:
+/// `resolve_launch_a_blank_name_is_no_name_and_a_padded_name_is_a_match`
+/// already proves the padded name MATCHES, and that test stays green with the
+/// label bug in place — nothing below `dispatch_subagent` sees the difference
+/// except this emit. Runs the same real path as the two neighbours above
+/// (`resolve_launch` → `dispatch_native` → `subagent_flow`).
+///
+/// No `env_lock()` (both neighbours' note applies verbatim): the space-level
+/// roots are scanned first, so a user-level `scout` can never shadow the
+/// space-level one written below, and nothing here asserts on a USER-level
+/// definition.
+#[tokio::test]
+async fn a_padded_agent_name_reaches_the_payload_trimmed() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "subagent".to_string(),
+                // The padding is the whole test: a model that emitted the name
+                // with surrounding space (a copy out of a prose list) is the
+                // realistic producer of this input.
+                arguments: json!({ "task": "recon the auth code", "agentName": "  scout  " }),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let models = vec![fake_model("m1"), fake_model("m2")];
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
+        events: sink_events.clone(),
+    });
+    let manager =
+        make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
+    let mut loop_ = build_loop_with_dispatcher(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        sink,
+        Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
+        models,
+        None,
+    );
+    let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
+    if let Some(parent) = agent_file.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &agent_file,
+        "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
+    )
+    .unwrap();
+    loop_.handle_prompt(&text_prompt("go")).await;
+    wait_for_event(&mut events_rx, SPAWN_MS, |e| {
+        matches!(e, RpcEvent::agent_settled)
+    })
+    .await
+    .expect("the parent turn settled");
+    let events = sink_events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let started = events
+        .iter()
+        .find(|(name, _)| name == "subagent-session-started")
+        .expect("the `subagent-session-started` frame was emitted");
+    // THE fix: the label the resolver actually selected by.
+    assert_eq!(
+        started.1["agentName"], "scout",
+        "the payload carries the TRIMMED name — the marker and the label must \
+         describe one string, got {:?}",
+        started.1["agentName"]
+    );
+    // And the trim did not COST the dispatch anything: it still matched, and it
+    // still ran the frontmatter (so this is not the `Unmatched` path in a
+    // different costume).
+    assert_eq!(
+        started.1["nameResolution"], "matched",
+        "a padded real name is still MATCHED"
+    );
+    assert_eq!(
+        started.1["model"], "fake/m2",
+        "the padded name still resolved the frontmatter's model"
     );
 }
 
@@ -554,7 +765,116 @@ async fn subagent_wait_a_resolving_completed_outcome_completes_the_tool() {
     .expect("the turn settled");
 }
 
-/// A test `SubagentDispatcher` that simulates a SLOW subagent (each
+/// (issue #78) The end-to-end delivery of the unknown-param warning: a
+/// `subagent` call carrying `agent` instead of `agentName` STILL dispatches and
+/// STILL succeeds, and its result carries a SECOND text block naming both keys.
+///
+/// Built on the `MockDispatcher` seam (not the `fake_worker` `WorkerManager`):
+/// the claim under test is the LOOP's delivery — the warning riding into the
+/// `tool_execution_end` payload and into the transcript `tool` message the model
+/// is re-sent — and the mock keeps the test off the process-spawn timing path.
+#[tokio::test]
+async fn a_mis_named_subagent_param_still_dispatches_and_announces_itself() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                // `agent` is NOT advertised — the checker's whole trigger.
+                name: "subagent".to_string(),
+                arguments: json!({ "task": "the task", "agent": "reviewer" }),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+    tx.send(SubagentOutcome::Completed {
+        output: "the answer".to_string(),
+        metrics: crate::agent::subagent::SubagentMetrics {
+            output: "the answer".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cost: 0.0,
+            duration_ms: 1,
+        },
+    })
+    .unwrap();
+    let mut loop_ = build_loop_with_dispatcher(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        Arc::new(TestSink {
+            updates: Arc::new(StdMutex::new(Vec::new())),
+        }),
+        Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let end = wait_for_event(
+        &mut events_rx,
+        SETTLE_MS,
+        |e| matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1"),
+    )
+    .await
+    .expect("the `subagent`'s tool_execution_end");
+    let RpcEvent::tool_execution_end {
+        result, is_error, ..
+    } = end
+    else {
+        unreachable!()
+    };
+    assert!(
+        !is_error,
+        "a mis-named param must not fail an otherwise-successful dispatch"
+    );
+    assert_eq!(
+        result["content"][0]["text"], "the answer",
+        "the child's own output stays the FIRST block (append, never prepend)"
+    );
+    let warning = result["content"][1]["text"]
+        .as_str()
+        .expect("the warning is the second text block");
+    assert!(
+        warning.starts_with("⚠ unknown param(s) for `subagent`"),
+        "{warning}"
+    );
+    assert!(warning.contains("`agent`"), "{warning}");
+    assert!(warning.contains("agentName"), "{warning}");
+    assert!(warning.contains("— ignored."), "{warning}");
+
+    // The warning travels into the TRANSCRIPT (the message list the model is
+    // re-sent next turn), not just the UI event.
+    let tool_message = loop_
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::Tool && m.tool_call_id.as_deref() == Some("t1"))
+        .expect("the tool message for t1");
+    let MessageContent::Blocks(blocks) = &tool_message.content else {
+        panic!("the tool message carries content blocks");
+    };
+    assert_eq!(
+        blocks.len(),
+        2,
+        "the transcript keeps the child output AND the warning"
+    );
+    assert!(matches!(blocks[1], ContentBlock::Text { .. }), "{blocks:?}");
+
+    wait_for_event(&mut events_rx, SETTLE_MS, |e| {
+        matches!(e, RpcEvent::agent_settled)
+    })
+    .await
+    .expect("the turn settled");
+}
+
 /// `dispatch` resolves after `delay`) while counting how many subagents
 /// are in-flight CONCURRENTLY (the parallel-dispatch assertion — the max
 /// in-flight count is N for a concurrent batch, 1 for sequential).
@@ -587,6 +907,7 @@ impl SubagentDispatcher for ConcurrentCountingDispatcher {
         _parent_model: &Model,
         _parent_enabled_tools: Vec<String>,
         _agent_name: String,
+        _name_resolution: AgentNameResolution,
         _launch: LaunchConfig,
         _task: String,
         _sink: &Arc<dyn EventSink>,
@@ -720,6 +1041,7 @@ impl SubagentDispatcher for CancellingDispatcher {
         _parent_model: &Model,
         _parent_enabled_tools: Vec<String>,
         _agent_name: String,
+        _name_resolution: AgentNameResolution,
         _launch: LaunchConfig,
         _task: String,
         _sink: &Arc<dyn EventSink>,
@@ -770,6 +1092,7 @@ impl SubagentDispatcher for OutOfOrderDispatcher {
         _parent_model: &Model,
         _parent_enabled_tools: Vec<String>,
         _agent_name: String,
+        _name_resolution: AgentNameResolution,
         _launch: LaunchConfig,
         task: String,
         _sink: &Arc<dyn EventSink>,
@@ -1025,6 +1348,7 @@ impl SubagentDispatcher for PartialResolveDispatcher {
         _parent_model: &Model,
         _parent_enabled_tools: Vec<String>,
         _agent_name: String,
+        _name_resolution: AgentNameResolution,
         _launch: LaunchConfig,
         task: String,
         _sink: &Arc<dyn EventSink>,

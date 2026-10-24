@@ -8,7 +8,9 @@
 //!
 //! The chain is `explicit subagent param > override > frontmatter > parent
 //! defaults` (ADR 0067), and each layer supplies each of `model` / `thinking`
-//! / `tools` INDEPENDENTLY. `resolve_launch` is the dispatch's entry point;
+//! / `tools` INDEPENDENTLY. `resolve_launch` is the dispatch's entry point, and
+//! it also REPORTS whether the `agentName` resolved (issue #47 — the tri-state
+//! that lets the UI say "no matching Agent" without changing what runs);
 //! `resolve_agent_launch` is the seam the Agents modal's command shares
 //! (ADR 0068), so the modal cannot print a config the next dispatch will not
 //! run.
@@ -20,7 +22,7 @@ use serde::Serialize;
 use crate::agent::harness::catalog::ModelCatalog;
 use crate::agent::harness::tool_specs;
 use crate::agent::harness::ModelRef;
-use crate::agent::subagent::LaunchConfig;
+use crate::agent::subagent::{AgentNameResolution, LaunchConfig};
 use crate::agents::AgentDefinition;
 use crate::config::{AgentOverrideFields, Settings};
 
@@ -285,27 +287,40 @@ pub(crate) fn resolve_agent_launch(
 /// empty / no match → the `launch` is returned VERBATIM (the label-only,
 /// config-less behavior — never an error).
 ///
-/// The signature is deliberately unchanged (one production caller,
-/// `dispatch.rs`, and a large inline suite) — the ADR 0066 layer is added by
-/// DELEGATING to the shared `resolve_agent_launch`, so the `config_dir: None`
-/// path goes through the same selector as the modal instead of hand-rolling
-/// "no layer".
+/// The return gained the `AgentNameResolution` (issue #47) because a MISS must
+/// be reportable on the wire: the verbatim return made "no name given" and "a
+/// name that matched nothing" BYTE-IDENTICAL exits, so a child that loaded no
+/// persona, no tool allowlist and no model was displayed under a confident
+/// agent label. The BEHAVIOUR is untouched — both non-matched exits still hand
+/// back `launch` unchanged and the child still runs.
+///
+/// `resolve_agent_launch` — the seam ADR 0068 shares with the Agents modal — is
+/// deliberately NOT part of that report: the modal resolves a definition it
+/// already HAS, so it can never have a NAME miss, only a field miss, which its
+/// `source` column already reports. The ADR 0066 layer is added by DELEGATING
+/// to that shared resolver, so the `config_dir: None` path goes through the
+/// same selector as the modal instead of hand-rolling "no layer".
 pub(crate) fn resolve_launch(
     launch: &LaunchConfig,
     agent_name: &str,
     catalog: &ModelCatalog,
     config_dir: Option<&Path>,
     space_cwd: &Path,
-) -> LaunchConfig {
+) -> (LaunchConfig, AgentNameResolution) {
     let name = agent_name.trim();
     if name.is_empty() {
-        return launch.clone();
+        // Deliberate config-less dispatch — NOT a miss. Pinned by
+        // `resolve_launch_with_an_empty_agent_name_short_circuits`.
+        return (launch.clone(), AgentNameResolution::NoName);
     }
     let Some(def) = crate::agents::discover_agents(Some(space_cwd))
         .into_iter()
         .find(|d| d.name.eq_ignore_ascii_case(name))
     else {
-        return launch.clone();
+        // (issue #47) The verbatim return is ADR 0020's and stays; what was
+        // missing was that this exit was BYTE-IDENTICAL to the one above, so
+        // nothing downstream could tell a typo from a deliberate nameless call.
+        return (launch.clone(), AgentNameResolution::Unmatched);
     };
     // TWO bindings, never one. The one-statement form
     // `override_layer(config_dir.map(load_settings).as_ref(), name)` is E0716
@@ -319,7 +334,10 @@ pub(crate) fn resolve_launch(
     // the defaults → no override.
     let settings = config_dir.map(crate::config::load_settings);
     let layer = override_layer(settings.as_ref(), name);
-    resolve_agent_launch(launch, &def, &layer, catalog).launch
+    (
+        resolve_agent_launch(launch, &def, &layer, catalog).launch,
+        AgentNameResolution::Matched,
+    )
 }
 
 #[cfg(test)]
@@ -402,6 +420,10 @@ mod tests {
 
     /// (ADR 0020) `agent_name: ""` → the launch is returned VERBATIM
     /// (the label-only, config-less behavior — never an error).
+    ///
+    /// The tri-state is the point of this test: an empty `agentName` is NOT a
+    /// miss (config-less dispatch is deliberate), and `NoName` is what keeps
+    /// the UI silent for it.
     #[test]
     fn resolve_launch_no_agent_name_returns_the_launch_verbatim() {
         let ctx = build_ctx(vec![fake_model("m1")], None);
@@ -420,8 +442,8 @@ mod tests {
                 ctx.config_dir.as_deref(),
                 &ctx.space_cwd
             ),
-            launch,
-            "an empty agentName returns the launch verbatim"
+            (launch, AgentNameResolution::NoName),
+            "an empty agentName returns the launch verbatim AND reports `NoName`"
         );
     }
 
@@ -466,6 +488,20 @@ mod tests {
                 ctx.config_dir.as_deref(),
                 &ctx.space_cwd
             ),
+            (launch.clone(), AgentNameResolution::Unmatched),
+            "an unknown agentName returns the launch verbatim AND reports the miss"
+        );
+        // The ADR 0020 half, pinned on its own so it survives a change to the
+        // tuple's shape: the CONFIG is byte-equal to the input.
+        assert_eq!(
+            resolve_launch(
+                &launch,
+                "nope",
+                &ctx.catalog,
+                ctx.config_dir.as_deref(),
+                &ctx.space_cwd
+            )
+            .0,
             launch,
             "an unknown agentName returns the launch verbatim"
         );
@@ -492,12 +528,17 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, resolution) = resolve_launch(
             &launch,
             "Scout",
             &ctx.catalog,
             ctx.config_dir.as_deref(),
             &ctx.space_cwd,
+        );
+        assert_eq!(
+            resolution,
+            AgentNameResolution::Matched,
+            "a different case is a MATCH (eq_ignore_ascii_case), never a miss"
         );
         assert_eq!(resolved.model, Some("fake/m1".to_string()));
         assert_eq!(resolved.frontmatter_thinking, Some("low".to_string()));
@@ -527,7 +568,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -568,7 +609,7 @@ mod tests {
             tools: Some(vec!["bash".to_string()]),
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -609,7 +650,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -651,7 +692,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -693,7 +734,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -732,7 +773,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -770,7 +811,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -822,7 +863,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -864,7 +905,7 @@ mod tests {
             tools: None,
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -916,7 +957,7 @@ mod tests {
             std::env::set_var("HOME", &home);
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -967,7 +1008,7 @@ mod tests {
             model: Some("fake/m1".to_string()),
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -1016,7 +1057,7 @@ mod tests {
             std::env::set_var("HOME", &home);
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1065,7 +1106,7 @@ mod tests {
             std::env::set_var("HOME", &home);
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "Scout",
             &ctx.catalog,
@@ -1114,7 +1155,7 @@ mod tests {
             std::env::set_var("HOME", &home);
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1154,7 +1195,7 @@ mod tests {
             std::env::set_var("HOME", &home);
         }
         let ctx = build_ctx(vec![fake_model("m1")], None);
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1262,7 +1303,7 @@ mod tests {
             r#"{ "agentOverrides": { "scout": { "model": "fake/m3", "thinking": "high", "tools": ["read"] } } }"#,
             "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [bash]\n---\nYou are a scout.\n",
         );
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1297,7 +1338,7 @@ mod tests {
             r#"{ "agentOverrides": { "scout": { "model": "fake/m3" } } }"#,
             "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [bash]\n---\nYou are a scout.\n",
         );
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1337,7 +1378,7 @@ mod tests {
             tools: Some(vec!["subagent".to_string()]),
             ..Default::default()
         };
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &launch,
             "scout",
             &ctx.catalog,
@@ -1379,7 +1420,7 @@ mod tests {
                 body,
                 "---\nname: scout\ndescription: Fast recon.\ntools: [read, bash]\n---\n",
             );
-            let resolved = resolve_launch(
+            let (resolved, _) = resolve_launch(
                 &LaunchConfig::default(),
                 "scout",
                 &ctx.catalog,
@@ -1403,7 +1444,7 @@ mod tests {
             r#"{ "agentOverrides": { "scout": { "tools": ["read", "subagent", "no-such-tool"] } } }"#,
             "---\nname: scout\ndescription: Fast recon.\ntools: [read, bash]\n---\n",
         );
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1429,7 +1470,7 @@ mod tests {
             r#"{ "agentOverrides": { "scout": { "model": "fake/m3", "thinking": "xhigh" } } }"#,
             "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\n",
         );
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1454,7 +1495,7 @@ mod tests {
             r#"{ "agentOverrides": { "Scout": { "model": "fake/m3", "tools": ["read"] } } }"#,
             "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [bash]\n---\n",
         );
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "Scout",
             &ctx.catalog,
@@ -1493,7 +1534,7 @@ mod tests {
             std::env::set_var("HOME", &home);
         }
         let ctx = build_ctx(vec![fake_model("m1")], None);
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1509,7 +1550,7 @@ mod tests {
             r#"{ "agentOverrides": {} }"#,
             "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [read]\n---\n",
         );
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1534,7 +1575,7 @@ mod tests {
             r#"{ "agentOverrides": { "scout": { "model": "fake/nope", "tools": ["read"] } } }"#,
             "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\ntools: [bash]\n---\n",
         );
-        let resolved = resolve_launch(
+        let (resolved, _) = resolve_launch(
             &LaunchConfig::default(),
             "scout",
             &ctx.catalog,
@@ -1873,7 +1914,7 @@ mod tests {
             ..Default::default()
         };
         // The verbatim return is the SHORT-CIRCUIT's doing, not the resolver's.
-        let resolved = resolve_launch(
+        let (resolved, resolution) = resolve_launch(
             &launch,
             "",
             &ctx.catalog,
@@ -1881,5 +1922,92 @@ mod tests {
             &ctx.space_cwd,
         );
         assert_eq!(resolved, launch);
+        assert_eq!(
+            resolution,
+            AgentNameResolution::NoName,
+            "an empty name is the DELIBERATE config-less case, never a miss"
+        );
+    }
+
+    /// (issue #47) The two whitespace edges of the tri-state, both on the
+    /// `trim()` short-circuit:
+    ///
+    /// * a WHITESPACE-ONLY name hits the same short-circuit as `""`, so it is
+    ///   `NoName` and NOT a miss — the UI stays silent for a call that never
+    ///   named anyone;
+    /// * a PADDED real name still matches its definition, so the trim must not
+    ///   turn a genuine `agentName` into a miss (that would flag a working
+    ///   dispatch).
+    ///
+    /// Neither case duplicates `resolve_launch_case_insensitive_match`, which
+    /// pins CASE and not whitespace.
+    #[test]
+    fn resolve_launch_a_blank_name_is_no_name_and_a_padded_name_is_a_match() {
+        let ctx = build_ctx(vec![fake_model("m1")], None);
+        // The user-level roots are ISOLATED (the same pattern as
+        // `resolve_launch_unknown_agent_name_returns_the_launch_verbatim`): a
+        // developer's real `~/.pi/agent/agents/…` must not answer for the
+        // whitespace-only case, and the scratch Space below is the ONLY place
+        // `scout` is defined.
+        let empty_home = std::env::temp_dir().join(format!(
+            "harness-resolve-launch-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&empty_home).unwrap();
+        let _lock = crate::test_support::env_lock();
+        let original = std::env::var_os("HOME");
+        let _restore = RestoreHome(original.clone());
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span (the `env_lock` guard); no other thread mutates HOME
+        // concurrently. The lock is held across BOTH cases below.
+        unsafe {
+            std::env::set_var("HOME", &empty_home);
+        }
+        let launch = LaunchConfig {
+            system_prompt: Some("explicit".to_string()),
+            ..Default::default()
+        };
+
+        // 1. whitespace-only → `NoName` (the `trim()` short-circuit).
+        let (resolved, resolution) = resolve_launch(
+            &launch,
+            "   ",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(resolved, launch, "a blank name is config-less");
+        assert_eq!(
+            resolution,
+            AgentNameResolution::NoName,
+            "a whitespace-only name is the DELIBERATE config-less case, never a miss"
+        );
+
+        // 2. a padded real name → `Matched`, with the frontmatter applied.
+        let agent_file = ctx.space_cwd.join(".agents/agents/scout.md");
+        if let Some(parent) = agent_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            &agent_file,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
+        )
+        .unwrap();
+        let bare = LaunchConfig::default();
+        let (resolved, resolution) = resolve_launch(
+            &bare,
+            "  scout  ",
+            &ctx.catalog,
+            ctx.config_dir.as_deref(),
+            &ctx.space_cwd,
+        );
+        assert_eq!(
+            resolution,
+            AgentNameResolution::Matched,
+            "the trim must not turn a real name into a miss"
+        );
+        assert_eq!(resolved.model, Some("fake/m1".to_string()));
+        assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
+        assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
     }
 }

@@ -605,6 +605,14 @@ async fn a_gate_denial_of_a_protected_dir_uses_the_protected_wording() {
         text.contains("protected agent-definition directory"),
         "the refusal names the real reason, got {text:?}"
     );
+    // (issue #33) The route is part of the sentence the two layers must agree
+    // on: a gate denial that refused without pointing anywhere is exactly the
+    // drift this shared text exists to prevent. Asserted against the SAME const
+    // the executor-side test uses, by its full path (no re-export).
+    assert!(
+        text.ends_with(crate::agent::tools::exec::access::PROTECTED_WRITE_ROUTE),
+        "the gate's refusal must end with the sanctioned route, got {text:?}"
+    );
     assert!(
         !target.exists(),
         "and nothing was written (the gate stopped it before the executor)"

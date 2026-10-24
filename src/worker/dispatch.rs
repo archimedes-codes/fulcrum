@@ -17,7 +17,7 @@ use crate::agent::events::EventSink;
 use crate::agent::harness::catalog::Model;
 use crate::agent::harness::dispatch::SubagentDispatcher;
 use crate::agent::harness::ModelKey;
-use crate::agent::subagent::{LaunchConfig, SubagentCancel, SubagentOutcome};
+use crate::agent::subagent::{AgentNameResolution, LaunchConfig, SubagentCancel, SubagentOutcome};
 use crate::agent::worker::protocol::Outbound;
 
 /// The `IpcDispatcher`'s waiter map (shared with the `WorkerCore` — the
@@ -52,6 +52,7 @@ impl SubagentDispatcher for IpcDispatcher {
         parent_model: &Model,
         parent_enabled_tools: Vec<String>,
         agent_name: String,
+        name_resolution: AgentNameResolution,
         launch: LaunchConfig,
         task: String,
         _sink: &Arc<dyn EventSink>,
@@ -72,6 +73,7 @@ impl SubagentDispatcher for IpcDispatcher {
             parent_cwd: parent_cwd.display().to_string(),
             parent_enabled_tools,
             agent_name,
+            name_resolution,
             launch,
             task,
             model_key,
@@ -110,7 +112,7 @@ mod tests {
     use super::*;
     use crate::agent::events::EventSink;
     use crate::agent::harness::catalog::Model;
-    use crate::agent::subagent::{LaunchConfig, SubagentOutcome};
+    use crate::agent::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::mpsc;
@@ -163,6 +165,7 @@ mod tests {
             &test_model(),
             vec!["bash".to_string()],
             "tester".to_string(),
+            AgentNameResolution::Matched,
             LaunchConfig {
                 system_prompt: Some("child".to_string()),
                 ..Default::default()
@@ -177,6 +180,7 @@ mod tests {
                 parent_cwd,
                 parent_enabled_tools,
                 agent_name,
+                name_resolution,
                 launch,
                 task,
                 model_key,
@@ -185,6 +189,11 @@ mod tests {
                 assert_eq!(parent_cwd, "/tmp/space");
                 assert_eq!(parent_enabled_tools, vec!["bash".to_string()]);
                 assert_eq!(agent_name, "tester");
+                assert_eq!(
+                    name_resolution,
+                    AgentNameResolution::Matched,
+                    "the resolver's report rides the frame verbatim"
+                );
                 assert_eq!(task, "do the thing");
                 assert_eq!(
                     launch.system_prompt.as_deref(),
@@ -241,6 +250,7 @@ mod tests {
             &test_model(),
             Vec::new(),
             "a".to_string(),
+            AgentNameResolution::NoName,
             LaunchConfig::default(),
             "t".to_string(),
             &sink,

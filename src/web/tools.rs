@@ -8,6 +8,53 @@ use crate::agent::web::extract::Mode;
 use crate::agent::web::providers::registry::{all_providers, execute_search_with_providers};
 use crate::agent::web::providers::types::{SearchOpts, SearchProvider};
 
+/// The parameter name the web tools' MODEL-VISIBLE prose calls the cache handle.
+///
+/// It is a `const` and not a literal repeated in each sentence for one reason:
+/// the sentence is an INSTRUCTION ("call `get_search_content` with this"), so it
+/// must name a key the advertised schema actually accepts — and the schema's
+/// `required` names `response_id`. Telling the model `responseId` while
+/// `required` names `response_id` is the same class of lie as issue #79's
+/// `NOT re-parsed`: a strict provider rejects the documented call against its
+/// own schema (`required` is not satisfied by an alias), and issue #78's
+/// unknown-param checker CANNOT help, because by design it only looks at
+/// `properties` — where both spellings sit. So the only feedback a strict model
+/// got was the provider's own schema rejection, for a call the tool provoked.
+///
+/// The handlers still ACCEPT the camelCase dialect (issue #82's open option (b)
+/// is about narrowing that, not this), and the specs still advertise it so the
+/// #78 checker does not flag a call the handler would honour. What moved is the
+/// sentence: the model is now told the key the schema REQUIRES.
+/// `the_model_facing_web_prose_names_the_key_the_advertised_schema_requires`
+/// pins the two together.
+///
+/// The `details` envelope keeps its camelCase `responseId` key on purpose: that
+/// is the UI's output contract (`exec.rs`: `content` is what the LLM sees,
+/// `details` is what the UI sees), the Client reads both spellings
+/// (`src/lib/toolOutput.ts`), and none of it is a parameter the model sends.
+pub(crate) const RESPONSE_ID_PARAM: &str = "response_id";
+
+/// The head line of a `web_search` result set, shown to the model. The handle is
+/// named by [`RESPONSE_ID_PARAM`] — see that doc for why the spelling matters.
+pub(crate) fn search_summary_head(response_id: &str) -> String {
+    format!("Search results ({RESPONSE_ID_PARAM}: {response_id}):")
+}
+
+/// The empty-result counterpart of [`search_summary_head`].
+pub(crate) fn search_summary_empty(response_id: &str) -> String {
+    format!("No search results found ({RESPONSE_ID_PARAM}: {response_id})")
+}
+
+/// The tail `fetch_content` appends when it truncates: the ONE place the tools
+/// tell the model how to finish reading, so it is the sentence issue #82's
+/// interim had to keep honest.
+pub(crate) fn truncation_note(remaining: usize, response_id: &str) -> String {
+    format!(
+        "\n\n…[{remaining} chars truncated — get_search_content with \
+         {RESPONSE_ID_PARAM} {response_id} for the rest]"
+    )
+}
+
 pub async fn exec_web_search(ctx: &ToolCtx, params: &Value) -> ToolResult {
     exec_web_search_with_providers(ctx, params, &all_providers()).await
 }
@@ -112,10 +159,11 @@ pub async fn exec_web_search_with_providers(
             }
 
             let summary = if formatted_entries.is_empty() {
-                format!("No search results found (responseId: {response_id})")
+                search_summary_empty(&response_id)
             } else {
                 format!(
-                    "Search results (responseId: {response_id}):\n\n{}",
+                    "{}\n\n{}",
+                    search_summary_head(&response_id),
                     formatted_entries.join("\n\n")
                 )
             };
@@ -247,10 +295,7 @@ pub async fn exec_fetch_content(ctx: &ToolCtx, params: &Value) -> ToolResult {
             let (head_text, truncated) = if doc_len > max_chars {
                 let head: String = doc.markdown.chars().take(max_chars).collect();
                 let remaining = doc_len.saturating_sub(max_chars);
-                let suffix = format!(
-                    "\n\n…[{} chars truncated — get_search_content with responseId {} for the rest]",
-                    remaining, response_id
-                );
+                let suffix = truncation_note(remaining, &response_id);
                 (format!("{}{}", head, suffix), true)
             } else {
                 (doc.markdown.clone(), false)
@@ -677,7 +722,24 @@ mod tests {
             ContentBlock::Text { text } => text.clone(),
             _ => panic!("expected text block"),
         };
-        assert!(text.contains("chars truncated — get_search_content with responseId"));
+        // The exact tail the model reads when the document is truncated, pinned
+        // BYTE-FOR-BYTE including the parameter name. This is the sentence that
+        // used to say `responseId` while `get_search_content`'s advertised schema
+        // declares `"required": ["response_id"]` — a documented call its own
+        // schema rejects, invisible to the #78 checker (which reads `properties`
+        // only). The literal is spelled out here rather than built from
+        // `RESPONSE_ID_PARAM` on purpose: a test that interpolates the same const
+        // the production code interpolates is a tautology and cannot redden.
+        assert!(
+            text.contains("chars truncated — get_search_content with response_id "),
+            "the truncation note must name the key the schema requires: {text:?}"
+        );
+        assert!(
+            !text.contains("with responseId"),
+            "the truncation note must not name the camelCase alias — `required` \
+             names `response_id`, so the alias form is a schema-invalid \
+             instruction: {text:?}"
+        );
 
         // Now test get_search_content slice
         let get_res = exec_get_search_content(
@@ -975,12 +1037,16 @@ mod tests {
         };
 
         let details = res.details.expect("details should exist");
+        // The `details` envelope keeps its camelCase `responseId` key (the UI's
+        // output contract, not a parameter the model sends) — see
+        // `RESPONSE_ID_PARAM`'s doc for why only the model-facing SPELLING moved.
         let response_id = details["responseId"]
             .as_str()
             .expect("responseId")
             .to_string();
 
-        // Check model text contains markdown link, snippet, and responseId
+        // Check model text contains markdown link, snippet, and the cache handle
+        // (the VALUE; the key naming it is the snake_case one the schema requires).
         assert!(text.contains("[Item One](https://example.com/item1)"));
         assert!(text.contains("This is the snippet for item one."));
         assert!(text.contains(&response_id));

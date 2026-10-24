@@ -75,41 +75,43 @@ pub async fn exec_find(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // `--` before the path (the `rg --` hardening — a pattern that looks
     // like a flag is not re-parsed as one).
     //
-    // The bound `cmd` (not a fluent chain) exists to carry the SAME env scrub
-    // `bash` gets: `fd` and `rg` are system binaries whose dependencies
-    // (`libpcre2-8.so.0`, `libcrypto`) the bundle also ships, so on a mounted
-    // host they bind the bundle's copies unversioned — `git`'s warning line is
-    // the same mechanism, and the poisoned `PATH` is what makes the bare-name
-    // lookup work at all (research §7's site table). KNOWN REMAINING GAP,
-    // deliberately out of scope here: unlike `exec_bash`, `exec_find` and
-    // `exec_grep` pass NO `current_dir`, so this child runs with the INHERITED
-    // cwd — which under `AppRun.c`'s `chdir("$APPDIR/usr")` is INSIDE the
-    // mount. The env half is fixed; the cwd half is not, and a relative path in
-    // a `find`/`grep` result can still surprise because of it (it is not a leak
-    // of libraries — do not read the scrub as having fixed that).
+    // Both halves of the child's starting conditions are now decided here, and
+    // the shape of the call is the reason they are decided together (issue
+    // #81):
     //
-    // The constructor is `crate::agent::childproc`'s, which owns the child's
-    // Windows console window policy (`CREATE_NO_WINDOW`).
-    let mut cmd = crate::agent::childproc::command("fd");
-    // A Tool child starts at EOF on stdin — see the note in `exec_bash`: an
-    // inherited handle is a live pipe nothing can ever feed, so a `fd` that
-    // read stdin would hang to the caller's deadline instead of failing.
-    crate::agent::childproc::closed_stdin(&mut cmd);
-    cmd.args([
-        "--max-results",
-        &max.to_string(),
-        "-g",
-        &pattern,
-        "--",
-        &resolved.to_string_lossy(),
-    ]);
-    crate::agent::hostenv::for_child().apply(&mut cmd);
+    // * the ENV — the AppImage scrub, `crate::agent::hostenv`, applied inside
+    //   the builder below. `fd` and `rg` are system binaries whose
+    //   dependencies (`libpcre2-8.so.0`, `libcrypto`) the bundle also ships,
+    //   so on a mounted host they bind the bundle's copies unversioned —
+    //   `git`'s warning line is the same mechanism, and the poisoned `PATH` is
+    //   what makes the bare-name lookup work at all (research §7's site
+    //   table).
+    // * the CWD — `ctx.cwd`, the Space, exactly as `exec_bash` passes it.
+    //   Without it the child ran wherever its parent sat, which under
+    //   `AppRun.c`'s `chdir("$APPDIR/usr")` is INSIDE the mount.
+    //
+    // What the cwd actually buys is NOT what the comment here used to claim.
+    // It never affected `fd`'s OUTPUT: `fd` echoes the search path as it was
+    // given (`output.rs` prints `entry.stripped_path(config)`, and
+    // `stripped_path` only calls `filesystem::strip_current_dir`, which is
+    // `path.strip_prefix(".")`), and `validate` hands every search root to
+    // this builder already ABSOLUTE and canonical, so the output is absolute
+    // at every cwd and the prefix strip below fires identically wherever the
+    // child starts. Measured on `fd` 10.4.2 at five cwds (`/`, `/tmp`, the
+    // Space, a directory under it, and a sibling of it): byte-identical output
+    // every time. The cwd matters for `rg`'s `-g` GLOBS, which resolve against
+    // the child's cwd when they contain a `/` — see the measurement above the
+    // `rg` spawn in [`exec_grep`], where the silent false negative lived.
+    let mut cmd = build_fd_command(&pattern, &resolved, max, &ctx.cwd);
     let fd = cmd.output().await;
     if let Ok(out) = fd {
-        // `fd` prints paths relative to its CWD — since the search dir is
-        // passed as an absolute (canonicalized) path, strip the prefix so
-        // the results are relative to the search dir (like the `walkdir`
-        // fallback).
+        // `fd` echoed the ABSOLUTE search root it was handed (see the note
+        // above the spawn: it strips only a literal `.` prefix, so an absolute
+        // search path prints absolute paths at every cwd), so strip that prefix
+        // to land on paths relative to the SEARCH DIR — the shape the `walkdir`
+        // fallback below produces. A relative path out of this tool is
+        // therefore relative to the search dir, NOT to the Space, which is
+        // still surprising when `path` names a directory below the Space.
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let prefix = format!("{}/", resolved.to_string_lossy());
         let stdout: String = stdout
@@ -174,6 +176,85 @@ pub async fn exec_find(ctx: &ToolCtx, params: &Value) -> ToolResult {
         matches.join("\n"),
         Some(json!({ "matches": matches.len(), "truncated": truncated })),
     )
+}
+
+/// Build the `Command` the `fd` fast path of [`exec_find`] spawns — everything
+/// except the `output()` call and the post-processing of its stdout.
+///
+/// The seam exists for the same reason `agent/mcp/stdio.rs`'s `build_command`
+/// and `agent/worker/client.rs`'s exist: the two assertions that matter here —
+/// the child starts in the Space, and the argument list did not grow — can only
+/// be made on a `Command` that was never spawned (`fd` is not installed on
+/// every runner, and a spawned child tells you nothing about what it was
+/// TOLD). Production calls it, so it needs no `cfg` and no `allow`.
+pub(crate) fn build_fd_command(
+    pattern: &str,
+    resolved: &Path,
+    max: u32,
+    cwd: &Path,
+) -> tokio::process::Command {
+    build_fd_command_with(
+        pattern,
+        resolved,
+        max,
+        cwd,
+        crate::agent::hostenv::for_child(),
+    )
+}
+
+/// [`build_fd_command`] with the patch as an argument.
+///
+/// Production passes exactly [`for_child`](crate::agent::hostenv::for_child);
+/// the parameter exists because that cached patch is EMPTY under `cargo test`
+/// (its gate needs this exe under `$APPDIR`; under cargo it is
+/// `target/debug/deps/<hash>`), so a test driven through the wrapper could not
+/// observe the env at all and could not fail.
+///
+/// `cwd` is the Space (`ctx.cwd`), NOT `resolved`: `resolved` is the search
+/// dir, which is `ctx.cwd` or a directory below it, and the two tools'
+/// cwd-dependent behaviour is defined against the Space. It is deliberately not
+/// canonicalized — `exec_bash` passes `ctx.cwd` raw and these two now agree with
+/// it. A `cwd` that does not exist makes the spawn fail: `exec_find` degrades
+/// into its `walkdir` fallback (which is cwd-independent) and `exec_grep`
+/// reports its existing rg-unavailable error, which for that one cause is a
+/// misleading message. Accepted, not overlooked: `exec_bash` has had exactly
+/// this property since it was written, and `validate` already refuses a
+/// non-existent `ctx.cwd` for the default `path: "."` before anything spawns.
+///
+/// The argument list is a byte-for-byte contract, pinned by
+/// `the_search_argument_lists_are_unchanged`: no `-a`/`--absolute-path` (the
+/// output is already absolute, because the search root is), no
+/// `-C`/`--base-directory` (fd-only, and it redefines what the printed paths
+/// are relative to), no `--path-separator` (it only rewrites separators). Each
+/// of those would silently un-make the prefix strip in [`exec_find`].
+pub(crate) fn build_fd_command_with(
+    pattern: &str,
+    resolved: &Path,
+    max: u32,
+    cwd: &Path,
+    patch: &crate::agent::hostenv::EnvPatch,
+) -> tokio::process::Command {
+    // The constructor is `crate::agent::childproc`'s, which owns the child's
+    // Windows console window policy (`CREATE_NO_WINDOW`). It is the ONLY
+    // constructor for this tool — the wrapper above delegates rather than
+    // building, because `agent/childproc.rs`'s census asserts exactly four
+    // `childproc::command(` calls under `agent/tools/exec*`.
+    let mut cmd = crate::agent::childproc::command("fd");
+    // A Tool child starts at EOF on stdin — see the note in `exec_bash`: an
+    // inherited handle is a live pipe nothing can ever feed, so a `fd` that
+    // read stdin would hang to the caller's deadline instead of failing.
+    crate::agent::childproc::closed_stdin(&mut cmd);
+    cmd.args([
+        "--max-results",
+        &max.to_string(),
+        "-g",
+        pattern,
+        "--",
+        &resolved.to_string_lossy(),
+    ]);
+    patch.apply(&mut cmd);
+    cmd.current_dir(cwd);
+    cmd
 }
 
 /// Match `candidate` against a glob `pattern` (`*` = any run of non-`/`
@@ -263,40 +344,36 @@ pub async fn exec_grep(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Err(e) => return ToolResult::fail(format!("grep: {e}"), None),
     };
 
-    let mut args: Vec<String> = Vec::new();
-    if ignore_case {
-        args.push("-i".to_string());
-    }
-    if let Some(g) = glob {
-        args.push("--glob".to_string());
-        args.push(g.to_string());
-    }
-    // `-m` bounds matches PER FILE (the total can exceed `max` when more
-    // files match) — the OUTPUT is additionally truncated below.
-    args.push("-m".to_string());
-    args.push(max.to_string());
-    // `--` terminates option parsing: the pattern is matched LITERALLY
-    // (an option-like pattern such as `--pre=sh` — which would otherwise
-    // be parsed by `rg` as a `--pre` option and run a program on every
-    // input file, un-gated — is treated as the pattern, and the search
-    // path stays the validated `resolved` dir, not `.`).
-    args.push("--".to_string());
-    args.push(pattern.clone());
-    args.push(resolved.to_string_lossy().into_owned());
-
-    // Bound `cmd` for the same reason as the `fd` arm of `exec_find`: the env
-    // scrub needs a name. Same KNOWN GAP too — no `current_dir` is passed, so
-    // the child's cwd stays the inherited one, which on a mounted host is
-    // inside the mount (`AppRun.c`'s `chdir("$APPDIR/usr")`); the env is
-    // scrubbed, the cwd is not.
+    // The env scrub AND the Space cwd, both decided in the builder (issue
+    // #81) — see the note above the `fd` spawn in `exec_find` for the env half
+    // and the measured reason the cwd half is not about output shape.
     //
-    // Same `crate::agent::childproc` constructor as `fd` — it owns the child's
-    // Windows console window policy (`CREATE_NO_WINDOW`).
-    let mut cmd = crate::agent::childproc::command("rg");
-    // Tool child → null stdin, for the same reason as `fd` and `bash` above.
-    crate::agent::childproc::closed_stdin(&mut cmd);
-    cmd.args(&args);
-    crate::agent::hostenv::for_child().apply(&mut cmd);
+    // The reason THIS tool needed the cwd is `rg`'s `--glob` matching, and it
+    // failed SILENTLY: a `-g` glob containing a `/` is matched against the
+    // candidate path relative to `rg`'s OWN cwd, so with the child sitting in
+    // `$APPDIR/usr` (or anywhere else that is not the Space) every
+    // directory-naming glob excluded everything and `rg` exited 1 with no
+    // output — which `exec_grep` reports as a successful `matches: 0`. A
+    // negated glob is inverted the same way (`-g '!sub/*'` excludes nothing
+    // while the cwd is elsewhere, and excludes exactly the `sub/` paths once the
+    // cwd IS the Space). A basename-only glob (no `/`) is cwd-independent, which
+    // is why the existing tests never saw it.
+    // Measured on `ripgrep 15.2.0` with a Space holding `space/sub/x.txt`:
+    //
+    // ```text
+    // cd <space> && rg -g 'sub/*' -- needle <space> → 1 match, exit 0
+    // cd <else>  && rg -g 'sub/*' -- needle <space> → 0 matches, exit 1
+    // cd <else>  && rg -g '**/sub/*' -- needle <space> → 1 match, exit 0
+    // cd <else>  && rg -g '*.txt' -- needle <space> → 1 match, exit 0
+    // ```
+    //
+    // `rg`'s ignore-file discovery was checked too and is NOT cwd-dependent in
+    // these versions (an ignore file in a PARENT of the search root is honoured
+    // from any cwd — `--no-ignore-parent` is what moves it, not the cwd — and
+    // one in a cwd ancestor that is not a search-root ancestor is honoured by
+    // neither tool from anywhere), so adding `current_dir` changes no ignore
+    // semantics.
+    let mut cmd = build_rg_command(&pattern, glob, &resolved, max, ignore_case, &ctx.cwd);
     match cmd.output().await {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -318,4 +395,87 @@ pub async fn exec_grep(ctx: &ToolCtx, params: &Value) -> ToolResult {
         }
         Err(e) => ToolResult::fail(format!("grep: ripgrep (rg) is not available: {e}"), None),
     }
+}
+
+/// Build the `Command` [`exec_grep`] spawns — everything except the `output()`
+/// call and the line-counting/truncation of its stdout.
+///
+/// The same unspawned-`Command` seam as [`build_fd_command`] (and the reason is
+/// sharper here: the bug this file's cwd fix kills is a FALSE NEGATIVE, so an
+/// end-to-end test cannot distinguish "no matches" from "the glob was never
+/// applied" without a control call — whereas `get_current_dir` and `get_args`
+/// read the two facts straight off the `Command`).
+pub(crate) fn build_rg_command(
+    pattern: &str,
+    glob: Option<&str>,
+    resolved: &Path,
+    max: u32,
+    ignore_case: bool,
+    cwd: &Path,
+) -> tokio::process::Command {
+    build_rg_command_with(
+        pattern,
+        glob,
+        resolved,
+        max,
+        ignore_case,
+        cwd,
+        crate::agent::hostenv::for_child(),
+    )
+}
+
+/// [`build_rg_command`] with the patch as an argument — see
+/// [`build_fd_command_with`] for why the parameter exists (the cached patch is
+/// EMPTY under `cargo test`).
+///
+/// Seven parameters, which is the `clippy::too_many_arguments` limit, not over
+/// it. If a later edit pushes it to eight, group them — do not add a flag to
+/// dodge the cwd, which is the mistake this whole task exists to prevent.
+pub(crate) fn build_rg_command_with(
+    pattern: &str,
+    glob: Option<&str>,
+    resolved: &Path,
+    max: u32,
+    ignore_case: bool,
+    cwd: &Path,
+    patch: &crate::agent::hostenv::EnvPatch,
+) -> tokio::process::Command {
+    let mut args: Vec<String> = Vec::new();
+    if ignore_case {
+        args.push("-i".to_string());
+    }
+    if let Some(g) = glob {
+        args.push("--glob".to_string());
+        args.push(g.to_string());
+    }
+    // `-m` bounds matches PER FILE (the total can exceed `max` when more
+    // files match) — the OUTPUT is additionally truncated below.
+    args.push("-m".to_string());
+    args.push(max.to_string());
+    // `--` terminates option parsing: the pattern is matched LITERALLY
+    // (an option-like pattern such as `--pre=sh` — which would otherwise
+    // be parsed by `rg` as a `--pre` option and run a program on every
+    // input file, un-gated — is treated as the pattern, and the search
+    // path stays the validated `resolved` dir, not `.`).
+    args.push("--".to_string());
+    args.push(pattern.to_string());
+    args.push(resolved.to_string_lossy().into_owned());
+
+    // Same `crate::agent::childproc` constructor as `fd` — it owns the child's
+    // Windows console window policy (`CREATE_NO_WINDOW`) — and the ONLY one for
+    // this tool, because `agent/childproc.rs`'s census asserts exactly four
+    // constructors under `agent/tools/exec*`.
+    let mut cmd = crate::agent::childproc::command("rg");
+    // Tool child → null stdin, for the same reason as `fd` and `bash` above.
+    crate::agent::childproc::closed_stdin(&mut cmd);
+    cmd.args(&args);
+    patch.apply(&mut cmd);
+    // BEFORE this line `rg`'s `-g` globs were resolved against wherever the
+    // parent happened to be, and every directory-naming glob matched nothing
+    // (see the measurement above the spawn in `exec_grep`). No new flag:
+    // `--glob`'s own semantics are fine once the child starts where the user
+    // thinks they are, and the output keeps its absolute-root shape because the
+    // search root is absolute.
+    cmd.current_dir(cwd);
+    cmd
 }

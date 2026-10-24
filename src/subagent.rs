@@ -60,6 +60,40 @@ pub struct LaunchConfig {
     pub tools: Option<Vec<String>>,
 }
 
+/// (issue #47) Whether a `subagent` call's `agentName` resolved against the
+/// discovered Agent definitions — the REPORT that `resolve_launch`'s
+/// never-an-error contract left unsaid.
+///
+/// The three states are NOT two. `resolve_launch` returns the SAME verbatim
+/// `LaunchConfig` for `NoName` and `Unmatched` (ADR 0020: "an UNKNOWN or
+/// omitted `agentName` is still a no-op for behavior — label-only, config-less,
+/// never an error"), and the child's config is identical in both, so the
+/// distinction is invisible downstream unless the resolver says it. It matters
+/// because the two cases are opposite stories for whoever is debugging:
+/// `NoName` is the designed config-less dispatch, `Unmatched` is a typo in a
+/// correctly-spelled key that leaves a child running the PARENT's model, the
+/// PARENT's tools and no persona while the UI prints a confident agent label.
+/// A `bool` would collapse them and force the UI to flag the deliberate case.
+///
+/// The wire spelling is the contract (`#[serde(rename_all = "snake_case")]` →
+/// `no_name` / `matched` / `unmatched`), pinned by
+/// `protocol::tests::the_agent_name_resolution_serialises_in_snake_case`; the
+/// frontend mirrors it as `AgentNameResolution` in `src/lib/tauri/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNameResolution {
+    /// No `agentName` was passed (or it was blank after `trim()`) — the
+    /// config-less dispatch ADR 0020 intends. NOT a miss; the UI stays silent.
+    NoName,
+    /// A definition matched (`discover_agents` + `eq_ignore_ascii_case`, so a
+    /// different case is a MATCH, not a miss).
+    Matched,
+    /// A name was given and matched NO discovered definition. The launch is
+    /// still returned verbatim and the child still runs — but with no persona,
+    /// no tool allowlist and no model from the name it was given.
+    Unmatched,
+}
+
 /// Manages the subagent dispatchs (ADR 0025 Task 5 — the re-plumb):
 /// `dispatch_native` delegates to the `WorkerManager` (the
 /// `dispatch_subagent` flow — a subagent Worker per dispatch; the
@@ -131,6 +165,12 @@ impl SubagentSessionManager {
     /// a native parent always has an attached `WorkerManager` in
     /// production; the "no manager" case is handled by
     /// `dispatch_subagent`'s existing `subagent: None` check).
+    ///
+    /// (issue #47) `name_resolution` is the report the loop's
+    /// `resolve_launch` computed on `agent_name`; it rides the wire VERBATIM
+    /// so the flow's `subagent-session-started` payload can name a resolve
+    /// miss. Nothing here branches on it — the child runs identically in all
+    /// three states.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_native(
         &self,
@@ -139,6 +179,7 @@ impl SubagentSessionManager {
         parent_model: &Model,
         parent_enabled_tools: Vec<String>,
         agent_name: String,
+        name_resolution: AgentNameResolution,
         launch: LaunchConfig,
         task: String,
         _sink: &Arc<dyn EventSink>,
@@ -169,6 +210,7 @@ impl SubagentSessionManager {
             parent_cwd: parent_cwd.display().to_string(),
             parent_enabled_tools,
             agent_name,
+            name_resolution,
             launch,
             task,
             // The RESOLVED model key (the `provider/id` composition —
@@ -321,7 +363,7 @@ mod tests {
     use crate::agent::events::EventSink;
     use crate::agent::harness::catalog::{Model, ModelCatalog};
     use crate::agent::subagent::{
-        LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentOutcome,
+        AgentNameResolution, LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentOutcome,
         SubagentSessionManager,
     };
     use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
@@ -505,6 +547,10 @@ mod tests {
             parent_model,
             parent_enabled_tools,
             "tester".to_string(),
+            // The fixture names an Agent; nothing here asserts on the
+            // resolution (the tri-state's own pins live in
+            // `harness::launch` and the `subagent_flow` tests).
+            AgentNameResolution::Matched,
             launch,
             task.to_string(),
             &sink,
@@ -772,6 +818,7 @@ mod tests {
             &test_model("m1", Vec::new()),
             Vec::new(),
             "tester".to_string(),
+            AgentNameResolution::Matched,
             LaunchConfig::default(),
             "do the thing".to_string(),
             &sink,
@@ -1084,7 +1131,10 @@ mod tests {
         wm.detach("p1");
 
         // Case 4: `None` prompt + NO todo tool → `None` (NO system
-        // message — the child's seq-0 row is absent).
+        // message — the child's seq-0 row is absent, and now PROVABLY so:
+        // the envelope's `mode` is `FreshChild`, so the worker's
+        // `(StartMode::FreshChild, None)` arm prepends NOTHING instead of
+        // falling through to the main-prompt arm — issue #9).
         let (manager, wm, _sink_events, events) = make_manager(
             Some(Duration::from_secs(30)),
             test_env("p1", vec![m1.clone()], None, true),

@@ -330,6 +330,8 @@ async fn a_sandboxed_shell_does_not_touch_the_path_tools() {
 /// exits 0, so `is_error` was false on the Windows runner. The exit-code
 /// DECISION is not unix-specific and stays covered everywhere by
 /// `bash_exit_report_nonzero_exit_is_an_error_with_its_real_code`.
+/// The #79 quoting fix does NOT make this fixture runnable on `cmd`: the gate is
+/// POSIX SYNTAX, not quoting.
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_nonzero_exit_is_error() {
@@ -402,6 +404,8 @@ async fn bash_timeout_kills_child() {
 /// product's own Windows branch kills the direct child only). Under
 /// `cmd /C` the command line does not even parse as written, so the
 /// marker got written by a survivor and the assertion inverted.
+/// The #79 quoting fix does NOT make this fixture runnable on `cmd`: the gate is
+/// POSIX SYNTAX, not quoting.
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_backgrounded_grandchild_killed_with_group() {
@@ -453,6 +457,8 @@ async fn bash_backgrounded_grandchild_killed_with_group() {
 /// run reported a parse error instead of a deadline. The Windows kill
 /// path itself is covered by `bash_timeout_kills_child`, which passes
 /// there with a shell-neutral `sleep 5`.
+/// The #79 quoting fix does NOT make this fixture runnable on `cmd`: the gate is
+/// POSIX SYNTAX, not quoting.
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_timeout_kills_a_child_that_closed_its_pipes() {
@@ -503,6 +509,8 @@ async fn bash_timeout_kills_a_child_that_closed_its_pipes() {
 /// the redirection, so the child exited at once with `cancelled: false`
 /// and the cancel never had a live process to race. The cancel path is
 /// covered on Windows by `bash_cancel_kills_child` (`sleep 5`).
+/// The #79 quoting fix does NOT make this fixture runnable on `cmd`: the gate is
+/// POSIX SYNTAX, not quoting.
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
@@ -549,6 +557,95 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
+// ── the quoting contract, on the shell that actually re-parses it ─────
+//
+// `#[cfg(windows)]` rather than `#[cfg(not(unix))]`: these spawn `cmd.exe`,
+// which exists on no other platform, and this app ships Windows / macOS /
+// Linux only, so `not(unix)` IS Windows for every artifact `release.yml`
+// builds (the product arm stays `not(unix)` because that is the predicate
+// `exec_bash` branches on).
+//
+// ⚠ These two tests are the fix's ONLY behavioural proof, and they run ONLY on
+// CI's `windows-latest` leg. Locally they are COMPILE-verified by
+// `cargo check --target x86_64-pc-windows-gnu --all-targets`. Do NOT re-gate
+// them behind a unix gate and do NOT add a `return`-style skip: a test that
+// silently does not run on the platform it guards is the exact blind spot issue
+// #79 was filed about.
+//
+// Do NOT "improve" them into an assertion on `cmd.as_std().get_args()`: std
+// stores `Arg::Regular` and `Arg::Raw` so that both yield the identical
+// `OsStr`, so such a test passes with `arg` AND with `raw_arg` alike. It looks
+// like proof and is not. Census invariant E (in `agent/childproc.rs`) plus the
+// two tests below are the real pair.
+
+/// Issue #79, the shape the reporter hit first: an inline double quote must
+/// reach `cmd.exe` intact.
+///
+/// `cmd`'s `echo` prints its operand verbatim, QUOTES INCLUDED, so the quotes in
+/// the OUTPUT are the evidence that the string arrived with its own quoting
+/// untouched. Under `Command::arg` the child received `echo \"a b\"` (std's
+/// `append_arg` escapes every embedded `"` as `\"` and `cmd /s` strips only the
+/// OUTER quote pair it added) and printed `\"a b\"`.
+///
+/// PREDICTED RED on Windows before the fix, derived from `append_arg`'s rules
+/// (the `2n+1` backslash loop) plus `cmd`'s documented quote handling — the same
+/// derivation the issue made and confirmed with its own `echo` reproduction. It
+/// cannot be OBSERVED on a Linux host: `cmd.exe` is not here, and std renders the
+/// command line inside `CreateProcess` with no getter. Confirmed on CI's
+/// `windows-latest` leg.
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_passes_inline_double_quotes_through_to_cmd_verbatim() {
+    let cwd = temp_cwd("bash-cmd-quotes");
+    let r = execute_tool(&ctx(&cwd), "bash", &json!({ "command": "echo \"a b\"" })).await;
+    assert!(!r.is_error, "the run succeeded: {:?}", text_of(&r));
+    assert_eq!(r.details.as_ref().unwrap()["exitCode"], 0);
+    assert_eq!(
+        text_of(&r).trim_end(),
+        "\"a b\"",
+        "the quotes survive: {:?}",
+        text_of(&r)
+    );
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+/// Issue #79's FALSE-SUCCESS shape, reproduced with a `cmd` BUILTIN so the test
+/// needs no third-party executable and cannot depend on a runner's tooling: a
+/// quoted operand inside `if exist`, asserted on the OUTPUT and NOT on the exit
+/// code.
+///
+/// Under escaping the line arrives as `if exist \"%SystemRoot%\System32\cmd.exe"
+/// (echo FOUND)`; the literal path then starts with a backslash, the condition is
+/// FALSE, `echo FOUND` never runs — **and `cmd` still exits 0**. That is exactly
+/// what the issue reported for `start /B "" cmd /c "…"`, which printed
+/// `Access is denied.` after its marker and still reported `exitCode: 0`, so the
+/// agent told the user a build was "running in the background". The assertion is
+/// on the output precisely BECAUSE the exit code is the thing that lies.
+///
+/// `%SystemRoot%\System32\cmd.exe` exists on every Windows including the CI
+/// runners, and `cmd` expands environment variables inside quotes.
+///
+/// PREDICTED RED on Windows before the fix (same derivation as
+/// [`bash_passes_inline_double_quotes_through_to_cmd_verbatim`]); confirmed on
+/// CI's `windows-latest` leg. If CI's first run of THIS test comes back RED
+/// after the fix, check first whether that runner expands `%SystemRoot%` inside a
+/// quoted operand; if it does not, replace the variable with a literal path in
+/// the fixture — do NOT weaken the assertion to the exit code.
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_an_inline_quoted_path_still_takes_the_branch() {
+    let cwd = temp_cwd("bash-cmd-if-exist");
+    let cmd = r#"if exist "%SystemRoot%\System32\cmd.exe" (echo FOUND)"#;
+    let r = execute_tool(&ctx(&cwd), "bash", &json!({ "command": cmd })).await;
+    assert!(
+        text_of(&r).contains("FOUND"),
+        "the quoted operand must reach `cmd` un-escaped or the branch is silently \
+         skipped WHILE STILL EXITING 0 — issue #79's false success: {:?}",
+        text_of(&r)
+    );
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
 // ── the exit-status truth table (pure — no child, no timing) ─────────
 //
 // A `sh -c` child reports EOF on its pipes the instant its LAST writing
@@ -561,18 +658,59 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
 
 /// A wait status from a raw `waitpid` value (`exit N` → `N << 8`; a
 /// signal death → the signal number, whose low bits are the cause).
+///
+/// UNIX-ONLY, deliberately: it is the raw-`waitpid` form, and a raw `waitpid`
+/// value is the only thing on any platform that can encode a SIGNAL DEATH (the
+/// shape the two signal rows below need). A child that merely EXITED with a
+/// code is built by [`exit_status_of`] instead, which exists on both platforms.
 #[cfg(unix)]
 fn wait_status(raw: i32) -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     std::process::ExitStatus::from_raw(raw)
 }
 
+/// A `wait` status for a child that EXITED with `code` (never a signal death).
+///
+/// Unix encodes an exit as `code << 8` in the `waitpid` value; Windows stores
+/// the exit code itself. `exit_signal` returns `None` on Windows, so a signal
+/// row has no Windows analogue and stays unix-only — which is why the four
+/// portable rows below use THIS helper instead of [`wait_status`].
+#[cfg(unix)]
+fn exit_status_of(code: i32) -> std::process::ExitStatus {
+    wait_status(code << 8)
+}
+
+#[cfg(not(unix))]
+fn exit_status_of(code: i32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw(code as u32)
+}
+
+/// A status the report can give NO code to. On unix that is a real signal
+/// death (`waitpid` value 9 → SIGKILL). Windows has no signal deaths and
+/// `exit_signal` is `None` for every status there, so `bash_exit_report`'s
+/// `(_, Some(sig))` arm is UNREACHABLE on Windows; the nearest thing the
+/// platform offers is the code a crash returns, which the report still refuses
+/// to call a success. The asymmetry is the point — do not "unify" it.
+#[cfg(unix)]
+fn a_death_with_no_exit_code() -> std::process::ExitStatus {
+    wait_status(9)
+}
+
+#[cfg(not(unix))]
+fn a_death_with_no_exit_code() -> std::process::ExitStatus {
+    // STATUS_ACCESS_VIOLATION, built directly rather than through
+    // `exit_status_of` (which takes an `i32` exit code, and this value is only
+    // meaningful as a `u32` NTSTATUS).
+    use std::os::windows::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw(0xC000_0005)
+}
+
 /// THE BUG: a command that exited 0 and whose exit status was observed
 /// is a SUCCESS. Not an error, code 0, no note.
-#[cfg(unix)]
 #[test]
 fn bash_exit_report_success_is_not_an_error() {
-    let (code, is_error, note) = bash_exit_report(false, false, Some(wait_status(0 << 8)));
+    let (code, is_error, note) = bash_exit_report(false, false, Some(exit_status_of(0)));
     assert!(
         !is_error,
         "a successful run must NOT be reported as a failure"
@@ -583,10 +721,9 @@ fn bash_exit_report_success_is_not_an_error() {
 
 /// A non-zero exit is an error carrying the REAL code (the shape
 /// `bash_nonzero_exit_is_error` asserts on the wire).
-#[cfg(unix)]
 #[test]
 fn bash_exit_report_nonzero_exit_is_an_error_with_its_real_code() {
-    let (code, is_error, note) = bash_exit_report(false, false, Some(wait_status(3 << 8)));
+    let (code, is_error, note) = bash_exit_report(false, false, Some(exit_status_of(3)));
     assert!(is_error);
     assert_eq!(code, Some(3), "the real code, never a fabricated one");
     assert_eq!(note, None);
@@ -595,6 +732,14 @@ fn bash_exit_report_nonzero_exit_is_an_error_with_its_real_code() {
 /// A signal death is an error, but is NOT dressed up as exit code -1 —
 /// it says which signal killed it (a real signal death must stay
 /// distinguishable from a non-zero exit).
+///
+/// ⚠ STAYS unix-gated, and that is a REAL PLATFORM LIMIT, not a dodge:
+/// `exit_signal` is `None` for EVERY status off Unix **by design**
+/// (`exec/bash.rs`'s `#[cfg(not(unix))]` arm), so on Windows there is no signal
+/// to name and no status that IS a signal death. Un-gating this row would force
+/// it either into a tautology or into a Linux RED. The code-less half of the
+/// same idea does port, and does — see [`a_death_with_no_exit_code`] and
+/// `bash_exit_report_success_is_the_only_non_error_row`.
 #[cfg(unix)]
 #[test]
 fn bash_exit_report_signal_death_names_the_signal() {
@@ -607,6 +752,15 @@ fn bash_exit_report_signal_death_names_the_signal() {
 
 /// A cancelled run is an error whatever the status says (the user asked
 /// for it to stop, so it did not complete).
+///
+/// ⚠ STAYS unix-gated for the same reason as the signal row above: its
+/// status list contains a real signal death (`wait_status(9)`) and asserts
+/// `code.is_none() || code == Some(0)` — a signal death has NO code, and there
+/// is no Windows status that is a signal death (`exit_signal` is `None` off
+/// Unix by design, `exec/bash.rs`), so that row cannot port. The two statuses
+/// that DO port (no status, and exit 0) are covered on both platforms by
+/// `bash_exit_report_unknown_status_says_so_and_claims_no_code` and
+/// `bash_exit_report_success_is_the_only_non_error_row`.
 #[cfg(unix)]
 #[test]
 fn bash_exit_report_cancelled_is_always_an_error() {
@@ -627,7 +781,6 @@ fn bash_exit_report_cancelled_is_always_an_error() {
 /// A deadline run is an error, and says it TIMED OUT (the old code
 /// inferred "timeout" from a fabricated -1, which is indistinguishable
 /// from any other unknown outcome).
-#[cfg(unix)]
 #[test]
 fn bash_exit_report_timeout_is_an_error_that_says_timed_out() {
     let (code, is_error, note) = bash_exit_report(false, true, None);
@@ -637,7 +790,7 @@ fn bash_exit_report_timeout_is_an_error_that_says_timed_out() {
     assert!(note.contains("timed out"), "got {note:?}");
     // A timeout that DID see the status still reports it (the kill
     // landed after the child had already exited).
-    let (code, is_error, _) = bash_exit_report(false, true, Some(wait_status(0 << 8)));
+    let (code, is_error, _) = bash_exit_report(false, true, Some(exit_status_of(0)));
     assert!(
         is_error,
         "a timed-out run is an error even with a clean status"
@@ -665,16 +818,20 @@ fn bash_exit_report_unknown_status_says_so_and_claims_no_code() {
 /// The one non-error row of the table is (not cancelled, not timed out,
 /// exited 0) — everything else is an error. Asserted as a table so a
 /// future edit cannot widen the success case.
-#[cfg(unix)]
+///
+/// The third row is a death the report can give NO code to: on unix a SIGKILL
+/// death, on Windows a crash code (see [`a_death_with_no_exit_code`]). The
+/// table's claim is that **exactly one row is a success**, and `ok == vec![0]`
+/// holds on each platform for its own reason.
 #[test]
 fn bash_exit_report_success_is_the_only_non_error_row() {
     let rows = [
-        (false, false, Some(wait_status(0 << 8))),
-        (false, false, Some(wait_status(1 << 8))),
-        (false, false, Some(wait_status(9))),
+        (false, false, Some(exit_status_of(0))),
+        (false, false, Some(exit_status_of(1))),
+        (false, false, Some(a_death_with_no_exit_code())),
         (false, false, None),
-        (true, false, Some(wait_status(0 << 8))),
-        (false, true, Some(wait_status(0 << 8))),
+        (true, false, Some(exit_status_of(0))),
+        (false, true, Some(exit_status_of(0))),
     ];
     let ok: Vec<usize> = rows
         .iter()
@@ -705,6 +862,8 @@ fn bash_exit_report_success_is_the_only_non_error_row() {
 /// under test. The DECISION — a child already exited 0 is a success, no
 /// fabricated -1 — is platform-neutral and stays covered everywhere by
 /// `bash_exit_report_success_is_not_an_error`.
+/// The #79 quoting fix does NOT make this fixture runnable on `cmd`: the gate is
+/// POSIX SYNTAX, not quoting.
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_success_after_closing_its_pipes_is_not_an_error() {
@@ -756,6 +915,8 @@ async fn bash_success_after_closing_its_pipes_is_not_an_error() {
 /// real 7-vs-1 mismatch. The real-code rule itself is covered on every
 /// platform by
 /// `bash_exit_report_nonzero_exit_is_an_error_with_its_real_code`.
+/// The #79 quoting fix does NOT make this fixture runnable on `cmd`: the gate is
+/// POSIX SYNTAX, not quoting.
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_nonzero_exit_after_closing_its_pipes_reports_its_real_code() {

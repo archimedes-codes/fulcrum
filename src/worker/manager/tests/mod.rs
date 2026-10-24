@@ -7,7 +7,9 @@ use tokio::sync::watch;
 
 use crate::agent::events::EventSink;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
-use crate::agent::subagent::{LaunchConfig, SubagentFailureReason, SubagentOutcome};
+use crate::agent::subagent::{
+    AgentNameResolution, LaunchConfig, SubagentFailureReason, SubagentOutcome,
+};
 use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
 use crate::agent::worker::manager::{
     feed_capture, finish_subagent, note_liveness_event, note_liveness_frame, note_liveness_gate,
@@ -164,6 +166,26 @@ fn make_manager(dead_bound: Option<Duration>) -> (WorkerManager, CrashLog, Event
 /// the capture as-is.
 const PUMP_STALL: Duration = Duration::from_millis(250);
 const PUMP_STALL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The **Dead bound** both ADR 0055 liveness tests inject (`#34`).
+///
+/// The arithmetic, because it is the whole point of the number:
+/// - **15×** the fixture's 100 ms `LONG_STREAM_GAP`, so the drive may lose
+///   fifteen consecutive frames — or the parent's read → decode → broadcast →
+///   pump chain may stall fifteen frames deep — before a streaming child is
+///   reaped. It used to be 300 ms, i.e. 3×, and ONE >300 ms observation gap on a
+///   loaded `macos-latest` runner reddened CI with 8 of 15 frames observed.
+/// - ~2× the observation lag the one recorded CI failure implies (~700 ms — seven
+///   100 ms frames the parent had not seen at 1.9 s), which is the quantity that
+///   actually breaks these tests: a bound sized against the CADENCE alone is
+///   answering the wrong question.
+/// - **HALF** the fixture's legitimate turn (30 chunks × 100 ms, and a 3.0 s
+///   `IN_TOOL_HOLD`). This is what keeps both tests RED against the pre-ADR 0055
+///   drive — the reaping still lands inside the child's production (streaming) or
+///   inside its silent tool hold (in-tool). Raise the bound without raising the
+///   fixture and the regression stops being caught — that trade is the reason both
+///   moved.
+const LIVENESS_DEAD_BOUND: Duration = Duration::from_millis(1500);
 
 /// The one-shot pump-stall gate (the state `make_stalling_manager` closes
 /// over): `armed` is flipped to `false` by the ONE frame it holds, and
@@ -352,6 +374,7 @@ fn dispatch_child_task_with_id(
             parent_cwd: "/tmp/space".to_string(),
             parent_enabled_tools: vec!["bash".to_string(), "read".to_string()],
             agent_name: "tester".to_string(),
+            name_resolution: AgentNameResolution::Matched,
             launch: LaunchConfig::default(),
             task: task.to_string(),
             // The RESOLVED `provider/id` key (what `subagent.rs` composes —
@@ -1189,22 +1212,31 @@ async fn a_silent_child_with_nothing_in_flight_hits_the_dead_bound() {
 }
 
 /// (ADR 0055 — the reported bug) A child that keeps PRODUCING outlives
-/// the bound. The fixture streams 15 `agent_message_chunk` `SinkFrame`s
-/// ~100 ms apart (~1.7 s of continuous production — 5× the bound
-/// injected here) and only then settles, so a drive that bounds the
-/// child's DELEGATION DURATION cuts it off mid-answer. The bound must be
-/// a SILENCE bound: every frame rearms it, so a streaming child is an
-/// Active Subagent and completes normally.
+/// the bound. The fixture streams 30 `agent_message_chunk` `SinkFrame`s
+/// ~100 ms apart (~3.0 s of continuous production — 2× the bound injected
+/// here) and only then settles, so a drive that bounds the child's
+/// DELEGATION DURATION cuts it off mid-answer. The bound must be a SILENCE
+/// bound: every frame rearms it, so a streaming child is an Active
+/// Subagent and completes normally.
 ///
-/// RED against the single never-rearmed `sleep(dead_bound)`: the
-/// sleep fires at 300 ms while the child is still streaming →
-/// `Failed { error: "unresponsive" }` (the reaping IS the bug). The
-/// fixture's total turn is ~1.8 s, so the bound is not merely short — it
-/// is exceeded 5× by pure production.
+/// RED against the single never-rearmed `sleep(dead_bound)`: the sleep
+/// fires at 1500 ms while the child is still streaming, with ~15 of the 30
+/// chunks still to come → `Failed { error: "unresponsive" }` and a
+/// visibly TRUNCATED `output` (the reaping IS the bug). This scenario has
+/// no `tool_call_id` outstanding, so — unlike the in-tool test below — its
+/// teeth come from the clock alone, not from the `in_flight` guard.
+///
+/// What the bound actually measures: the longest run of UNEXPLAINED SILENCE
+/// this drive OBSERVES — the inter-frame gap on `liveness_rx`, not the
+/// child's own cadence. The test's residual exposure is therefore a
+/// >`LIVENESS_DEAD_BOUND` OBSERVATION stall in the parent's read → decode →
+/// broadcast → pump chain, NOT the child's speed; 1500 ms is 15× the
+/// fixture's cadence and ~2× the observation lag the one recorded CI
+/// failure implies.
 #[tokio::test]
 async fn a_streaming_subagent_outlives_the_dead_bound() {
-    // The bound is 300 ms; the child streams for ~1.7 s.
-    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_millis(300)));
+    // The bound is 1500 ms — 15× the fixture's cadence, half its ~3.0 s stream.
+    let (manager, _crashes, events, _sinks) = make_manager(Some(LIVENESS_DEAD_BOUND));
     manager
         .attach("l1", &test_env("l1", None))
         .await
@@ -1224,15 +1256,24 @@ async fn a_streaming_subagent_outlives_the_dead_bound() {
             // The child genuinely ran PAST the bound — the proof that
             // this is the liveness case, not a race the fixture won.
             assert!(
-                metrics.duration_ms >= 600,
-                "the child must have run well past the 300 ms bound \
-                     (it streamed for ~1.7 s), got {metrics:?}"
+                metrics.duration_ms >= 2000,
+                "the child must have run well past the 1500 ms bound \
+                     (its own sleeps are 30 × 100 ms = 3.0 s), got {metrics:?}"
             );
         }
         other => panic!(
             "a streaming child is an Active Subagent and must COMPLETE, got {other:?} \
-                 (a `Failed {{ unresponsive }}` here is the bug: the drive bounded the \
-                 delegation's DURATION instead of the child's SILENCE)"
+             (FIRST suspect for a `Failed {{ unresponsive }}` here is OBSERVATION \
+             latency, NOT the ADR 0055 fix: the silence clock bounds the inter-frame \
+             gap the SUPERVISOR OBSERVES on `liveness_rx` (`subagent_flow.rs`), so a \
+             stall longer than this test's {bound} ms bound in the parent's \
+             read → decode → broadcast → pump chain reads as child silence while the \
+             child keeps producing. Compare the frame count in `output` against the \
+             fixture's 30 chunks: a TRUNCATED `output` (the CI failure showed 8 of 15 \
+             at 1.9 s) means the child was alive and the parent was starved. The \
+             DURATION-instead-of-SILENCE bug this test was written for is only the \
+             answer if every frame was observed and the drive still reaped.)",
+            bound = LIVENESS_DEAD_BOUND.as_millis(),
         ),
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1245,19 +1286,32 @@ async fn a_streaming_subagent_outlives_the_dead_bound() {
 }
 
 /// (ADR 0055) A child INSIDE a tool call is never reaped. The fixture
-/// announces a `tool_execution_start`, produces NOTHING for ~1.5 s (the
+/// announces a `tool_execution_start`, produces NOTHING for ~3.0 s (the
 /// tool is running — the child is silent BY CONSTRUCTION and legitimately
 /// blocked), then closes the call and settles. An outstanding
 /// `tool_call_id` is precisely the state in which silence means NOTHING,
 /// so the bound must not run at all here — not "be longer".
 ///
-/// RED against the single never-rearmed `sleep(dead_bound)`: the
-/// 300 ms sleep expires during the silent tool window →
-/// `Failed { error: "unresponsive" }` while `in_flight` holds `t1`.
+/// RED against the pre-ADR 0055 drive, whose SLEEP ARM RAN EVEN WITH a
+/// `tool_call_id` outstanding (it had no `in_flight` concept at all): the
+/// 1500 ms sleep expires inside the 3.0 s silent tool window →
+/// `Failed { error: "unresponsive" }` while `in_flight` holds `t1`, and it
+/// does so UNCONDITIONALLY (measured: dropping only the `if !in_flight` guard
+/// reddens this test every run). A never-rearmed clock ALONE also reddens it
+/// most runs — the guard only DELAYS the reaping, because the frozen deadline
+/// has already expired by the time the `tool_execution_end` lifts the guard, so
+/// the expired sleep then races the settle arm and usually wins — but the
+/// GUARD is this test's own guarantee, so the guard is what the mutation probe
+/// removes here. The streaming test is the one whose teeth are the REARM alone.
+///
+/// The test's load exposure is the COLD START, not the hold: the bound stops
+/// being armed only once the pump has OBSERVED the `tool_execution_start`
+/// announce, so the one window a stalled parent can lose here is the drive's
+/// first deadline vs that single frame.
 #[tokio::test]
 async fn a_child_inside_a_tool_call_is_never_reaped() {
-    // The bound is 300 ms; the tool call stays open for ~1.5 s.
-    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_millis(300)));
+    // The bound is 1500 ms; the tool call stays open for ~3.0 s.
+    let (manager, _crashes, events, _sinks) = make_manager(Some(LIVENESS_DEAD_BOUND));
     manager
         .attach("i1", &test_env("i1", None))
         .await
@@ -1272,15 +1326,17 @@ async fn a_child_inside_a_tool_call_is_never_reaped() {
     match outcome {
         SubagentOutcome::Completed { metrics, .. } => {
             assert!(
-                metrics.duration_ms >= 1000,
+                metrics.duration_ms >= 2000,
                 "the child must have been held by the OPEN tool call well past \
-                     the 300 ms bound, got {metrics:?}"
+                     the 1500 ms bound, got {metrics:?}"
             );
         }
         other => panic!(
             "a child with an outstanding `tool_call_id` must NEVER be reaped, got \
                  {other:?} (a `Failed {{ unresponsive }}` here is the bug: the bound ran \
-                 while the child was blocked inside its tool)",
+                 while the child was blocked inside its tool — first suspect: the \
+                 announce frame was not OBSERVED within the bound, see the note on \
+                 OBSERVATION latency in a_streaming_subagent_outlives_the_dead_bound)",
         ),
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1801,6 +1857,7 @@ async fn a_gate_whose_tool_closed_without_an_answer_is_still_closed() {
         parent_cwd: "/tmp/space".to_string(),
         parent_enabled_tools: vec!["bash".to_string()],
         agent_name: "tester".to_string(),
+        name_resolution: AgentNameResolution::Matched,
         launch: crate::agent::subagent::LaunchConfig::default(),
         task: "the parked task".to_string(),
         model_key: "fake/m1".to_string(),
@@ -1932,6 +1989,10 @@ async fn the_subagent_ui_lifecycle_events_fire_on_the_parent_sink() {
     assert_eq!(started["parentSessionId"], "u1");
     assert!(started["sessionId"].is_string(), "the child session id");
     assert_eq!(started["agentName"], "tester");
+    assert_eq!(
+        started["nameResolution"], "matched",
+        "the tri-state rides the payload"
+    );
     assert_eq!(started["task"], "the task");
     assert_eq!(
         started["model"], "fake/m1",
@@ -1960,6 +2021,130 @@ async fn the_subagent_ui_lifecycle_events_fire_on_the_parent_sink() {
     assert!(metrics["inputTokens"].is_u64());
     assert!(metrics["outputTokens"].is_u64());
     assert!(metrics["cost"].is_number());
+}
+
+/// (issue #47) The `subagent-session-started` payload names a resolve MISS, and
+/// its key set is pinned EXACTLY.
+///
+/// Three things this pins in one place, none of which a frontend test can see:
+///
+/// 1. the `nameResolution` key carries the WIRE spelling (`unmatched` /
+///    `no_name`) taken verbatim off the wire — from the REAL emit, not from a
+///    serde unit test;
+/// 2. the payload's key set is EXACTLY the eight keys — the byte-for-byte
+///    payload pin. It lives HERE (at the emitter) rather than in
+///    `src/lib/ipc/events.test.ts`, which pins event NAMES and nothing else;
+/// 3. the miss is NON-BLOCKING: the drive still reaches `subagent-closed` with
+///    `status: "completed"`, which is the acceptance criterion and the only way
+///    to prove it without a model.
+///
+/// Each case runs on its OWN parent session (its own `register_sink` +
+/// `attach`) so the two drives' events cannot be confused, and with a DISTINCT
+/// DISPATCH id (`subagent-result` / `subagent-cancel` route by DISPATCH id, so
+/// a shared id would attribute one drive's outcome to the other). The wire is
+/// built inline — a copy of `dispatch_child_task_with_id`'s nine field
+/// assignments with `name_resolution` differing per case — because that
+/// helper's signature is shared by ten call sites and stays untouched.
+#[tokio::test]
+async fn the_started_payload_names_a_resolve_miss_and_pins_its_full_key_set() {
+    for (parent, dispatch_id, resolution, want) in [
+        ("n1", "miss-1", AgentNameResolution::Unmatched, "unmatched"),
+        ("n2", "miss-2", AgentNameResolution::NoName, "no_name"),
+    ] {
+        let (manager, _crashes, _events, sinks) = make_manager(Some(Duration::from_secs(30)));
+        let sink_events = register_sink(&sinks, parent);
+        manager
+            .attach(parent, &test_env(parent, Some(vec!["bash".to_string()])))
+            .await
+            .expect("the parent attach completes");
+        manager.dispatch_subagent(
+            parent,
+            SubagentDispatchWire {
+                id: dispatch_id.to_string(),
+                parent_session_id: parent.to_string(),
+                parent_cwd: "/tmp/space".to_string(),
+                parent_enabled_tools: vec!["bash".to_string(), "read".to_string()],
+                agent_name: "tester".to_string(),
+                name_resolution: resolution,
+                launch: LaunchConfig::default(),
+                task: "the task".to_string(),
+                model_key: "fake/m1".to_string(),
+            },
+        );
+
+        // Bounded poll for `subagent-closed` (every exit path emits it) — the
+        // same shape as the neighbouring lifecycle test, so a missing frame is
+        // a failure and not a hang.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let got: Vec<(String, Value)> = sink_events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if got.iter().any(|(e, _)| e == "subagent-closed")
+                || tokio::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let got: Vec<(String, Value)> = sink_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let started = got
+            .iter()
+            .find(|(e, _)| e == "subagent-session-started")
+            .map(|(_, p)| p.clone())
+            .expect("the `subagent-session-started` fired on the parent's sink");
+
+        assert_eq!(
+            started["nameResolution"], want,
+            "the wire spelling rides the payload ({resolution:?})"
+        );
+        assert_eq!(
+            started["agentName"], "tester",
+            "the marker is ADDITIVE — the label never disappears"
+        );
+
+        // The byte-for-byte payload pin: EXACTLY these eight keys.
+        let keys: std::collections::BTreeSet<String> = started
+            .as_object()
+            .expect("the payload is an object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "sessionId",
+                "parentSessionId",
+                "agentName",
+                "nameResolution",
+                "task",
+                "model",
+                "thinkingLevel",
+                "enabledTools",
+            ]
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect::<std::collections::BTreeSet<String>>(),
+            "the `subagent-session-started` key set is exactly eight keys ({want})"
+        );
+
+        // NON-BLOCKING: the miss never stops the child.
+        let closed = got
+            .iter()
+            .find(|(e, _)| e == "subagent-closed")
+            .map(|(_, p)| p.clone())
+            .expect("the `subagent-closed` fired on the parent's sink");
+        assert_eq!(
+            closed["status"], "completed",
+            "a resolve miss never fails the dispatch ({want})"
+        );
+        assert_eq!(closed["sessionId"], started["sessionId"], "the same child");
+        manager.detach(parent);
+    }
 }
 
 /// The `enabled_tools` wire convention (reviewer-corrected — the

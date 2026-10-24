@@ -106,6 +106,65 @@ impl EnvPatch {
         self.set.is_empty() && self.remove.is_empty()
     }
 
+    /// The one-line verdict of this patch, for the process's stderr.
+    ///
+    /// Issue #81's residual: "the scrub did not fire" and "the scrub fired and
+    /// found nothing" used to be ONE observable, which is what made a bundled
+    /// run's child-env failures unanswerable from the log. Two verdicts, each
+    /// greppable on its own (`changed nothing` / `hostenv: scrubbed`), and the
+    /// fired one names every variable with its action.
+    ///
+    /// Deliberately NOT `cfg`-gated: off Linux the patch is always empty, so
+    /// this returns the no-op line there, which is that platform's real
+    /// behaviour (pinned by `an_empty_patch_reports_that_nothing_was_removed`,
+    /// which runs on every target). Walking [`TAINTED_VARS`] rather than the two
+    /// vectors is what keeps the const's `allow(dead_code)` honest off Linux and
+    /// is also what makes the order the documented one.
+    ///
+    /// Two limits this wording must not oversell, both recorded in
+    /// [`for_child`]'s doc: an empty patch does NOT distinguish a closed gate
+    /// from an open gate on an already-clean mount (hence "not running from an
+    /// AppImage mount, **or** a mount whose env needed no change"), and no
+    /// variable's VALUE is ever printed — a `PATH` is user data and the log this
+    /// reaches is a shared file. [`EnvPatch`]'s `Debug` stays the tool for test
+    /// failures.
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return "hostenv: the child env scrub changed nothing (not running from an \
+                    AppImage mount, or a mount whose env needed no change)"
+                .to_string();
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(self.set.len() + self.remove.len());
+        // The const's order, which its doc declares to be "the order the patch
+        // reports" — NOT `set` then `remove`, because the two vectors are
+        // separate and walking them would list every filter before every
+        // removal. A name is in exactly ONE of the two (see [`Self::apply`]), so
+        // this yields each scrubbed variable exactly once.
+        for name in TAINTED_VARS {
+            // Fully qualified: the module's `use std::ffi::OsStr` follows the
+            // `cfg(unix)` of its other consumers, and this method is NOT
+            // `cfg`-gated (off Linux it still has to produce the no-op line).
+            let key = std::ffi::OsStr::new(name);
+            let action = if self.remove.iter().any(|k| k == key) {
+                Some("removed")
+            } else if self.set.iter().any(|(k, _)| k == key) {
+                Some("set")
+            } else {
+                None
+            };
+            if let Some(action) = action {
+                parts.push(format!("{name}={action}"));
+            }
+        }
+        format!(
+            "hostenv: scrubbed the AppImage's own paths out of every child env ({} \
+             variable{}): {}",
+            parts.len(),
+            if parts.len() == 1 { "" } else { "s" },
+            parts.join(", ")
+        )
+    }
+
     /// Apply the patch. Call this BEFORE the call site's own `env`/`envs`,
     /// so a caller's explicit variable still wins.
     ///
@@ -148,6 +207,45 @@ impl EnvPatch {
 /// closes and this returns an EMPTY patch on every host — a test that
 /// asserts against `for_child()` asserts nothing. Tests must call [`scrub`]
 /// with a fabricated `appdir`/`exe` pair.
+///
+/// # The verdict line, and why it goes to stderr
+///
+/// The initializer prints [`EnvPatch::describe`] once per PROCESS. That is the
+/// only correct cardinality: the patch is a `OnceLock` over `APPDIR` +
+/// `current_exe()`, i.e. a process-lifetime constant, so "what the scrub did"
+/// is a per-process fact — while [`EnvPatch::apply`] runs once per CHILD, and
+/// instrumenting it instead would print on every `bash`/`fd`/`rg`/MCP spawn
+/// into a 5 MB rotating log (and would mean changing `apply`'s return type at
+/// six call sites). Instrumenting the initializer also means it cannot be
+/// forgotten at a call site and cannot fire twice.
+///
+/// It is `eprintln!` and NOT [`crate::agent::debuglog::log`] for the same class
+/// of reason this task exists to kill: the tools run in the WORKER, and
+/// `debuglog::init_from_env()` is only ever called from `lib.rs::run()` (the
+/// Supervisor), so a `debuglog::log` from here would be a SILENT NO-OP in
+/// exactly the process whose verdict is being asked for. The Worker's stderr IS
+/// its log channel: `WorkerHandle::spawn` pipes it and the drain task forwards
+/// every line to `debuglog::log_truncated("worker-stderr:", …)` on the
+/// Supervisor side (`worker/client.rs`, proven end-to-end by
+/// `src-tauri/tests/worker_stderr.rs`), and `worker/mod.rs` already uses bare
+/// `eprintln!` for its own diagnostics for exactly this reason. In the
+/// Supervisor the line lands on the inherited stderr, which is where a
+/// `cargo run` developer sees it.
+///
+/// Two recorded limitations, both deliberate:
+///
+/// * `commands/update.rs::relaunch_patch` calls [`scrub`] DIRECTLY (not
+///   through here) and therefore stays SILENT. Its result is already asserted
+///   end-to-end by `update.rs`'s own tests, it is called from those tests, and
+///   a relaunch is a once-per-restart event whose outcome is visible in the
+///   child's env. Silence there is a decision, not an oversight.
+/// * An EMPTY patch is reported as "changed nothing" WITHOUT distinguishing a
+///   closed gate (not running from a mount) from an open gate on a mount whose
+///   env was already clean — both produce `EnvPatch::default()`, and separating
+///   them means plumbing the Linux-only `appimage_mount_root` decision (this
+///   doc comment is not `cfg`-gated, so it does not link a Linux-only item) out
+///   of [`scrub`]. The wording therefore names both possibilities rather than
+///   inventing a third state it cannot observe.
 pub fn for_child() -> &'static EnvPatch {
     static PATCH: std::sync::OnceLock<EnvPatch> = std::sync::OnceLock::new();
     PATCH.get_or_init(|| {
@@ -155,11 +253,15 @@ pub fn for_child() -> &'static EnvPatch {
         // gate rejects it (no `Component::Normal`), which fails toward "do
         // nothing" rather than toward "strip the user's PATH".
         let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("/").to_path_buf());
-        scrub(
+        let patch = scrub(
             std::env::vars_os().collect(),
             std::env::var_os("APPDIR").as_deref().map(Path::new),
             &exe,
-        )
+        );
+        // Once per process — see the doc above for why this is stderr and not
+        // the debug log.
+        eprintln!("{}", patch.describe());
+        patch
     })
 }
 
@@ -410,8 +512,14 @@ mod tests {
     //! is *defined* to return the empty patch, so writing their assertions
     //! unguarded would make them pass vacuously on macOS and Windows. Gating
     //! them at compile time keeps that honest — `cargo test hostenv` reports
-    //! 14 tests on Linux and 6 elsewhere — and mirrors `sandbox.rs`, whose
+    //! 16 tests on Linux and 7 elsewhere — and mirrors `sandbox.rs`, whose
     //! whole Linux-only test module is `cfg`'d out the same way.
+    //!
+    //! The two verdict tests (15–16) are the deliberate EXCEPTION to that
+    //! split, and the asymmetry is the point: 15 asserts the NO-OP verdict and
+    //! is ungated, because off Linux the empty patch IS the behaviour, so the
+    //! test must RUN there rather than skip; 16 asserts the FIRED verdict and is
+    //! Linux-only, because nothing off Linux can build a non-empty patch.
     //!
     //! None of them calls [`for_child()`]: under `cargo test` `current_exe()`
     //! is `target/debug/deps/<hash>`, never under `$APPDIR`, so the cached
@@ -973,6 +1081,135 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "/usr/lib",
             "the patch did not reach the child's environment"
+        );
+    }
+    // ── 15–16: the verdict line (issue #81, residual 2) ──────────────────
+
+    /// Claim: a patch that changes nothing SAYS so, in words that cannot be
+    /// mistaken for a job done.
+    ///
+    /// Deliberately NOT `#[cfg]`-gated, unlike the strip tests: off Linux
+    /// `scrub` is *defined* to return the empty patch, so "the scrub changed
+    /// nothing" IS the behaviour of those targets and the honest test for it
+    /// RUNS there instead of skipping. This is the no-op half of the
+    /// discrimination issue #81 asks for — "the scrub did not fire" and "the
+    /// scrub fired and found nothing" used to be ONE observable, and the fix is
+    /// a sentence that distinguishes them.
+    ///
+    /// Both possible causes are named, because `describe` cannot tell them
+    /// apart: a closed gate (not running from a mount) and an open gate on a
+    /// mount whose env was already clean both produce `EnvPatch::default()`.
+    /// Wording that claimed one would assert a state the code cannot know.
+    #[test]
+    fn an_empty_patch_reports_that_nothing_was_removed() {
+        let patch = EnvPatch::default();
+        assert!(patch.is_empty(), "the fixture must be the no-op case");
+        let line = patch.describe();
+        assert!(
+            line.contains("changed nothing"),
+            "the no-op verdict must be greppable, got {line:?}"
+        );
+        // The two verdicts must not be confusable by a reader (or a `grep`):
+        // "scrubbed" is the verb of a thing DONE, and nothing was done.
+        assert!(
+            !line.contains("scrubbed "),
+            "the no-op line must not read as work performed, got {line:?}"
+        );
+    }
+
+    /// Claim: when the scrub DID fire, the line names every variable and which
+    /// half of the patch it landed in — the `set` half (`PATH`,
+    /// `LD_LIBRARY_PATH`: filtered, something of the user's survived) and the
+    /// `remove` half (`PYTHONHOME`: the mount owned all of it).
+    ///
+    /// Built on [`fixtures::tainted_patch`] — the fabricated-host injection —
+    /// and NOT on [`for_child`], which is EMPTY under `cargo test` (its gate
+    /// needs this exe under `$APPDIR`), so a test driven through it would
+    /// describe the no-op patch and assert nothing while passing. The fixtures
+    /// module asserts its own patch is non-empty for exactly that reason; the
+    /// end-to-end "the line really gets printed, once, in a real process that
+    /// is inside a mount" half lives in
+    /// `agent/tools/exec/tests/bash_hostenv.rs`.
+    ///
+    /// No VALUE is printed (a `PATH` is user data and the log is a shared file),
+    /// so this asserts names and actions only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_summary_names_every_variable_and_its_action() {
+        let patch = super::fixtures::tainted_patch();
+        let line = patch.describe();
+        assert!(
+            line.contains("hostenv: scrubbed"),
+            "the fired verdict must be greppable, got {line:?}"
+        );
+        assert!(
+            line.contains("PATH=set") && line.contains("LD_LIBRARY_PATH=set"),
+            "the filtered half must be named as `set`, got {line:?}"
+        );
+        assert!(
+            line.contains("PYTHONHOME=removed"),
+            "the fully-stripped half must be named as `removed`, got {line:?}"
+        );
+        assert!(
+            !line.contains("changed nothing"),
+            "a patch that fired must never read as a no-op, got {line:?}"
+        );
+        // Order is `TAINTED_VARS` order (the const's doc declares it "the order
+        // the patch reports"). Walking the two vectors instead would report
+        // every `set` before every `remove`, and for THIS fixture that happens
+        // to coincide — so the coincidence is pinned separately below, with an
+        // input where the two strategies disagree.
+        let at = |needle: &str| {
+            line.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from {line:?}"))
+        };
+        assert!(
+            at("PATH=set") < at("LD_LIBRARY_PATH=set")
+                && at("LD_LIBRARY_PATH=set") < at("PYTHONHOME=removed"),
+            "the report must follow TAINTED_VARS order, got {line:?}"
+        );
+        // The case that actually tells the two implementations apart: here the
+        // EARLIER name (`PATH`, position 0) is the `remove` and the later one
+        // (`LD_LIBRARY_PATH`, position 1) the `set`, so a `set`-then-`remove`
+        // vector walk reports them in the WRONG order while a `TAINTED_VARS`
+        // walk reports them in the documented one.
+        let removed_first = scrub(
+            env(&[
+                ("PATH", format!("{MOUNT}/usr/bin/").as_str()),
+                (
+                    "LD_LIBRARY_PATH",
+                    format!("{MOUNT}/usr/lib/:/usr/lib").as_str(),
+                ),
+            ]),
+            Some(Path::new(MOUNT)),
+            Path::new(EXE_INSIDE),
+        );
+        let swapped = removed_first.describe();
+        assert!(
+            removes(&removed_first, "PATH") && set_of(&removed_first, "LD_LIBRARY_PATH").is_some(),
+            "control: this input must produce a remove BEFORE a set in const order, \
+             else the ordering claim above is vacuous: {removed_first:?}"
+        );
+        assert!(
+            swapped.find("PATH=removed") < swapped.find("LD_LIBRARY_PATH=set"),
+            "the report must interleave both halves in TAINTED_VARS order, got {swapped:?}"
+        );
+        // The stated count agrees with the list it introduces, and reads as
+        // English at the boundary. `describe` owns that pluralisation, so it is
+        // asserted rather than left to a log line nobody re-reads.
+        assert!(
+            line.contains("(3 variables)"),
+            "the fixture scrubs three names, so the count must read 3, got {line:?}"
+        );
+        let single = scrub(
+            env(&[("PYTHONHOME", format!("{MOUNT}/usr").as_str())]),
+            Some(Path::new(MOUNT)),
+            Path::new(EXE_INSIDE),
+        );
+        let line = single.describe();
+        assert!(
+            line.contains("(1 variable): PYTHONHOME=removed"),
+            "a one-variable patch must not read \"1 variables\", got {line:?}"
         );
     }
 }

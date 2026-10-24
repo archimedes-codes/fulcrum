@@ -15,8 +15,8 @@ use crate::agent::events::EventSink;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
 use crate::agent::harness::provider::ToolCall;
 use crate::agent::subagent::{
-    LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentMetrics, SubagentOutcome,
-    SubagentSessionManager,
+    AgentNameResolution, LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentMetrics,
+    SubagentOutcome, SubagentSessionManager,
 };
 use crate::agent::tools::{ContentBlock, ToolResult};
 
@@ -38,6 +38,7 @@ pub trait SubagentDispatcher: Send + Sync {
         parent_model: &Model,
         parent_enabled_tools: Vec<String>,
         agent_name: String,
+        name_resolution: AgentNameResolution,
         launch: LaunchConfig,
         task: String,
         sink: &Arc<dyn EventSink>,
@@ -67,6 +68,7 @@ impl SubagentDispatcher for InProcessDispatcher {
         parent_model: &Model,
         parent_enabled_tools: Vec<String>,
         agent_name: String,
+        name_resolution: AgentNameResolution,
         launch: LaunchConfig,
         task: String,
         sink: &Arc<dyn EventSink>,
@@ -80,6 +82,7 @@ impl SubagentDispatcher for InProcessDispatcher {
             parent_model,
             parent_enabled_tools,
             agent_name,
+            name_resolution,
             launch,
             task,
             sink,
@@ -139,6 +142,7 @@ impl SubagentDispatcher for MockDispatcher {
         _parent_model: &Model,
         _parent_enabled_tools: Vec<String>,
         _agent_name: String,
+        _name_resolution: AgentNameResolution,
         _launch: LaunchConfig,
         _task: String,
         _sink: &Arc<dyn EventSink>,
@@ -267,15 +271,29 @@ pub(crate) async fn dispatch_subagent(
             };
         }
     };
+    // The label is TRIMMED here, at the one binding that feeds BOTH consumers:
+    // `resolve_launch` selects on `agent_name.trim()`, so a padded `"  scout  "`
+    // is a genuine `Matched`. Handing the RAW string downstream would put a
+    // label on the wire that the resolver never selected by, and the
+    // `subagent-session-started` payload would print the padding while its
+    // `nameResolution` described the trimmed name — a marker and a label about
+    // two different strings (the UI's row shows the padding verbatim). Trimming
+    // at the EMITTER instead would leave the wire raw and the payload trimmed,
+    // i.e. the same disagreement one hop earlier; and `resolve_launch` keeps its
+    // own `trim()` because its other callers (the Agents modal) pass raw names.
     let agent_name = params
         .get("agentName")
         .and_then(Value::as_str)
         .unwrap_or_default()
+        .trim()
         .to_string();
-    // ADR 0020: resolve `agentName` against the discovered Agent
-    // definitions (layered — explicit params win; no match / empty =
-    // config-less, never an error).
-    let launch = crate::agent::harness::launch::resolve_launch(
+    // ADR 0020: resolve `agentName` against the discovered Agent definitions
+    // (layered — explicit params win; no match / empty = config-less, never an
+    // error). (issue #47) The resolution is NOT a control-flow decision — it
+    // changes nothing here — it is the payload the UI reads: `Unmatched` is a
+    // name that matched no definition, i.e. a child running the parent's config
+    // under a label no one wrote down.
+    let (launch, name_resolution) = crate::agent::harness::launch::resolve_launch(
         &launch,
         &agent_name,
         parent.catalog,
@@ -288,6 +306,7 @@ pub(crate) async fn dispatch_subagent(
         parent.model,
         parent.enabled_tools.map(|v| v.to_vec()).unwrap_or_default(),
         agent_name,
+        name_resolution,
         launch,
         task,
         parent.sink,
@@ -489,6 +508,9 @@ mod tests {
             &test_model(),
             Vec::new(),
             "tester".to_string(),
+            // A real `InProcessDispatcher` + a named Agent: the truthful value
+            // for this fixture (nothing here asserts on the resolution).
+            AgentNameResolution::Matched,
             LaunchConfig::default(),
             "do the thing".to_string(),
             &sink,
@@ -614,6 +636,9 @@ mod tests {
             &test_model(),
             Vec::new(),
             "a".to_string(),
+            // The honest value for a nameless test call (the `MockDispatcher`
+            // drops the parameter either way).
+            AgentNameResolution::NoName,
             LaunchConfig::default(),
             "t".to_string(),
             &sink,
@@ -653,6 +678,9 @@ mod tests {
             &test_model(),
             Vec::new(),
             "a".to_string(),
+            // The honest value for a nameless test call (the `MockDispatcher`
+            // drops the parameter either way).
+            AgentNameResolution::NoName,
             LaunchConfig::default(),
             "t".to_string(),
             &sink,

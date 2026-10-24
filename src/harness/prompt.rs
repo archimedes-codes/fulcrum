@@ -14,7 +14,17 @@ const PREAMBLE: &str = "You are an expert coding assistant operating inside Arch
 
 const TODO_GUIDANCE: &str = "Use manage_todo_list to track multi-step work — write the plan before starting, mark items completed as you go";
 
-const SUBAGENT_GUIDANCE: &str = "Delegate independent subtasks with subagent — give each a systemPrompt describing its role and constraints (e.g. a read-only researcher, a focused reviewer), or a discovered agent (list_agents)";
+/// (issue #78, ADR 0020) `agentName` is the DEFAULT route and an explicit
+/// `systemPrompt` is the exception that needs justifying — the reverse of the
+/// superseded ADR 0017 "shape it with systemPrompt or use a discovered agent"
+/// wording this replaced.
+///
+/// HARD CONSTRAINT on the wording: the constant must keep opening with
+/// `Delegate independent subtasks with subagent` — `main_prompt_rules_conditional`
+/// asserts `!prompt.contains("Delegate independent subtasks")` as its "the
+/// guidance is absent without the tool" half, so rewording the opening silently
+/// weakens that test.
+const SUBAGENT_GUIDANCE: &str = "Delegate independent subtasks with subagent — pass a discovered agent's name in `agentName` (`list_agents`) and put your constraints in the task text; do NOT pass a `systemPrompt` alongside `agentName`, it replaces the agent's own prompt";
 
 const CONTEXT_CANDIDATES: &[&str] = &[
     "AGENTS.override.md",
@@ -145,10 +155,14 @@ pub fn build_main_prompt(ctx: &PromptContext) -> String {
 /// `systemPrompt` (if any — an empty/whitespace-only value counts as `None`,
 /// so no leading blank line) + the `manage_todo_list` guidance line (when the
 /// child has the tool) — no preamble, no tools list. `None` + no tool → `None`,
-/// and `None` means "no REDUCED message", NOT "no system message": the worker's
-/// `(StartMode::Fresh, None)` arm then builds the MAIN prompt for that child,
-/// whose `<skills>` section is FILTERED like any other (ADR 0036's subagent
-/// bullet is the authoritative statement of both child shapes).
+/// and `None` means NO SYSTEM MESSAGE AT ALL: the worker's
+/// `(StartMode::FreshChild, None)` arm prepends NOTHING, so such a child has no
+/// system message and no seq-0 transcript row (issue #9 removed the fall-through
+/// that used to hand it the MAIN prompt). The ADR 0036 filter therefore lives on
+/// the TOOLS side of the child story alone: no child shape — reduced message or
+/// no message at all — carries a `<skills>` section, so `read_skill`/`list_skills`
+/// (ADR 0036's subagent bullet) are the whole child story for a model-hidden
+/// Skill.
 pub fn build_child_system_message(
     system_prompt: Option<&str>,
     has_todo_tool: bool,
@@ -527,8 +541,9 @@ When a skill file references a relative path, resolve it against the skill direc
         );
     }
 
-    // 2b — (ADR 0020) the guidance mentions `list_agents` (the parent
-    // discovers its Agent definitions via the `list_agents` tool).
+    // 2b — (issue #78, ADR 0020) the guidance makes `agentName` the route,
+    // names `list_agents` (the discovery tool), and forbids the habit ADR 0020
+    // superseded: hand-shaping a discovered agent with a `systemPrompt`.
     #[test]
     fn the_subagent_guidance_mentions_list_agents() {
         let root = scratch();
@@ -543,8 +558,12 @@ When a skill file references a relative path, resolve it against the skill direc
         };
         let prompt = build_main_prompt(&ctx);
         assert!(
-            prompt.contains("or a discovered agent (list_agents)"),
-            "SUBAGENT_GUIDANCE must mention list_agents: {prompt}"
+            prompt.contains("`agentName` (`list_agents`)"),
+            "SUBAGENT_GUIDANCE must make `agentName` the route and name `list_agents`: {prompt}"
+        );
+        assert!(
+            prompt.contains("do NOT pass a `systemPrompt` alongside `agentName`"),
+            "SUBAGENT_GUIDANCE must forbid the replacing-systemPrompt habit ADR 0020 superseded: {prompt}"
         );
     }
 

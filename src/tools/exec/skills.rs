@@ -119,9 +119,15 @@ pub async fn exec_read_skill(ctx: &ToolCtx, params: &Value) -> ToolResult {
         // only a name-substring filter (`ChatStream.tsx`), deliberately — the
         // Client's skill catalog must stay total or this flag would delete the
         // user's own route (ADR 0036). So for Skills the predicate is enforced
-        // in exactly TWO places — this refusal and the Skills-dialog tooltip —
-        // and the `$` picker CAN offer a name this tool refuses. That is the
-        // accepted shape, not a drift to fix.
+        // in FOUR places, and this refusal is one of them: the Skills-dialog
+        // tooltip (`manualOnlyTooltip`, which promises a `$name` only when the
+        // grammar can carry it), that dialog's ROW AFFORDANCE (an unmentionable
+        // row renders inert — issue #10), `insertSkill`'s guard before it
+        // dispatches the token (issue #10), and here. All three Client sides
+        // branch on `isMentionableSkillName` in `src/lib/skills.ts`, whose
+        // "where it is applied" paragraph is the count to keep in step with
+        // this one. The `$` picker still CAN offer a name this tool refuses.
+        // That is the accepted shape, not a drift to fix.
         let route = if crate::skills::is_mentionable_name(&skill.name) {
             // `${key}` is LOWERCASED on purpose: the token grammar is
             // lowercase-only, so `$DeBuG` expands nothing while `$debug` does.

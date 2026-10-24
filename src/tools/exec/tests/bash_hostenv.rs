@@ -474,6 +474,36 @@ async fn a_bash_child_under_a_fabricated_appimage_mount_sees_a_scrubbed_env() {
         "the reporter did not see a capable host inside the child — the fabricated gate \
          did not open, so nothing here was observed:\n{log}"
     );
+    // ── the scrub's VERDICT line (issue #81, residual 2) ─────────────────
+    //
+    // This is the only place in the tree where a NON-EMPTY patch exists inside
+    // a real process, so it is the only honest proof that the line fires where
+    // it matters (the unit tests describe a fabricated patch; they cannot show
+    // that anything prints it).
+    //
+    // Exactly ONE line, though the child spawns three tool children (`sh`,
+    // `fd`, `rg`): the verdict comes from `for_child()`'s `OnceLock`
+    // initializer, which is a per-PROCESS fact. If this ever reads 2 the
+    // initializer is not the right place — find out why, do not relax the
+    // count. The PARENT's own verdict cannot inflate it: it goes to the
+    // parent's stderr, which is not in `log`.
+    assert_eq!(
+        log.matches("hostenv: scrubbed").count(),
+        1,
+        "the scrub verdict must be printed exactly once per process (the fabricated \
+         child spawns a bash, an fd and an rg child, so a per-CHILD line would read \
+         higher and a missing initializer would read 0):\n{log}"
+    );
+    // And inside a mount the verdict must be the SCRUBBED one — `PYTHONHOME` is
+    // set to `$APPDIR/usr` above and the mount owns all of it, so the patch
+    // `env_remove`s it and the line must say so. This is the discrimination
+    // issue #81 asks for: a run that silently reported `changed nothing` from
+    // inside a mount would pass every assertion above.
+    assert!(
+        log.contains("PYTHONHOME=removed"),
+        "inside a fabricated mount the verdict must name the removed variable, not \
+         claim nothing was done:\n{log}"
+    );
 }
 
 /// The AppDir-shaped tree: `$APPDIR/usr/lib`, `$APPDIR/usr/bin` and a hard

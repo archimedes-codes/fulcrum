@@ -65,7 +65,7 @@ impl OutputCollector {
     }
 }
 
-/// Execute a shell command (`sh -c` on Unix, `cmd /C` on Windows) inside
+/// Execute a shell command (`sh -c` on Unix, `cmd /d /s /c` on Windows) inside
 /// `ctx.cwd`, bounded by an optional `timeout_ms` (default 300 s, max 15 min;
 /// clamped by [`clamp_timeout_ms`]).
 ///
@@ -102,11 +102,11 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
         c
     };
     #[cfg(not(unix))]
-    let mut cmd = {
-        let mut c = crate::agent::childproc::command("cmd");
-        c.arg("/C");
-        c
-    };
+    // No `/C` here: the whole `/d /s /c "<command>"` tail is appended as ONE raw
+    // argument below, by the module that owns the Windows shape of a child's
+    // command line. `arg("/C")` + `arg(command)` is exactly what issue #79 is
+    // about — see `childproc::append_cmd_c`.
+    let mut cmd = crate::agent::childproc::command("cmd");
     // Tool child, so stdin is NULL, not inherited. Nothing can ever feed this
     // child: the Worker owns the only pipe a stdin could be (`worker/client.rs`
     // holds the `BufWriter<ChildStdin>` for its whole life) and `tokio`'s
@@ -118,7 +118,18 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // Deliberately NOT applied to Runtime children (the Worker's own stdin, an
     // MCP server's, `sudo_exec`'s password stdin) — we write those pipes.
     crate::agent::childproc::closed_stdin(&mut cmd);
+    // The command string reaches the shell UNMODIFIED on both platforms — that
+    // is this tool's whole contract. Unix: `sh -c` takes it verbatim. Windows:
+    // `arg` would wrap it in an outer quote pair and escape every embedded `"`
+    // as `\"`, and `cmd /s` strips only the OUTER pair, so the escapes stay
+    // visible to command parsing — inline quoting becomes unusable and `start`'s
+    // title-slot rule turns the wreckage into a modal dialog on the user's
+    // desktop (issue #79). Hence the raw tail, appended inside `childproc`
+    // (census invariant E).
+    #[cfg(unix)]
     cmd.arg(&command);
+    #[cfg(not(unix))]
+    crate::agent::childproc::append_cmd_c(&mut cmd, &command);
     cmd.current_dir(&ctx.cwd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());

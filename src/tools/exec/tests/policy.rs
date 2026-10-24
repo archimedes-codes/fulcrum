@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::support::*;
+use crate::agent::tools::exec::access::PROTECTED_WRITE_ROUTE;
 use crate::agent::tools::exec::execute_tool;
 #[cfg(unix)]
 use crate::agent::tools::exec::protected_refusal_text;
@@ -162,6 +163,20 @@ async fn write_into_a_protected_dir_is_refused_under_every_policy() {
         );
         let text = text_of(&r).to_string();
         assert!(text.contains("protected"), "{policy_writes:?}: {text}");
+        // (issue #33) The refusal must not just refuse — it must append the ONE
+        // route that ends in a human, and that route must not name an elevated
+        // or shell path. Pinned against the const, not a literal, so the
+        // executor side and the gate side cannot drift apart.
+        assert!(
+            text.ends_with(PROTECTED_WRITE_ROUTE),
+            "{policy_writes:?}: the refusal must end with the sanctioned route: {text}"
+        );
+        assert!(
+            !PROTECTED_WRITE_ROUTE.contains("sudo")
+                && !PROTECTED_WRITE_ROUTE.contains("bash")
+                && !PROTECTED_WRITE_ROUTE.contains("shell"),
+            "the refusal must not suggest an elevated or shell route: {PROTECTED_WRITE_ROUTE}"
+        );
         assert_eq!(
             std::fs::read_to_string(protected.join("SKILL.md")).unwrap(),
             "OLD",
@@ -352,6 +367,10 @@ fn a_raw_argument_still_refuses_against_canonical_protected_entries() {
     assert!(
         refusal.contains("protected agent-definition directory"),
         "{refusal}"
+    );
+    assert!(
+        refusal.ends_with(PROTECTED_WRITE_ROUTE),
+        "the gate-seam wording must carry the route too: {refusal}"
     );
     // The refusal names the entry the caller registered (canonical here) —
     // the SAME sentence the executor produces.

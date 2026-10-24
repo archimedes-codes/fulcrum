@@ -47,6 +47,14 @@
 //! nightly-only on stable Rust; the latter is documented to make
 //! `CREATE_NO_WINDOW` *ignored*, and leaves the child free to `AllocConsole`).
 //!
+//! What it DOES also own since #79: **the Windows shape of a Tool child's
+//! command line** — [`cmd_c_tail`] / [`append_cmd_c`]. Same reason as the
+//! creation flags: `raw_arg` arrives on the same
+//! `std::os::windows::process::CommandExt` trait as `creation_flags`, so a call
+//! site given one has a one-line `use` away from the other, and census
+//! invariant E keeps both call forms in this module. The Unix `sh -c`
+//! convention, the env and the child's stdio stay where they were.
+//!
 //! Nothing here is provable by running it — `cargo test` is itself a
 //! console-subsystem process, so a child inherits the test harness's console
 //! whether or not the flag is set, and neither std nor tokio can read a
@@ -108,6 +116,57 @@ pub fn closed_stdin(cmd: &mut tokio::process::Command) {
     cmd.stdin(std::process::Stdio::null());
 }
 
+/// The `cmd.exe` tail that runs `command` exactly as written: `/d /s /c "<command>"`.
+///
+/// PURE and cross-platform on purpose — it is a `format!`, so the exact bytes
+/// are asserted on Linux and macOS too (`the_cmd_c_tail_is_the_documented_form_and_escapes_nothing`).
+/// That is the only honest local proof this fix has: std renders the command
+/// line inside `CreateProcess` and exposes no getter (the same introspection
+/// hole as `creation_flags`, rust-lang/rust#96794), so nothing runnable can
+/// read back what `cmd.exe` was actually handed.
+///
+/// * `/d` suppresses the `HKCU\Software\Microsoft\Command Processor\AutoRun`
+///   command, so a machine-wide AutoRun cannot splice itself in front of every
+///   agent command.
+/// * `/s` makes `cmd.exe` follow its documented rule for the quotes around the
+///   rest of the line: if the first character is a quote, strip it and remove
+///   the last quote. Our outer pair is therefore consumed and EVERY INNER QUOTE
+///   SURVIVES — which is the entire point of building the tail by hand.
+pub fn cmd_c_tail(command: &str) -> String {
+    format!("/d /s /c \"{command}\"")
+}
+
+/// Appends [`cmd_c_tail`] to a Tool child's `Command` with NO quoting and NO
+/// escaping (`raw_arg`). Windows-only in effect; the call is unconditional so a
+/// non-Windows build has one code path.
+///
+/// Why not `arg`: `Command::arg` escapes for a program that follows
+/// `CommandLineToArgvW`, and `cmd.exe` does not. `append_arg`
+/// (`library/std/src/sys/args/windows.rs:173`) wraps any string containing a
+/// space in an outer quote pair and turns every embedded `"` into `\"`; `cmd /s`
+/// consumes only the OUTER pair, so the `\"` stay in the text `cmd` parses.
+/// `tasklist /FI "IMAGENAME eq x.exe"` therefore arrives as
+/// `/FI \"IMAGENAME eq x.exe\"` — and `start`'s title-slot rule turns that
+/// wreckage into a modal `Windows cannot find '\'` dialog on the user's desktop
+/// (issue #79; CVE-2024-24576 / CVE-2024-43402 are the same contract failure).
+///
+/// It lives HERE rather than at the call site for the same reason the
+/// `CREATE_NO_WINDOW` flag does: `raw_arg` sits on the same
+/// `std::os::windows::process::CommandExt` trait as `creation_flags`, and the
+/// census keeps that trait's call forms inside this module (invariant E — see
+/// the census's docs and ADR 0060's amendment). A call site that could reach
+/// `raw_arg` can reach `creation_flags` by the same one-line `use`.
+pub fn append_cmd_c(_cmd: &mut tokio::process::Command, _command: &str) {
+    #[cfg(windows)]
+    {
+        // Resolves to tokio's INHERENT `raw_arg`
+        // (tokio-1.53.1/src/process/mod.rs:420, inside `cfg_windows!`), which
+        // forwards to std's. No second `use` — the module-level
+        // `CommandExt as _` above is what `hide` needs and stays as it is.
+        _cmd.raw_arg(cmd_c_tail(_command));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +213,66 @@ mod tests {
             out.status.success() && out.stdout.is_empty(),
             "`sh -c 'cat'` on a null stdin must exit 0 with no output, got {out:?}"
         );
+    }
+
+    /// Claim: [`cmd_c_tail`] renders the documented `/d /s /c "<command>"` form
+    /// with the command inside it BYTE-FOR-BYTE and no escaping of any kind —
+    /// in particular no `\"`, which is what `Command::arg` (std's
+    /// `append_arg`, `library/std/src/sys/args/windows.rs:173`) produces for
+    /// every embedded quote (issue #79).
+    ///
+    /// This is the strongest proof this fix has on a non-Windows host: the
+    /// function is PURE (a `format!`), so the exact bytes are asserted here, on
+    /// Linux and macOS, and not only on the leg that can run `cmd.exe`.
+    ///
+    /// What it does NOT prove: what `cmd.exe` did with those bytes. std renders
+    /// the command line inside `CreateProcess` and exposes no getter for it —
+    /// the same introspection hole as `creation_flags` (rust-lang/rust#96794) —
+    /// so nothing runnable can read back what the child was handed. That half
+    /// is the two `#[cfg(windows)]` tests in
+    /// `agent/tools/exec/tests/bash.rs`, which run only on CI's
+    /// `windows-latest` leg.
+    #[test]
+    fn the_cmd_c_tail_is_the_documented_form_and_escapes_nothing() {
+        // The documented shape: `/d /s /c` + ONE outer quote pair, nothing else.
+        assert_eq!(
+            cmd_c_tail("echo hi"),
+            "/d /s /c \"echo hi\"",
+            "the tail is `/d /s /c \"<command>\"` and nothing more"
+        );
+
+        // The command issue #79 was reported with, verbatim. Both sides are raw
+        // strings on purpose: an escaped-quote expectation is easy to mistype,
+        // and a mistyped expectation is a false RED.
+        let q = r#"tasklist /FI "IMAGENAME eq x.exe""#;
+        assert_eq!(
+            cmd_c_tail(q),
+            r#"/d /s /c "tasklist /FI "IMAGENAME eq x.exe"""#,
+            "the command is wrapped in ONE outer pair and otherwise untouched"
+        );
+        // The regression assertion, and the reason this test exists: `arg`
+        // escapes every embedded `"` as `\"` (std's `append_arg` emits `2n+1`
+        // backslashes) and `cmd /s` strips only the OUTER quote pair, so those
+        // escapes stay visible to command parsing — which is issue #79. Green
+        // here means the seam hands `raw_arg` a string with NONE of that.
+        assert!(
+            !cmd_c_tail(q).contains("\\\""),
+            "the tail must contain NO backslash-escaped quote — `Command::arg` \
+             would have produced one for every `\"` in the command, and `cmd /s` \
+             strips only the outer pair, so the escapes reach command parsing \
+             (issue #79). got {:?}",
+            cmd_c_tail(q)
+        );
+        // The command survives byte-for-byte INSIDE the tail.
+        assert!(
+            cmd_c_tail(q).contains(q),
+            "the command must appear verbatim inside the tail, got {:?}",
+            cmd_c_tail(q)
+        );
+        // An empty command is a no-op tail (and `arg` rendered it `""` too, so
+        // nothing moves here — pinned so a future "optimisation" cannot drop
+        // the quotes, which would make `cmd /c` inherit the console instead).
+        assert_eq!(cmd_c_tail(""), "/d /s /c \"\"");
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -568,6 +687,122 @@ mod tests {
              panic path means the hook slot decides where the user's crash logs go, so a \
              test panic on ANY thread writes into the real data dir (the 862-file bug); \
              the directory must come from the caller — `install_panic_hook(tag, dir)`",
+        );
+    }
+
+    /// Invariant E — only `childproc` may append a raw command line to a child.
+    ///
+    /// **Why this invariant exists at all.** The `raw_arg` seam is technically
+    /// reachable from `exec/bash.rs` without breaking invariants A, B or C:
+    /// `raw_arg` APPENDS an argument, so it neither constructs a `Command` (A)
+    /// nor sets a creation flag (B) nor touches stdin (C). Without E the next
+    /// contributor adds `raw_arg` at a call site, and the
+    /// `use std::os::windows::process::CommandExt` that brings it in is the same
+    /// one-line `use` that makes a stray `creation_flags(…)` compile there —
+    /// silently un-hiding every child and re-opening a console window per
+    /// command, which is the bug ADR 0060 exists to prevent. E therefore keeps
+    /// the trait's CALL FORMS in one file.
+    ///
+    /// **What it does NOT prove** (the census header demands this of every
+    /// invariant): it is a LINT on text. It does not prove `cmd.exe` received
+    /// the right bytes — nothing runnable can (`std` renders the command line
+    /// inside `CreateProcess` and has no getter, rust-lang/rust#96794); that
+    /// half is the two `#[cfg(windows)]` tests in
+    /// `agent/tools/exec/tests/bash.rs`, which run only on CI's `windows-latest`
+    /// leg.
+    ///
+    /// **Inherited blind spots**, both stated rather than implied:
+    /// * This matches TEXT, so a string literal containing `.raw_arg(` also
+    ///   trips it. That error goes the safe way — a false alarm costs one
+    ///   rename, a false pass costs a window per command on someone's desktop.
+    /// * [`is_comment`]'s `*`-prefix rule still drops any line whose trimmed
+    ///   text starts with `*`, so a `.raw_arg(` written as the target of a
+    ///   deref-assignment on its own line would slip through.
+    /// * E inherits the census's SCOPE rule: [`production_region`] returns an
+    ///   empty `Vec` for `**/tests.rs` and anything under `/tests/`, so test
+    ///   fixtures are outside E exactly as they are outside A and B — a fixture
+    ///   may build a raw `Command` or append raw text on purpose, and one that
+    ///   wants the policy opts in explicitly. E guards production code, not the
+    ///   outside view.
+    #[test]
+    fn production_code_never_appends_a_raw_command_line_itself() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(
+            src_root.is_dir(),
+            "the census resolved the wrong root: {} is not a directory",
+            src_root.display()
+        );
+        let mut paths = Vec::new();
+        rust_files(&src_root, &mut paths);
+        // Sorted so a violation report is reproducible run to run.
+        paths.sort();
+        let relative = |path: &std::path::Path| {
+            path.strip_prefix(&src_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let regions: Vec<(String, Vec<SourceLine>)> = paths
+            .iter()
+            .map(|path| (relative(path), production_region(path)))
+            .collect();
+
+        // ── Vacuity guard FIRST, in the census's own style: a scanner that sees
+        // nothing must fail loudly, not report a clean bill. Exactly ONE
+        // production caller of [`append_cmd_c`] is expected, and it is
+        // `exec/bash.rs` (`crate::agent::childproc::append_cmd_c(` contains the
+        // needle). This does double duty: it proves the scanner can SEE the API
+        // it polices, and it pins that the `bash` child's command line still
+        // goes through its owner. `SELF` is excluded and would score 0 anyway —
+        // inside `childproc` the tail is reached as a bare `cmd_c_tail(`, and
+        // the definition line reads `pub fn append_cmd_c(`, which does NOT
+        // contain `childproc::append_cmd_c(`. The `1` is meant to be brittle: a
+        // second site wanting a `cmd.exe` tail must have this conversation, not
+        // quietly widen the surface. Comment lines that mention the seam are
+        // dropped by [`is_comment`] before any match, so prose cannot inflate
+        // the count.
+        let caller_count = regions
+            .iter()
+            .filter(|(rel, _)| rel != SELF)
+            .map(|(_, region)| {
+                region
+                    .iter()
+                    .filter(|l| l.text.contains("childproc::append_cmd_c("))
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            caller_count, 1,
+            "Invariant E is BLIND: {} production line(s) outside `{SELF}` call \
+             `childproc::append_cmd_c(`, expected exactly 1 (`exec/bash.rs`, the Tool \
+             child that owns a `cmd.exe` tail) — at 0 the scanner cannot see the API it \
+             polices (a drifted match string would make the check below vacuous), and \
+             above 1 something else has acquired a raw `cmd.exe` command line without \
+             this conversation",
+            caller_count,
+        );
+
+        // ── The invariant itself, anchored on the CALL form exactly as
+        // invariant B anchors `.creation_flags(` (so prose naming `raw_arg`
+        // cannot false-positive; [`is_comment`] filters those anyway).
+        let mut violations: Vec<String> = Vec::new();
+        for (rel, region) in &regions {
+            if rel == SELF {
+                continue;
+            }
+            for line in region.iter().filter(|l| l.text.contains(".raw_arg(")) {
+                violations.push(format!("{rel}:{}", line.line));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "Invariant E (one owner of the raw command line): production code calls \
+             `.raw_arg(` outside `{SELF}` at {violations:?} — `raw_arg` sits on the SAME \
+             `std::os::windows::process::CommandExt` trait as `creation_flags`, so a call \
+             site that reaches one is one `use` away from the other, and `creation_flags` \
+             REPLACES rather than ORs (rust-lang/rust#96794): the stray call silently \
+             un-hides every child and re-opens a console window per command (ADR 0060). \
+             Append the tail through `childproc::append_cmd_c` instead.",
         );
     }
 }

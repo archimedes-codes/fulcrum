@@ -21,13 +21,24 @@
 
 use serde_json::Value;
 
-/// The session-start mode (the `start` envelope's `mode` field).
+/// The session-start mode (the `start` envelope's `mode` field): WHICH
+/// prompt this session starts from, and the FIRST half of every arm of
+/// `default_build_loop`'s init `match`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartMode {
-    /// A fresh session: the Worker builds the main system prompt itself
-    /// (the seq-0 transcript row).
+    /// A fresh MAIN session: the Worker builds the main system prompt itself
+    /// (the seq-0 transcript row) — ADR 0017.
     Fresh,
+    /// A fresh SUBAGENT child (ADR 0017's REDUCED message): the Supervisor has
+    /// already computed `build_child_system_message` into `system_prompt`.
+    /// `Some` → that message is the seq-0 row; `None` → the child gets NO
+    /// system message at all and NO seq-0 row. A child NEVER reaches the
+    /// main-prompt arm — that is the whole reason this variant exists
+    /// (issue #9: `(Fresh, None)` used to mean both "main session" and
+    /// "child with nothing to say", and the child lost that tie to the
+    /// largest prompt in the app).
+    FreshChild,
     /// A resume: the Supervisor rehydrated the provider transcript (the
     /// `native_messages` re-read — moved from harness to Supervisor) and
     /// it arrives in the envelope's `transcript`.
@@ -164,6 +175,31 @@ pub enum Outbound {
         parent_cwd: String,
         parent_enabled_tools: Vec<String>,
         agent_name: String,
+        /// (issue #47) `resolve_launch`'s report on `agent_name` (computed
+        /// Worker-side, in the loop's `harness::dispatch`), so the Supervisor's
+        /// `subagent-session-started` payload can distinguish "no name given"
+        /// from "name given, matched" from "name given, NO match".
+        ///
+        /// Deliberately NOT `#[serde(default)]`, unlike the `subagent-result`
+        /// fields above. Every default for this field is a LIE: `NoName` would
+        /// silence the marker for a child that was named and missed, which is
+        /// the exact defect the field exists to fix, and the other two would
+        /// accuse a genuinely nameless dispatch. A missing field is therefore a
+        /// hard `ProtoError::Json` (this `type` is in `decode_outbound`'s
+        /// explicit allow-list) — the loud direction — and it cannot occur in
+        /// production: the Worker is a self-exec of the SAME binary
+        /// (`WorkerHandle::spawn(std::env::current_exe())` + `--worker`), so
+        /// Supervisor and Worker are always one build. Pinned by
+        /// `an_old_shape_subagent_dispatch_line_without_name_resolution_is_a_decode_error`.
+        ///
+        /// What the loud direction costs, in writing: the Client's read loop
+        /// turns a decode `Err` into `eprintln!` + `continue`, so a dropped
+        /// `SubagentDispatch` line leaves the Worker's `IpcDispatcher` waiter
+        /// unresolved and the parent's `subagent` tool call hanging until the
+        /// turn is cancelled — and that `eprintln!` is visible only under
+        /// `ARCHIMEDES_DEBUG`, which is why the self-exec pin above, not the
+        /// log, is what keeps this consequence unpayable.
+        name_resolution: crate::agent::subagent::AgentNameResolution,
         launch: crate::agent::subagent::LaunchConfig,
         task: String,
         model_key: String,
@@ -294,6 +330,12 @@ pub struct SubagentDispatchWire {
     pub parent_cwd: String,
     pub parent_enabled_tools: Vec<String>,
     pub agent_name: String,
+    /// (issue #47) The `subagent-session-started` payload's `nameResolution`,
+    /// verbatim — the flow does not re-derive it (a second `discover_agents`
+    /// there would be a second name selector). No `#[serde(default)]`, for the
+    /// same reason as the `Outbound` variant above: every default would be a
+    /// lie about whether a persona loaded.
+    pub name_resolution: crate::agent::subagent::AgentNameResolution,
     pub launch: crate::agent::subagent::LaunchConfig,
     pub task: String,
     pub model_key: String,
@@ -398,7 +440,7 @@ mod tests {
     use crate::agent::harness::provider::{ChatMessage, ChatRole, MessageContent};
     use crate::agent::permission::PermissionOutcome;
     use crate::agent::subagent::{
-        LaunchConfig, SubagentFailureReason, SubagentMetrics, SubagentOutcome,
+        AgentNameResolution, LaunchConfig, SubagentFailureReason, SubagentMetrics, SubagentOutcome,
     };
 
     /// A fake OpenAI-compatible model (the wire shapes ride verbatim).
@@ -610,6 +652,85 @@ mod tests {
         );
     }
 
+    /// (issue #47) The `AgentNameResolution`'s WIRE SPELLING. Like
+    /// `SubagentFailureReason`, a nested serde enum does NOT inherit an outer
+    /// `rename_all`, so the enum carries its own `snake_case` attribute and this
+    /// test is what pins it.
+    ///
+    /// `no_name` is the only TWO-WORD value in the whole subagent vocabulary
+    /// (`SubagentFailureReason`'s four values are single words, so snake_case
+    /// and camelCase and bare lowercase coincide there — which is exactly why
+    /// nobody ever noticed the missing attribute). A "consistency" rename to
+    /// `noName` would silently break the frontend's three-way comparison, so
+    /// the spelling is pinned at the type.
+    #[test]
+    fn the_agent_name_resolution_serialises_in_snake_case() {
+        let encode = |r| serde_json::to_value(r).unwrap();
+        assert_eq!(
+            encode(AgentNameResolution::NoName),
+            serde_json::json!("no_name"),
+            "`no_name` is the one two-word value in this vocabulary"
+        );
+        assert_eq!(
+            encode(AgentNameResolution::Matched),
+            serde_json::json!("matched")
+        );
+        assert_eq!(
+            encode(AgentNameResolution::Unmatched),
+            serde_json::json!("unmatched")
+        );
+    }
+
+    /// (issue #47) An OLD-shape `SubagentDispatch` frame — one with NO
+    /// `nameResolution` — is a hard decode ERROR, and the CURRENT frame decodes.
+    ///
+    /// Why loud here when the `subagent-result` fields above are permissive:
+    /// `subagent-dispatch` is in `decode_outbound`'s explicit `type` allow-list,
+    /// so the permissive `Unknown { raw }` fallback does NOT apply and a missing
+    /// field is a `ProtoError::Json`. That is the chosen direction because every
+    /// possible `#[serde(default)]` for this field is a LIE about whether a
+    /// persona loaded: `NoName` would silence the resolve-miss marker for a
+    /// child that WAS named and missed (the exact defect the field exists to
+    /// fix), and `Matched` / `Unmatched` would accuse or absolve a genuinely
+    /// nameless dispatch. The mix is also UNREACHABLE in production — the Worker
+    /// is a self-exec of the SAME binary, so Supervisor and Worker are always
+    /// one build — which is what makes a hard error affordable. This is the
+    /// trap-pin against someone "tidying" the tolerance in a later task, the
+    /// same shape as T10's
+    /// `an_unknown_start_mode_is_a_decode_error_never_a_silent_main_prompt`.
+    #[test]
+    fn an_old_shape_subagent_dispatch_line_without_name_resolution_is_a_decode_error() {
+        let case = Outbound::SubagentDispatch {
+            id: "sub1".to_string(),
+            parent_session_id: "s1".to_string(),
+            parent_cwd: "/tmp/space".to_string(),
+            parent_enabled_tools: vec!["bash".to_string()],
+            agent_name: "tester".to_string(),
+            name_resolution: AgentNameResolution::Matched,
+            launch: LaunchConfig::default(),
+            task: "do the thing".to_string(),
+            model_key: "fake/m1".to_string(),
+        };
+        let line = encode_outbound(&case);
+
+        // The CURRENT frame decodes and the field reads back — so the error
+        // below is the MISSING field and not a broken encoder.
+        match decode_outbound(&line).expect("the current frame decodes") {
+            Outbound::SubagentDispatch {
+                name_resolution, ..
+            } => assert_eq!(name_resolution, AgentNameResolution::Matched),
+            other => panic!("expected `SubagentDispatch`, got {other:?}"),
+        }
+
+        let old = line.replace(r#""nameResolution":"matched","#, "");
+        assert_ne!(old, line, "the rewrite happened");
+        assert!(
+            decode_outbound(&old).is_err(),
+            "a frame with no `nameResolution` is a loud error, never a \
+             silently-defaulted resolution: {old}"
+        );
+    }
+
     /// Every `Outbound` variant round-trips through `encode_outbound` +
     /// `decode_outbound` (including the `PermissionRequest` /
     /// `InteractiveRequest` frames carrying full canned gate payloads
@@ -687,6 +808,7 @@ mod tests {
                 parent_cwd: "/tmp/space".to_string(),
                 parent_enabled_tools: vec!["bash".to_string()],
                 agent_name: "tester".to_string(),
+                name_resolution: AgentNameResolution::Matched,
                 launch: LaunchConfig::default(),
                 task: "do the thing".to_string(),
                 model_key: "fake/m1".to_string(),
@@ -886,6 +1008,51 @@ mod tests {
             }
             other => panic!("expected `Start`, got {other:?}"),
         }
+    }
+
+    /// (E) `FreshChild`'s WIRE SPELLING is `fresh_child`, pinned as a raw
+    /// substring of the encoded line — not merely a decoded equality: the
+    /// spelling IS the contract, and a variant rename (or a stray per-variant
+    /// `rename`) must not silently change it.
+    #[test]
+    fn the_fresh_child_mode_round_trips_as_the_fresh_child_wire_name() {
+        let mut env = test_env();
+        env.mode = StartMode::FreshChild;
+        let line = encode_inbound(&Inbound::from(&env));
+        assert!(
+            line.contains(r#""mode":"fresh_child""#),
+            "the wire spells the child mode `fresh_child`, got {line}"
+        );
+        match decode_inbound(&line).expect("the frame decodes") {
+            Inbound::Start(env_dec) => assert_eq!(
+                env_dec.mode,
+                StartMode::FreshChild,
+                "the child mode round-trips"
+            ),
+            other => panic!("expected `Start`, got {other:?}"),
+        }
+    }
+
+    /// (F) An UNREADABLE `mode` is a decode ERROR — never a silent main
+    /// prompt. This is the DESIRED direction, and the trap-pin against
+    /// "tidying" the tolerance later: the protocol is permissive about
+    /// unknown top-level `type`s ONLY (`decode_inbound` routes on `type`,
+    /// then deserializes the WHOLE payload), so a bad nested `mode` is a
+    /// `ProtoError::Json` the Worker prints as `worker: bad inbound line` on
+    /// the stderr the Supervisor pipes into its log — LOUD. The alternative,
+    /// a `#[serde(other)]` fallback on `Fresh`, would make an unreadable mode
+    /// SILENTLY become the main-prompt arm: the exact defect issue #9 removes.
+    #[test]
+    fn an_unknown_start_mode_is_a_decode_error_never_a_silent_main_prompt() {
+        let mut env = test_env();
+        env.mode = StartMode::FreshChild;
+        let line = encode_inbound(&Inbound::from(&env));
+        let bad = line.replace(r#""mode":"fresh_child""#, r#""mode":"nonsense""#);
+        assert_ne!(bad, line, "the rewrite happened");
+        assert!(
+            decode_inbound(&bad).is_err(),
+            "an unreadable `mode` is a loud error, not a silent main prompt: {bad}"
+        );
     }
 
     /// Every `Start` mints its OWN incarnation stamp: the token is what keeps

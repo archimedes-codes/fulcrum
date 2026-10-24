@@ -350,6 +350,18 @@ impl AgentLoop {
         turn: &CancellationToken,
     ) -> Vec<Value> {
         let mut turn_tool_results = Vec::new();
+        // (issue #78) The unknown-param check runs HERE, before the `join_all`
+        // below, and NOT inside `dispatch_tool`: a `subagent` call is dispatched
+        // CONCURRENTLY ahead of the sequential loop, so a check that ran inside
+        // the dispatch would announce itself only after the wasted config-less
+        // child already exists. One `advertised_specs()` per batch — the SAME
+        // value `model_request` sends as `tools[]` and the prompt renders into
+        // `<tools>`, so the checker cannot flag a key the model was told to send.
+        let specs = self.advertised_specs();
+        let warnings: Vec<Option<String>> = tool_calls
+            .iter()
+            .map(|tc| crate::agent::harness::tool_specs::unknown_param_warning(&specs, tc))
+            .collect();
         let mut subagent_results: HashMap<usize, ToolResult> = if turn.is_cancelled() {
             HashMap::new()
         } else {
@@ -375,7 +387,7 @@ impl AgentLoop {
         };
 
         for (idx, tc) in tool_calls.iter().enumerate() {
-            let result = if crate::agent::harness::dispatch::is_subagent_call(&tc.name) {
+            let mut result = if crate::agent::harness::dispatch::is_subagent_call(&tc.name) {
                 match subagent_results.remove(&idx) {
                     Some(r) => r,
                     None if turn.is_cancelled() => Self::cancelled_tool_result(),
@@ -402,6 +414,20 @@ impl AgentLoop {
                     _ => self.dispatch_tool(tc, turn).await,
                 }
             };
+            // The warning travels with the result it describes: appended LAST,
+            // so `content[0]` stays the tool's own output (every existing
+            // assertion and the UI's child-output render are untouched), and
+            // `is_error` stays whatever the tool decided — a typo must not fail
+            // a good long delegation. One push covers all three consumers below:
+            // the `tool_execution_end` payload, the transcript `tool` message
+            // (`result.content.clone()`) and the persisted row. On a cancelled
+            // turn the result is the synthetic `"cancelled"` block and the extra
+            // line is harmless truth, so no branch.
+            if let Some(Some(warning)) = warnings.get(idx) {
+                result.content.push(ContentBlock::Text {
+                    text: warning.clone(),
+                });
+            }
             let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
             turn_tool_results.push(result_value.clone());
             self.emit(RpcEvent::tool_execution_end {

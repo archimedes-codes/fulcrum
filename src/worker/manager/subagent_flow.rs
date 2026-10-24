@@ -593,8 +593,10 @@ pub(crate) fn dispatch_subagent(
         }
     };
     // 4. The child system message (the `harness/prompt` function —
-    // `has_todo_tool` from the resolved child tool list; `None` →
-    // no system message — the child's seq-0 row is absent).
+    // `has_todo_tool` from the resolved child tool list; `None` → the child
+    // gets NO system message at all and NO seq-0 row, and the envelope's
+    // `FreshChild` mode is what makes that true: `(Fresh, None)` is the
+    // MAIN-prompt arm and a child must never reach it (issue #9)).
     let has_todo_tool = child_tools.iter().any(|t| t == "manage_todo_list");
     let system_prompt =
         build_child_system_message(wire.launch.system_prompt.as_deref(), has_todo_tool);
@@ -611,7 +613,7 @@ pub(crate) fn dispatch_subagent(
     let env = StartEnv::from_parts(
         child_id.clone(),
         wire.parent_cwd.clone(),
-        StartMode::Fresh,
+        StartMode::FreshChild,
         None,
         model.clone(),
         parent_env.catalog.clone(),
@@ -626,14 +628,27 @@ pub(crate) fn dispatch_subagent(
     // current driver's step 9 — the PARENT session's sink: the
     // `model` in the COMPOSED `provider/id` form, the
     // `thinkingLevel` the step-2 RESOLVED value, the
-    // `enabledTools` the child's resolved set).
+    // `enabledTools` the child's resolved set, and the
+    // `nameResolution` the resolver's tri-state (issue #47) — the
+    // eight-key payload the subagent directory row and the sheet read.
     if let Some(sink) = state.hooks.sink_for(&parent_session_id) {
         sink.emit(
             "subagent-session-started",
             json!({
                 "sessionId": child_id,
                 "parentSessionId": parent_session_id,
+                // The label, TRIMMED by the time it reaches the wire —
+                // `harness::dispatch::dispatch_subagent` trims the `agentName`
+                // param BEFORE `resolve_launch`, so this field and
+                // `nameResolution` below describe the SAME string. Nothing here
+                // re-trims: the emitter normalising as well would be a second
+                // name selector for one label.
                 "agentName": wire.agent_name,
+                // (issue #47) The tri-state, verbatim off the wire — NOT
+                // re-derived here (a second `discover_agents` on
+                // `wire.parent_cwd` would be a second name selector, and two
+                // selectors is how the dispatch and the report drift).
+                "nameResolution": wire.name_resolution,
                 "task": wire.task,
                 "model": ModelKey::from(&model).to_string(),
                 "thinkingLevel": thinking.as_deref(),
@@ -818,12 +833,13 @@ async fn drive_subagent(
     // settle-then-exit is the teardown below) vs the `SubagentCancel` (a
     // parent turn abort — `cancel_subagent` flips it).
     //
-    // The bound is a SELF-REARMING silence clock: `dead_bound` is the
-    // child's maximum run of UNEXPLAINED SILENCE, so it is recomputed on
-    // every pass of the loop below — a pass is only ever entered because
-    // something CHANGED. There is no ceiling on how long a delegation may
-    // run, and while a `tool_call_id` is outstanding the bound does not run
-    // at all (the arm is disabled, not merely lengthened).
+    // The bound is a SELF-REARMING silence clock: `dead_bound` is the longest run
+    // of UNEXPLAINED SILENCE THIS DRIVE OBSERVES — the gap between frames that
+    // actually reached `liveness_rx`, NOT a measurement of what the child was
+    // doing — so it is recomputed on every pass of the loop below — a pass is
+    // only ever entered because something CHANGED. There is no ceiling on how
+    // long a delegation may run, and while a `tool_call_id` is outstanding the
+    // bound does not run at all (the arm is disabled, not merely lengthened).
     // The declared-outside binding is only a scope (the value is meaningless
     // before the loop's first pass, which is exactly where it is computed).
     let mut deadline;

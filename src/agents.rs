@@ -425,6 +425,37 @@ fn parse_tools(raw: &str) -> Option<Vec<String>> {
 /// NBSP/dedent byte-offset guard documented below), it must be applied to
 /// BOTH copies.)
 ///
+/// ONE CARVE-OUT to that "both copies" rule, and it is not a shape bug: the
+/// trailing `#`-comment strip that `skills.rs`'s `parse_value` gained for issue
+/// #11 belongs HERE NOT. The two copies mirror DIFFERENT upstream readers.
+/// `skills.rs` mirrors pi's `parseFrontmatter`, which parses with the `yaml`
+/// package — a plain scalar ENDS at a `#` preceded by a space or tab, so pi
+/// strips it. This copy mirrors the reader ADR 0020 names for Agent
+/// definitions: pi's subagent extension (`pi-subagents`,
+/// `src/agents/frontmatter.ts`), whose `parseFrontmatter` is a hand-rolled
+/// `/^([\w-]+):\s*(.*)$/` regex reader. Measured against it, that reader KEEPS
+/// the comment — `name: a # note` → `"a # note"` and `description: Do the thing
+/// # internal` → `"Do the thing # internal"`. Stripping here would therefore
+/// move the desktop AWAY from the only pi-side reader of Agent definitions and
+/// MANUFACTURE the divergence ADR 0036 exists to prevent. So: the "both copies"
+/// rule binds for SHAPE bugs (the NBSP/dedent guard, the quote pair, the `: `
+/// guard — where both copies read the same thing) and does NOT bind for this
+/// strip. Should that scoping ever be revisited, it needs its own parity target
+/// decided first, plus a truth table here — issue #11 is about Skills only.
+///
+/// A SECOND exception sits in the quote pair itself, and it narrows the
+/// "the quote pair" clause above rather than contradicting it: `skills.rs` now
+/// additionally UN-DOUBLES a SINGLE-quoted scalar's `''` escapes, because YAML's
+/// single-quote escape IS the doubled pair and `yaml` resolves it to one `'`
+/// (`'it''s fine'` → `it's fine`). This copy must NOT do that. The same
+/// `frontmatter.ts` reader slices one quote pair off and stops
+/// (`value = value.slice(1, -1)`) — measured against it, `description: 'it''s'`
+/// is `it''s`, pair still doubled. So the shared part of the quote pair is what
+/// both readers actually do (remove one matching surrounding pair); the
+/// un-doubling belongs to the `yaml`-backed reader alone, for the same reason as
+/// the comment strip above: a second divergence in the same direction, against
+/// the same target, manufactured for free. Each side names the other.
+///
 /// - inline: the rest of the line, trimmed; strip one pair of matching
 ///   surrounding quotes; an empty inline value means "no value".
 /// - block: the inline value is exactly `|` or `>` (optionally followed
@@ -621,6 +652,122 @@ mod tests {
         let s2 = out.iter().find(|d| d.name == "s2").unwrap();
         assert_eq!(s1.tools, Some(vec!["read".to_string(), "bash".to_string()]));
         assert_eq!(s2.tools, Some(vec!["read".to_string(), "bash".to_string()]));
+    }
+
+    /// The two `parse_value` copies are DOCUMENTED to diverge on exactly two
+    /// shapes (see this fn's doc: the trailing `#` strip and the single-quoted
+    /// `''` un-doubling), and the doc is only worth anything if a change that
+    /// re-unifies them is caught. So this pins the DIVERGENCE at the discovery
+    /// level — both public readers, the SAME frontmatter text, two expected
+    /// values — rather than asserting equality (which would be the wrong
+    /// invariant) or reading a private fn (which would need the visibility
+    /// change ADR 0020 forbids).
+    ///
+    /// HALF 1 — the trailing `#` strip. Each copy mirrors a different upstream
+    /// reader and the two readers disagree about comments: `skills.rs` mirrors
+    /// pi's `parseFrontmatter`, which parses with `yaml`, and a plain scalar
+    /// ENDS at a ` #` — so it drops the note. This copy mirrors the reader ADR
+    /// 0020 names for Agent definitions, `pi-subagents/src/agents/frontmatter.ts`,
+    /// a hand-rolled `/^([\w-]+):\s*(.*)$/` regex reader with NO comment rule at
+    /// all — measured against it `description: 'it''s fine' # note` is verbatim.
+    /// Stripping here would move the desktop away from its only pi-side reader
+    /// of Agent definitions.
+    ///
+    /// HALF 2 — the `''` escape, and it needs its OWN fixture: a value that is
+    /// a CLOSED quote pair, so the quote branch actually runs. (Half 1's fixture
+    /// ends in `note`, so its first and last chars differ and the branch is
+    /// never reached — pinning `''` through that fixture would test nothing.)
+    /// Here both copies DO enter the branch and DO slice the one surrounding
+    /// pair; they differ only in what happens after the slice, because YAML's
+    /// single-quote escape IS the doubled pair: `yaml` resolves `''` to one `'`,
+    /// so `'it''s'` is `it's` on the skill side, while `frontmatter.ts` is
+    /// `value = value.slice(1, -1)` and STOPS — measured against it the same
+    /// input is `it''s`, quotes gone, pair still doubled. Un-doubling on this
+    /// side would manufacture the divergence ADR 0036 exists to prevent, in the
+    /// same direction and against the same target as half 1.
+    #[test]
+    fn the_two_parse_value_copies_diverge_where_their_parity_targets_differ() {
+        let root = scratch();
+        // Half 1: the trailing `#` strip, on a value that does NOT close its
+        // quote pair (it ends in `note`), so only the comment rule is in play.
+        let comment_fm = "---\nname: quote\ndescription: 'it''s fine' # note\n---\nB.\n";
+        // Half 2: the `''` escape, on a CLOSED pair so the quote branch runs.
+        let closed_fm = "---\nname: pair\ndescription: 'it''s'\n---\nB.\n";
+
+        // The agent side (this module's copy) and the skill side (`skills.rs`'s
+        // copy) get the SAME frontmatter text, each fixture in both readers.
+        write_file(&root.join("quote.md"), comment_fm);
+        write_file(&root.join("pair.md"), closed_fm);
+        write_file(&root.join("skills/quote/SKILL.md"), comment_fm);
+        write_file(&root.join("skills/pair/SKILL.md"), closed_fm);
+
+        let agents = discover_in_roots(&[(root.clone(), AgentScope::Space)]);
+        let skills =
+            crate::skills::discover_in_roots(&[(root.clone(), crate::skills::SkillScope::User)]);
+        assert_eq!(
+            agents.len(),
+            2,
+            "both agents must still be discovered: {agents:?}"
+        );
+        assert_eq!(
+            skills.len(),
+            2,
+            "both skills must still be discovered: {skills:?}"
+        );
+        let agent = |n: &str| {
+            agents
+                .iter()
+                .find(|d| d.name == n)
+                .unwrap_or_else(|| panic!("agent `{n}` missing: {agents:?}"))
+                .description
+                .clone()
+        };
+        let skill = |n: &str| {
+            skills
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap_or_else(|| panic!("skill `{n}` missing: {skills:?}"))
+                .description
+                .clone()
+        };
+
+        // ── Half 1: the trailing `#` strip ────────────────────────────────────
+        assert_eq!(
+            agent("quote"),
+            "'it''s fine' # note",
+            "DIVERGENCE HALF 1, agent side: this copy mirrors `frontmatter.ts`, \
+             a regex reader with NO comment rule at all, so the value stays \
+             verbatim. Stripping the note here would move the desktop away from \
+             its only pi-side reader of Agent definitions and manufacture the \
+             divergence ADR 0036 exists to prevent"
+        );
+        assert_eq!(
+            skill("quote"),
+            "it's fine",
+            "DIVERGENCE HALF 1, skill side: `skills.rs` mirrors pi's `yaml`, \
+             where a plain scalar ENDS at a ` #`, so the note is stripped and \
+             the `''` escape resolves to one `'`"
+        );
+
+        // ── Half 2: the `''` escape inside a CLOSED quote pair ────────────────
+        assert_eq!(
+            agent("pair"),
+            "it''s",
+            "DIVERGENCE HALF 2, agent side: the quote branch DOES run here (the \
+             value starts and ends with `'`), and it does exactly what \
+             `frontmatter.ts` does — `value.slice(1, -1)`: one surrounding pair \
+             removed, NOTHING else. The doubled `''` survives, because that \
+             reader has no escape rule. Un-doubling it here (`\"''\"` → `\"'\"`) \
+             would manufacture the same ADR 0036 divergence as half 1, against \
+             the same parity target"
+        );
+        assert_eq!(
+            skill("pair"),
+            "it's",
+            "DIVERGENCE HALF 2, skill side: the same slice happens, then `yaml`'s \
+             single-quote escape resolves the surviving `''` to one `'` — which \
+             is what the escape MEANS"
+        );
     }
 
     // 6

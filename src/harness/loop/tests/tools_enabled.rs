@@ -312,11 +312,13 @@ fn read_skill_description_is_honest_about_read_and_model_hidden() {
 /// The DEFAULT child's message is `build_child_system_message`'s REDUCED
 /// one, which carries no `<skills>` section (ADR 0017), so for THAT shape the
 /// TOOLS are the only surface left that filters — which holds only while a
-/// child still HAS them. (The one child shape with no reduced message at
+/// child still HAS them. (And the one child shape with no reduced message at
 /// all — no launch/definition prompt AND no `manage_todo_list` in the
-/// resolved child tools, so `build_child_system_message` returns `None` —
-/// falls through to the MAIN-prompt arm in `worker/core.rs`, whose section
-/// is FILTERED the same way; ADR 0036's subagent bullet owns that shape.)
+/// resolved child tools, so `build_child_system_message` returns `None` — now
+/// gets NO system message AT ALL: `worker/core.rs`'s `(StartMode::FreshChild,
+/// None)` arm prepends nothing (issue #9). So NO child shape carries a
+/// `<skills>` section, and the TOOLS are the ONLY filter for EVERY child
+/// shape; ADR 0036's subagent bullet (amended) owns that statement.)
 /// Drop either spec and the DEFAULT child would have neither a catalog nor
 /// the tool that filters, and the ADR's claim would be silently false rather
 /// than tested.
@@ -354,10 +356,11 @@ fn the_child_tool_set_is_pinned() {
     // filtering for free" is an untested claim. (The contrast lives in the
     // assertions above: this set IS reduced — it lost the two dispatch
     // tools — yet neither skill tool went with them.) The `None`
-    // fall-through child (no prompt AND no `manage_todo_list`) does get a
-    // section — the main prompt's, FILTERED the same way — so the flag holds
-    // for that shape too; ADR 0036's subagent bullet states it, and what the
-    // assertions here pin is the DEFAULT shape's tool set.
+    // fall-through child (no prompt AND no `manage_todo_list`) now gets NO
+    // system message at all (issue #9), so it has no section either — the
+    // tool-side filter is the whole child story for EVERY child shape, and
+    // ADR 0036's subagent bullet (amended) states it; what the assertions here
+    // pin is the DEFAULT shape's tool set.
     assert!(
         child.iter().any(|s| s.name == "read_skill"),
         "a child still advertises `read_skill` — the tool that refuses a \

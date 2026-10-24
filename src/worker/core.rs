@@ -6,7 +6,9 @@
 //! `Start` builds the `AgentLoop` via the `build_loop` seam
 //! (injectable in tests — the DEFAULT is the production path: the
 //! session initialization moved from `session.rs`'s start path: the
-//! main system prompt for `Fresh`, the transcript hydration for
+//! main system prompt for `Fresh` (and ONLY for it — a child arrives as
+//! `FreshChild`), the reduced child message (or nothing) for
+//! `FreshChild`, the transcript hydration for
 //! `Resume`, the `enabled_tools` VERBATIM application, the thinking
 //! level).
 
@@ -337,23 +339,25 @@ pub fn default_build_loop(
                 let messages = env.transcript.clone().unwrap_or_default();
                 loop_.load_transcript(messages);
             }
-            (StartMode::Fresh, Some(sp)) => {
-                // A subagent Worker: the Supervisor-computed
+            (StartMode::Fresh | StartMode::FreshChild, Some(sp)) => {
+                // A Supervisor-computed message — a child's
                 // `build_child_system_message(launch.system_prompt,
-                // has_todo_tool)` output (it needs the resolved child
-                // tool list's `has_todo_tool`) — the child's seq-0 row.
+                // has_todo_tool)` output (`FreshChild` — the child's seq-0
+                // row), or any envelope that carries an explicit prompt. One
+                // arm for both fresh modes so the seq-0 push has ONE home.
                 loop_.prepend_system(sp.clone());
             }
             (StartMode::Fresh, None) => {
-                // The main system prompt (ADR 0017) — NEW sessions only:
-                // the `cwd`, the `~/.pi/agent` roots (best-effort: no
-                // home dir → no global file), the advertised tool specs
-                // (the `<tools>` section matches the `tools[]` API param),
-                // the discovered skills (ADR 0013). NOTE: this arm is NOT
-                // main-session-only in practice — a child whose REDUCED message
-                // resolved to `None` arrives here too, so such a child gets this
-                // whole prompt (its `<skills>` section filtered the same way);
-                // ADR 0036's subagent bullet owns that shape.
+                // THE MAIN PROMPT (ADR 0017) — the main session ONLY: the
+                // `cwd`, the `~/.pi/agent` roots (best-effort: no home dir →
+                // no global file), the advertised tool specs (the `<tools>`
+                // section matches the `tools[]` API param), the discovered
+                // skills (ADR 0013). A CHILD arrives as `FreshChild`, so the
+                // shape that used to land here by accident (`None` reduced
+                // message + no `manage_todo_list`) now prepends NOTHING in
+                // the arm below; `(Fresh, Some(_))` above stays so the
+                // envelope remains total (production's main path always sends
+                // `None` — `session/mod.rs` passes it literally).
                 let agent_dir = crate::skills::home_dir()
                     .map(|h| h.join(".pi/agent"))
                     .unwrap_or_default();
@@ -366,6 +370,18 @@ pub fn default_build_loop(
                     skills: &skills,
                 });
                 loop_.prepend_system(prompt);
+            }
+            (StartMode::FreshChild, None) => {
+                // A child with NO reduced message: no launch/definition
+                // prompt AND no `manage_todo_list` in the resolved child tool
+                // set. It gets NO system message and NO seq-0 row — the first
+                // `native_messages` row is the `user` task. Do NOT "fix" this
+                // into an empty `prepend_system("")`: every provider wire
+                // folds `System` text and OMITS the field when it is empty
+                // (`provider/types.rs`'s `system_text`), so an empty row would
+                // be a transcript record of a prompt the model never receives,
+                // and `run_compaction` would preserve it forever as prompt
+                // state.
             }
         }
         // (5) The handles (the `prompt_tx` / `control_tx` clones are
@@ -788,18 +804,22 @@ mod tests {
             "t".to_string(),
         );
         // The session initialization (the seam stub mirrors the
-        // `build_loop` default's init steps).
+        // `build_loop` default's init steps — the SAME four arms, so the
+        // stub cannot drift from the production `match`. `(Fresh, None)`
+        // keeps a literal DISTINCT from the `Some` arm's value, or the
+        // stub-based tests could not tell the two arms apart).
         match (&env.mode, &env.system_prompt) {
             (StartMode::Resume, _) => {
                 let messages = env.transcript.clone().unwrap_or_default();
                 loop_.load_transcript(messages);
             }
-            (StartMode::Fresh, Some(sp)) => {
+            (StartMode::Fresh | StartMode::FreshChild, Some(sp)) => {
                 loop_.prepend_system(sp.clone());
             }
             (StartMode::Fresh, None) => {
                 loop_.prepend_system("test system prompt".to_string());
             }
+            (StartMode::FreshChild, None) => {}
         }
         loop_.set_enabled_tools(env.enabled_tools.clone());
         if let Some(level) = &env.thinking {
@@ -994,14 +1014,17 @@ mod tests {
         );
     }
 
-    /// A subagent Worker (`Fresh` + `system_prompt: Some`) — the
+    /// A subagent Worker (`FreshChild` + `system_prompt: Some`) — the
     /// Supervisor-computed `build_child_system_message` output is
-    /// `prepend_system`ed (the child's seq-0 row).
+    /// `prepend_system`ed (the child's seq-0 row). The STUB mirror of
+    /// `a_child_with_a_reduced_message_gets_that_message_and_nothing_else`
+    /// (which drives the PRODUCTION builder): cheap to keep honest, and the
+    /// pair is the reason the stub's init `match` exists.
     #[tokio::test]
     async fn subagent_worker_system_prompt_is_the_seq_zero_row() {
         let (mut core, mut out_rx, _in_tx) = stub_core();
         let env = test_env(
-            StartMode::Fresh,
+            StartMode::FreshChild,
             None,
             Some("child system prompt".to_string()),
         );
@@ -1021,6 +1044,136 @@ mod tests {
         assert!(
             seq0.contains("child system prompt"),
             "the Supervisor-computed child prompt is the seq-0 row"
+        );
+    }
+
+    // ── The three CHILD/MAIN start shapes, on the PRODUCTION builder ──
+    //
+    // Every other test in this module swaps the `build_loop` seam, so the
+    // real `default_build_loop` init `match` had never been asserted. These
+    // three use `WorkerCore::new` (NO `with_build_loop`) — the production
+    // arm — and differ ONLY in the `mode` / `system_prompt` pair, which is
+    // exactly the pair issue #9 made load-bearing. No `Prompt` is sent: the
+    // built loop idles and the runtime drops it at test end (the same shape
+    // `start_builds_the_loop_and_a_prompt_runs_a_full_turn` has).
+
+    /// A `WorkerCore` on the PRODUCTION `default_build_loop` (the canned
+    /// provider resolves from the envelope's `Model`, which the test model
+    /// points at a dead `http://fake/v1` — never called: these tests send no
+    /// `Prompt`).
+    fn production_core() -> (
+        WorkerCore,
+        mpsc::UnboundedReceiver<Outbound>,
+        mpsc::Sender<Inbound>,
+    ) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (core, in_tx) = WorkerCore::new(out_tx);
+        (core, out_rx, in_tx)
+    }
+
+    /// (A) A child (`FreshChild`) WITH a reduced message: that message is its
+    /// seq-0 row and NOTHING ELSE — no preamble, no `<tools>`, no `<cwd>`.
+    /// Those two markers are the sections `build_main_prompt` pushes
+    /// UNCONDITIONALLY, so the assertion cannot be perturbed by a stray
+    /// `AGENTS.md` or by a `HOME` another test is mutating.
+    #[tokio::test]
+    async fn a_child_with_a_reduced_message_gets_that_message_and_nothing_else() {
+        let (mut core, mut out_rx, _in_tx) = production_core();
+        let env = test_env(
+            StartMode::FreshChild,
+            None,
+            Some("child reduced message".to_string()),
+        );
+        core.handle(Inbound::from(&env)).await;
+        let frames = drain(&mut out_rx);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, Outbound::TranscriptInsert { .. }))
+                .count(),
+            1,
+            "the reduced message is the ONLY transcript row the `start` handler writes, got {frames:?}"
+        );
+        let seq0 = frames
+            .iter()
+            .find_map(|f| match f {
+                Outbound::TranscriptInsert {
+                    seq: 0,
+                    role,
+                    content_json,
+                    ..
+                } if role == "system" => Some(content_json.clone()),
+                _ => None,
+            })
+            .expect("the child's seq-0 transcript row is its reduced message");
+        assert!(
+            seq0.contains("child reduced message"),
+            "the Supervisor-computed reduced message is the seq-0 row, got {seq0}"
+        );
+        assert!(
+            !seq0.contains("<tools>"),
+            "the child's seq-0 row is NOT the main prompt (`<tools>`), got {seq0}"
+        );
+        assert!(
+            !seq0.contains("<cwd>"),
+            "the child's seq-0 row is NOT the main prompt (`<cwd>`), got {seq0}"
+        );
+    }
+
+    /// (B) A child (`FreshChild`) with NO reduced message gets NO prompt at
+    /// all: the `start` handler emits NO `TranscriptInsert` of ANY seq — no
+    /// seq-0 row exists, so the child's first `native_messages` row will be
+    /// the `user` task. (Asserted as "no `TranscriptInsert`", not "no
+    /// frames": `prepend_system` is not the only thing that could ever emit
+    /// here, and a future context frame must not redden this for the wrong
+    /// reason. Test C is the contrast that keeps this from passing
+    /// vacuously.)
+    #[tokio::test]
+    async fn a_child_with_no_reduced_message_gets_no_prompt_at_all() {
+        let (mut core, mut out_rx, _in_tx) = production_core();
+        let env = test_env(StartMode::FreshChild, None, None);
+        core.handle(Inbound::from(&env)).await;
+        let frames = drain(&mut out_rx);
+        assert!(
+            frames
+                .iter()
+                .all(|f| !matches!(f, Outbound::TranscriptInsert { .. })),
+            "a child with no reduced message prepends NOTHING, got {frames:?}"
+        );
+    }
+
+    /// (C) The CONTRAST that keeps B honest: `Fresh` + `system_prompt: None`
+    /// — a MAIN session — still gets the FULL main prompt as its seq-0 row.
+    /// Same builder, same `None`, only the `mode` differs. `<tools>` and
+    /// `<cwd>` are the two UNCONDITIONAL sections; `<project_context>` and
+    /// `<skills>` are filesystem-conditional (and these tests run at
+    /// `cwd = "/tmp"` with no `ENV_LOCK`), so they are deliberately NOT
+    /// asserted.
+    #[tokio::test]
+    async fn only_the_main_fresh_mode_builds_the_main_prompt() {
+        let (mut core, mut out_rx, _in_tx) = production_core();
+        let env = test_env(StartMode::Fresh, None, None);
+        core.handle(Inbound::from(&env)).await;
+        let frames = drain(&mut out_rx);
+        let seq0 = frames
+            .iter()
+            .find_map(|f| match f {
+                Outbound::TranscriptInsert {
+                    seq: 0,
+                    role,
+                    content_json,
+                    ..
+                } if role == "system" => Some(content_json.clone()),
+                _ => None,
+            })
+            .expect("a main session's seq-0 row is the main prompt");
+        assert!(
+            seq0.contains("<tools>"),
+            "the main session still gets the main prompt's `<tools>` section, got {seq0}"
+        );
+        assert!(
+            seq0.contains("<cwd>"),
+            "the main session still gets the main prompt's `<cwd>` section, got {seq0}"
         );
     }
 

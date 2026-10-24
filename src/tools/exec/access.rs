@@ -30,6 +30,18 @@ pub(crate) fn write_backend(ctx: &ToolCtx) -> FsBackend {
     }
 }
 
+/// The reason + the route the protected-write refusal appends after the
+/// refusal sentence: this is by design, and the sanctioned way to get the
+/// file there is to stage it in the session and let the HUMAN move it into
+/// place. Deliberately the ONLY route the refusal names — `sudo_exec` and the
+/// shell can both reach these dirs and both are documented as intended
+/// (ADR 0030: a guard-rail, not a security boundary), but the refusal is read
+/// at the moment of decision, and naming an elevated route there is what sent
+/// the reporting agent reaching for one over a markdown file (issue #33).
+/// Pinned negative by `write_into_a_protected_dir_is_refused_under_every_policy`
+/// and by the gate's `a_gate_denial_of_a_protected_dir_uses_the_protected_wording`.
+pub(crate) const PROTECTED_WRITE_ROUTE: &str = "This is by design: these directories are the agent's own instructions. Write the file under your session directory instead and ask the user to move it into place (the `ask` tool).";
+
 /// The write DENY-LIST check (ADR 0030 Deviation 3): a resolved path under
 /// one of `ctx.protected` (the user-level agent-definition dirs) is refused
 /// in EVERY policy — including `writes: Allow` — because a model that can
@@ -44,6 +56,15 @@ pub(crate) fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> O
 /// protected write in EXACTLY the executor's words — two copies of that
 /// sentence would drift, and a gate-level deny that reads differently from
 /// the executor-level one is indistinguishable from a bug to a user.
+///
+/// The refusal carries more than the refusal: after the sentence that states
+/// the floor, it appends the reason the floor exists and the one route the
+/// guard-rail was designed to have (stage the file under the session directory
+/// and let the human move it into place). Both live in
+/// [`PROTECTED_WRITE_ROUTE`] so the executor-side and gate-side test families
+/// assert the SAME value rather than two literals that can drift, and the gate
+/// gets them for free — it calls this function, which is the whole reason the
+/// split exists.
 ///
 /// # The comparison is CANONICAL on both sides
 ///
@@ -136,7 +157,7 @@ pub(crate) fn protected_refusal_text(
             .is_ok_and(|canon| resolved.starts_with(canon))
     })?;
     Some(format!(
-        "{tool}: {} is a protected agent-definition directory ({}) — writing there is refused in every policy",
+        "{tool}: {} is a protected agent-definition directory ({}) — writing there is refused in every policy. {PROTECTED_WRITE_ROUTE}",
         resolved.display(),
         hit.display()
     ))
