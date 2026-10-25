@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -46,11 +46,13 @@ async fn a_failed_summary_does_not_rewrite_the_transcript() {
         reason: "threshold",
         will_retry: false,
     });
-    // The failed compaction shrinks nothing (the wrapper's return).
-    assert!(
-        !loop_
+    // The failed compaction reports `Failed` — the outcome the overflow caller
+    // now reads differently from `Skipped` (issue #90).
+    assert_eq!(
+        loop_
             .run_compaction("threshold", false, None, &CancellationToken::new())
             .await,
+        CompactionRan::Failed,
         "a failed compaction rewrote nothing"
     );
     // The summary failed: the transcript is UNCHANGED (NOT replaced
@@ -116,10 +118,11 @@ async fn a_skipped_compaction_reports_no_shrink() {
         },
     ];
     let len_before = loop_.messages.len();
-    assert!(
-        !loop_
+    assert_eq!(
+        loop_
             .run_compaction("threshold", false, None, &CancellationToken::new())
             .await,
+        CompactionRan::Skipped,
         "a skipped compaction shrank nothing"
     );
     assert_eq!(loop_.messages.len(), len_before, "the transcript is intact");
@@ -969,7 +972,14 @@ async fn a_second_overflow_after_a_failed_recovery_gives_up_without_a_second_req
         unreachable!()
     };
     assert_eq!(reason, "overflow");
-    assert!(will_retry, "the trigger was the overflow recovery");
+    // (issue #90 item 1) `will_retry` describes what the loop is about to DO,
+    // not why the compaction was triggered. The loop settles this turn — no
+    // second request is spent — so the flag is `false`: pre-fix it echoed the
+    // trigger and promised a retry on the way to a dead turn.
+    assert!(
+        !will_retry,
+        "the turn settles here, so no retry is promised"
+    );
     assert!(
         !aborted,
         "a Skipped compaction is not an abort (nothing failed — there was nothing to summarize)"
@@ -980,27 +990,45 @@ async fn a_second_overflow_after_a_failed_recovery_gives_up_without_a_second_req
         "the user gets an actionable line, not a provider string"
     );
 
-    // The transcript line the normalize arm produced for that event: ONE
-    // `Compaction failed: …` chunk, and no weld with the success line.
-    let lines: Vec<String> = captured
+    // The transcript frames the normalize arm produced for the pair (issue #90
+    // item 2): a card announced, then settled `failed` carrying the actionable
+    // line — and NO compaction `system_chunk`, the shape that used to weld.
+    let frames: Vec<Value> = captured
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
         .filter(|(event, _)| event == "session-update")
-        .filter_map(|(_, payload)| {
-            payload["update"]["content"]["text"]
-                .as_str()
-                .map(str::to_string)
+        .map(|(_, payload)| payload["update"].clone())
+        .filter(|u| {
+            let kind = u["sessionUpdate"].as_str().unwrap_or_default();
+            kind == "tool_call" || kind == "tool_call_update" || kind == "agent_message_chunk"
         })
-        .filter(|t| t.starts_with("Compact"))
         .collect();
+    let announce = frames
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call")
+        .expect("the compaction announced a card");
+    let settle = frames
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call_update")
+        .expect("the compaction settled its card");
+    assert_eq!(settle["toolCallId"], announce["toolCallId"]);
+    assert_eq!(settle["status"], "failed");
     assert_eq!(
-        lines,
-        vec![
-            "Compacting context…".to_string(),
-            "Compaction failed: Context overflow: not enough older context to compact — try a larger-context model.".to_string(),
-        ],
-        "the failure line REPLACES `Compaction finished` (two system chunks would weld)"
+        settle["rawOutput"]["details"]["error"].as_str(),
+        Some("Context overflow: not enough older context to compact — try a larger-context model."),
+        "the actionable line is the card's failure text"
+    );
+    assert!(
+        !frames.iter().any(|u| {
+            u["sessionUpdate"] == "agent_message_chunk"
+                && u["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("Compact")
+        }),
+        "no `Compacting context…` / `Compaction finished` one-liner survives — the \
+         weld these lines needed replacing is now unreachable"
     );
 
     // No doomed second request: the overflowed call was the ONLY model call
@@ -1227,4 +1255,75 @@ async fn abort_cancels_an_idle_compaction() {
     );
     session_cancel.cancel();
     let _ = tokio::time::timeout(SETTLE, join).await;
+}
+
+/// (issue #90 item 1) An overflow recovery whose compaction FAILED continues
+/// inference anyway. The summary call is a model call like any other and it
+/// fails for TRANSIENT reasons — measured on real sessions, 29 of 75
+/// compactions ended `Compaction failed: retryable: the summary hit the output
+/// token limit` — so `Failed` says nothing about whether the turn's own
+/// request is doomed. Pre-fix the loop settled the turn as an error the moment
+/// the compaction shrank nothing, while the SAME `compaction_end` promised
+/// `will_retry: true` ("the turn continues on the other side of this
+/// compaction"), so the user watched the indicator clear and then had to type
+/// "continue" — the exact symptom ADR 0045 was written to end.
+///
+/// This is deliberately NOT the `Skipped` case below: `Skipped` proves the kept
+/// tail alone is over the window, so a second request genuinely cannot
+/// succeed; `Failed` proves only that the summary call did not.
+#[tokio::test]
+async fn an_overflow_recovery_reissues_the_turn_when_the_summary_fails() {
+    // Call 0 overflows; call 1 is the summary and it comes back TRUNCATED
+    // (`Done(Length)` — the real failure shape above), so the transcript is
+    // left intact and shrinks nothing; call 2 is the retried model call.
+    let (provider, calls) = OverflowingProvider::new(
+        &[0],
+        vec![
+            Vec::new(),
+            vec![ProviderEvent::Done(FinishReason::Length)],
+            vec![
+                ProviderEvent::TextDelta("recovered".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ],
+        ],
+    );
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let mut loop_ = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    // Large enough that `older` is non-empty, so the summary IS attempted
+    // (a `Skipped` would test the other outcome).
+    loop_.messages = large_transcript(3);
+    loop_.handle_prompt(&text_prompt("hello")).await;
+    let events =
+        collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    // The turn CONTINUES: the model call is re-issued after the failed
+    // compaction, and the turn ends the SUCCESSFUL way.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the overflowed call + the summary + the RETRIED call — settling the turn here \
+         is the bug (the user had to type 'continue'), got {kinds:?}"
+    );
+    let agent_end = kinds.iter().position(|k| k == "agent_end");
+    let turn_end = kinds.iter().position(|k| k == "turn_end");
+    assert!(
+        matches!((agent_end, turn_end), (Some(a), Some(t)) if a < t),
+        "the turn completed normally after the failed compaction, got {kinds:?}"
+    );
+
+    // The transcript holds the reply the model actually produced on the retry.
+    assert!(
+        loop_
+            .messages
+            .iter()
+            .any(|m| matches!(&m.content, MessageContent::Text(t) if t == "recovered")),
+        "the retried reply is in the transcript"
+    );
 }

@@ -99,6 +99,26 @@ pub(crate) struct CompactionTrigger {
     pub will_retry: bool,
 }
 
+/// What [`AgentLoop::run_compaction`] decided, and therefore what the turn does
+/// next. The three-way shape exists because the two ways a compaction shrinks
+/// nothing are NOT the same fact: `Skipped` proves the kept tail alone is over
+/// the window (a second request cannot succeed), while `Failed` proves only
+/// that the summary call did not — a transient mechanism failure that says
+/// nothing about the turn's own request. Collapsing both into one boolean is
+/// what made an overflow recovery abandon a turn it should have re-issued
+/// (issue #90).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionRan {
+    /// The older messages were replaced by a summary: the transcript shrank.
+    Compacted,
+    /// Nothing old enough to summarize (`older` empty) — the transcript is
+    /// unchanged and, for an overflow, a second request is provably doomed.
+    Skipped,
+    /// The summary call errored: the transcript is intact and the failure is
+    /// the SUMMARY's, not the turn's.
+    Failed,
+}
+
 /// The suite's `sudo_exec` state (the frame-free core's dependencies —
 /// `runner` / `pending_sudo` / `sudo_password`, mirroring the
 /// `SessionDriver` fields).
@@ -802,37 +822,44 @@ impl AgentLoop {
     /// extra summary instructions (`/compact <args>`); the automatic paths
     /// (threshold / overflow) pass `None`.
     ///
-    /// Returns whether the transcript actually SHRANK (`Compacted` — the older
-    /// messages were replaced by a summary): `Skipped` (nothing old enough to
-    /// summarize) and `Failed` (the summary call errored, the transcript is
-    /// intact) both shrink nothing. A caller recovering from an overflow reads
-    /// this to decide whether a second request is worth sending at all.
+    /// Returns [`CompactionRan`] — the three-way outcome, because a caller
+    /// recovering from an overflow must NOT read "shrunk nothing" as one fact:
+    /// `Skipped` means the kept tail alone is over the window (a second request
+    /// is doomed), `Failed` means the SUMMARY call errored (which says nothing
+    /// about the turn's own request, so the turn is re-issued).
     ///
     /// For `reason: "overflow"` the SAME `compaction_end` also carries an
     /// ACTIONABLE `error_message` when the transcript did not shrink (ADR 0045):
-    /// the caller settles the turn right there, so the one event the user sees
-    /// must say what to do (a larger window, or that the summary call failed and
-    /// the transcript is unchanged). It is composed HERE rather than by the
-    /// caller because this is the only place that emits `compaction_end` — a
-    /// second one would double the transcript line and the state frame.
+    /// the one event the user sees must say what to do (a larger window, or that
+    /// the summary call failed and the transcript is unchanged). It is composed
+    /// HERE rather than by the caller because this is the only place that emits
+    /// `compaction_end` — a second one would double the transcript line and the
+    /// state frame.
+    ///
+    /// `will_retry` is reconciled with the outcome HERE for the same reason: it
+    /// is a promise about what the loop does next, and the only party that
+    /// knows both halves is this function. An overflow recovery that lands on
+    /// `Skipped` settles the turn, so it must not promise a retry.
     async fn run_compaction(
         &mut self,
         reason: &str,
         will_retry: bool,
         instructions: Option<String>,
         turn: &CancellationToken,
-    ) -> bool {
+    ) -> CompactionRan {
         self.emit(RpcEvent::compaction_start {
             reason: reason.to_string(),
         });
         let mut aborted = false;
         let mut error_message: Option<String> = None;
+        // The compaction's own output (pi's `CompactionResult` shape), shown on
+        // the transcript card. `None` unless the summary was actually produced.
+        let mut result: Option<Value> = None;
         // The overflow recovery's outcome needs a DIFFERENT message from the
-        // transient ones (below): the caller has already decided not to send
-        // another request, so the user is the only one who can act.
+        // transient ones (below): only the user can act on a window too small.
         let overflow = reason == "overflow";
-        // Whether the rewrite happened (the return value — see above).
-        let mut shrank = false;
+        // What actually happened (the return value — see above).
+        let mut ran = CompactionRan::Skipped;
         // The keep-recent budget comes from the COMPACTOR (its config copy +
         // THIS model's window), not from `catalog.compaction` directly: the
         // catalog budget is catalog-wide while the window is per-model, and an
@@ -865,8 +892,17 @@ impl AgentLoop {
                     );
                 }
             }
-            compact::CompactionOutcome::Compacted { context_tokens } => {
-                shrank = true;
+            compact::CompactionOutcome::Compacted {
+                context_tokens,
+                summary,
+            } => {
+                ran = CompactionRan::Compacted;
+                // The summary is the compaction's OUTPUT — the one thing worth
+                // reading and, until issue #90, visible only to the model. It
+                // rides `result` (pi's `CompactionResult` carries a `summary`
+                // field for the same reason) so `normalize` can render it as the
+                // card's body.
+                result = Some(json!({ "summary": summary }));
                 // The re-estimate is the post-compaction BASELINE (the
                 // `context_usage_update` frame — the percentage drops
                 // after the compaction instead of staying at the
@@ -875,10 +911,12 @@ impl AgentLoop {
                 self.emit_context_usage();
             }
             compact::CompactionOutcome::Failed { error } => {
+                ran = CompactionRan::Failed;
                 aborted = true;
-                // An overflow's failure says what it cost: the transcript was
-                // left AS-IS, so the next call would fail exactly the same way
-                // (the caller acts on that by NOT sending it).
+                // An overflow's failure says what it cost — the transcript was
+                // left AS-IS — without claiming the turn is over: the caller
+                // re-issues the request (issue #90), because a failed SUMMARY
+                // says nothing about whether the turn's own request fits.
                 error_message = Some(if overflow {
                     format!(
                         "Context overflow: the summary call failed ({error}) — the transcript was left unchanged."
@@ -888,14 +926,22 @@ impl AgentLoop {
                 });
             }
         }
+        // `will_retry` is the promise that the turn continues on the other side
+        // of this compaction, so it is RECONCILED with what the caller is about
+        // to do rather than echoed from the trigger: the one overflow outcome
+        // that settles the turn is `Skipped` (the kept tail alone is over the
+        // window, so a second request cannot succeed — ADR 0045's "no doomed
+        // second request"). Pre-fix this line carried the trigger's `true`
+        // straight through to a dead turn.
+        let will_retry = will_retry && !(overflow && ran == CompactionRan::Skipped);
         self.emit(RpcEvent::compaction_end {
             reason: reason.to_string(),
-            result: None,
+            result,
             aborted,
             will_retry,
             error_message,
         });
-        shrank
+        ran
     }
 
     /// The model request (the `messages` vec + the tool specs + the

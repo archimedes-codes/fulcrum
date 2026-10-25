@@ -74,6 +74,15 @@ pub struct TurnState {
     /// messageId UNIQUE per discard (ADR 0048) — two lines on the shared
     /// `system` key (today `{stamp}:system`) would weld into one bubble.
     pub retract_seq: u64,
+    /// The card id of the compaction currently in flight, set by
+    /// `compaction_start` and taken by `compaction_end` (issue #90: a
+    /// compaction renders as a `ToolCallCard`, so the settle must land on the
+    /// card the announcement opened — a fresh id per compaction, because a long
+    /// session compacts many times and one card per session would merge them).
+    pub open_compaction_id: Option<String>,
+    /// How many compaction cards this turn has announced (the per-compaction
+    /// id counter, same role as `retract_seq`).
+    pub compaction_seq: u64,
     /// The stamp for this Worker's life (ADR 0049), prefixed onto every id
     /// this state mints. An EMPTY stamp is a test artifact — production can
     /// only build a `TurnState` through `AgentLoop::new`, which requires one.
@@ -129,6 +138,12 @@ pub fn is_bookkeeping_message_id(id: &str) -> bool {
     id.split(':')
         .any(|field| field == "system" || field == "retract")
 }
+
+/// The transcript title of a compaction's card (issue #90 item 2). Not a real
+/// tool: nothing is dispatched under this name, and it is deliberately NOT in
+/// `tool_specs()` — it exists only as a display title, so the model can never
+/// call it.
+pub(crate) const COMPACTION_TOOL: &str = "compaction";
 
 /// A one-line `agent_message_chunk` with the dedicated `system` messageId
 /// (the bookkeeping one-liners — never mixed into a real message's
@@ -408,50 +423,115 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             "sessionUpdate": "session_info_update",
             "title": name,
         })],
-        // Bookkeeping / de-structured one-liners (the adapter's parity; the
-        // strings are stable for tests). They carry the SHARED
-        // `{incarnation}:system` messageId (a dedicated key — never mixed into
-        // a real message's accumulated text).
+        // (issue #90 item 2) A compaction renders as a TOOL CARD, like `bash`
+        // and the rest, because that is the transcript's existing shape for
+        // "something ran, here is what it produced" — and what a compaction
+        // produces (the summary) was previously shown NOWHERE: it lived only in
+        // the `native_messages` `System` row the model is replayed, and the
+        // transcript's only trace was the one-liner.
         //
-        // A compaction emits a SECOND frame beside the one-liner: the
-        // `compaction_update` STATE frame ("a compaction is running", and the
-        // trigger `reason` — `manual` / `threshold` / `overflow`) the
-        // renderer's indicator reads. It has no display row (see
-        // `compute_display_rows`' catch-all), so the one-liner stays the only
-        // durable transcript trace — the summary itself is a `native_messages`
-        // `System` row, never a display row.
-        RpcEvent::compaction_start { reason } => vec![
-            system_chunk(&st.id("system"), "Compacting context…"),
-            json!({
-                "sessionUpdate": "compaction_update",
-                "active": true,
-                "reason": reason,
-            }),
-        ],
-        // A `compaction_end` that carries an `error_message` (ADR 0045: the
-        // overflow recovery's actionable line — "not enough older context to
-        // compact" / "the summary call failed") prints THAT instead of the
-        // success line, never both: these one-liners all share
-        // `messageId: "{stamp}:system"`, and the frontend appends
-        // same-`messageId` chunks with no separator, so two in one batch weld
-        // into one bubble.
-        // A successful compaction has no `error_message`, so the pinned
-        // "Compaction finished" still ships on the success path.
+        // So the two `system_chunk` one-liners are GONE, replaced by the
+        // announce/settle pair a `ToolCallCard` renders. Removing them also
+        // removes the weld they were engineered to dodge: every `system_chunk`
+        // shares `{stamp}:system` and the frontend APPENDS same-`messageId`
+        // chunks with no separator, so a session that compacts repeatedly reads
+        // as one bubble — measured in a real database:
+        // `Compacting context…Compaction finishedCompacting context…Compaction
+        // finishedCompaction failed: …`. Each compaction now gets its own card.
+        //
+        // The `compaction_update` STATE frame SURVIVES both events: the
+        // indicator, `composerLocked` and the Esc-to-cancel gate read that, and
+        // it is session state rather than transcript content (it persists no
+        // display row).
+        RpcEvent::compaction_start { reason } => {
+            st.compaction_seq += 1;
+            // Its OWN id per compaction (a long session compacts many times; one
+            // id per session would merge every card into one). Stamped like every
+            // other id this state mints (ADR 0049), and shaped so no provider
+            // `toolCallId` (`call_…`, `chatcmpl-tool-…`) can ever collide with it.
+            let id = st.id(&format!("compact:{}", st.compaction_seq));
+            st.open_compaction_id = Some(id.clone());
+            st.announced_tool_calls.insert(id.clone());
+            vec![
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "title": COMPACTION_TOOL,
+                    "status": "in_progress",
+                    // The trigger, as the card's summary line: which of
+                    // `manual` / `threshold` / `overflow` opened this card is
+                    // information the one-liner never carried.
+                    "rawInput": { "reason": reason },
+                }),
+                json!({
+                    "sessionUpdate": "compaction_update",
+                    "active": true,
+                    "reason": reason,
+                }),
+            ]
+        }
+        // The settle lands on the announced card when the pair is intact. A
+        // `compaction_end` whose announcement was never seen (a resume, or a
+        // Worker that started mid-compaction) still settles SOMETHING:
+        // `compute_display_rows` and the reducer both treat an unknown id as a
+        // new card, so the outcome is never silently dropped.
         RpcEvent::compaction_end {
             reason,
+            result,
+            aborted,
             error_message,
             ..
-        } => vec![
-            match error_message {
-                Some(m) => system_chunk(&st.id("system"), format!("Compaction failed: {m}")),
-                None => system_chunk(&st.id("system"), "Compaction finished"),
-            },
-            json!({
-                "sessionUpdate": "compaction_update",
-                "active": false,
-                "reason": reason,
-            }),
-        ],
+        } => {
+            let id = st.open_compaction_id.take().unwrap_or_else(|| {
+                // No announcement was seen (a resume, or a Worker that started
+                // mid-compaction). Still a UNIQUE id — reusing one bare key for
+                // every orphan settle would merge unrelated compactions into one
+                // card, the very defect the per-compaction id exists to avoid.
+                st.compaction_seq += 1;
+                st.id(&format!("compact:{}", st.compaction_seq))
+            });
+            // `failed` on any error, exactly as a real tool settles; the reason
+            // goes where `failureText` reads first (`details.error`), so the
+            // header's Failed chip carries the actionable line ADR 0045 composes.
+            let raw_output = match error_message {
+                Some(m) => json!({
+                    "content": [{ "type": "text", "text": m }],
+                    "details": { "error": m },
+                }),
+                None => match result {
+                    // pi's `CompactionResult.summary`, in the `AgentToolResult`
+                    // shape `normalizeToolOutput` joins.
+                    Some(r) => json!({
+                        "content": [
+                            { "type": "text", "text": r.get("summary").and_then(Value::as_str).unwrap_or_default() }
+                        ]
+                    }),
+                    // `Skipped` — nothing old enough to summarize. Nothing
+                    // failed, so it settles `completed`; an EMPTY body would
+                    // render as "(no output)", which reads as a tool that ran
+                    // and printed nothing rather than "there was nothing to do".
+                    None => json!({
+                        "content": [{
+                            "type": "text",
+                            "text": "Nothing old enough to summarize — the transcript is unchanged."
+                        }]
+                    }),
+                },
+            };
+            vec![
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "status": if *aborted || error_message.is_some() { "failed" } else { "completed" },
+                    "rawOutput": raw_output,
+                }),
+                json!({
+                    "sessionUpdate": "compaction_update",
+                    "active": false,
+                    "reason": reason,
+                }),
+            ]
+        }
         // (ADR 0048) An Abandoned attempt's reply is retracted. The id is the one
         // the harness is ON — the retried call REUSES it (`message_start` fires
         // once per assistant message), which is precisely why the discard is a
@@ -774,6 +854,7 @@ mod normalize_tests {
     use super::temp_db;
     use super::{
         compute_display_rows, is_bookkeeping_message_id, normalize, ThoughtState, TurnState,
+        COMPACTION_TOOL,
     };
     use crate::agent::events::RpcEvent;
     use crate::agent::harness::store::{SessionStore, Store};
@@ -1147,12 +1228,13 @@ mod normalize_tests {
     /// The bookkeeping one-liners (stable strings for tests) + the
     /// no-frame bookkeeping events (`agent_settled` / `turn_end` / …).
     ///
-    /// A compaction event carries TWO frames: the durable transcript
-    /// one-liner (the only trace of the compaction in the display rows —
-    /// the summary itself is a `native_messages` `System` row) AND the
-    /// `compaction_update` STATE frame ("a compaction is running", with
-    /// the trigger `reason` — `manual` / `threshold` / `overflow`), which
-    /// the renderer's indicator reads and which persists no display row.
+    /// A compaction event carries TWO frames (issue #90 item 2): the
+    /// `ToolCallCard` half of the pair (`tool_call` announce / `tool_call_update`
+    /// settle) AND the `compaction_update` STATE frame ("a compaction is
+    /// running", with the trigger `reason` — `manual` / `threshold` /
+    /// `overflow`), which the renderer's indicator reads and which persists no
+    /// display row. The `system_chunk` one-liners these assertions used to pin
+    /// are GONE — see the normalize arms for why (the weld).
     #[test]
     fn bookkeeping_events_and_one_liners() {
         let mut st = TurnState::stamped("t");
@@ -1160,11 +1242,12 @@ mod normalize_tests {
             &ev(json!({ "type": "compaction_start", "reason": "manual" })),
             &mut st,
         );
-        assert_eq!(compacting.len(), 2, "the one-liner + the state frame");
-        assert_eq!(compacting[0]["content"]["text"], "Compacting context…");
+        assert_eq!(compacting.len(), 2, "the card announce + the state frame");
+        assert_eq!(compacting[0]["sessionUpdate"], "tool_call");
+        assert_eq!(compacting[0]["title"], COMPACTION_TOOL);
         assert_eq!(
-            compacting[0]["messageId"], "t:system",
-            "the one-liners key the stamped dedicated system id"
+            compacting[0]["toolCallId"], "t:compact:1",
+            "the card id is stamped AND unique per compaction (ADR 0049)"
         );
         assert_eq!(
             compacting[1],
@@ -1178,12 +1261,31 @@ mod normalize_tests {
             ),
             &mut st,
         );
-        assert_eq!(done.len(), 2, "the one-liner + the state frame");
-        assert_eq!(done[0]["content"]["text"], "Compaction finished");
+        assert_eq!(done.len(), 2, "the card settle + the state frame");
+        assert_eq!(done[0]["sessionUpdate"], "tool_call_update");
+        assert_eq!(
+            done[0]["toolCallId"], "t:compact:1",
+            "the settle lands on the announced card"
+        );
         assert_eq!(
             done[1],
             json!({ "sessionUpdate": "compaction_update", "active": false, "reason": "manual" }),
             "the state frame closes the indicator, with the same reason"
+        );
+
+        // A SECOND compaction of the same turn opens its OWN card — the defect
+        // the counter exists for (one shared id would merge every card, which is
+        // what the shared `system` key did to the one-liners).
+        let second = st.id(&format!("compact:{}", st.compaction_seq + 1));
+        normalize(
+            &ev(json!({ "type": "compaction_start", "reason": "threshold" })),
+            &mut st,
+        );
+        assert_eq!(
+            st.open_compaction_id.as_deref(),
+            Some(second.as_str()),
+            "each compaction gets its own card id, got {:?}",
+            st.open_compaction_id
         );
 
         let retry = normalize(
@@ -1215,73 +1317,72 @@ mod normalize_tests {
             );
         }
     }
-    /// A `compaction_end` that CARRIES an `error_message` prints it INSTEAD
-    /// of the success line — and not in addition to it. Both lines are
-    /// `system_chunk`s, i.e. they share `messageId: "{stamp}:system"`, and the
-    /// frontend's `applySessionUpdate` APPENDS same-`messageId` chunks with NO
-    /// separator: two of them in one batch weld into one bubble reading
-    /// `Compaction finishedCompaction failed: …` (pinned at the store level in
-    /// `src/store/sessions.test.ts`). Replacing the line is what keeps the
-    /// transcript readable — and a SUCCESSFUL compaction has no `error_message`,
-    /// so the pinned `"Compaction finished"` string still ships on that path.
+    /// A `compaction_end` whose `compaction_start` was never seen still lands
+    /// (a resume, or a Worker that started mid-compaction): the settle becomes a
+    /// card of its own rather than being dropped, because the outcome —
+    /// especially a FAILED one carrying ADR 0045's actionable line — is the
+    /// thing the user needs and there is no announcement to attach it to.
     ///
-    /// The scope is any `error_message`, not just the overflow ones: this is
-    /// the first time a provider-side compaction failure is visible to the user
-    /// at all (see `a_failed_summary_does_not_rewrite_the_transcript`).
+    /// The old version of this test pinned the opposite contract: that an
+    /// `error_message` REPLACED the `"Compaction finished"` one-liner so the two
+    /// `system_chunk`s could not weld into one bubble. The weld is now
+    /// unreachable — a compaction emits no `system_chunk` at all — and each
+    /// compaction gets its own card id, so repeated compactions cannot merge
+    /// either (issue #90 item 2).
     #[test]
-    fn a_compaction_error_message_replaces_the_success_line() {
+    fn a_compaction_end_with_no_announcement_still_settles_its_own_card() {
         let mut st = TurnState::stamped("t");
         let failed = normalize(
             &ev(json!({
                 "type": "compaction_end",
                 "reason": "overflow",
                 "aborted": false,
-                "willRetry": true,
+                "willRetry": false,
                 "errorMessage": "Context overflow: not enough older context to compact — try a larger-context model.",
             })),
             &mut st,
         );
-        assert_eq!(failed.len(), 2, "the one-liner + the state frame");
+        assert_eq!(failed.len(), 2, "the card settle + the state frame");
+        assert_eq!(failed[0]["sessionUpdate"], "tool_call_update");
+        assert_eq!(failed[0]["status"], "failed");
         assert_eq!(
-            failed[0]["content"]["text"],
-            "Compaction failed: Context overflow: not enough older context to compact — try a larger-context model.",
-            "the actionable message is the line the user reads"
+            failed[0]["toolCallId"], "t:compact:1",
+            "an orphan settle mints its OWN stamped id, not a shared bare key"
         );
-        assert!(
-            !failed[0]["content"]["text"]
+
+        // A second orphan in the same turn must NOT land on the first card —
+        // that is the merge the per-compaction counter exists to prevent.
+        let second = normalize(
+            &ev(json!({
+                "type": "compaction_end",
+                "reason": "threshold",
+                "aborted": false,
+                "willRetry": false,
+            })),
+            &mut st,
+        );
+        assert_eq!(
+            second[0]["toolCallId"], "t:compact:2",
+            "each compaction gets its own card, got {}",
+            second[0]["toolCallId"]
+        );
+        assert_eq!(
+            failed[0]["rawOutput"]["details"]["error"]
                 .as_str()
-                .unwrap_or_default()
-                .contains("Compaction finished"),
-            "the success line is REPLACED, not followed (the weld)"
-        );
-        assert_eq!(
-            failed[0]["messageId"], "t:system",
-            "the failure line keeps the system id"
+                .unwrap_or_default(),
+            "Context overflow: not enough older context to compact — try a larger-context model.",
+            "the actionable message is the card's failure text, where failureText reads it"
         );
         assert_eq!(
             failed[1],
             json!({ "sessionUpdate": "compaction_update", "active": false, "reason": "overflow" }),
-            "the frame order is unchanged: [one-liner, state frame]"
-        );
-
-        // A `Failed` compaction (aborted) prints the same way.
-        let aborted = normalize(
-            &ev(json!({
-                "type": "compaction_end",
-                "reason": "overflow",
-                "aborted": true,
-                "willRetry": true,
-                "errorMessage": "Context overflow: the summary call failed (boom) — the transcript was left unchanged.",
-            })),
-            &mut st,
+            "the state frame still closes the indicator"
         );
         assert!(
-            aborted[0]["content"]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("Compaction failed: Context overflow: the summary call failed (boom)"),
-            "an aborted compaction prints its error too, got {:?}",
-            aborted[0]["content"]["text"]
+            !failed
+                .iter()
+                .any(|f| f["sessionUpdate"] == "agent_message_chunk"),
+            "no system one-liner is emitted on any compaction path, got {failed:?}"
         );
     }
 
@@ -1602,6 +1703,266 @@ mod normalize_tests {
             is_bookkeeping_message_id(":retract:1"),
             "the EMPTY-stamp shape (`TurnState::default()`) is bookkeeping too \
              — a position-based rule would miss it"
+        );
+    }
+    /// (issue #90 item 2) The DURABLE half: what a reload reads back. A frame
+    /// the reducer renders but `compute_display_rows` never persists would show
+    /// the summary live and lose it on reopen, so this drives the whole
+    /// downstream pipeline (`normalize` → `compute_display_rows` →
+    /// `persist_display`) and reads the `messages` table.
+    ///
+    /// The second compaction is the point of the test: the announce/settle pair
+    /// must write a SECOND row, not UPSERT over the first. The one-liners this
+    /// replaced shared `{stamp}:system` and appended, so a real database held
+    /// every compaction of a session in one welded bubble.
+    #[test]
+    fn a_compaction_pair_persists_one_card_per_compaction_with_its_summary() {
+        let (db, _dir) = temp_db();
+        let store = SessionStore::new(db.clone());
+        let mut st = TurnState::stamped("t");
+        let text = StdMutex::new(HashMap::new());
+        let tools = StdMutex::new(HashMap::new());
+        let thoughts = StdMutex::new(ThoughtState::default());
+
+        for e in [
+            ev(json!({ "type": "compaction_start", "reason": "threshold" })),
+            ev(json!({
+                "type": "compaction_end",
+                "reason": "threshold",
+                "result": { "summary": "first summary text" },
+                "aborted": false,
+                "willRetry": false,
+            })),
+            ev(json!({ "type": "compaction_start", "reason": "overflow" })),
+            ev(json!({
+                "type": "compaction_end",
+                "reason": "overflow",
+                "result": { "summary": "second summary text" },
+                "aborted": false,
+                "willRetry": true,
+            })),
+        ] {
+            persist_frames(
+                &store,
+                "s1",
+                normalize(&e, &mut st),
+                &text,
+                &tools,
+                &thoughts,
+            );
+        }
+
+        let rows: Vec<(String, String, String)> = db
+            .messages_for("s1")
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.kind, m.message_key.unwrap_or_default(), m.payload_json))
+            .collect();
+        let cards: Vec<&(String, String, String)> =
+            rows.iter().filter(|(k, _, _)| k == "tool-call").collect();
+        assert_eq!(
+            cards.len(),
+            2,
+            "one row PER compaction (the welded single-row defect), got {rows:?}"
+        );
+        assert_eq!(cards[0].1, "t:compact:1");
+        assert_eq!(cards[1].1, "t:compact:2");
+        // The settle MERGED into the announced row (same key), and the summary
+        // is the payload `rowToMessages` reads back into `rawOutput`.
+        assert!(
+            cards[0].2.contains("first summary text") && cards[0].2.contains("\"completed\""),
+            "the first card holds its summary and settled status, got {}",
+            cards[0].2
+        );
+        assert!(
+            cards[1].2.contains("second summary text") && cards[1].2.contains("\"overflow\""),
+            "the second card holds its OWN summary and its own trigger, got {}",
+            cards[1].2
+        );
+        // And no welded system bubble exists at all.
+        assert!(
+            !rows
+                .iter()
+                .any(|(k, key, _)| k == "agent-text" && key.ends_with(":system")),
+            "a compaction writes no system one-liner row, got {rows:?}"
+        );
+    }
+
+    /// (issue #90 item 2) A compaction is presented like a tool: a card the user
+    /// can expand to read what the compaction actually produced. Pre-fix the
+    /// only trace was the welded one-liner (`Compacting context…Compaction
+    /// finished`) and the summary text — the one thing worth reading — was
+    /// NEVER rendered: `run_compaction` hardcoded `result: None` and the
+    /// summary lived only in `native_messages` (the model's transcript), which
+    /// no display row is built from.
+    ///
+    /// So a successful `compaction_end` carries its summary in `result` and the
+    /// normalizer emits the two frames a `ToolCallCard` already knows how to
+    /// render: the `tool_call` announcement (pending) and the
+    /// `tool_call_update` that settles it with the summary as `rawOutput`.
+    #[test]
+    fn a_successful_compaction_emits_a_tool_card_carrying_the_summary() {
+        let mut st = TurnState::stamped("t");
+        let start = normalize(
+            &ev(json!({ "type": "compaction_start", "reason": "threshold" })),
+            &mut st,
+        );
+        // The announcement: a `tool_call` (the FIRST frame for an id must be the
+        // announcement with a real title — see `announced_tool_calls`).
+        let announce = start
+            .iter()
+            .find(|f| f["sessionUpdate"] == "tool_call")
+            .expect("compaction_start announces a tool card, got {start:?}");
+        // The title is the stable tool-ish NAME, not prose — the same contract
+        // every real tool honours, so `ToolCallCardHeader` renders its own verb
+        // ("Compacting" / "Compacted") and the resume merge key
+        // (`tool-call|<id>|<title>|<status>`) stays byte-stable.
+        assert_eq!(announce["title"], COMPACTION_TOOL);
+        assert_eq!(announce["status"], "in_progress");
+        // The trigger rides as the card's summary input.
+        assert_eq!(announce["rawInput"]["reason"], "threshold");
+        let card_id = announce["toolCallId"]
+            .as_str()
+            .expect("the card has an id")
+            .to_string();
+        assert!(
+            card_id.starts_with("t:"),
+            "the id is stamped like every other id this state mints (ADR 0049), got {card_id}"
+        );
+        // The STATE frame still ships — the indicator is a separate surface from
+        // the card, and `composerLocked` reads it.
+        assert!(
+            start
+                .iter()
+                .any(|f| f["sessionUpdate"] == "compaction_update" && f["active"] == true),
+            "the indicator frame survives, got {start:?}"
+        );
+
+        let summary = "User asked for X. Decided Y. Open task: Z.";
+        let end = normalize(
+            &ev(json!({
+                "type": "compaction_end",
+                "reason": "threshold",
+                "result": { "summary": summary },
+                "aborted": false,
+                "willRetry": false,
+            })),
+            &mut st,
+        );
+        let settle = end
+            .iter()
+            .find(|f| f["sessionUpdate"] == "tool_call_update")
+            .expect("compaction_end settles the card, got {end:?}");
+        assert_eq!(
+            settle["toolCallId"], card_id,
+            "the update lands on the announced card (a new id would append a second one)"
+        );
+        assert_eq!(settle["status"], "completed");
+        // The summary is the card's OUTPUT, in the `AgentToolResult` shape the
+        // frontend's `normalizeToolOutput` joins (`content[]` text items).
+        assert_eq!(settle["rawOutput"]["content"][0]["text"], summary);
+        assert!(
+            end.iter()
+                .any(|f| f["sessionUpdate"] == "compaction_update" && f["active"] == false),
+            "the indicator frame still closes, got {end:?}"
+        );
+    }
+
+    /// A FAILED compaction settles the same card as `failed` and puts the
+    /// actionable line in it, so a collapsed card shows the failure the way every
+    /// other failed tool does — the reason reaches the header's Failed tooltip
+    /// (`failureText` reads `details.error` first) and the expanded body.
+    #[test]
+    fn a_failed_compaction_settles_its_card_as_failed_with_the_reason() {
+        let mut st = TurnState::stamped("t");
+        let start = normalize(
+            &ev(json!({ "type": "compaction_start", "reason": "overflow" })),
+            &mut st,
+        );
+        let card_id = start
+            .iter()
+            .find(|f| f["sessionUpdate"] == "tool_call")
+            .and_then(|f| f["toolCallId"].as_str())
+            .expect("the card id")
+            .to_string();
+
+        let end = normalize(
+            &ev(json!({
+                "type": "compaction_end",
+                "reason": "overflow",
+                "aborted": true,
+                "willRetry": true,
+                "errorMessage": "the summary hit the output token limit",
+            })),
+            &mut st,
+        );
+        let settle = end
+            .iter()
+            .find(|f| f["sessionUpdate"] == "tool_call_update")
+            .expect("the card is settled even on failure, got {end:?}");
+        assert_eq!(settle["toolCallId"], card_id);
+        assert_eq!(settle["status"], "failed");
+        // `failureText` reads `details.error` first — that is where the reason goes,
+        // so the header's Failed chip carries ADR 0045's actionable line, exactly
+        // as every other failed tool does. It is no longer a `system_chunk`
+        // one-liner: those welded into one bubble across repeated compactions.
+        assert_eq!(
+            settle["rawOutput"]["details"]["error"],
+            "the summary hit the output token limit"
+        );
+        // The one-liners are gone: no `agent_message_chunk` at all.
+        assert!(
+            !end.iter()
+                .any(|f| f["sessionUpdate"] == "agent_message_chunk"),
+            "the compaction no longer writes a system one-liner, got {end:?}"
+        );
+    }
+
+    /// A compaction with NO summary to show (a `Skipped` — nothing old enough to
+    /// summarize) still settles the card it announced: an unsettled card is a
+    /// spinner forever. It settles `completed` with no output, not `failed` —
+    /// nothing failed.
+    #[test]
+    fn a_skipped_compaction_still_settles_its_card() {
+        let mut st = TurnState::stamped("t");
+        normalize(
+            &ev(json!({ "type": "compaction_start", "reason": "manual" })),
+            &mut st,
+        );
+        let end = normalize(
+            &ev(json!({
+                "type": "compaction_end",
+                "reason": "manual",
+                "aborted": false,
+                "willRetry": false,
+            })),
+            &mut st,
+        );
+        let settle = end
+            .iter()
+            .find(|f| f["sessionUpdate"] == "tool_call_update")
+            .expect("a skipped compaction closes its card, got {end:?}");
+        assert_eq!(
+            settle["status"], "completed",
+            "nothing failed — there was simply nothing old enough to summarize"
+        );
+        assert_eq!(
+            settle["rawOutput"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default(),
+            "Nothing old enough to summarize — the transcript is unchanged.",
+            "the body says why, rather than rendering as '(no output)'"
+        );
+        assert!(
+            !end.iter()
+                .any(|f| f["sessionUpdate"] == "agent_message_chunk"),
+            "no one-liner on the skip path either, got {end:?}"
+        );
+        // The indicator still closes — that is what unlocks the composer.
+        assert!(
+            end.iter()
+                .any(|f| f["sessionUpdate"] == "compaction_update" && f["active"] == false),
+            "the state frame still closes the indicator, got {end:?}"
         );
     }
 }

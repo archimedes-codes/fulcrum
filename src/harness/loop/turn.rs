@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::emit::TurnAccumulator;
 use super::AgentLoop;
+use super::CompactionRan;
 use super::CompactionTrigger;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::provider::{
@@ -85,15 +86,23 @@ impl AgentLoop {
                 reason: "threshold",
                 will_retry: false,
             });
-            let shrank = self
+            let ran = self
                 .run_compaction(t.reason, t.will_retry, None, turn)
                 .await;
-            if t.reason == "overflow" && !shrank {
-                // No doomed second request: the oversized prompt turn is exactly
-                // what just failed, and a request that cannot succeed costs
-                // a round trip. `run_compaction` has already emitted the
-                // single `compaction_end` carrying the actionable
-                // `error_message` — emit NOTHING here.
+            // (issue #90) Only a `Skipped` overflow ends the turn. Its kept tail
+            // is ALONE over the window, so the oversized request is exactly what
+            // just failed and a second one cannot succeed — `run_compaction` has
+            // already emitted the single `compaction_end` carrying the
+            // actionable `error_message`, so emit NOTHING here.
+            //
+            // A `Failed` overflow does NOT settle: the SUMMARY call is what
+            // errored (a truncated summary, a transport hiccup), which is a fact
+            // about that call and not about the turn's request, and the
+            // transcript is intact — so the turn continues and the model call is
+            // re-issued. Settling here was the bug: it left the user watching
+            // the indicator clear and typing "continue", the symptom ADR 0045
+            // exists to end.
+            if t.reason == "overflow" && ran == CompactionRan::Skipped {
                 self.settle_error(std::mem::take(turn_tool_results));
                 return TurnFlow::Return;
             }

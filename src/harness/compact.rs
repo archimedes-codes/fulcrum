@@ -405,8 +405,14 @@ pub(crate) enum CompactionOutcome {
     /// UNCHANGED and the caller emits a non-aborted `compaction_end`.
     Skipped,
     /// The summary succeeded: the caller re-emits its context usage from
-    /// `context_tokens` (the post-compaction re-estimate).
-    Compacted { context_tokens: u64 },
+    /// `context_tokens` (the post-compaction re-estimate) and shows `summary`
+    /// to the user (issue #90: the summary was previously visible only to the
+    /// model — it lived in the `System` transcript row and no display row was
+    /// ever built from it).
+    Compacted {
+        context_tokens: u64,
+        summary: String,
+    },
     /// The summary failed: the transcript is UNCHANGED (a failed
     /// compaction is never a lost context).
     Failed { error: String },
@@ -506,7 +512,13 @@ pub(crate) async fn run_compaction(
             if let Err(e) = ctx.store.replace_messages(ctx.session_id, &rows) {
                 eprintln!("harness: transcript rewrite failed: {e}");
             }
-            CompactionOutcome::Compacted { context_tokens }
+            // What the USER sees is what the MODEL was given — the summary plus
+            // ADR 0047's trim record — so a partial summary cannot read as a
+            // complete one on the one surface a person actually reads.
+            CompactionOutcome::Compacted {
+                context_tokens,
+                summary: format!("{summary}{record}"),
+            }
         }
         Err(e) => {
             // The summary failed: the transcript is UNCHANGED (the
