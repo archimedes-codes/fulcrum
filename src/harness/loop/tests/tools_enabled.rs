@@ -19,7 +19,7 @@ use crate::agent::harness::retry::RetryPolicy;
 #[tokio::test]
 async fn a_disabled_tool_is_a_tool_result_error_not_execution() {
     let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -103,7 +103,7 @@ async fn a_native_session_with_enabled_tools_cannot_dispatch_a_disabled_tool() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -148,7 +148,7 @@ async fn a_native_session_with_enabled_tools_cannot_dispatch_a_disabled_tool() {
 #[tokio::test]
 async fn the_dispatch_subagent_alias_is_gated_by_the_subagent_enabled_tool() {
     let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -392,7 +392,7 @@ async fn list_agents_tool_lists_discovered_agents() {
     let (events_tx, _events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let (settle_tx, _settle_rx) = watch::channel(0u64);
-    let loop_ = build_loop(
+    let (_space, loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel,
@@ -400,8 +400,7 @@ async fn list_agents_tool_lists_discovered_agents() {
         RetryPolicy::new_with(5, Duration::from_millis(1)),
     );
     let empty_home =
-        std::env::temp_dir().join(format!("harness-list-agents-home-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&empty_home).unwrap();
+        crate::test_support::ScratchDir::in_env_temp("harness-list-agents-home-", "lists");
     // The `env_lock` helper is poison-tolerant (a sibling test
     // panicking while holding the lock must not turn this test's
     // failure into an opaque `PoisonError` panic — see its docs).
@@ -412,7 +411,7 @@ async fn list_agents_tool_lists_discovered_agents() {
     // span (the `env_lock` guard); no other thread mutates HOME
     // concurrently.
     unsafe {
-        std::env::set_var("HOME", &empty_home);
+        std::env::set_var("HOME", empty_home.path());
     }
     let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
     if let Some(parent) = agent_file.parent() {
@@ -442,7 +441,7 @@ async fn list_agents_tool_returns_none_when_empty() {
     let (events_tx, _events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let (settle_tx, _settle_rx) = watch::channel(0u64);
-    let loop_ = build_loop(
+    let (_space, loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel,
@@ -450,8 +449,7 @@ async fn list_agents_tool_returns_none_when_empty() {
         RetryPolicy::new_with(5, Duration::from_millis(1)),
     );
     let empty_home =
-        std::env::temp_dir().join(format!("harness-list-agents-home-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&empty_home).unwrap();
+        crate::test_support::ScratchDir::in_env_temp("harness-list-agents-home-", "none-empty");
     // The `env_lock` helper is poison-tolerant (a sibling test
     // panicking while holding the lock must not turn this test's
     // failure into an opaque `PoisonError` panic — see its docs).
@@ -462,7 +460,7 @@ async fn list_agents_tool_returns_none_when_empty() {
     // span (the `env_lock` guard); no other thread mutates HOME
     // concurrently.
     unsafe {
-        std::env::set_var("HOME", &empty_home);
+        std::env::set_var("HOME", empty_home.path());
     }
     let result = loop_.list_agents_tool().await;
     assert_eq!(result_text(&result), "none");
@@ -484,7 +482,7 @@ async fn list_agents_tool_flattens_block_scalar_descriptions() {
     let (events_tx, _events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let (settle_tx, _settle_rx) = watch::channel(0u64);
-    let loop_ = build_loop(
+    let (_space, loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel,
@@ -492,8 +490,7 @@ async fn list_agents_tool_flattens_block_scalar_descriptions() {
         RetryPolicy::new_with(5, Duration::from_millis(1)),
     );
     let empty_home =
-        std::env::temp_dir().join(format!("harness-list-agents-home-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&empty_home).unwrap();
+        crate::test_support::ScratchDir::in_env_temp("harness-list-agents-home-", "block-scalar");
     // The `env_lock` helper is poison-tolerant (a sibling test
     // panicking while holding the lock must not turn this test's
     // failure into an opaque `PoisonError` panic — see its docs).
@@ -504,7 +501,7 @@ async fn list_agents_tool_flattens_block_scalar_descriptions() {
     // span (the `env_lock` guard); no other thread mutates HOME
     // concurrently.
     unsafe {
-        std::env::set_var("HOME", &empty_home);
+        std::env::set_var("HOME", empty_home.path());
     }
     // The space-level `.pi/agents` root (the other space root,
     // `.agents/agents`, is covered by the sibling test above).

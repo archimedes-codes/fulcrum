@@ -152,7 +152,7 @@ async fn a_native_subagent_with_a_suffix_model_key_uses_the_suffix_thinking() {
     });
     let manager =
         make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -255,11 +255,18 @@ async fn a_native_subagent_with_a_settings_override_runs_the_override_model() {
     // frontmatter target) + `fake/m3` (the override target — IN the
     // catalog, so it is NOT stale).
     let models = vec![fake_model("m1"), fake_model("m2"), fake_model("m3")];
-    let config_dir = std::env::temp_dir().join(format!(
-        "harness-agent-def-e2e-cfg-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&config_dir).unwrap();
+    // #96: a TEST-SCOPE guard, declared BEFORE `make_subagent_manager` and
+    // the loop, so it outlives both. Both get `Some(config_dir.path())` — a
+    // borrowed path, never the guard. LIMIT, recorded honestly: the value
+    // does travel to the child via `StartEnv.config_dir`, but this test's
+    // child is `src/bin/fake_worker.rs`, a canned stdin/stdout fixture that
+    // performs NO filesystem I/O, so the "read by a real child process"
+    // premise is false for it. The dir still must outlive the test because
+    // the PARENT-side `AgentLoop` holds the same `config_dir` and re-reads
+    // `settings.json` every turn, and the `WorkerManager` owns the child —
+    // and this placement provides that.
+    let config_dir =
+        crate::test_support::ScratchDir::in_env_temp("harness-agent-def-e2e-cfg-", "override");
     std::fs::write(
         config_dir.join("settings.json"),
         r#"{ "subagentModels": { "scout": "fake/m3" } }"#,
@@ -272,11 +279,11 @@ async fn a_native_subagent_with_a_settings_override_runs_the_override_model() {
     let manager = make_subagent_manager(
         Duration::from_secs(30),
         models.clone(),
-        Some(&config_dir),
+        Some(config_dir.path()),
         sink.clone(),
     )
     .await;
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -285,7 +292,7 @@ async fn a_native_subagent_with_a_settings_override_runs_the_override_model() {
         sink,
         Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
         models,
-        Some(&config_dir),
+        Some(config_dir.path()),
     );
     // The Agent definition: `model: fake/m2` (IN the catalog — NOT
     // stale) + `thinking: low` (the override replaces ONLY the
@@ -398,7 +405,7 @@ async fn a_native_subagent_with_a_matching_agent_name_runs_the_frontmatter_confi
     });
     let manager =
         make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -528,7 +535,7 @@ async fn a_subagent_named_after_no_definition_still_runs_and_says_so() {
     });
     let manager =
         make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -633,7 +640,7 @@ async fn a_padded_agent_name_reaches_the_payload_trimmed() {
     });
     let manager =
         make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -725,7 +732,7 @@ async fn subagent_wait_a_resolving_completed_outcome_completes_the_tool() {
         },
     })
     .unwrap();
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -805,7 +812,7 @@ async fn a_mis_named_subagent_param_still_dispatches_and_announces_itself() {
         },
     })
     .unwrap();
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -983,7 +990,7 @@ async fn subagent_calls_in_one_message_run_in_parallel() {
         ]),
     ]);
     let (dispatcher, max_in_flight) = ConcurrentCountingDispatcher::new(Duration::from_millis(50));
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1154,7 +1161,7 @@ async fn subagent_batch_a_turn_cancel_cancels_all_in_flight_subagents() {
     ]);
     let (dispatcher, cancels) = CancellingDispatcher::new();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -1232,7 +1239,7 @@ async fn subagent_batch_results_are_appended_in_original_order_regardless_of_com
         ]),
     ]);
     let (dispatcher, completion_order) = OutOfOrderDispatcher::new();
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1301,7 +1308,7 @@ async fn subagent_batch_mixed_with_a_non_subagent_tool_runs_both_in_order() {
         ]),
     ]);
     let (dispatcher, _max) = ConcurrentCountingDispatcher::new(Duration::from_millis(20));
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1407,7 +1414,7 @@ async fn subagent_batch_a_completed_result_survives_a_mid_batch_stop() {
         ]),
     ]);
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -1511,7 +1518,7 @@ async fn subagent_wait_a_failed_outcome_is_an_error_result() {
         metrics: crate::agent::subagent::SubagentMetrics::default(),
     })
     .unwrap();
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1571,7 +1578,7 @@ async fn subagent_wait_a_turn_cancel_cancels_the_dispatch() {
     let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let turn_cancel_c = turn_cancel.clone();
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         turn_cancel,

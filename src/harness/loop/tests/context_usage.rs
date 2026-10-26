@@ -55,7 +55,7 @@ async fn a_usage_event_emits_a_context_usage_update_frame() {
         }),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -95,7 +95,7 @@ async fn a_model_call_without_usage_falls_back_to_the_local_estimate() {
         ProviderEvent::TextDelta("hi".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -154,7 +154,7 @@ async fn a_usage_less_turn_never_lowers_the_context_accounting() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -248,7 +248,7 @@ async fn a_tool_batch_is_measured_before_the_next_compaction_check() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -323,7 +323,7 @@ async fn a_large_prompt_is_measured_before_the_first_compaction_check() {
         ProviderEvent::TextDelta("hi".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -396,7 +396,7 @@ async fn the_context_frame_of_a_turn_follows_turn_start() {
         ProviderEvent::TextDelta("hi".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -463,7 +463,7 @@ async fn a_turn_that_reported_usage_emits_the_context_frame_once() {
         }),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -517,7 +517,7 @@ async fn a_turn_without_usage_emits_a_frame_per_context_change() {
         ProviderEvent::TextDelta("a somewhat longer reply".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -656,7 +656,7 @@ async fn a_failed_turn_still_measures_the_next_prompt() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -735,7 +735,7 @@ async fn a_cancelled_turn_still_measures_the_next_prompt() {
         calls: AtomicU32::new(0),
         turn_cancel: turn_cancel.clone(),
     };
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -832,7 +832,7 @@ async fn a_retried_model_call_does_not_compact_for_the_reply_it_threw_away() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -883,7 +883,7 @@ async fn load_transcript_emits_a_context_usage_update_from_the_reestimate() {
         updates: updates.clone(),
     });
     let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -929,7 +929,7 @@ async fn a_compaction_emits_a_context_usage_update_from_the_reestimate() {
         ProviderEvent::TextDelta("the summary".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1028,7 +1028,7 @@ async fn a_model_switch_emits_a_context_usage_update_with_the_new_window() {
     let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
     // The switch TARGET is a model whose compaction threshold is 100 (the
     // default 16384 reserve), so a 1001-token transcript is already due.
-    let mut loop_ = build_loop_with_dispatcher(
+    let (_space, mut loop_) = build_loop_with_dispatcher(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),

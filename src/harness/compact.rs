@@ -841,7 +841,7 @@ mod tests {
     async fn recorded_summary_prompt(instructions: Option<String>) -> String {
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = SystemPromptRecordingProvider::new(recorded.clone());
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let model = fake_model("m1");
         let mut compactor = Compactor::new(CompactionConfig::default(), model.context_window);
         let older = vec![text_msg("history")];
@@ -897,10 +897,8 @@ mod tests {
     /// The moved tests' harness: a temp-dir `Db` with the `"s1"` session
     /// row (the `native_messages` FK), a `SessionStore`, and the fake
     /// model (what `build_loop_with_db` gave the `AgentLoop`).
-    fn temp_store() -> (Arc<Db>, Arc<dyn Store>) {
-        let dir =
-            std::env::temp_dir().join(format!("harness-compact-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn temp_store() -> (crate::test_support::ScratchDir, Arc<Db>, Arc<dyn Store>) {
+        let dir = crate::test_support::ScratchDir::in_env_temp("harness-compact-test-", "store");
         let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
         db.record_session(&SessionInfo {
             session_id: "s1".to_string(),
@@ -914,7 +912,7 @@ mod tests {
         })
         .expect("record_session");
         let store: Arc<dyn Store> = Arc::new(SessionStore::new(db.clone()));
-        (db, store)
+        (dir, db, store)
     }
 
     fn text_msg(t: &str) -> ChatMessage {
@@ -1629,7 +1627,7 @@ mod tests {
             ProviderEvent::TextDelta("the summary".to_string()),
             ProviderEvent::Done(FinishReason::Stop),
         ])]);
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let mut harness = Harness::new(&provider, store);
         harness.messages = transcript_with_system();
         harness.run().await;
@@ -1679,7 +1677,7 @@ mod tests {
             ProviderEvent::TextDelta("the summary".to_string()),
             ProviderEvent::Done(FinishReason::Stop),
         ])]);
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let mut harness = Harness::new(&provider, store);
         harness.messages = transcript_without_system();
         harness.run().await;
@@ -1720,7 +1718,7 @@ mod tests {
                 ProviderEvent::Done(FinishReason::Stop),
             ]),
         ]);
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let mut harness = Harness::new(&provider, store);
         harness.messages = vec![
             text_msg("u1"),
@@ -1780,7 +1778,7 @@ mod tests {
                 ProviderEvent::Done(FinishReason::Stop),
             ]),
         ]);
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let mut harness = Harness::new(&provider, store);
         harness.messages = transcript_with_system();
         harness.run().await;
@@ -1819,7 +1817,7 @@ mod tests {
             ProviderEvent::TextDelta("the summary".to_string()),
             ProviderEvent::Done(FinishReason::Stop),
         ])]);
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let mut harness = Harness::new(&provider, store);
         // A 32k model: 32 768 − 16 384 reserve − 4 096 headroom = 12 288 of the
         // configured 20 000, read from the COMPACTOR — where production reads
@@ -1904,7 +1902,7 @@ mod tests {
             ProviderEvent::TextDelta("the summary".to_string()),
             ProviderEvent::Done(FinishReason::Stop),
         ])]);
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let mut harness = Harness::new(&provider, store.clone());
         // The budget is the binding constraint: 16 384 − 8 192 output − 4 096
         // headroom = 4 096.
@@ -1944,7 +1942,7 @@ mod tests {
             ProviderEvent::TextDelta("never called".to_string()),
             ProviderEvent::Done(FinishReason::Stop),
         ])]);
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let mut harness = Harness::new(&provider, store);
         // The window is already inside its own reserve: budget 0.
         harness.compactor = Compactor::new(
@@ -1972,7 +1970,7 @@ mod tests {
         provider: &dyn Provider,
         older: &[ChatMessage],
     ) -> Result<String, ProviderError> {
-        let (_db, store) = temp_store();
+        let (_dir, _db, store) = temp_store();
         let model = fake_model("m1");
         let mut compactor = Compactor::new(CompactionConfig::default(), model.context_window);
         let ctx = CompactionCtx {

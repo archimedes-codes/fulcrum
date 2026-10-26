@@ -24,7 +24,7 @@ async fn a_failed_summary_does_not_rewrite_the_transcript() {
         ProviderEvent::Done(FinishReason::Error),
     ])]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -94,7 +94,7 @@ async fn a_skipped_compaction_reports_no_shrink() {
     // test would also catch a summary call that should not have happened.
     let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
     let (events_tx, _events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -205,7 +205,7 @@ async fn a_context_overflow_error_compacts_and_retries_the_turn() {
         ]],
     );
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -300,7 +300,7 @@ async fn a_mid_stream_context_overflow_compacts_and_retries_the_turn() {
         ]),
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -369,7 +369,7 @@ async fn a_retried_reply_is_retracted_before_the_retry() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -433,7 +433,7 @@ async fn a_mid_stream_overflow_retracts_the_partial_reply() {
         ]),
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -485,7 +485,7 @@ async fn a_pre_stream_overflow_retracts_nothing() {
         ]],
     );
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -523,7 +523,7 @@ async fn an_abandoned_attempt_that_streamed_nothing_is_silent() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -573,7 +573,7 @@ async fn a_retried_reply_closes_the_tool_calls_it_abandoned() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -663,7 +663,7 @@ async fn an_abandoned_tool_call_appends_no_tool_message() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -739,7 +739,7 @@ async fn a_mid_stream_overflow_closes_the_abandoned_tool_call() {
         ]),
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -809,7 +809,7 @@ async fn an_abandoned_attempt_that_announced_nothing_closes_nothing() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -878,7 +878,7 @@ async fn a_later_overflow_in_the_same_turn_gets_its_own_compact_and_retry() {
         ],
     );
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -930,7 +930,7 @@ async fn a_second_overflow_after_a_failed_recovery_gives_up_without_a_second_req
         events: Arc::new(StdMutex::new(Vec::new())),
     });
     let captured = sink.events.clone();
-    let (mut loop_, _db) = build_loop_with_sink(
+    let (_space, mut loop_, _db) = build_loop_with_sink(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1065,7 +1065,7 @@ async fn a_stale_overflow_trigger_does_not_hijack_the_next_turn() {
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1111,7 +1111,7 @@ async fn a_compact_control_command_compacts_when_idle() {
     // model call happened.
     let (provider, calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1200,7 +1200,7 @@ async fn abort_cancels_an_idle_compaction() {
     let (provider, _calls) = ScriptedProvider::new(vec![None]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -1288,7 +1288,7 @@ async fn an_overflow_recovery_reissues_the_turn_when_the_summary_fails() {
         ],
     );
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
