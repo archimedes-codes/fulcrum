@@ -20,6 +20,22 @@ pub(super) enum TurnFlow {
     Return,
 }
 
+/// A rejected call's result (issue #93). Mirrors `cancelled_tool_result` /
+/// `deny_tool_result`: one text block, no details, `is_error: true`. The text
+/// is `unknown_param_error`'s sentence — the model gets the offending key AND
+/// the key it should have sent. `is_error` serialises as `isError`
+/// (`tools/types.rs`), the wire contract the frontend already reads, which is
+/// why "fail properly" needs no wire change.
+fn unknown_param_result(message: &str) -> ToolResult {
+    ToolResult {
+        content: vec![ContentBlock::Text {
+            text: message.to_string(),
+        }],
+        details: None,
+        is_error: true,
+    }
+}
+
 pub(super) struct TurnLoopState {
     pub(super) turn_tool_results: Vec<Value>,
     pub(super) message_started: bool,
@@ -359,17 +375,20 @@ impl AgentLoop {
         turn: &CancellationToken,
     ) -> Vec<Value> {
         let mut turn_tool_results = Vec::new();
-        // (issue #78) The unknown-param check runs HERE, before the `join_all`
+        // (issue #93) The unknown-param check runs HERE, before the `join_all`
         // below, and NOT inside `dispatch_tool`: a `subagent` call is dispatched
-        // CONCURRENTLY ahead of the sequential loop, so a check that ran inside
-        // the dispatch would announce itself only after the wasted config-less
-        // child already exists. One `advertised_specs()` per batch — the SAME
-        // value `model_request` sends as `tools[]` and the prompt renders into
-        // `<tools>`, so the checker cannot flag a key the model was told to send.
+        // CONCURRENTLY ahead of the sequential loop, so a check that only ran
+        // inside the loop would PREVENT nothing — the wasted config-less child
+        // would already exist by the time the rejection was written (the check
+        // used to only ANNOUNCE that waste; it now stops it). One
+        // `advertised_specs()` per batch — the SAME value `model_request` sends
+        // as `tools[]` and the prompt renders into `<tools>` (ADR 0017's
+        // byte-identity), so the checker cannot flag a key the model was told
+        // to send.
         let specs = self.advertised_specs();
-        let warnings: Vec<Option<String>> = tool_calls
+        let param_errors: Vec<Option<String>> = tool_calls
             .iter()
-            .map(|tc| crate::agent::harness::tool_specs::unknown_param_warning(&specs, tc))
+            .map(|tc| crate::agent::harness::tool_specs::unknown_param_error(&specs, tc))
             .collect();
         let mut subagent_results: HashMap<usize, ToolResult> = if turn.is_cancelled() {
             HashMap::new()
@@ -378,11 +397,28 @@ impl AgentLoop {
             let futures: Vec<_> = tool_calls
                 .iter()
                 .enumerate()
-                .filter(|(_, tc)| {
-                    crate::agent::harness::dispatch::is_enabled_subagent_call(
-                        me.enabled_tools(),
-                        tc,
-                    )
+                .filter(|(idx, tc)| {
+                    // A rejected call must never spawn a child (issue #93).
+                    // These futures run BEFORE the dispatch loop below, so the
+                    // rejection has to gate them HERE — a rejection that only
+                    // lives in the loop would have paid for the child it then
+                    // refused to report. Cancellation is not consulted here:
+                    // the whole batch is already behind `if turn.is_cancelled()`
+                    // above.
+                    //
+                    // `idx` is the call's ORIGINAL index in `tool_calls` — it
+                    // comes from the `.enumerate()` BEFORE this filter and MUST
+                    // stay that. The dispatch loop below keys
+                    // `subagent_results.remove(&idx)` on the same original
+                    // index; re-enumerating after this filter ("tidying" it
+                    // into a 0-based position among the survivors) silently
+                    // mis-keys every child result whenever a batch mixes
+                    // rejected and accepted `subagent` calls. Do not renumber.
+                    param_errors.get(*idx).is_none_or(|err| err.is_none())
+                        && crate::agent::harness::dispatch::is_enabled_subagent_call(
+                            me.enabled_tools(),
+                            tc,
+                        )
                 })
                 .map(|(idx, tc)| {
                     let args = tc.arguments.clone();
@@ -396,14 +432,33 @@ impl AgentLoop {
         };
 
         for (idx, tc) in tool_calls.iter().enumerate() {
-            let mut result = if crate::agent::harness::dispatch::is_subagent_call(&tc.name) {
+            let result = if crate::agent::harness::dispatch::is_subagent_call(&tc.name) {
                 match subagent_results.remove(&idx) {
+                    // A child that ran (or that the `SubagentWait` select
+                    // itself cancelled) keeps its own result — unchanged.
                     Some(r) => r,
+                    // CANCELLATION BEATS REJECTION: a call that never ran
+                    // because the user stopped the turn must not be told to
+                    // "fix the key and retry".
                     None if turn.is_cancelled() => Self::cancelled_tool_result(),
+                    // A rejected `subagent` was filtered out of the futures
+                    // above, so it has NO entry here. This arm MUST precede the
+                    // `dispatch_tool` fallback: that fallback routes a subagent
+                    // call to `dispatch_subagent` (issue #93), so a rejection
+                    // placed after it would dispatch the very child it rejects.
+                    None if param_errors.get(idx).is_some_and(Option::is_some) => {
+                        unknown_param_result(param_errors[idx].as_deref().unwrap_or_default())
+                    }
                     None => self.dispatch_tool(tc, turn).await,
                 }
             } else if turn.is_cancelled() {
+                // Cancellation beats rejection (same rule, the sequential tools).
                 Self::cancelled_tool_result()
+            } else if let Some(Some(err)) = param_errors.get(idx) {
+                // REJECTED, not warned: no dispatch, and deliberately NOT
+                // `policy_verdict` / `gate_tool` — a call that will not run
+                // must never raise a permission prompt.
+                unknown_param_result(err)
             } else {
                 match self.policy_verdict(tc) {
                     Some(Decision::Ask) => {
@@ -423,20 +478,6 @@ impl AgentLoop {
                     _ => self.dispatch_tool(tc, turn).await,
                 }
             };
-            // The warning travels with the result it describes: appended LAST,
-            // so `content[0]` stays the tool's own output (every existing
-            // assertion and the UI's child-output render are untouched), and
-            // `is_error` stays whatever the tool decided — a typo must not fail
-            // a good long delegation. One push covers all three consumers below:
-            // the `tool_execution_end` payload, the transcript `tool` message
-            // (`result.content.clone()`) and the persisted row. On a cancelled
-            // turn the result is the synthetic `"cancelled"` block and the extra
-            // line is harmless truth, so no branch.
-            if let Some(Some(warning)) = warnings.get(idx) {
-                result.content.push(ContentBlock::Text {
-                    text: warning.clone(),
-                });
-            }
             let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
             turn_tool_results.push(result_value.clone());
             self.emit(RpcEvent::tool_execution_end {

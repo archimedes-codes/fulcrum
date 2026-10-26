@@ -142,6 +142,41 @@ async fn edit_replace_all() {
     );
 }
 
+/// (issue #93, the hazard record) The EXECUTOR cannot be trusted to catch a
+/// misspelled parameter: `exec_edit` reads exactly `.get("replace_all")`, so a
+/// camelCase `replaceAll: true` is invisible to it — the edit runs as a
+/// first-occurrence-only replace, REPORTS SUCCESS (`Edited e.txt`,
+/// `occurrences: 1`), and the file ends up in a state the caller did not ask
+/// for. This characterization test exists so the central advertised-shape
+/// check in `harness/tool_specs.rs` (consumed by `run_tool_batch`,
+/// `harness/loop/turn.rs`) cannot be deleted later on the theory that the
+/// executors would catch it — they would not. The rejection itself is pinned
+/// in `harness/loop/tests/param_rejection.rs`.
+#[tokio::test]
+async fn edit_ignores_a_misspelled_replace_all_and_understates_the_write() {
+    let cwd = temp_cwd("edit-typo");
+    std::fs::write(cwd.join("e.txt"), "X mid X").unwrap();
+    let r = execute_tool(
+        &ctx(&cwd),
+        "edit",
+        &json!({ "path": "e.txt", "old_text": "X", "new_text": "Y", "replaceAll": true }),
+    )
+    .await;
+    assert!(!r.is_error, "the executor reports SUCCESS");
+    assert_eq!(text_of(&r), "Edited e.txt");
+    assert_eq!(
+        r.details.as_ref().unwrap()["occurrences"],
+        1,
+        "the camelCase alias is invisible to `.get(\"replace_all\")`"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("e.txt")).unwrap(),
+        "Y mid X",
+        "the second `X` is silently NOT replaced — the caller asked for \
+         replace-all and got a partial write, reported as success"
+    );
+}
+
 #[tokio::test]
 async fn edit_empty_old_text_rejected() {
     // `old_text: ""` passes `contains("")` and `replacen`/`replace`
