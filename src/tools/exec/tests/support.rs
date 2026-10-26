@@ -1,13 +1,21 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::tools::types::{ContentBlock, ToolCtx, ToolResult};
 
-/// A fresh temp dir as the sandbox `cwd`.
-pub(crate) fn temp_cwd(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("exec-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh temp dir as the sandbox `cwd`, OWNED (#96 task 08): removed when the
+/// caller drops it. NOT `Clone` — `to_path_buf()` is the escape hatch where a
+/// `PathBuf` is needed (a `ToolCtx` field, a `vec![]` of roots). The name is
+/// byte-identical to the old `temp_dir().join(format!("exec-{tag}-{uuid}"))` —
+/// `ScratchDir` spells `{prefix}{tag}-{uuid}` and the tag was already in that
+/// slot — so all 17 census tags are unchanged (D12).
+///
+/// This ONE helper is the sole `exec-*` minter for the whole `exec/tests` seam
+/// (`boundary.rs`'s `Tmp::new("exec-cwd")` produces `boundary-exec-cwd-*`, which
+/// does not match `exec-*`), so it owns 99 dirs per run — 17 of which leaked on
+/// a green run, all of them from `tests/skills.rs`.
+pub(crate) fn temp_cwd(tag: &str) -> crate::test_support::ScratchDir {
+    crate::test_support::ScratchDir::in_env_temp("exec-", tag)
 }
 
 /// The test `ToolCtx`. HERMETIC BY DESIGN: `boundary` is the single

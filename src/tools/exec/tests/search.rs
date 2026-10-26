@@ -40,7 +40,6 @@ async fn find_matches_fixture() {
     assert!(!r.is_error);
     assert_eq!(r.details.as_ref().unwrap()["matches"], 1);
     assert_eq!(text_of(&r), "sub/c.txt");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -58,7 +57,6 @@ async fn find_max_results_truncates() {
     assert!(!r.is_error);
     assert_eq!(r.details.as_ref().unwrap()["matches"], 1);
     assert_eq!(r.details.as_ref().unwrap()["truncated"], true);
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -71,7 +69,6 @@ async fn find_escape_rejected() {
     )
     .await;
     assert!(r.is_error, "a sandbox escape must be rejected");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[test]
@@ -107,7 +104,6 @@ async fn grep_matches_fixture() {
     assert_eq!(r.details.as_ref().unwrap()["matches"], 1);
     assert!(text_of(&r).contains("a.txt"));
     assert!(text_of(&r).contains("needle"));
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -132,7 +128,6 @@ async fn grep_option_like_pattern_is_matched_literally() {
     );
     assert_eq!(r.details.as_ref().unwrap()["matches"], 1);
     assert!(text_of(&r).contains("a.txt"), "the literal text matched");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 // ── the spawn shape (the `#81` cwd fix, asserted on an unspawned Command) ──
@@ -156,7 +151,7 @@ fn the_search_children_start_in_the_space_cwd() {
     let fd = build_fd_command_with("a.txt", &space, 100, &space, &EnvPatch::default());
     assert_eq!(
         fd.as_std().get_current_dir(),
-        Some(space.as_path()),
+        Some(space.path()),
         "the `fd` child must start in the Space"
     );
     let rg = build_rg_command_with(
@@ -170,10 +165,9 @@ fn the_search_children_start_in_the_space_cwd() {
     );
     assert_eq!(
         rg.as_std().get_current_dir(),
-        Some(space.as_path()),
+        Some(space.path()),
         "the `rg` child must start in the Space (its `-g` globs resolve against it)"
     );
-    let _ = std::fs::remove_dir_all(&space);
 }
 
 /// Claim: the argument lists are BYTE-IDENTICAL to what they were before the
@@ -235,7 +229,6 @@ fn the_search_argument_lists_are_unchanged() {
         vec!["-i", "--glob", "*.rs", "-m", "5", "--", "needle", &root],
         "the `rg` flag order is a byte-for-byte contract"
     );
-    let _ = std::fs::remove_dir_all(&space);
 }
 
 /// The bug the missing `current_dir` actually costs (`#81`), and the RED
@@ -313,7 +306,6 @@ async fn a_slash_glob_matches_from_the_space_cwd() {
         "the grep output must still carry the absolute search root, got {:?}",
         text_of(&r)
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// `find`'s output stays relative to the SEARCH DIR after the child starts
@@ -350,7 +342,6 @@ async fn an_absolute_path_argument_still_reports_paths_relative_to_it() {
         "a result is relative to the SEARCH DIR, not to the Space — and the \
          strip must still fire when the child's cwd is the Space"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -362,7 +353,6 @@ async fn grep_missing_rg_is_error() {
     let cwd = temp_cwd("grep-missing");
     let r = execute_tool(&ctx(&cwd), "grep", &json!({ "pattern": "x" })).await;
     assert!(r.is_error, "a missing rg is a tool error");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// (finding) `exec_grep` has a `DEFAULT_MAX_RESULTS`-style cap (like
@@ -400,5 +390,4 @@ async fn grep_output_bounded_by_max_results() {
         2,
         "the output is bounded to max_results lines"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }

@@ -223,19 +223,27 @@ mod tests {
     use super::*;
 
     /// A temp-dir `Db` + a `sessions` row (the `native_messages` FK
-    /// source).
-    fn temp_db() -> (Arc<Db>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("persist-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// source), OWNED (#96 task 08). Guard FIRST: destructured locals drop in
+    /// reverse, so the `Db` — whose SQLite file lives INSIDE `dir` — closes
+    /// before `dir` is removed. Windows needs that; Linux cannot show it
+    /// (POSIX unlinks under an open handle and `ScratchDir::Drop` swallows the
+    /// failure), so this is enforced by reading. Matches the two `temp_db`
+    /// siblings tasks 03/06 converted.
+    ///
+    /// HONEST SIZING: all five callers already ran `remove_dir_all(&dir)` on the
+    /// green path, so this file's census delta is 0 BEFORE and 0 AFTER. The win
+    /// is the panic path — five dirs that survive a failed assertion today.
+    fn temp_db() -> (crate::test_support::ScratchDir, Arc<Db>) {
+        let dir = crate::test_support::ScratchDir::in_env_temp("persist-test-", "db");
         let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
-        (db, dir)
+        (dir, db)
     }
 
     /// `apply` (Insert) → a `native_messages` row (idempotent — a
     /// replayed frame collapses to one row).
     #[test]
     fn apply_insert_is_idempotent() {
-        let (db, dir) = temp_db();
+        let (_dir, db) = temp_db();
         let p = TranscriptPersister::new(db.clone());
         p.set_cwd("s1", "/tmp/space");
         let frame = StoreFrame::Insert {
@@ -248,13 +256,12 @@ mod tests {
         p.apply(false, &frame); // replay — must not duplicate.
         let rows = db.load_native_messages("s1").unwrap();
         assert_eq!(rows.len(), 1, "a replayed insert collapses to one row");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `apply` (Display) → a `messages` row (idempotent upsert).
     #[test]
     fn apply_display_is_idempotent() {
-        let (db, dir) = temp_db();
+        let (_dir, db) = temp_db();
         let p = TranscriptPersister::new(db.clone());
         p.set_cwd("s1", "/tmp/space");
         let frame = StoreFrame::Display {
@@ -274,13 +281,12 @@ mod tests {
             1,
             "a replayed display upsert collapses to one row"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `apply` (ContextUsage) → the `sessions.context_usage_json` write.
     #[test]
     fn apply_context_usage_writes_the_session_row() {
-        let (db, dir) = temp_db();
+        let (_dir, db) = temp_db();
         let p = TranscriptPersister::new(db.clone());
         p.set_cwd("s1", "/tmp/space");
         let frame = StoreFrame::ContextUsage {
@@ -294,7 +300,6 @@ mod tests {
             serde_json::from_str(&row.context_usage_json.unwrap()).unwrap();
         assert_eq!(usage["used"], 53_760);
         assert_eq!(usage["window"], 128_000);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `ensure_session_row` (subagent) → a HIDDEN `sessions` row
@@ -302,7 +307,7 @@ mod tests {
     /// `native_messages` FK holds (the insert succeeds).
     #[test]
     fn ensure_session_row_creates_a_hidden_subagent_row() {
-        let (db, dir) = temp_db();
+        let (_dir, db) = temp_db();
         let p = TranscriptPersister::new(db.clone());
         p.set_cwd("sub-1", "/tmp/space");
         let frame = StoreFrame::Insert {
@@ -326,12 +331,11 @@ mod tests {
         );
         // Its transcript is loadable.
         assert_eq!(db.load_native_messages("sub-1").unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn apply_interactive_event_updates_and_clears_todos() {
-        let (db, dir) = temp_db();
+        let (_dir, db) = temp_db();
         let p = TranscriptPersister::new(db.clone());
         let info = SessionInfo {
             session_id: "s1".to_string(),
@@ -415,7 +419,5 @@ mod tests {
         p.apply_interactive_event("s1", &bad_payload);
         // todos_json was not overwritten with invalid payload
         assert!(db.session_todos("s1").unwrap().unwrap().contains("t1"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -315,18 +315,46 @@ mod tests {
     ///   compared for equality with a returned path — and a raw `/var/…` link
     ///   target is the better fixture for the escape tests, since escaping the
     ///   sandbox THROUGH a symlink is what they are about.
-    fn temp_root(tag: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("fsb-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = dir.canonicalize().unwrap();
+    ///
+    /// Returns `(GUARD, canonical root, outside)` — the guard FIRST (#96 task
+    /// 08) so destructuring drops `outside` → `root` → the dir, i.e. the dir
+    /// goes last, after every `FsBackend` and every derived `PathBuf`.
+    ///
+    /// THE ONE WRINKLE THIS FILE HAS. The old body said
+    /// `let dir = dir.canonicalize().unwrap();` — which SHADOWS the mint with a
+    /// `PathBuf`, so the guard's `Drop` would never run and the leak would
+    /// survive the conversion SILENTLY (green tests, an unchanged census). So the
+    /// canonicalised path is bound to a SEPARATE name and the guard travels out
+    /// as the tuple's first element. `guard.canonicalize()` compiles because
+    /// `ScratchDir: Deref<Target = Path>` supplies `Path::canonicalize`, and it
+    /// does not consume the guard.
+    ///
+    /// The canonical root still travels out as its own element: the doc comment
+    /// above explains why the fixtures need the CANONICAL form (macOS
+    /// `/var` → `/private/var`, Windows verbatim paths), so handing the caller
+    /// the raw guard instead would have destroyed the fixture's premise — and
+    /// `root` staying a `PathBuf` means the `roots: vec![root.clone()]` sites
+    /// need no edit at all.
+    ///
+    /// `outside` stays a bare `PathBuf`: `temp_dir().join(…)` creates nothing, so
+    /// there is nothing to own, and a `ScratchDir` there would CREATE the dir and
+    /// destroy the fixture's premise.
+    ///
+    /// HONEST SIZING: 9 created dirs, all 9 already `remove_dir_all`d on the
+    /// green path — census delta 0 before and after; the win is the panic path.
+    fn temp_root(tag: &str) -> (crate::test_support::ScratchDir, PathBuf, PathBuf) {
+        let guard = crate::test_support::ScratchDir::in_env_temp("fsb-", tag);
+        let dir = guard
+            .canonicalize()
+            .expect("the scratch dir exists, so canonicalizing it cannot fail");
         let outside =
             std::env::temp_dir().join(format!("fsb-outside-{tag}-{}", uuid::Uuid::new_v4()));
-        (dir, outside)
+        (guard, dir, outside)
     }
 
     #[test]
     fn resolve_existing_file_under_root() {
-        let (root, _outside) = temp_root("ok");
+        let (_guard, root, _outside) = temp_root("ok");
         let f = root.join("a.txt");
         fs::write(&f, "x").unwrap();
         let backend = FsBackend {
@@ -334,31 +362,28 @@ mod tests {
         };
         let resolved = backend.validate(Path::new("a.txt")).unwrap();
         assert_eq!(resolved, f);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn resolve_missing_file_under_root_ok() {
-        let (root, _outside) = temp_root("missing");
+        let (_guard, root, _outside) = temp_root("missing");
         let backend = FsBackend {
             roots: vec![root.clone()],
         };
         // A brand-new file (and its new parents) validate fine.
         let resolved = backend.validate(Path::new("nested/deep/a.txt")).unwrap();
         assert_eq!(resolved, root.join("nested/deep/a.txt"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn resolve_dotdot_escape_rejected() {
-        let (root, _outside) = temp_root("esc");
+        let (_guard, root, _outside) = temp_root("esc");
         fs::write(root.join("a.txt"), "x").unwrap();
         let backend = FsBackend {
             roots: vec![root.clone()],
         };
         let err = backend.validate(Path::new("../a.txt")).unwrap_err();
         assert!(matches!(err, FsError::PathEscape { .. }));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A trailing `..` in the SLOW path (the target's parent does not
@@ -370,7 +395,7 @@ mod tests {
     /// report one path and land another.
     #[test]
     fn resolve_dotdot_in_missing_parent_rejected() {
-        let (root, _outside) = temp_root("esc-slow");
+        let (_guard, root, _outside) = temp_root("esc-slow");
         fs::write(root.join("a.txt"), "x").unwrap();
         let backend = FsBackend {
             roots: vec![root.clone()],
@@ -407,12 +432,11 @@ mod tests {
                 "the OS-level lexical collapse must stay inside the root, got {ok:?}"
             );
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn resolve_symlink_escape_rejected() {
-        let (root, outside) = temp_root("sym");
+        let (_guard, root, outside) = temp_root("sym");
         fs::write(&outside, "secret").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
@@ -427,7 +451,6 @@ mod tests {
         };
         let err = backend.validate(Path::new("link")).unwrap_err();
         assert!(matches!(err, FsError::PathEscape { .. }));
-        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&outside);
     }
 
@@ -440,7 +463,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_through_dangling_symlink_rejected() {
-        let (root, outside) = temp_root("dangle");
+        let (_guard, root, outside) = temp_root("dangle");
         // A dangling symlink under the sandbox pointing at a NON-existent
         // target outside it.
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
@@ -468,7 +491,6 @@ mod tests {
         // `validate` (the `ls`/`find`/`grep`/image-`read` seam) agrees.
         let err = backend.validate(Path::new("link/inner.txt")).unwrap_err();
         assert!(matches!(err, FsError::PathEscape { .. }), "got {err:?}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The slow path (the dangling-symlink probe + the trailing-`..`
@@ -478,8 +500,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_through_a_dangling_symlink_in_a_non_first_root_rejected() {
-        let (a, _unused) = temp_root("dangle-a");
-        let (b, outside) = temp_root("dangle-b");
+        let (_ga, a, _unused) = temp_root("dangle-a");
+        let (_gb, b, outside) = temp_root("dangle-b");
         std::os::unix::fs::symlink(&outside, b.join("link")).unwrap();
         let backend = FsBackend {
             roots: vec![a.clone(), b.clone()],
@@ -501,8 +523,6 @@ mod tests {
             "expected PathEscape, got {err:?}"
         );
         assert!(!outside.exists(), "still not created");
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// An EMPTY root set fails closed (an `Io` error) — never "everything is
@@ -520,7 +540,7 @@ mod tests {
     /// not an error either: a path under another (real) root still validates.
     #[test]
     fn a_missing_root_does_not_break_the_other_roots() {
-        let (root, _outside) = temp_root("missing-root");
+        let (_guard, root, _outside) = temp_root("missing-root");
         // A root that will never exist (a sibling of the real root, so it
         // is not incidentally in bounds).
         let gone = std::env::temp_dir().join(format!("fsb-gone-{}", uuid::Uuid::new_v4()));
@@ -533,6 +553,5 @@ mod tests {
         // And the missing root grants nothing.
         let err = backend.validate(&gone.join("a.txt")).unwrap_err();
         assert!(matches!(err, FsError::PathEscape { .. }), "got {err:?}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

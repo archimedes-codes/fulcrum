@@ -537,10 +537,19 @@ mod tests {
 
     /// A scratch root with an EMPTY `.git/` dir so the context walk is
     /// bounded at the scratch (a stray `~/.agents/agents` or `~/.pi`
-    /// from a developer's real home must not break the assertions).
-    fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("archimedes-agents-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+    /// from a developer's real home must not break the assertions) — and
+    /// OWNED (#96 task 08): the dir and everything under it is removed when
+    /// the guard drops. NOT `Clone`; `to_path_buf()` is the escape hatch
+    /// where a `PathBuf` is needed.
+    ///
+    /// The `archimedes-agents-` prefix is verbatim (D12: #96's census
+    /// attributes by prefix) with a `root` tag inserted INSIDE it, so the
+    /// name shape changes and the census glob does not. This helper is
+    /// called 24 times per run and the file contained ZERO `remove_dir_all`
+    /// before this change — 24 dirs/run, the largest single-file leak in the
+    /// lib suite.
+    fn scratch() -> crate::test_support::ScratchDir {
+        let dir = crate::test_support::ScratchDir::in_env_temp("archimedes-agents-", "root");
         fs::create_dir_all(dir.join(".git")).unwrap();
         dir
     }
@@ -560,6 +569,57 @@ mod tests {
         fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
     }
 
+    /// #96 task 08: the agents fixture must OWN its scratch. `scratch()` handed
+    /// back a bare `PathBuf` and this file contained ZERO `remove_dir_all`, so
+    /// all 24 dirs per run outlived it (1896 of them on disk at the baseline,
+    /// 24/run — the largest single-file leak in the lib suite). The GREEN half
+    /// of this assertion is the real win; the drop is what makes the panic path
+    /// cost nothing.
+    #[test]
+    fn the_agents_scratch_helper_owns_its_dir() {
+        let dir = scratch();
+        let captured = dir.to_path_buf();
+        assert!(captured.is_dir(), "the helper created its scratch dir");
+        assert!(
+            captured.join(".git").is_dir(),
+            "and the `.git` marker that bounds the context walk"
+        );
+        drop(dir);
+        assert!(
+            !captured.exists(),
+            "the helper's scratch goes with its owner: {captured:?}"
+        );
+    }
+
+    /// The panic path: an assertion that FAILS while the fixture still owns its
+    /// scratch must not leave it behind. The guard is MOVED INTO the panicking
+    /// scope — that is the value the unwind drops (the `test_support` /
+    /// `agent/mcp/oauth.rs` precedent). What this does NOT pin is #96's headline
+    /// case — a test failing with its guard as a plain local, so the HARNESS's
+    /// own unwind would have to remove the dir — because Rust makes no portable
+    /// guarantee there and status-doc D10 assigns that case to task 09's census.
+    #[test]
+    fn a_panicking_assertion_still_removes_the_agents_scratch() {
+        let captured = {
+            let dir = scratch();
+            let p = dir.to_path_buf();
+            assert!(p.is_dir(), "the helper created its scratch dir");
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _dir = dir;
+                assert_eq!(
+                    1, 2,
+                    "an assertion fails while the fixture owns its scratch"
+                );
+            }));
+            assert!(r.is_err(), "the assertion failed as arranged");
+            p
+        };
+        assert!(
+            !captured.exists(),
+            "the unwind ran the removal: {captured:?}"
+        );
+    }
+
     // 1
     #[test]
     fn a_flat_agent_file_is_discovered_with_all_fields() {
@@ -568,7 +628,7 @@ mod tests {
             &root.join("scout.md"),
             "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: read, bash\n---\nYou are a scout.\n",
         );
-        let out = discover_in_roots(&[(root.clone(), AgentScope::Space)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::Space)]);
         assert_eq!(out.len(), 1, "one agent expected: {out:?}");
         let d = &out[0];
         assert_eq!(d.name, "scout");
@@ -589,7 +649,7 @@ mod tests {
     fn a_file_without_frontmatter_uses_the_stem_name() {
         let root = scratch();
         write_file(&root.join("worker.md"), "Do the work.\n");
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         assert_eq!(out.len(), 1, "one agent expected: {out:?}");
         assert_eq!(out[0].name, "worker");
         assert_eq!(out[0].description, "");
@@ -607,7 +667,7 @@ mod tests {
             &root.join("helper.md"),
             "---\ndescription: A helper.\n---\nHelp.\n",
         );
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         assert_eq!(out.len(), 1, "one agent expected: {out:?}");
         assert_eq!(out[0].name, "helper");
         assert_eq!(out[0].description, "A helper.");
@@ -625,7 +685,7 @@ mod tests {
         );
         // A positive control: a well-formed file in the same root.
         write_file(&root.join("good.md"), "---\nname: good\n---\nB.\n");
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         assert_eq!(
             out.len(),
             1,
@@ -646,7 +706,7 @@ mod tests {
             &root.join("s2.md"),
             "---\nname: s2\ntools: [read, bash]\n---\nB2.\n",
         );
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         assert_eq!(out.len(), 2, "two agents expected: {out:?}");
         let s1 = out.iter().find(|d| d.name == "s1").unwrap();
         let s2 = out.iter().find(|d| d.name == "s2").unwrap();
@@ -701,9 +761,11 @@ mod tests {
         write_file(&root.join("skills/quote/SKILL.md"), comment_fm);
         write_file(&root.join("skills/pair/SKILL.md"), closed_fm);
 
-        let agents = discover_in_roots(&[(root.clone(), AgentScope::Space)]);
-        let skills =
-            crate::skills::discover_in_roots(&[(root.clone(), crate::skills::SkillScope::User)]);
+        let agents = discover_in_roots(&[(root.to_path_buf(), AgentScope::Space)]);
+        let skills = crate::skills::discover_in_roots(&[(
+            root.to_path_buf(),
+            crate::skills::SkillScope::User,
+        )]);
         assert_eq!(
             agents.len(),
             2,
@@ -776,7 +838,7 @@ mod tests {
         let root = scratch();
         write_file(&root.join("e1.md"), "---\nname: e1\ntools: []\n---\nB.\n");
         write_file(&root.join("e2.md"), "---\nname: e2\ntools: \"\"\n---\nB.\n");
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         assert_eq!(out.len(), 2, "two agents expected: {out:?}");
         let e1 = out.iter().find(|d| d.name == "e1").unwrap();
         let e2 = out.iter().find(|d| d.name == "e2").unwrap();
@@ -802,7 +864,7 @@ mod tests {
         write_file(&root.join("notes.txt"), "not an agent definition");
         // A positive control: a well-formed `.md` file in the same root.
         write_file(&root.join("good.md"), "---\nname: good\n---\nB.\n");
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         assert_eq!(out.len(), 1, "only the `.md` file is discovered: {out:?}");
         assert_eq!(out[0].name, "good");
     }
@@ -821,8 +883,8 @@ mod tests {
             "---\nname: scout\ndescription: user version\n---\nU.\n",
         );
         let out = discover_in_roots(&[
-            (space_root.clone(), AgentScope::Space),
-            (user_root.clone(), AgentScope::User),
+            (space_root.to_path_buf(), AgentScope::Space),
+            (user_root.to_path_buf(), AgentScope::User),
         ]);
         assert_eq!(out.len(), 1, "first-wins dedupe: {out:?}");
         assert_eq!(out[0].description, "space version");
@@ -871,8 +933,8 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(a.join("scout.md"), b.join("scout.md")).unwrap();
         let out = discover_in_roots(&[
-            (a.clone(), AgentScope::Space),
-            (b.clone(), AgentScope::User),
+            (a.to_path_buf(), AgentScope::Space),
+            (b.to_path_buf(), AgentScope::User),
         ]);
         assert_eq!(out.len(), 1, "the symlink must collapse: {out:?}");
         assert_eq!(out[0].scope, AgentScope::Space);
@@ -890,7 +952,7 @@ mod tests {
             &root.join("m.md"),
             "---\nname: m\nmodel: fake/m2:high\n---\nB.\n",
         );
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         assert_eq!(out.len(), 1, "one agent expected: {out:?}");
         assert_eq!(out[0].model.as_deref(), Some("fake/m2:high"));
     }
@@ -901,7 +963,7 @@ mod tests {
         let root = scratch();
         write_file(&root.join("zeta.md"), "---\nname: Zeta\n---\nZ.\n");
         write_file(&root.join("alpha.md"), "---\nname: Alpha\n---\nA.\n");
-        let out = discover_in_roots(&[(root.clone(), AgentScope::User)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
         let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["Alpha", "Zeta"], "sorted by lowercased name");
     }
@@ -940,8 +1002,15 @@ mod tests {
         // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
+        //
+        // `tmp.path()` and NOT `&tmp` (#96 task 08, D15): `set_var` wants an
+        // `AsRef<OsStr>` and `ScratchDir` deliberately implements only
+        // `AsRef<Path>` + `Deref<Target = Path>`. The declaration order above
+        // is load-bearing — `_lock`, then `_restore`, then `tmp` — so the
+        // scratch is removed while the env lock is STILL held and before the
+        // `HOME` restore runs.
         unsafe {
-            std::env::set_var("HOME", &tmp);
+            std::env::set_var("HOME", tmp.path());
         }
         let roots = user_roots();
         // Raw joined paths (NO `canon` — these directories never exist
@@ -1000,8 +1069,8 @@ mod tests {
         write_file(&space_root.join("scout.md"), bytes);
         write_file(&user_root.join("scout.md"), bytes);
         let out = discover_in_roots(&[
-            (space_root.clone(), AgentScope::Space),
-            (user_root.clone(), AgentScope::User),
+            (space_root.to_path_buf(), AgentScope::Space),
+            (user_root.to_path_buf(), AgentScope::User),
         ]);
         assert_eq!(out.len(), 1, "one entry for a Duplicate: {out:?}");
         assert!(
@@ -1024,8 +1093,8 @@ mod tests {
         write_file(&space_root.join("scout.md"), lf);
         write_file(&user_root.join("scout.md"), &crlf);
         let out = discover_in_roots(&[
-            (space_root.clone(), AgentScope::Space),
-            (user_root.clone(), AgentScope::User),
+            (space_root.to_path_buf(), AgentScope::Space),
+            (user_root.to_path_buf(), AgentScope::User),
         ]);
         assert_eq!(out.len(), 1, "one entry for a CRLF copy: {out:?}");
         assert!(
@@ -1051,8 +1120,8 @@ mod tests {
             "---\nname: scout\ndescription: user version\n---\nU.\n",
         );
         let out = discover_in_roots(&[
-            (space_root.clone(), AgentScope::Space),
-            (user_root.clone(), AgentScope::User),
+            (space_root.to_path_buf(), AgentScope::Space),
+            (user_root.to_path_buf(), AgentScope::User),
         ]);
         assert_eq!(out.len(), 1, "the collision stays ONE entry: {out:?}");
         assert_eq!(out[0].shadowed.len(), 1, "{out:?}");

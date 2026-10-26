@@ -857,17 +857,22 @@ fn parse_value(fm: &[&str], idx: usize, rest: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A fresh scratch directory (one per call, so tests never share state).
+    /// A fresh scratch directory (one per call, so tests never share state),
+    /// OWNED (#96 task 08) — removed when the guard drops.
     ///
     /// Deliberately NOT a copy of `agents.rs::scratch()`: that helper also
     /// creates an empty `.git/` dir because `discover_agents` runs a context
     /// walk that stops at a `.git`. `discover_in_roots` takes its roots as
     /// given and never walks up (the upward search lives in `space_roots`),
     /// so such a dir would be inert here and its comment a false claim.
-    fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("archimedes-skills-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    ///
+    /// NOT `Clone`; `to_path_buf()` is the escape hatch. The
+    /// `archimedes-skills-` prefix is verbatim (D12) with a `root` tag
+    /// inserted INSIDE it — 39 mints per run from 26 call sites (D14: the
+    /// `fixture()` helper mints twice per call and runs `ROUNDS = 8` times),
+    /// ZERO of them removed before this change.
+    fn scratch() -> crate::test_support::ScratchDir {
+        crate::test_support::ScratchDir::in_env_temp("archimedes-skills-", "root")
     }
 
     fn write_file(path: &Path, content: &str) {
@@ -965,7 +970,7 @@ mod tests {
         );
         std::os::unix::fs::symlink(&real_dir, root.join("linked")).unwrap();
 
-        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), SkillScope::Space)]);
         assert_eq!(out.len(), 1, "the linked Skill must be discovered: {out:?}");
         assert_eq!(out[0].name, "real");
         assert_eq!(out[0].scope, SkillScope::Space);
@@ -985,7 +990,7 @@ mod tests {
         );
         std::os::unix::fs::symlink(&loopdir, loopdir.join("self")).unwrap();
 
-        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), SkillScope::Space)]);
         assert_eq!(
             out.iter().filter(|s| s.name == "looped").count(),
             1,
@@ -1071,7 +1076,25 @@ mod tests {
         /// across the `nest*` block (probing name-sorted filesystems and — since
         /// a hash-ordered fs derives its order from the name — drawing a fresh
         /// order on those). Both vary because each scheme ignores the other.
-        fn fixture(shallow_name: &str, shallow_first: bool) -> (PathBuf, bool) {
+        ///
+        /// BOTH dirs travel out as guards (#96 task 08). `home` is NOT a detail
+        /// of this helper: every symlink in `root` points INTO it, so a `home`
+        /// guard dropped at this function's return would delete the symlink
+        /// TARGETS before the caller ever reached `discover_in_roots` — a fixture
+        /// whose premise had been quietly removed. Returning it keeps `home`
+        /// alive for the whole round; it still drops at the round's end, so
+        /// nothing leaks. (This is the shape task 06 recorded for `fs_backend`:
+        /// the link lives in one guard's dir and points into another's, so no
+        /// single guard owns both — but both are removed, and a dangling symlink
+        /// is not an open file, so neither removal is blocked on Windows.)
+        fn fixture(
+            shallow_name: &str,
+            shallow_first: bool,
+        ) -> (
+            crate::test_support::ScratchDir,
+            crate::test_support::ScratchDir,
+            bool,
+        ) {
             let root = scratch();
             let home = scratch();
             let target = home.join("shared");
@@ -1122,7 +1145,7 @@ mod tests {
                 .position(|n| deeps.iter().any(|d| d == n))
                 .unwrap();
             let first_shallow = order.iter().position(|n| n == shallow_name).unwrap();
-            (root, first_deep < first_shallow)
+            (root, home, first_deep < first_shallow)
         }
 
         let mut deep_first_rounds = 0;
@@ -1130,11 +1153,11 @@ mod tests {
             // Each name variant gets both creation orders (4 × 2 = ROUNDS).
             let shallow_name = SHALLOW_NAMES[round % SHALLOW_NAMES.len()];
             let shallow_first = (round / SHALLOW_NAMES.len()).is_multiple_of(2);
-            let (root, deep_first) = fixture(shallow_name, shallow_first);
+            let (root, _home, deep_first) = fixture(shallow_name, shallow_first);
             if deep_first {
                 deep_first_rounds += 1;
             }
-            let out = discover_in_roots(&[(root, SkillScope::Space)]);
+            let out = discover_in_roots(&[(root.to_path_buf(), SkillScope::Space)]);
             for name in ["shared", "mid", "deep_only"] {
                 assert_eq!(
                     out.iter().filter(|s| s.name == name).count(),
@@ -1172,7 +1195,7 @@ mod tests {
             "---\nname: beta\ndescription: D.\n---\nB.\n",
         );
 
-        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), SkillScope::Space)]);
         assert_eq!(out.len(), 2, "both nested Skills expected: {out:?}");
     }
 
@@ -1190,7 +1213,7 @@ mod tests {
         );
         std::os::unix::fs::symlink(&hidden, root.join("node_modules")).unwrap();
 
-        let out = discover_in_roots(&[(root, SkillScope::Space)]);
+        let out = discover_in_roots(&[(root.to_path_buf(), SkillScope::Space)]);
         assert_eq!(out.len(), 0, "node_modules stays pruned: {out:?}");
     }
 
@@ -1213,7 +1236,10 @@ mod tests {
         write_file(&space.join("discuss").join("SKILL.md"), bytes);
         write_file(&user.join("discuss").join("SKILL.md"), bytes);
 
-        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        let out = discover_in_roots(&[
+            (space.to_path_buf(), SkillScope::Space),
+            (user.to_path_buf(), SkillScope::User),
+        ]);
         assert_eq!(out.len(), 1, "one row for a Duplicate: {out:?}");
         assert!(
             out[0].shadowed.is_empty(),
@@ -1233,7 +1259,10 @@ mod tests {
         write_file(&space.join("discuss").join("SKILL.md"), lf);
         write_file(&user.join("discuss").join("SKILL.md"), &crlf);
 
-        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        let out = discover_in_roots(&[
+            (space.to_path_buf(), SkillScope::Space),
+            (user.to_path_buf(), SkillScope::User),
+        ]);
         assert_eq!(out.len(), 1, "one row for a CRLF copy: {out:?}");
         assert!(
             out[0].shadowed.is_empty(),
@@ -1257,7 +1286,10 @@ mod tests {
         write_file(&space.join("discuss").join("SKILL.md"), visible);
         write_file(&user.join("discuss").join("SKILL.md"), hidden);
 
-        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        let out = discover_in_roots(&[
+            (space.to_path_buf(), SkillScope::Space),
+            (user.to_path_buf(), SkillScope::User),
+        ]);
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(
             !out[0].disable_model_invocation,
@@ -1288,7 +1320,10 @@ mod tests {
             "---\nname: discuss\ndescription: user version\n---\nU.\n",
         );
 
-        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        let out = discover_in_roots(&[
+            (space.to_path_buf(), SkillScope::Space),
+            (user.to_path_buf(), SkillScope::User),
+        ]);
         assert_eq!(out.len(), 1, "the collision stays ONE entry: {out:?}");
         assert_eq!(out[0].name, "discuss");
         assert_eq!(
@@ -1326,7 +1361,10 @@ mod tests {
             "---\nname: discuss\ndescription: from .pi\n---\nP.\n",
         );
 
-        let out = discover_in_roots(&[(agents, SkillScope::User), (pi, SkillScope::User)]);
+        let out = discover_in_roots(&[
+            (agents.to_path_buf(), SkillScope::User),
+            (pi.to_path_buf(), SkillScope::User),
+        ]);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].scope, SkillScope::User, "winner is a user skill");
         assert_eq!(out[0].shadowed.len(), 1, "{out:?}");
@@ -1381,7 +1419,10 @@ mod tests {
                 "---\nname: discuss\ndescription: user version\n---\nU.\n",
             );
 
-            let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+            let out = discover_in_roots(&[
+                (space.to_path_buf(), SkillScope::Space),
+                (user.to_path_buf(), SkillScope::User),
+            ]);
             assert_eq!(out.len(), 1, "{out:?}");
             assert!(
                 out[0].shadowed.is_empty(),
@@ -1409,7 +1450,10 @@ mod tests {
             &format!("---\nname: discuss\ndescription: {long}\n---\nU.\n"),
         );
 
-        let out = discover_in_roots(&[(space, SkillScope::Space), (user, SkillScope::User)]);
+        let out = discover_in_roots(&[
+            (space.to_path_buf(), SkillScope::Space),
+            (user.to_path_buf(), SkillScope::User),
+        ]);
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(
             out[0].shadowed.is_empty(),
@@ -1441,9 +1485,9 @@ mod tests {
         );
 
         let out = discover_in_roots(&[
-            (space, SkillScope::Space),
-            (second, SkillScope::Space),
-            (third, SkillScope::User),
+            (space.to_path_buf(), SkillScope::Space),
+            (second.to_path_buf(), SkillScope::Space),
+            (third.to_path_buf(), SkillScope::User),
         ]);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].shadowed.len(), 2, "both losers reported: {out:?}");

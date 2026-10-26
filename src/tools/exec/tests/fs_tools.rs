@@ -22,7 +22,6 @@ async fn read_happy_and_offset_limit() {
     assert!(!r.is_error);
     assert_eq!(text_of(&r), "line2\nline3");
     assert_eq!(r.details.as_ref().unwrap()["lines"], 2);
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -44,7 +43,6 @@ async fn read_image_returns_image_block() {
         v["content"][0]["image"]["data"],
         base64::engine::general_purpose::STANDARD.encode(png)
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -52,7 +50,6 @@ async fn read_escape_rejected() {
     let cwd = temp_cwd("read-esc");
     let r = execute_tool(&ctx(&cwd), "read", &json!({ "path": "../etc/passwd" })).await;
     assert!(r.is_error, "a sandbox escape must be rejected");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 // ── write ────────────────────────────────────────────────────────────
@@ -70,7 +67,6 @@ async fn write_happy() {
     assert_eq!(text_of(&r), "Wrote 5 bytes to a.txt");
     assert_eq!(r.details.as_ref().unwrap()["bytes"], 5);
     assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "hello");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -84,7 +80,6 @@ async fn write_creates_parent_dirs() {
     .await;
     assert!(!r.is_error);
     assert!(cwd.join("nested/deep/a.txt").exists());
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -97,7 +92,6 @@ async fn write_escape_rejected() {
     )
     .await;
     assert!(r.is_error, "a sandbox escape must be rejected");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 // ── edit ─────────────────────────────────────────────────────────────
@@ -128,7 +122,6 @@ async fn edit_replaces_first_occurrence() {
         std::fs::read_to_string(cwd.join("e.txt")).unwrap(),
         "Y mid X"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -147,7 +140,6 @@ async fn edit_replace_all() {
         std::fs::read_to_string(cwd.join("e.txt")).unwrap(),
         "Y mid Y"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -169,7 +161,6 @@ async fn edit_empty_old_text_rejected() {
         std::fs::read_to_string(cwd.join("e.txt")).unwrap(),
         "X mid X"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -184,7 +175,6 @@ async fn edit_not_found_is_error() {
     .await;
     assert!(r.is_error);
     assert!(text_of(&r).contains("old_text not found in e.txt"));
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -197,7 +187,6 @@ async fn edit_escape_rejected() {
     )
     .await;
     assert!(r.is_error, "a sandbox escape must be rejected");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 // ── ls ───────────────────────────────────────────────────────────────
@@ -213,7 +202,6 @@ async fn ls_lists_entries() {
     assert_eq!(r.details.as_ref().unwrap()["entries"], 3);
     let lines: Vec<&str> = text_of(&r).lines().collect();
     assert_eq!(lines, vec!["a.txt", "b.txt", "d/"]);
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -221,7 +209,6 @@ async fn ls_escape_rejected() {
     let cwd = temp_cwd("ls-esc");
     let r = execute_tool(&ctx(&cwd), "ls", &json!({ "path": "../" })).await;
     assert!(r.is_error, "a sandbox escape must be rejected");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 // ── dispatch ─────────────────────────────────────────────────────────
@@ -232,7 +219,6 @@ async fn unknown_tool_is_error() {
     let r = execute_tool(&ctx(&cwd), "nope", &json!({})).await;
     assert!(r.is_error);
     assert_eq!(text_of(&r), "unknown tool: nope");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -242,7 +228,6 @@ async fn web_search_dispatches_via_execute_tool() {
     // Missing query returns error result from exec_web_search, not "unknown tool"
     assert!(r.is_error);
     assert!(text_of(&r).contains("web_search requires 'query' or 'queries'"));
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -255,5 +240,4 @@ async fn fetch_content_and_get_search_content_dispatch_via_execute_tool() {
     let r2 = execute_tool(&ctx(&cwd), "get_search_content", &json!({})).await;
     assert!(r2.is_error);
     assert!(text_of(&r2).contains("get_search_content: missing `response_id` parameter"));
-    let _ = std::fs::remove_dir_all(&cwd);
 }

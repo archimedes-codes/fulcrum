@@ -48,8 +48,6 @@ async fn read_beyond_the_boundary_succeeds_when_reads_allow() {
     .await;
     assert!(!r.is_error, "{}", text_of(&r));
     assert_eq!(text_of(&r), "OUTSIDE-OK");
-
-    let _ = std::fs::remove_dir_all(&parent);
 }
 
 /// (ADR 0030) A read boundary with MULTIPLE roots: a file in the second
@@ -64,10 +62,10 @@ async fn read_reaches_a_second_boundary_root_when_sandboxed() {
     // The boundary the harness would hand the tools: cwd FIRST, then the
     // discovery root.
     let c = ToolCtx {
-        boundary: vec![cwd.clone(), skill_dir.clone()],
+        boundary: vec![cwd.to_path_buf(), skill_dir.to_path_buf()],
         ..ctx(&cwd)
     };
-    assert_eq!(boundary, vec![cwd.clone()]);
+    assert_eq!(boundary, vec![cwd.to_path_buf()]);
 
     let r = execute_tool(&c, "read", &json!({ "path": skill_dir.join("SKILL.md") })).await;
     assert!(
@@ -82,10 +80,6 @@ async fn read_reaches_a_second_boundary_root_when_sandboxed() {
     std::fs::write(elsewhere.join("no.txt"), "NO").unwrap();
     let r = execute_tool(&c, "read", &json!({ "path": elsewhere.join("no.txt") })).await;
     assert!(r.is_error, "a non-root must stay rejected");
-
-    let _ = std::fs::remove_dir_all(&cwd);
-    let _ = std::fs::remove_dir_all(&skill_dir);
-    let _ = std::fs::remove_dir_all(&elsewhere);
 }
 
 /// `writes: Allow` widens the WRITE direction the same way (an approved
@@ -120,7 +114,6 @@ async fn write_beyond_the_boundary_succeeds_when_writes_allow() {
     .await;
     assert!(r.is_error, "a sandboxed write must NOT land");
     assert!(!parent.join("other.txt").exists());
-    let _ = std::fs::remove_dir_all(&parent);
 }
 
 /// The DENY-LIST is unconditional: a write whose resolved path is under a
@@ -198,7 +191,6 @@ async fn write_into_a_protected_dir_is_refused_under_every_policy() {
         )
         .await;
         assert!(!ok.is_error, "{policy_writes:?}: {}", text_of(&ok));
-        let _ = std::fs::remove_dir_all(&cwd);
     }
 }
 
@@ -227,7 +219,6 @@ async fn write_a_new_file_under_a_protected_dir_is_refused() {
     .await;
     assert!(r.is_error, "a new file under a protected dir is refused");
     assert!(!protected.join("new").exists(), "nothing is created");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The deny-list compares CANONICALLY, so a RAW (never-canonicalized)
@@ -312,7 +303,6 @@ async fn a_raw_protected_entry_still_refuses_a_canonical_path_under_it() {
         "OLD",
         "the file behind the symlink must be untouched"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// The MIRROR of `a_raw_protected_entry_still_refuses_a_canonical_path_under_it`:
@@ -398,7 +388,6 @@ fn a_raw_argument_still_refuses_against_canonical_protected_entries() {
         None,
         "a non-protected raw path must not be refused"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `bash` IGNORES the boundary (its `Sandboxed` tier is Landlock, Task 5):
@@ -421,6 +410,4 @@ async fn bash_ignores_the_file_boundary() {
         text_of(&r)
     );
     assert_eq!(text_of(&r), "FROM-OUTSIDE");
-    let _ = std::fs::remove_dir_all(&cwd);
-    let _ = std::fs::remove_dir_all(&sibling);
 }
