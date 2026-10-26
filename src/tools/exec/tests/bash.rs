@@ -114,7 +114,6 @@ async fn bash_happy_path_serializes_camel_case() {
     assert_eq!(v["details"]["truncated"], false);
     assert_eq!(v["details"]["cancelled"], false);
     assert_eq!(v["isError"], false);
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// Set on the re-executed test binary to tell it that it IS the child half
@@ -247,7 +246,6 @@ async fn live_stdin_child_half() {
     );
     assert_eq!(text_of(&r).trim(), "");
     assert!(!r.is_error);
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// (ADR 0030 Task 5) `Shell=Sandboxed` runs the command INSIDE the
@@ -298,7 +296,6 @@ async fn a_sandboxed_shell_runs_confined_or_fails_closed_visibly() {
     let r = execute_tool(&ctx(&cwd), "bash", &json!({ "command": "touch ran.txt" })).await;
     assert!(!r.is_error, "the default policy still runs bash");
     assert!(cwd.join("ran.txt").exists());
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The confined stub is scoped to the SHELL direction: a path-param
@@ -320,7 +317,6 @@ async fn a_sandboxed_shell_does_not_touch_the_path_tools() {
     let r = execute_tool(&confined, "read", &json!({ "path": "a.txt" })).await;
     assert!(!r.is_error, "a read is not gated by the shell policy");
     assert!(text_of(&r).contains("hello"));
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The fixture is a POSIX-SHELL fixture, so it runs where a POSIX shell
@@ -345,7 +341,6 @@ async fn bash_nonzero_exit_is_error() {
     assert!(r.is_error);
     assert_eq!(r.details.as_ref().unwrap()["exitCode"], 3);
     assert!(text_of(&r).contains("oops"), "stderr is captured");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -353,10 +348,10 @@ async fn bash_cancel_kills_child() {
     let cwd = temp_cwd("bash-cancel");
     let token = CancellationToken::new();
     let c = ToolCtx {
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         cancel: token.clone(),
         skill_roots: None,
-        boundary: vec![cwd.clone()],
+        boundary: vec![cwd.to_path_buf()],
         file_policy: crate::agent::policy::FilePolicy::default(),
         protected: Vec::new(),
         web: Default::default(),
@@ -376,7 +371,6 @@ async fn bash_cancel_kills_child() {
         elapsed < Duration::from_secs(4),
         "the child was killed (took {elapsed:?})"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -395,7 +389,6 @@ async fn bash_timeout_kills_child() {
         start.elapsed() < Duration::from_secs(4),
         "the timeout killed the child"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The fixture is POSIX through and through: `( … ) &` backgrounding and
@@ -442,7 +435,6 @@ async fn bash_backgrounded_grandchild_killed_with_group() {
         !cwd.join("marker.txt").exists(),
         "the backgrounded grandchild was killed with the process group"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// A child that CLOSES ITS OWN PIPES and then runs past its deadline
@@ -498,7 +490,6 @@ async fn bash_timeout_kills_a_child_that_closed_its_pipes() {
         !cwd.join("marker.txt").exists(),
         "the child was killed at its deadline before it could write"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The cancel path applies the same rule: a cancelled child that had
@@ -517,10 +508,10 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
     let cwd = temp_cwd("bash-closed-pipes-cancel");
     let token = CancellationToken::new();
     let c = ToolCtx {
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         cancel: token.clone(),
         skill_roots: None,
-        boundary: vec![cwd.clone()],
+        boundary: vec![cwd.to_path_buf()],
         file_policy: crate::agent::policy::FilePolicy::default(),
         protected: Vec::new(),
         web: Default::default(),
@@ -554,7 +545,6 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
         !cwd.join("marker.txt").exists(),
         "the cancelled child was killed with its process group"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 // ── the quoting contract, on the shell that actually re-parses it ─────
@@ -606,7 +596,6 @@ async fn bash_passes_inline_double_quotes_through_to_cmd_verbatim() {
         "the quotes survive: {:?}",
         text_of(&r)
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// Issue #79's FALSE-SUCCESS shape, reproduced with a `cmd` BUILTIN so the test
@@ -643,7 +632,6 @@ async fn bash_an_inline_quoted_path_still_takes_the_branch() {
          skipped WHILE STILL EXITING 0 — issue #79's false success: {:?}",
         text_of(&r)
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 // ── the exit-status truth table (pure — no child, no timing) ─────────
@@ -895,7 +883,6 @@ async fn bash_success_after_closing_its_pipes_is_not_an_error() {
         text_of(&r)
     );
     assert_eq!(r.details.as_ref().unwrap()["cancelled"], false);
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The other half of "report the REAL exit status": a child that closed
@@ -953,7 +940,6 @@ async fn bash_nonzero_exit_after_closing_its_pipes_reports_its_real_code() {
             text_of(&r)
         );
     }
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The flake's shape, reproduced on purpose: the executor pinned to ONE
@@ -1000,7 +986,6 @@ async fn bash_success_survives_a_saturated_machine() {
         bad.is_empty(),
         "successful runs reported under load: {bad:?}"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The native `bash` deadline without a `timeout_ms` is 300 s (matching
@@ -1041,5 +1026,4 @@ async fn bash_output_capped_at_max() {
         "output is capped at {MAX_OUTPUT_BYTES} bytes (got {})",
         text_of(&r).len()
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }

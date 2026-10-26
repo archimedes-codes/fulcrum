@@ -31,7 +31,7 @@ async fn a_slow_events_consumer_never_drops_the_settle() {
         ProviderEvent::TextDelta("hi".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -95,7 +95,7 @@ async fn the_persisted_ask_row_and_the_emitted_request_carry_the_same_payload() 
         events: Arc::new(StdMutex::new(Vec::new())),
     });
     let captured = sink.events.clone();
-    let (mut loop_, db) = build_loop_with_sink(
+    let (_space, mut loop_, db) = build_loop_with_sink(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -214,7 +214,7 @@ async fn a_cancel_stops_the_remaining_tool_calls_in_a_batch() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -273,7 +273,7 @@ async fn a_cancel_stops_an_in_flight_model_call() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let (provider, calls) = ScriptedProvider::new(vec![None]); // a HANGING `complete`
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -313,7 +313,7 @@ async fn a_skipped_prompt_settles_the_pending_turn() {
     let (settle_tx, settle_rx) = watch::channel(0u64);
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let (provider, _calls) = ScriptedProvider::new(vec![None]); // a HANGING `complete`
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -357,7 +357,7 @@ async fn a_drained_queued_prompt_settles_the_pending_turn() {
     let (settle_tx, settle_rx) = watch::channel(0u64);
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let (provider, _calls) = ScriptedProvider::new(vec![None]); // a HANGING `complete`
-    let loop_ = build_loop(
+    let (_space, loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -398,7 +398,7 @@ async fn a_failed_model_call_settles_with_turn_end_and_agent_settled() {
     let provider = FailingProvider {
         error: ProviderError::Fatal("the model call failed".to_string()),
     };
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -439,7 +439,7 @@ async fn a_cancel_stops_a_sudo_flow_blocking_on_its_confirm_prompt() {
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -519,7 +519,7 @@ async fn a_retried_model_call_emits_one_message_start() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -561,7 +561,7 @@ async fn a_cancel_during_the_retry_backoff_settles_fast() {
     let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![ProviderEvent::Error(
         ProviderError::Retryable("transient".to_string()),
     )])]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -619,7 +619,7 @@ async fn an_empty_stop_turn_is_retried_and_never_persisted() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -747,7 +747,7 @@ async fn a_stop_that_streamed_nothing_at_all_is_retried() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -800,7 +800,7 @@ async fn an_empty_stop_with_an_exhausted_budget_settles_as_an_error() {
         ProviderEvent::ThinkingDelta("thinking <invoke name=\"read\">".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -867,7 +867,7 @@ async fn a_reply_with_text_and_no_tool_call_settles_normally() {
         ProviderEvent::TextDelta("a normal reply".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -933,7 +933,7 @@ async fn an_empty_text_tool_calls_turn_is_not_treated_as_empty() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1004,7 +1004,7 @@ async fn an_empty_turn_shares_the_retry_budget_with_the_ladder() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1070,7 +1070,7 @@ async fn an_empty_turn_after_a_ladder_retry_reports_no_success() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1140,7 +1140,7 @@ async fn prepend_system_persists_at_seq_zero() {
         ProviderEvent::TextDelta("hi".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1174,7 +1174,7 @@ async fn resume_replays_system_message_verbatim() {
         ProviderEvent::TextDelta("hi".to_string()),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
-    let (mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, _db) = build_loop_with_db(
         Box::new(provider),
         mpsc::unbounded_channel().0,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1251,7 +1251,7 @@ async fn a_tool_result_image_reaches_the_model_transcript() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -1319,7 +1319,7 @@ async fn a_prompt_with_images_pushes_a_blocks_user_message() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -1415,7 +1415,7 @@ async fn model_requests_carry_the_session_id_across_turns_and_tool_calls() {
             ],
         ],
     );
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
@@ -1461,7 +1461,15 @@ async fn model_requests_carry_the_session_id_across_turns_and_tool_calls() {
 #[tokio::test]
 async fn an_mcp_tool_call_round_trips_into_the_transcript() {
     // A temp dir with a `.pi/mcp.json` (the fake stdio server).
-    let dir = std::env::temp_dir().join(format!("mcp-loop-test-{}", uuid::Uuid::new_v4()));
+    //
+    // #96 ownership: `dir` is a TEST-SCOPE local declared BEFORE the loop,
+    // and nothing here is spawned — the last use of the path is inside
+    // `handle_prompt(..).await`, which completes in this body, so the guard
+    // drops strictly after it. `McpManager` gets a `PathBuf` COPY, never the
+    // guard (`ScratchDir` is deliberately not `Clone`: a second owner would
+    // `remove_dir_all` the same path).
+    let dir = crate::test_support::ScratchDir::in_env_temp("mcp-loop-test-", "roundtrip");
+    // Stays: this makes a SUBDIR inside the guard's dir, not the root.
     std::fs::create_dir_all(dir.join(".pi")).unwrap();
     let bin = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1492,7 +1500,7 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
         ]),
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -1501,7 +1509,7 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
     );
     // Swap in the temp-config MCP manager (the `build_loop` default reads
     // the real home — this one reads the temp `mcp.json`).
-    loop_.mcp = McpManager::new(dir.clone(), dir.clone(), None);
+    loop_.mcp = McpManager::new(dir.to_path_buf(), dir.to_path_buf(), None);
     loop_.handle_prompt(&text_prompt("call the mcp tool")).await;
     // The `mcp` tool result round-tripped (the `echo` → "hi").
     let end = wait_for_event(
@@ -1526,7 +1534,24 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
 /// stdio child is killed via `kill_on_drop`).
 #[tokio::test]
 async fn a_stop_mid_mcp_call_cancels() {
-    let dir = std::env::temp_dir().join(format!("mcp-loop-stop-{}", uuid::Uuid::new_v4()));
+    // #96 ownership — THE SPAWN CRUX. `dir` is a TEST-SCOPE local and is
+    // NEVER moved into the `tokio::spawn` below: only `loop_` crosses, and it
+    // carries a `PathBuf` COPY (`to_path_buf()`), never the guard. The task
+    // handle is awaited (`timeout(SETTLE, task).await`) before this body
+    // ends — and the `Err(_)` arm PANICS, so even the timeout path unwinds
+    // the body while the runtime is still dropping the task's future. Hence
+    // the guard outlives the task that holds the path.
+    //
+    // The ordering that actually matters is the CHILD PROCESS: the stdio MCP
+    // server has `current_dir` inside this dir, and it dies via
+    // `kill_on_drop` when its `StdioClient` drops — which happens when
+    // `McpManager` drops, i.e. when `loop_` drops INSIDE the spawned task,
+    // at or before that `timeout(SETTLE, task).await`. So the child is gone
+    // before `dir` drops. THAT AWAIT IS LOAD-BEARING FOR THIS GUARD: if it
+    // were ever removed, the dir could be removed under a live child (the
+    // `a_drained_queued_prompt_settles_the_pending_turn` limit), so keep it.
+    let dir = crate::test_support::ScratchDir::in_env_temp("mcp-loop-stop-", "cancel");
+    // Stays: a SUBDIR inside the guard's dir, not the root.
     std::fs::create_dir_all(dir.join(".pi")).unwrap();
     let bin = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1558,14 +1583,14 @@ async fn a_stop_mid_mcp_call_cancels() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
-    let mut loop_ = build_loop(
+    let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
         watch::channel(0u64).0,
         RetryPolicy::new_with(5, Duration::from_millis(1)),
     );
-    loop_.mcp = McpManager::new(dir.clone(), dir.clone(), None);
+    loop_.mcp = McpManager::new(dir.to_path_buf(), dir.to_path_buf(), None);
     let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("call mcp")).await });
     // The `mcp` tool starts (the `hang` never answers). This wait covers
     // SPAWNING the MCP server process + handshake inside a spawned task,

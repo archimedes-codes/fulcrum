@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -20,6 +20,7 @@ use crate::agent::harness::retry::RetryPolicy;
 use crate::agent::harness::store::SessionStore;
 use crate::agent::interactive::SudoRunner;
 use crate::storage::Db;
+use crate::test_support::ScratchDir;
 
 /// Dev machines see this whole suite in ~10 s on 8 cores, so the bare 5 s
 /// bounds these waits used were tuned against margins they never came
@@ -270,6 +271,14 @@ impl EventSink for TestSink {
 /// provider; the `events` / `turn_cancel` / `settle_tx` wiring mirrors
 /// `build_native_session`). The `Db` is returned (the tests assert on
 /// the STORE via `loop_.store` against the same `Db`).
+///
+/// #96: the scratch dir is the FIRST tuple element, owned by the caller.
+/// `AgentLoop::space_cwd` is a production `PathBuf` and stays one, so the
+/// guard cannot live in the loop — it rides out beside it. Position is
+/// load-bearing: destructured locals drop in REVERSE declaration order, so
+/// a guard-first tuple closes the `Db` (a live SQLite file inside that dir)
+/// before `remove_dir_all` runs. Wrong order is invisible on Linux
+/// (unlink-while-open succeeds) and leaks on Windows.
 pub(super) fn build_loop_with_db(
     provider: Box<dyn Provider>,
     events: mpsc::UnboundedSender<RpcEvent>,
@@ -278,11 +287,11 @@ pub(super) fn build_loop_with_db(
     retry: RetryPolicy,
     models: Vec<Model>,
     config_dir: Option<&std::path::Path>,
-) -> (AgentLoop, Arc<Db>) {
+) -> (ScratchDir, AgentLoop, Arc<Db>) {
     let sink = Arc::new(TestSink {
         updates: Arc::new(StdMutex::new(Vec::new())),
     });
-    let (loop_, db) = build_loop_with_sink(
+    let (space, loop_, db) = build_loop_with_sink(
         provider,
         events,
         turn_cancel,
@@ -292,7 +301,7 @@ pub(super) fn build_loop_with_db(
         config_dir,
         sink,
     );
-    (loop_, db)
+    (space, loop_, db)
 }
 
 /// `build_loop_with_db` with the sink INJECTED (the tests that assert on
@@ -309,10 +318,9 @@ pub(super) fn build_loop_with_sink(
     models: Vec<Model>,
     config_dir: Option<&std::path::Path>,
     sink: Arc<dyn EventSink>,
-) -> (AgentLoop, Arc<Db>) {
-    let dir = std::env::temp_dir().join(format!("harness-loop-test-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
+) -> (ScratchDir, AgentLoop, Arc<Db>) {
+    let space = crate::test_support::ScratchDir::in_env_temp("harness-loop-test-", "space");
+    let db = Arc::new(Db::open(&space.join("t.db")).expect("db should open"));
     // The `native_messages` rows FK to `sessions`: record the test
     // session so transcript writes (e.g. the `run_compaction`
     // rewrite) are valid.
@@ -337,7 +345,8 @@ pub(super) fn build_loop_with_sink(
     let sink: Arc<dyn EventSink> = sink;
     let loop_ = AgentLoop::new(
         "s1".to_string(),
-        dir,
+        // The loop gets a COPY of the path and never owns the dir (#96).
+        space.to_path_buf(),
         model,
         provider,
         catalog,
@@ -359,19 +368,21 @@ pub(super) fn build_loop_with_sink(
         config_dir.map(|p| p.to_path_buf()),
         "t".to_string(),
     );
-    (loop_, db)
+    (space, loop_, db)
 }
 
 /// Build an `AgentLoop` (drops the `Db` — the tests that need the
-/// `Db` use `build_loop_with_db`).
+/// `Db` use `build_loop_with_db`). The scratch guard is the first element
+/// for the reason recorded on `build_loop_with_db`: never `.0`-project a
+/// builder result to discard the guard — bind it.
 pub(super) fn build_loop(
     provider: Box<dyn Provider>,
     events: mpsc::UnboundedSender<RpcEvent>,
     turn_cancel: Arc<StdMutex<CancellationToken>>,
     settle_tx: watch::Sender<u64>,
     retry: RetryPolicy,
-) -> AgentLoop {
-    build_loop_with_db(
+) -> (ScratchDir, AgentLoop) {
+    let (space, loop_, _db) = build_loop_with_db(
         provider,
         events,
         turn_cancel,
@@ -379,8 +390,8 @@ pub(super) fn build_loop(
         retry,
         vec![fake_model("m1")],
         None,
-    )
-    .0
+    );
+    (space, loop_)
 }
 
 /// A text-only `PromptTurn` (the test's common case — no image
@@ -519,19 +530,19 @@ pub(super) fn build_loop_with_dispatcher(
     subagent: Option<Arc<dyn SubagentDispatcher>>,
     models: Vec<Model>,
     config_dir: Option<&std::path::Path>,
-) -> AgentLoop {
-    let dir = std::env::temp_dir().join(format!("harness-loop-test-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
+) -> (ScratchDir, AgentLoop) {
+    let space = crate::test_support::ScratchDir::in_env_temp("harness-loop-test-", "dispatch");
+    let db = Arc::new(Db::open(&space.join("t.db")).expect("db should open"));
     let catalog = ModelCatalog {
         models: models.clone(),
         default_model: None,
         compaction: CompactionConfig::default(),
     };
     let (prompt_tx, prompt_rx) = mpsc::channel(8);
-    AgentLoop::new(
+    let loop_ = AgentLoop::new(
         "s1".to_string(),
-        dir,
+        // A copy of the path — the guard below owns the dir (#96).
+        space.to_path_buf(),
         models[0].clone(),
         provider,
         catalog,
@@ -552,7 +563,8 @@ pub(super) fn build_loop_with_dispatcher(
         retry,
         config_dir.map(|p| p.to_path_buf()),
         "t".to_string(),
-    )
+    );
+    (space, loop_)
 }
 
 /// A recording `EventSink` (pushes EVERY event's `(name, payload)`
@@ -571,21 +583,19 @@ impl EventSink for RecordingSink {
     }
 }
 
-/// A fresh temp dir (created, removed on drop — the boundary tests'
-/// `Tmp`, local to this module).
-pub(super) struct Tmp(pub(super) PathBuf);
+/// A fresh temp dir (created, removed on drop — the removal belongs to the
+/// shared `test_support` guard; this only fixes the BASE and the PREFIX, so
+/// #96's per-prefix census keeps attributing these dirs here). The field is
+/// private: nothing outside this module read it.
+pub(super) struct Tmp(crate::test_support::ScratchDir);
 impl Tmp {
     pub(super) fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("loop-policy-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        Self(d)
+        Self(crate::test_support::ScratchDir::in_env_temp(
+            "loop-policy-",
+            tag,
+        ))
     }
     pub(super) fn path(&self) -> &Path {
-        &self.0
-    }
-}
-impl Drop for Tmp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }

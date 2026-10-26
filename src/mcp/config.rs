@@ -126,7 +126,6 @@ mod tests {
     use super::*;
     use crate::agent::mcp::types::{AuthSpec, HttpDef, StdioDef};
     use std::io::Write;
-    use std::path::PathBuf;
 
     /// Write a file (creating parents).
     fn write_file(path: &Path, text: &str) {
@@ -135,14 +134,20 @@ mod tests {
         f.write_all(text.as_bytes()).unwrap();
     }
 
-    /// A temp dir (a fresh one per call).
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mcp-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A temp dir (a fresh one per call), OWNED (#96 task 08). The name is
+    /// byte-identical to the old `temp_dir().join(format!("mcp-{tag}-{uuid}"))`
+    /// — `ScratchDir` spells `{prefix}{tag}-{uuid}` and the tag was already in
+    /// that slot — so the census glob does not change at all (D12).
+    fn temp_dir(tag: &str) -> crate::test_support::ScratchDir {
+        crate::test_support::ScratchDir::in_env_temp("mcp-", tag)
     }
 
-    fn home_with_mcp_json(mcp_json: &str) -> PathBuf {
+    /// A `$HOME` holding `.pi/agent/mcp.json`. Returns the OWNED dir; the caller
+    /// binds it and it drops with the test. NOT `Clone` — `load_servers` takes
+    /// `&Path`, which `Deref` supplies, so no call site needs `.path()`.
+    /// (This `home` is a plain ARGUMENT, never the `HOME` env var: this module's
+    /// tests mutate the environment not at all, so no `ENV_LOCK` belongs here.)
+    fn home_with_mcp_json(mcp_json: &str) -> crate::test_support::ScratchDir {
         let home = temp_dir("home");
         write_file(&home.join(".pi/agent/mcp.json"), mcp_json);
         home

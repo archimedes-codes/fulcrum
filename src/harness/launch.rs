@@ -355,7 +355,18 @@ mod tests {
     struct Ctx {
         catalog: ModelCatalog,
         config_dir: Option<PathBuf>,
-        space_cwd: PathBuf,
+        /// The scratch Space this fixture MINTED, held by its OWNER rather
+        /// than as a `PathBuf` copy of one (#96): holding the fixture and
+        /// holding its ownership are then the same act, so a green run cannot
+        /// leave the dir behind. Declared LAST so it drops LAST among the
+        /// fields; every read site (`&ctx.space_cwd`, `ctx.space_cwd.join(..)`)
+        /// still compiles through `Deref<Target = Path>`.
+        ///
+        /// `config_dir` above stays an `Option<PathBuf>` on purpose: it is a
+        /// copy of a path its CALLER owns (the settings scratch dir), and a
+        /// second owner would `remove_dir_all` a dir someone else is still
+        /// asserting against.
+        space_cwd: crate::test_support::ScratchDir,
     }
 
     /// A `Model` for a given bare id (a `fake` provider — the unit
@@ -404,9 +415,6 @@ mod tests {
     /// Build the three inputs (the catalog gets the full `models` vec;
     /// `config_dir` is the settings dir holding `settings.json`).
     fn build_ctx(models: Vec<Model>, config_dir: Option<&std::path::Path>) -> Ctx {
-        let space_cwd =
-            std::env::temp_dir().join(format!("harness-launch-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&space_cwd).unwrap();
         Ctx {
             catalog: ModelCatalog {
                 models,
@@ -414,7 +422,15 @@ mod tests {
                 compaction: CompactionConfig::default(),
             },
             config_dir: config_dir.map(|p| p.to_path_buf()),
-            space_cwd,
+            // The constructor owns the name AND the create (#96) — the former
+            // bare `join(format!(…-{uuid}))` mint + `create_dir_all` pair had
+            // no cleanup anywhere in this file, so every green run leaked one
+            // dir per call site. Prefix preserved verbatim (status doc D12:
+            // the census attributes leaks by prefix); the tag names the fixture.
+            space_cwd: crate::test_support::ScratchDir::in_env_temp(
+                "harness-launch-test-",
+                "space",
+            ),
         }
     }
 
@@ -456,11 +472,10 @@ mod tests {
     #[test]
     fn resolve_launch_unknown_agent_name_returns_the_launch_verbatim() {
         let ctx = build_ctx(vec![fake_model("m1")], None);
-        let empty_home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&empty_home).unwrap();
+        let empty_home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "unknown-name",
+        );
         // The `env_lock` helper is poison-tolerant (a sibling test
         // panicking while holding the lock must not turn this test's
         // failure into an opaque `PoisonError` panic — see its docs).
@@ -471,7 +486,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
         unsafe {
-            std::env::set_var("HOME", &empty_home);
+            std::env::set_var("HOME", empty_home.path());
         }
         let launch = LaunchConfig {
             system_prompt: Some("explicit prompt".to_string()),
@@ -927,20 +942,19 @@ mod tests {
     /// in the catalog) beats the frontmatter `model`.
     #[test]
     fn resolve_launch_settings_override_beats_frontmatter_model() {
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_dir = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-settings-",
+            "override-beats-file",
+        );
         std::fs::write(
             config_dir.join("settings.json"),
             r#"{ "subagentModels": { "scout": "fake/m2" } }"#,
         )
         .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "override-beats-file",
+        );
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(
             home.join(".agents/agents/scout.md"),
@@ -954,7 +968,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
         let (resolved, _) = resolve_launch(
@@ -974,20 +988,19 @@ mod tests {
     /// (ADR 0023) the EXPLICIT launch param beats the settings override.
     #[test]
     fn resolve_launch_explicit_param_beats_settings_override() {
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_dir = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-settings-",
+            "explicit-beats-override",
+        );
         std::fs::write(
             config_dir.join("settings.json"),
             r#"{ "subagentModels": { "scout": "fake/m2" } }"#,
         )
         .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "explicit-beats-override",
+        );
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(
             home.join(".agents/agents/scout.md"),
@@ -1001,7 +1014,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
         let launch = LaunchConfig {
@@ -1027,20 +1040,19 @@ mod tests {
     /// `model` (never an error, never `None`).
     #[test]
     fn resolve_launch_stale_override_degrades_to_frontmatter() {
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_dir = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-settings-",
+            "stale-override",
+        );
         std::fs::write(
             config_dir.join("settings.json"),
             r#"{ "subagentModels": { "scout": "fake/nope" } }"#,
         )
         .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "stale-override",
+        );
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(
             home.join(".agents/agents/scout.md"),
@@ -1054,7 +1066,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
         let (resolved, _) = resolve_launch(
@@ -1076,20 +1088,19 @@ mod tests {
     /// case-insensitive `agentName` `"Scout"`).
     #[test]
     fn resolve_launch_case_insensitive_override_key() {
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_dir = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-settings-",
+            "case-insensitive-key",
+        );
         std::fs::write(
             config_dir.join("settings.json"),
             r#"{ "subagentModels": { "Scout": "fake/m2" } }"#,
         )
         .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "case-insensitive-key",
+        );
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(
             home.join(".agents/agents/scout.md"),
@@ -1103,7 +1114,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
         let (resolved, _) = resolve_launch(
@@ -1125,20 +1136,19 @@ mod tests {
     /// behavior).
     #[test]
     fn resolve_launch_no_override_keeps_the_frontmatter() {
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_dir = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-settings-",
+            "no-override",
+        );
         std::fs::write(
             config_dir.join("settings.json"),
             r#"{ "subagentModels": {} }"#,
         )
         .unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "no-override",
+        );
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(
             home.join(".agents/agents/scout.md"),
@@ -1152,7 +1162,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(vec![fake_model("m1"), fake_model("m2")], Some(&config_dir));
         let (resolved, _) = resolve_launch(
@@ -1175,10 +1185,10 @@ mod tests {
     /// frontmatter's `thinking` LAST.
     #[test]
     fn resolve_launch_frontmatter_thinking_migrates_to_its_own_field() {
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "thinking-migrates",
+        );
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(
             home.join(".agents/agents/scout.md"),
@@ -1192,7 +1202,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(vec![fake_model("m1")], None);
         let (resolved, _) = resolve_launch(
@@ -1244,6 +1254,16 @@ mod tests {
         _restore: RestoreHome,
         _lock: std::sync::MutexGuard<'static, ()>,
         ctx: Ctx,
+        /// The isolated `$HOME` this `World` pointed the process at, and the
+        /// settings dir `ctx.config_dir` borrows. Fields drop in DECLARATION
+        /// order, so these two — declared LAST — drop AFTER `_restore` and
+        /// `_lock`: `$HOME` is restored (while the lock is still held) first,
+        /// and only then is the dir it named removed. Declaring them before
+        /// `_restore` would remove the dir while `$HOME` still pointed at it,
+        /// and the lib reads env WITHOUT holding `ENV_LOCK` (see its docs), so
+        /// another test could observe that hole.
+        _home: crate::test_support::ScratchDir,
+        _settings: crate::test_support::ScratchDir,
     }
 
     /// Write a `settings.json` holding `agentOverrides` for `scout` (ADR 0066)
@@ -1251,16 +1271,13 @@ mod tests {
     /// `Ctx` over them. Keeps the ADR 0066 tests below from repeating the
     /// `env_lock` / `RestoreHome` / scratch-dir dance.
     fn write_override_world(settings_body: &str, definition: &str) -> World {
-        let config_dir = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-settings-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_dir = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-settings-",
+            "world",
+        );
         std::fs::write(config_dir.join("settings.json"), settings_body).unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home =
+            crate::test_support::ScratchDir::in_env_temp("harness-resolve-launch-home-", "world");
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(home.join(".agents/agents/scout.md"), definition).unwrap();
         let lock = crate::test_support::env_lock();
@@ -1270,16 +1287,21 @@ mod tests {
         // span (the `env_lock` guard the `World` carries); no other thread
         // mutates HOME concurrently.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(
             vec![fake_model("m1"), fake_model("m2"), levelled_model("m3")],
             Some(&config_dir),
         );
+        // Both dirs MOVE INTO the `World`: a helper-local guard would
+        // `remove_dir_all` the fixture at the end of this helper, while the
+        // caller is still asserting against it.
         World {
             _restore: restore,
             _lock: lock,
             ctx,
+            _home: home,
+            _settings: config_dir,
         }
     }
 
@@ -1516,10 +1538,10 @@ mod tests {
     #[test]
     fn resolve_launch_no_settings_and_an_empty_map_are_both_a_silent_layer() {
         // (a) no `config_dir` at all.
-        let home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "no-settings-layer",
+        );
         std::fs::create_dir_all(home.join(".agents/agents")).unwrap();
         std::fs::write(
             home.join(".agents/agents/scout.md"),
@@ -1531,7 +1553,7 @@ mod tests {
         let _restore = RestoreHome(original.clone());
         // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("HOME", home.path());
         }
         let ctx = build_ctx(vec![fake_model("m1")], None);
         let (resolved, _) = resolve_launch(
@@ -1949,11 +1971,10 @@ mod tests {
         // developer's real `~/.pi/agent/agents/…` must not answer for the
         // whitespace-only case, and the scratch Space below is the ONLY place
         // `scout` is defined.
-        let empty_home = std::env::temp_dir().join(format!(
-            "harness-resolve-launch-home-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&empty_home).unwrap();
+        let empty_home = crate::test_support::ScratchDir::in_env_temp(
+            "harness-resolve-launch-home-",
+            "blank-name",
+        );
         let _lock = crate::test_support::env_lock();
         let original = std::env::var_os("HOME");
         let _restore = RestoreHome(original.clone());
@@ -1961,7 +1982,7 @@ mod tests {
         // span (the `env_lock` guard); no other thread mutates HOME
         // concurrently. The lock is held across BOTH cases below.
         unsafe {
-            std::env::set_var("HOME", &empty_home);
+            std::env::set_var("HOME", empty_home.path());
         }
         let launch = LaunchConfig {
             system_prompt: Some("explicit".to_string()),
@@ -2009,5 +2030,57 @@ mod tests {
         assert_eq!(resolved.model, Some("fake/m1".to_string()));
         assert_eq!(resolved.tools, Some(vec!["read".to_string()]));
         assert_eq!(resolved.system_prompt, Some("You are a scout.".to_string()));
+    }
+
+    /// #96: the `Ctx` fixture's `space_cwd` must be OWNED, not a bare `PathBuf`.
+    /// A green run that leaves its dir behind is what exhausted the per-user
+    /// temp quota; a per-test assertion is the smallest thing that can prove
+    /// ownership exists AT ALL (the escaped-panic case — a FAILING test whose
+    /// guard is a plain local — is pinned by task 09's census, per status doc
+    /// D10, and cannot be claimed from here).
+    #[test]
+    fn the_ctx_removes_its_space_cwd_when_it_is_dropped() {
+        let ctx = build_ctx(vec![fake_model("m1")], None);
+        let captured = ctx.space_cwd.to_path_buf();
+        assert!(captured.is_dir(), "build_ctx created the dir");
+        drop(ctx);
+        assert!(
+            !captured.exists(),
+            "the fixture owns its scratch dir — {captured:?} is gone with the `Ctx`"
+        );
+    }
+
+    /// The same claim for the two dirs `write_override_world` mints. The `home`
+    /// path is read back from `$HOME` while the `World` still holds the env lock
+    /// (so this reads `HOME` under the lock, as the `ENV_LOCK` docs require) and
+    /// the settings path from `ctx.config_dir` — no accessor API is added for the
+    /// test, and neither path is guessed, so the assertion cannot be confused by
+    /// another test's live dir of the same prefix.
+    #[test]
+    fn write_override_world_removes_both_of_its_scratch_dirs() {
+        let world = write_override_world(
+            r#"{ "agentOverrides": { "scout": { "model": "fake/m1" } } }"#,
+            "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m1\n---\n",
+        );
+        let home = std::path::PathBuf::from(
+            std::env::var_os("HOME").expect("write_override_world points HOME at its scratch dir"),
+        );
+        let settings = world
+            .config_dir
+            .clone()
+            .expect("the settings dir is ctx.config_dir");
+        assert!(
+            home.is_dir() && settings.is_dir(),
+            "both fixtures exist while the `World` is alive"
+        );
+        drop(world);
+        assert!(
+            !home.exists(),
+            "`$HOME`'s scratch dir goes with the `World` — {home:?}"
+        );
+        assert!(
+            !settings.exists(),
+            "the settings dir goes with the `World` — {settings:?}"
+        );
     }
 }

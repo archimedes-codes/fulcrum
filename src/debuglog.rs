@@ -135,11 +135,18 @@ mod tests {
         crate::test_support::env_lock()
     }
 
-    /// A unique temp dir (cleaned up by the caller).
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("debuglog-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A unique temp dir, OWNED (#96 task 08) — removed when the guard drops.
+    /// Declared after the `lock()` guard in every caller, so it drops BEFORE the
+    /// env lock is released; and every test ends with `init(false, None)`, which
+    /// clears the process-global `DIR` before the guard drops (that statement is
+    /// a TEARDOWN, not a cleanup — kept).
+    ///
+    /// HONEST SIZING: 4 mints, 4 `remove_dir_all` — green delta 0 before and
+    /// after; the win is the panic path. (D14: `grep -c 'temp_dir()'` reads 6
+    /// here because it counts the definition line and the helper's inner
+    /// `std::env::temp_dir()`; the CALL form `= temp_dir();` reads 4.)
+    fn temp_dir() -> crate::test_support::ScratchDir {
+        crate::test_support::ScratchDir::in_env_temp("debuglog-test-", "dir")
     }
 
     /// The rotation: when the current file exceeds the 5 MB threshold,
@@ -174,7 +181,6 @@ mod tests {
             fresh.contains("after rotation"),
             "the new line is in the fresh file:\n{fresh}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `log` → `append_to` delegation (the global-state wiring — the
@@ -184,7 +190,7 @@ mod tests {
     fn log_delegates_to_append_to_when_enabled() {
         let _g = lock();
         let dir = temp_dir();
-        init(true, Some(dir.clone()));
+        init(true, Some(dir.to_path_buf()));
         log("delegation marker");
         let content =
             std::fs::read_to_string(dir.join("supervisor.log")).expect("the log file is created");
@@ -193,7 +199,6 @@ mod tests {
             "the line is in the log:\n{content}"
         );
         init(false, None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With the flag off, `log` is a no-op (no file is created).
@@ -207,7 +212,6 @@ mod tests {
             !dir.join("supervisor.log").exists(),
             "no file is created when the flag is off"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `init_from_env`: `ARCHIMEDES_DEBUG=1` enables (the `ENV_LOCK`
@@ -223,12 +227,11 @@ mod tests {
         assert!(!dir.join("supervisor.log").exists());
         std::env::set_var("ARCHIMEDES_DEBUG", "1");
         init_from_env();
-        init(true, Some(dir.clone())); // the data dir is not testable here — re-point.
+        init(true, Some(dir.to_path_buf())); // the data dir is not testable here — re-point.
         log("y");
         assert!(dir.join("supervisor.log").exists());
         std::env::remove_var("ARCHIMEDES_DEBUG");
         init(false, None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `truncate_line`: a short line is unchanged; a long line is cut

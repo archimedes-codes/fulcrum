@@ -8,13 +8,19 @@ use crate::agent::tools::types::ToolCtx;
 
 // ── list_skills / read_skill ─────────────────────────────────────────
 
-/// A skill root holding `<name>/SKILL.md`; returns the root.
-fn skill_root(tag: &str, name: &str, content: &str) -> PathBuf {
+/// A skill root holding `<name>/SKILL.md`. Returns (GUARD, root path) — the
+/// guard FIRST (#96 task 08): destructured locals drop in REVERSE declaration
+/// order, so the `PathBuf` dies before the dir it names. The path travels as a
+/// separate element because `ctx_with_roots` takes `&[PathBuf]` — which is what
+/// turns what would have been 18 `.to_path_buf()` edits into zero: once the
+/// bindings are rebound, `&[root]` and `from_ref(&root)` compile unchanged.
+fn skill_root(tag: &str, name: &str, content: &str) -> (crate::test_support::ScratchDir, PathBuf) {
     let root = temp_cwd(tag);
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("SKILL.md"), content).unwrap();
-    root
+    let path = root.to_path_buf();
+    (root, path)
 }
 
 /// `roots` as the ONLY discovery roots — the skill tools take their
@@ -40,7 +46,7 @@ fn ctx_with_roots(cwd: &Path, roots: &[PathBuf]) -> ToolCtx {
 #[tokio::test]
 async fn list_skills_lists_name_scope_and_description() {
     let cwd = temp_cwd("skills-list");
-    let root = skill_root(
+    let (_g_root, root) = skill_root(
         "skills-list-root",
         "alpha",
         "---\nname: alpha\ndescription: Does alpha.\n---\nBody.\n",
@@ -48,17 +54,20 @@ async fn list_skills_lists_name_scope_and_description() {
     let r = execute_tool(&ctx_with_roots(&cwd, &[root]), "list_skills", &json!({})).await;
     assert!(!r.is_error);
     assert_eq!(text_of(&r), "alpha (space): Does alpha.");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
 async fn list_skills_empty_is_none_not_error() {
     let cwd = temp_cwd("skills-list-empty");
-    let root = temp_cwd("skills-list-empty-root");
+    // The guard is a NAMED local, NOT `temp_cwd(..).to_path_buf()`: a temporary
+    // guard would drop at the end of that statement and delete the dir BEFORE
+    // `list_skills` ever saw it — the assertion would then pass because the root
+    // was gone, not because the catalog was empty. A silent vacuous green.
+    let root_guard = temp_cwd("skills-list-empty-root");
+    let root = root_guard.to_path_buf();
     let r = execute_tool(&ctx_with_roots(&cwd, &[root]), "list_skills", &json!({})).await;
     assert!(!r.is_error, "an empty catalog is not a failure");
     assert_eq!(text_of(&r), "none");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -66,12 +75,12 @@ async fn list_skills_omits_model_hidden_skills() {
     // ADR 0036: to the Agent a model-hidden skill is NOT in the catalog —
     // its name AND its description (the routing hint) are both absent.
     let cwd = temp_cwd("skills-list-hidden");
-    let a = skill_root(
+    let (_g_a, a) = skill_root(
         "tag-a",
         "alpha",
         "---\nname: alpha\ndescription: D\n---\nA.\n",
     );
-    let o = skill_root(
+    let (_g_o, o) = skill_root(
         "tag-o",
         "omega",
         "---\nname: omega\ndescription: D\ndisable-model-invocation: true\n---\nO.\n",
@@ -80,7 +89,6 @@ async fn list_skills_omits_model_hidden_skills() {
     assert!(!r.is_error, "{}", text_of(&r));
     assert_eq!(text_of(&r), "alpha (space): D");
     assert!(!text_of(&r).contains("omega"), "{}", text_of(&r));
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -89,7 +97,7 @@ async fn list_skills_is_none_when_every_skill_is_model_hidden() {
     // dialog shows a full one — that is the feature, and an empty catalog
     // is still not a failure (cf. `list_skills_empty_is_none_not_error`).
     let cwd = temp_cwd("skills-list-all-hidden");
-    let root = skill_root(
+    let (_g_root, root) = skill_root(
         "skills-list-all-hidden-root",
         "omega",
         "---\nname: omega\ndescription: D\ndisable-model-invocation: true\n---\nO.\n",
@@ -97,7 +105,6 @@ async fn list_skills_is_none_when_every_skill_is_model_hidden() {
     let r = execute_tool(&ctx_with_roots(&cwd, &[root]), "list_skills", &json!({})).await;
     assert!(!r.is_error, "an empty catalog is not a failure");
     assert_eq!(text_of(&r), "none");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 /// The names the `<skills>` section ADVERTISES, in the prompt (the
@@ -191,69 +198,62 @@ async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
     // unaddressable, and the report rides on the winner as data the prompt
     // never interpolates. If a future change advertised `shadowed` (or listed
     // the loser), the `visible` set below stops matching and this fails.
+    // The six roots are hoisted ABOVE the vec (#96 task 08) so their
+    // `ScratchDir` guards are body locals: they outlive `discover_in_roots` and
+    // `execute_tool` and drop at the body's end. An inline `skill_root(...)`
+    // inside the `vec![]` would drop its guard at the end of that expression and
+    // delete the skill before either catalog was built.
+    let (_g1, r1) = skill_root(
+        "drift-visible-space",
+        "alpha",
+        "---\nname: alpha\ndescription: Does alpha.\n---\nA.\n",
+    );
+    let (_g2, r2) = skill_root(
+        "drift-visible-user",
+        "beta",
+        "---\nname: beta\ndescription: Does beta.\n---\nB.\n",
+    );
+    let (_g3, r3) = skill_root(
+        "drift-hidden-space",
+        "omega",
+        "---\nname: omega\ndescription: Does omega.\ndisable-model-invocation: true\n---\nO.\n",
+    );
+    let (_g4, r4) = skill_root(
+        "drift-hidden-user",
+        "zeta",
+        "---\nname: zeta\ndescription: Does zeta.\ndisable-model-invocation: true\n---\nZ.\n",
+    );
+    let (_g5, r5) = skill_root(
+        "drift-shadow-space",
+        "gamma",
+        "---\nname: gamma\ndescription: Does gamma (space).\ndisable-model-invocation: true\n---\nG.\n",
+    );
+    let (_g6, r6) = skill_root(
+        "drift-shadow-user",
+        "gamma",
+        "---\nname: gamma\ndescription: Does gamma (user).\n---\nG other.\n",
+    );
+    // The **Shadowing** pair: one name, two roots, DIFFERENT bytes, so the
+    // second is a shadowed loser and not a Duplicate. Both are
+    // model-HIDDEN, which is what makes this a zero-drift fixture: the
+    // winner is hidden and the loser is unaddressable, so `gamma` may appear
+    // in NEITHER advertised set — the two catalogs must stay byte-identical
+    // to the pre-shadow ones while `skills` grows by one row.
+    // The **Shadowing** pair: one name, two roots, DIFFERENT bytes, so the
+    // second is a shadowed loser and not a Duplicate. Shaped deliberately:
+    // the WINNER is model-HIDDEN and the LOSER is model-VISIBLE. The loser
+    // carries an advertisable `description`, so it is the case a naive
+    // "make the loser a row" implementation would advertise — and the
+    // `visible` set below (UNCHANGED: `gamma` joins neither catalog) is what
+    // reddens it, while the winner's own hiddenness keeps `gamma` out of
+    // both catalogs legitimately (ADR 0036 + ADR 0065).
     let roots: Vec<(PathBuf, SkillScope)> = vec![
-        (
-            skill_root(
-                "drift-visible-space",
-                "alpha",
-                "---\nname: alpha\ndescription: Does alpha.\n---\nA.\n",
-            ),
-            SkillScope::Space,
-        ),
-        (
-            skill_root(
-                "drift-visible-user",
-                "beta",
-                "---\nname: beta\ndescription: Does beta.\n---\nB.\n",
-            ),
-            SkillScope::User,
-        ),
-        (
-            skill_root(
-                "drift-hidden-space",
-                "omega",
-                "---\nname: omega\ndescription: Does omega.\ndisable-model-invocation: true\n---\nO.\n",
-            ),
-            SkillScope::Space,
-        ),
-        (
-            skill_root(
-                "drift-hidden-user",
-                "zeta",
-                "---\nname: zeta\ndescription: Does zeta.\ndisable-model-invocation: true\n---\nZ.\n",
-            ),
-            SkillScope::User,
-        ),
-        // The **Shadowing** pair: one name, two roots, DIFFERENT bytes, so the
-        // second is a shadowed loser and not a Duplicate. Both are
-        // model-HIDDEN, which is what makes this a zero-drift fixture: the
-        // winner is hidden and the loser is unaddressable, so `gamma` may appear
-        // in NEITHER advertised set — the two catalogs must stay byte-identical
-        // to the pre-shadow ones while `skills` grows by one row.
-        // The **Shadowing** pair: one name, two roots, DIFFERENT bytes, so the
-        // second is a shadowed loser and not a Duplicate. Shaped deliberately:
-        // the WINNER is model-HIDDEN and the LOSER is model-VISIBLE. The loser
-        // carries an advertisable `description`, so it is the case a naive
-        // "make the loser a row" implementation would advertise — and the
-        // `visible` set below (UNCHANGED: `gamma` joins neither catalog) is what
-        // reddens it, while the winner's own hiddenness keeps `gamma` out of
-        // both catalogs legitimately (ADR 0036 + ADR 0065).
-        (
-            skill_root(
-                "drift-shadow-space",
-                "gamma",
-                "---\nname: gamma\ndescription: Does gamma (space).\ndisable-model-invocation: true\n---\nG.\n",
-            ),
-            SkillScope::Space,
-        ),
-        (
-            skill_root(
-                "drift-shadow-user",
-                "gamma",
-                "---\nname: gamma\ndescription: Does gamma (user).\n---\nG other.\n",
-            ),
-            SkillScope::User,
-        ),
+        (r1, SkillScope::Space),
+        (r2, SkillScope::User),
+        (r3, SkillScope::Space),
+        (r4, SkillScope::User),
+        (r5, SkillScope::Space),
+        (r6, SkillScope::User),
     ];
     // The SAME rows for both seams: the prompt builder is handed the
     // discovered set directly, and the tool ctx takes the SAME roots (the
@@ -269,7 +269,6 @@ async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
         "the fixture must discover all five rows (the premise): the four \
          single-root skills plus ONE row for the shadowed pair"
     );
-    let paths: Vec<PathBuf> = roots.iter().map(|(p, _)| p.clone()).collect();
 
     // Seam 1: the prompt's `<skills>` section. `read_skill` is advertised so
     // the section is emitted at all (ADR 0017's skill-loading-tool guard).
@@ -328,10 +327,8 @@ async fn the_prompt_catalog_and_the_list_skills_catalog_agree() {
         "the user row must be reported on the Space winner: {skills:?}"
     );
 
-    for root in paths {
-        let _ = std::fs::remove_dir_all(&root);
-    }
-    let _ = std::fs::remove_dir_all(&cwd);
+    // No cleanup loop: the six guards above own the six roots (#96 task 08), so
+    // the removals this test used to run by hand are the guards' `Drop`.
 }
 
 #[tokio::test]
@@ -340,7 +337,7 @@ async fn read_skill_reads_skill_md_without_touching_the_sandbox() {
     // case — user skills live in `~/.agents/skills`), so `read` rejects
     // it and `read_skill` must not.
     let cwd = temp_cwd("skill-outside");
-    let root = skill_root(
+    let (_g_root, root) = skill_root(
         "skill-outside-root",
         "alpha",
         "---\nname: alpha\ndescription: Does alpha.\n---\nUse the alpha way.\n",
@@ -368,13 +365,12 @@ async fn read_skill_reads_skill_md_without_touching_the_sandbox() {
     assert!(!r.is_error, "{}", text_of(&r));
     assert_eq!(text_of(&r), "Use the alpha way.");
     assert_eq!(r.details.as_ref().unwrap()["skill"], "alpha");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
 async fn read_skill_name_is_case_insensitive_and_flattens_nothing() {
     let cwd = temp_cwd("skill-case");
-    let root = skill_root("skill-case-root", "Alpha", "---\nname: Alpha\n---\nBody.\n");
+    let (_g_root, root) = skill_root("skill-case-root", "Alpha", "---\nname: Alpha\n---\nBody.\n");
     let r = execute_tool(
         &ctx_with_roots(&cwd, &[root]),
         "read_skill",
@@ -383,13 +379,12 @@ async fn read_skill_name_is_case_insensitive_and_flattens_nothing() {
     .await;
     assert!(!r.is_error);
     assert_eq!(text_of(&r), "Body.");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
 async fn read_skill_bundled_file_resolves_relative_to_the_skill_dir() {
     let cwd = temp_cwd("skill-bundle");
-    let root = skill_root(
+    let (_g_root, root) = skill_root(
         "skill-bundle-root",
         "discuss",
         "---\nname: discuss\n---\nSee [adr](./adr-format.md).\n",
@@ -406,7 +401,6 @@ async fn read_skill_bundled_file_resolves_relative_to_the_skill_dir() {
     // `read`'s line-join) — the whole point is reaching the exact file a
     // skill references.
     assert_eq!(text_of(&r), "# ADR format\n");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -415,7 +409,7 @@ async fn read_skill_bundled_escape_is_rejected() {
     // it stays inside a sibling skill — the boundary is the skill dir,
     // not the skill ROOT.
     let cwd = temp_cwd("skill-esc");
-    let root = skill_root("skill-esc-root", "alpha", "---\nname: alpha\n---\nA.\n");
+    let (_g_root, root) = skill_root("skill-esc-root", "alpha", "---\nname: alpha\n---\nA.\n");
     std::fs::write(root.join("secret.txt"), "top secret").unwrap();
     let r = execute_tool(
         &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
@@ -441,13 +435,12 @@ async fn read_skill_bundled_escape_is_rejected() {
         r.is_error,
         "an absolute path outside the skill dir is rejected"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
 async fn read_skill_unknown_name_is_error_with_the_catalog() {
     let cwd = temp_cwd("skill-unknown");
-    let root = skill_root("skill-unknown-root", "alpha", "---\nname: alpha\n---\nA.\n");
+    let (_g_root, root) = skill_root("skill-unknown-root", "alpha", "---\nname: alpha\n---\nA.\n");
     let r = execute_tool(
         &ctx_with_roots(&cwd, &[root]),
         "read_skill",
@@ -459,7 +452,6 @@ async fn read_skill_unknown_name_is_error_with_the_catalog() {
     assert!(text.contains("unknown skill"), "{text}");
     // The hint points at the tool that WOULD have listed them.
     assert!(text.contains("list_skills"), "{text}");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -469,7 +461,7 @@ async fn read_skill_rejects_a_model_hidden_skill_with_the_mention_route() {
     // Mention. The whole string is pinned — it is the model's only
     // instruction about that route (ADR 0036).
     let cwd = temp_cwd("skill-hidden-route");
-    let root = skill_root(
+    let (_g_root, root) = skill_root(
         "skill-hidden-route-root",
         "omega",
         "---\nname: omega\ndescription: D\ndisable-model-invocation: true\n---\nO.\n",
@@ -489,7 +481,7 @@ async fn read_skill_rejects_a_model_hidden_skill_with_the_mention_route() {
     // The `$` Mention token grammar is LOWERCASE-only (ADR 0031), so the
     // route echoed back is the lowercased key: `$DeBuG` expands nothing
     // while `$debug` does.
-    let dbg = skill_root(
+    let (_g_dbg, dbg) = skill_root(
         "skill-hidden-route-debug",
         "DeBuG",
         "---\nname: DeBuG\ndisable-model-invocation: true\n---\nD.\n",
@@ -511,7 +503,6 @@ async fn read_skill_rejects_a_model_hidden_skill_with_the_mention_route() {
         "the failure must not disclose a path: {}",
         text_of(&r)
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -528,7 +519,7 @@ async fn read_skill_refuses_a_non_mentionable_hidden_skill_without_a_dead_token(
     // this frontmatter is the path that actually yields a hidden,
     // non-mentionable skill.)
     let cwd = temp_cwd("skill-hidden-unmentionable");
-    let root = skill_root(
+    let (_g_root, root) = skill_root(
         "skill-hidden-unmentionable-root",
         "has-space",
         "---\nname: has space\ndescription: D\ndisable-model-invocation: true\n---\nH.\n",
@@ -575,7 +566,6 @@ async fn read_skill_refuses_a_non_mentionable_hidden_skill_without_a_dead_token(
         !text.contains("has-space"),
         "the failure must not disclose the directory name: {text}"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -584,7 +574,7 @@ async fn read_skill_rejects_a_model_hidden_skill_before_reading_a_bundled_file()
     // skill's bundled files are never read — not merely reported as
     // escaped.
     let cwd = temp_cwd("skill-hidden-bundle");
-    let hidden = skill_root(
+    let (_g_hidden, hidden) = skill_root(
         "skill-hidden-bundle-hidden",
         "omega",
         "---\nname: omega\ndisable-model-invocation: true\n---\nO.\n",
@@ -592,7 +582,7 @@ async fn read_skill_rejects_a_model_hidden_skill_before_reading_a_bundled_file()
     std::fs::write(hidden.join("omega/ref.md"), "HIDDEN-BUNDLED-BODY\n").unwrap();
     // The visible CONTROL: a visible skill's bundled file still reads, so
     // this test cannot pass merely because the bundled path is broken.
-    let visible = skill_root(
+    let (_g_visible, visible) = skill_root(
         "skill-hidden-bundle-visible",
         "alpha",
         "---\nname: alpha\n---\nA.\n",
@@ -629,7 +619,6 @@ async fn read_skill_rejects_a_model_hidden_skill_before_reading_a_bundled_file()
     .await;
     assert!(!c.is_error, "{}", text_of(&c));
     assert_eq!(text_of(&c), "CONTROL-BODY\n");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -638,7 +627,6 @@ async fn read_skill_missing_name_param_is_error() {
     let r = execute_tool(&ctx(&cwd), "read_skill", &json!({})).await;
     assert!(r.is_error);
     assert!(text_of(&r).contains("`name`"), "{}", text_of(&r));
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -646,7 +634,7 @@ async fn read_skill_bundled_binary_is_an_error_not_garbage() {
     // `FsBackend::read` is `read_to_string`, so a bundled IMAGE fails
     // (the documented ADR 0029 limitation — unlike `read`'s image path).
     let cwd = temp_cwd("skill-binary");
-    let root = skill_root("skill-binary-root", "alpha", "---\nname: alpha\n---\nA.\n");
+    let (_g_root, root) = skill_root("skill-binary-root", "alpha", "---\nname: alpha\n---\nA.\n");
     std::fs::write(root.join("alpha/pic.png"), [0x89, 0x50, 0x4e, 0x47, 0x00]).unwrap();
     let r = execute_tool(
         &ctx_with_roots(&cwd, std::slice::from_ref(&root)),
@@ -655,7 +643,6 @@ async fn read_skill_bundled_binary_is_an_error_not_garbage() {
     )
     .await;
     assert!(r.is_error, "a non-UTF-8 bundled file is an error");
-    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[tokio::test]
@@ -666,7 +653,7 @@ async fn read_skill_rejected_symlink_does_not_disclose_its_target() {
     // path-disclosure oracle. `read` may echo a path the model itself
     // supplied; `read_skill` must not invent one.
     let cwd = temp_cwd("skill-sym-oi");
-    let root = skill_root("skill-sym-oi-root", "alpha", "---\nname: alpha\n---\nA.\n");
+    let (_g_root, root) = skill_root("skill-sym-oi-root", "alpha", "---\nname: alpha\n---\nA.\n");
     let outside = std::env::temp_dir().join(format!("oi-target-{}", uuid::Uuid::new_v4()));
     std::fs::write(&outside, "secret").unwrap();
     #[cfg(unix)]
@@ -691,6 +678,5 @@ async fn read_skill_rejected_symlink_does_not_disclose_its_target() {
         text.contains("link"),
         "the call must still be diagnosable: {text}"
     );
-    let _ = std::fs::remove_dir_all(&cwd);
     let _ = std::fs::remove_file(&outside);
 }

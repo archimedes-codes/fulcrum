@@ -301,7 +301,6 @@ async fn the_bash_tool_keeps_the_users_path_entries() {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let out = cmd.output().await.expect("the sh starts");
-    let _ = std::fs::remove_dir_all(&user_bin);
     assert!(out.status.success(), "the sh failed: {out:?}");
     let printed = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -439,7 +438,13 @@ async fn a_bash_child_under_a_fabricated_appimage_mount_sees_a_scrubbed_env() {
         format!("{}/usr/bin/:{}:/bin", appdir.display(), shim.display()),
     );
     cmd.env(FABRICATED, "1");
-    cmd.env(SHIM_DIR, &shim);
+    // `shim.path()` and NOT `&shim` (#96 task 08): `Command::env` wants an
+    // `AsRef<OsStr>`, which `ScratchDir` deliberately does not implement (only
+    // `AsRef<Path>` + `Deref<Target = Path>`); `&Path` DOES implement
+    // `AsRef<OsStr>`, so the accessor is the escape hatch. Same D15 shape as
+    // `agents.rs`'s `set_var("HOME", tmp.path())`, one seam over — a CHILD's
+    // env rather than the process's.
+    cmd.env(SHIM_DIR, shim.path());
     cmd.env(FAST_PATHS, installed.join(","));
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -458,8 +463,12 @@ async fn a_bash_child_under_a_fabricated_appimage_mount_sees_a_scrubbed_env() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // KEPT on purpose (#96 task 08): `appdir` comes from
+    // `fabricated_mount()`, which builds `.mount_archimTEST-*` under
+    // `target/<profile>/` — a DIFFERENT base than the temp dir, so it is
+    // outside #96's census and no `ScratchDir` owns it. Deleting this
+    // cleanup would be a regression.
     let _ = std::fs::remove_dir_all(&appdir);
-    let _ = std::fs::remove_dir_all(&shim);
     assert!(
         out.status.success(),
         "the run inside the fabricated mount failed (its own assertions are the failure):\n{log}"
@@ -607,7 +616,6 @@ async fn assert_bash_child_env_is_scrubbed() -> (String, String) {
         &json!({ "command": format!("printf '%s{SEP}%s' \"$LD_LIBRARY_PATH\" \"$PATH\"") }),
     )
     .await;
-    let _ = std::fs::remove_dir_all(&cwd);
     assert!(!r.is_error, "the bash tool failed: {}", text_of(&r));
     let text = text_of(&r).to_string();
     let (ld, path) = text.split_once(SEP).unwrap_or_else(|| {
@@ -656,7 +664,6 @@ async fn assert_fast_path_children_are_scrubbed(shim: &Path, installed: &[String
         };
         let r = execute_tool(&ctx(&cwd), tool, &params).await;
         let text = text_of(&r).to_string();
-        let _ = std::fs::remove_dir_all(&cwd);
         assert!(
             !r.is_error,
             "the `{tool}` fast path must still work on a scrubbed env: {text}"

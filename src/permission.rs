@@ -385,14 +385,28 @@ mod tests {
     }
 
     /// A temp `Db` + a temp `cwd` dir (the `spaces` rows are keyed by
-    /// the CANONICAL path, so the cwd must exist).
-    fn temp_db_cwd() -> (Arc<Db>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("perm-gate-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// the CANONICAL path, so the cwd must exist), OWNED (#96 task 08).
+    ///
+    /// THE GUARD IS FIRST and the tuple is WIDER than it was
+    /// (`(Arc<Db>, PathBuf)` → `(ScratchDir, Arc<Db>, PathBuf)`): destructured
+    /// locals drop in REVERSE declaration order, so `cwd` → `db` → `dir`. That
+    /// is the order Windows needs — `dir` holds `db.sqlite`, and Windows refuses
+    /// to remove a directory containing an open file — and it is the order
+    /// `harness/store.rs::temp_db` (task 03) and `tests/harness_store.rs::temp_db`
+    /// (task 06) already use. The `cwd` is `dir.join("workspace")`, a CHILD of
+    /// the guard, so `Drop` takes it with the tree; it stays a `PathBuf` because
+    /// the tests pass it to `db.upsert_space(&cwd.display().to_string(), …)` and
+    /// to the gate.
+    ///
+    /// Linux cannot show a wrong order here (POSIX unlinks out from under an open
+    /// handle and `ScratchDir::Drop` swallows the failure), so this ordering is
+    /// enforced by reading, not by any gate on this box.
+    fn temp_db_cwd() -> (crate::test_support::ScratchDir, Arc<Db>, std::path::PathBuf) {
+        let dir = crate::test_support::ScratchDir::in_env_temp("perm-gate-", "db");
         let db = Arc::new(Db::open(&dir.join("db.sqlite")).unwrap());
         let cwd = dir.join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
-        (db, cwd)
+        (dir, db, cwd)
     }
 
     fn fresh_pending() -> PendingPermissions {
@@ -401,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_gate_trusted_space_auto_approves() {
-        let (db, cwd) = temp_db_cwd();
+        let (_dir, db, cwd) = temp_db_cwd();
         db.upsert_space(&cwd.display().to_string(), false).unwrap();
         db.set_space_trusted(&cwd.display().to_string(), true)
             .unwrap();
@@ -441,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_gate_untrusted_prompts_and_maps_the_outcome() {
-        let (db, cwd) = temp_db_cwd();
+        let (_dir, db, cwd) = temp_db_cwd();
         db.upsert_space(&cwd.display().to_string(), false).unwrap();
         // Untrusted (the default) → the prompt flow.
         let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
@@ -506,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_gate_trust_space_allows_without_writing_the_flag() {
-        let (db, cwd) = temp_db_cwd();
+        let (_dir, db, cwd) = temp_db_cwd();
         db.upsert_space(&cwd.display().to_string(), false).unwrap();
         assert!(!db.space_trusted(&cwd).unwrap(), "untrusted by default");
         let (sink_tx, _sink_rx) = mpsc::unbounded_channel();
@@ -570,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_gate_cancel_is_a_denial() {
-        let (db, cwd) = temp_db_cwd();
+        let (_dir, db, cwd) = temp_db_cwd();
         let (sink_tx, _sink_rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
         let pending = fresh_pending();

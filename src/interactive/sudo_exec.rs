@@ -551,14 +551,15 @@ mod tests {
         // would leave the grandchild alive), and the PARTIAL stdout (the
         // marker) must survive the timeout (the read tasks are dropped, the
         // shared buffers keep what was read so far).
-        let grandchild_pid_file = std::env::temp_dir().join(format!(
-            "archimedes-sudo-group-test-{}-{}.pid",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // OWNED (#96 task 08): a `ScratchDir` keeping the
+        // `archimedes-sudo-group-test-` prefix verbatim with a `pid` tag inserted
+        // INSIDE it (D12); the pid file is a CHILD of it, so the guard owns it.
+        // The old `{pid}-{nanos}` uniqueness is DROPPED on purpose — it existed
+        // only to avoid collisions between parallel runs, which the guard's uuid
+        // segment already guarantees.
+        let scratch =
+            crate::test_support::ScratchDir::in_env_temp("archimedes-sudo-group-test-", "pid");
+        let grandchild_pid_file = scratch.join("grandchild.pid");
         let script = format!(
             "echo partial; sleep 60 & echo $! > {}; sleep 60",
             grandchild_pid_file.display()
@@ -606,7 +607,6 @@ mod tests {
             gone,
             "the grandchild (pid {grandchild_pid}) is dead — the group kill reached it"
         );
-        let _ = std::fs::remove_file(&grandchild_pid_file);
     }
 
     /// (finding 3) A `run_sudo_real` future DROPPED mid-flight (the
@@ -622,14 +622,15 @@ mod tests {
             std::path::Path::new("/bin/sh").exists(),
             "/bin/sh must exist"
         );
-        let grandchild_pid_file = std::env::temp_dir().join(format!(
-            "archimedes-sudo-drop-test-{}-{}.pid",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // OWNED (#96 task 08): a `ScratchDir` keeping the
+        // `archimedes-sudo-drop-test-` prefix verbatim with a `pid` tag inserted
+        // INSIDE it (D12); the pid file is a CHILD of it, so the guard owns it.
+        // The old `{pid}-{nanos}` uniqueness is DROPPED on purpose — it existed
+        // only to avoid collisions between parallel runs, which the guard's uuid
+        // segment already guarantees.
+        let scratch =
+            crate::test_support::ScratchDir::in_env_temp("archimedes-sudo-drop-test-", "pid");
+        let grandchild_pid_file = scratch.join("grandchild.pid");
         // The script echoes a marker, backgrounds a `sleep` (the GRANDCHILD),
         // records its pid, then blocks in the foreground — a DROP of the run
         // future must kill the WHOLE group (a bare kill of the child alone
@@ -675,7 +676,6 @@ mod tests {
             gone,
             "the dropped run killed the whole process group (the grandchild is dead)"
         );
-        let _ = std::fs::remove_file(&grandchild_pid_file);
     }
 
     /// (finding 3) A `run_sudo_real` command that BACKGROUNDS a grandchild
@@ -700,14 +700,15 @@ mod tests {
         // until it exits — the run would time out, not complete): the run
         // completes when the `sh` process exits, so the `sleep` is still
         // running (the grandchild must survive a normal completion).
-        let grandchild_pid_file = std::env::temp_dir().join(format!(
-            "archimedes-sudo-normal-test-{}-{}.pid",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // OWNED (#96 task 08): a `ScratchDir` keeping the
+        // `archimedes-sudo-normal-test-` prefix verbatim with a `pid` tag inserted
+        // INSIDE it (D12); the pid file is a CHILD of it, so the guard owns it.
+        // The old `{pid}-{nanos}` uniqueness is DROPPED on purpose — it existed
+        // only to avoid collisions between parallel runs, which the guard's uuid
+        // segment already guarantees.
+        let scratch =
+            crate::test_support::ScratchDir::in_env_temp("archimedes-sudo-normal-test-", "pid");
+        let grandchild_pid_file = scratch.join("grandchild.pid");
         let script = format!(
             "sleep 5 > /dev/null 2>&1 & echo $! > {}; echo done",
             grandchild_pid_file.display()
@@ -740,7 +741,6 @@ mod tests {
         );
         // Clean up: kill the backgrounded grandchild (the test's process).
         let _ = unsafe { libc::kill(grandchild_pid as i32, libc::SIGKILL) };
-        let _ = std::fs::remove_file(&grandchild_pid_file);
     }
 
     #[cfg(unix)]

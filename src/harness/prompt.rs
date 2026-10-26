@@ -366,9 +366,8 @@ mod tests {
     /// bounded at the scratch (a stray `AGENTS.md`/`CLAUDE.md` in `/tmp`
     /// or `/` — from another project's test run — must not break the
     /// exact-golden or absence assertions).
-    fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("archimedes-prompt-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
+    fn scratch() -> crate::test_support::ScratchDir {
+        let dir = crate::test_support::ScratchDir::in_env_temp("archimedes-prompt-", "root");
         fs::create_dir_all(dir.join(".git")).unwrap();
         dir
     }

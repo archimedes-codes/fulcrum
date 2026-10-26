@@ -50,6 +50,12 @@ fn policy_settings(reads: &str, writes: &str, shell: &str) -> String {
 /// drop — dropping it early would silently degrade every test to the
 /// all-`Allow` default).
 ///
+/// #96: the `space_cwd` scratch guard is the FIRST element (it is a
+/// production `PathBuf` field on `AgentLoop` and cannot live in the loop),
+/// so the caller owns it. First, because destructured locals drop in
+/// REVERSE declaration order: guard-first means the `Db` — a live SQLite
+/// file inside that dir — closes before `remove_dir_all` runs.
+///
 /// The caller pins `$HOME` FIRST (the `RestoreHome` + `env_lock`
 /// pattern) so `AgentLoop::new`'s `read_roots` / `protected_dirs` see an
 /// empty scratch home: the read boundary is then EXACTLY the `cwd` and
@@ -60,12 +66,15 @@ fn build_policy_loop(
     events: mpsc::UnboundedSender<RpcEvent>,
     sink: Arc<dyn EventSink>,
     settings: Option<&str>,
-) -> (AgentLoop, Option<Tmp>) {
+) -> (crate::test_support::ScratchDir, AgentLoop, Option<Tmp>) {
     let config_dir = settings.map(|_| Tmp::new("cfg"));
     if let (Some(dir), Some(json)) = (config_dir.as_ref(), settings) {
         std::fs::write(dir.path().join("settings.json"), json).unwrap();
     }
-    let (mut loop_, _db) = build_loop_with_db(
+    // `_cfg_space` is MOVED OUT into the return tuple below: dropping it
+    // here would remove the config dir while the caller still asserts
+    // against it.
+    let (_cfg_space, mut loop_, _db) = build_loop_with_db(
         provider,
         events,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -79,7 +88,7 @@ fn build_policy_loop(
     );
     // Swap the `TestSink` for the recording one (the field is `pub`).
     loop_.sink = sink;
-    (loop_, config_dir)
+    (_cfg_space, loop_, config_dir)
 }
 
 /// The tool call the policy tests share: a `read` of `path`.
@@ -176,7 +185,7 @@ async fn ask_beyond_the_boundary_prompts_naming_the_path_then_runs() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let (mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _cfg) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
@@ -232,7 +241,7 @@ async fn sandboxed_beyond_the_boundary_errors_with_no_prompt() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let (mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _cfg) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
@@ -306,7 +315,7 @@ async fn the_default_policy_reads_and_writes_beyond_the_boundary_in_silence() {
         ]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-        let (mut loop_, _cfg) = build_policy_loop(
+        let (_space, mut loop_, _cfg) = build_policy_loop(
             Box::new(provider),
             events_tx,
             Arc::new(RecordingSink {
@@ -382,7 +391,7 @@ async fn a_settings_edit_between_prompts_changes_the_next_turns_gating() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
     let settings = policy_settings("ask", "ask", "ask");
-    let (mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _cfg) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
@@ -456,15 +465,25 @@ async fn a_sandboxed_shell_dispatches_confined_with_no_prompt() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    // #96: the `space_cwd` guard is a TEST-SCOPE local, not a block local.
+    // This test asserts AFTER the block on a file inside `space_cwd`
+    // (`cwd.join("confined_ran.txt")`), and today that only works because
+    // the dir leaked. With the guard owning the dir, a guard declared inside
+    // the block would remove it at the block's closing brace and redden the
+    // `confined_here` arm on any Landlock machine. Same rule the sibling
+    // `a_gate_denial_of_a_protected_dir_uses_the_protected_wording` records
+    // for its `link` dir: the thing the post-block assertions read must
+    // OUTLIVE the block, so it is bound here. The BLOCK stays — it scopes the
+    // TURN — and no assertion moves.
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "allow", "sandboxed")),
+    );
     let cwd = {
-        let (mut loop_, _cfg) = build_policy_loop(
-            Box::new(provider),
-            events_tx,
-            Arc::new(RecordingSink {
-                events: sink_events.clone(),
-            }),
-            Some(&policy_settings("allow", "allow", "sandboxed")),
-        );
         let cwd = loop_.space_cwd.clone();
         bounded_prompt(&mut loop_, "go").await;
         cwd
@@ -580,7 +599,7 @@ async fn a_gate_denial_of_a_protected_dir_uses_the_protected_wording() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let (mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _cfg) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
@@ -651,7 +670,7 @@ async fn a_trusted_space_suppresses_the_prompt_the_policy_would_raise() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let (mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _cfg) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
@@ -734,7 +753,7 @@ async fn the_skill_tools_stay_outside_the_policy_gate() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let (mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _cfg) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
