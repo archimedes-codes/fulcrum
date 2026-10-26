@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -571,21 +571,19 @@ impl EventSink for RecordingSink {
     }
 }
 
-/// A fresh temp dir (created, removed on drop — the boundary tests'
-/// `Tmp`, local to this module).
-pub(super) struct Tmp(pub(super) PathBuf);
+/// A fresh temp dir (created, removed on drop — the removal belongs to the
+/// shared `test_support` guard; this only fixes the BASE and the PREFIX, so
+/// #96's per-prefix census keeps attributing these dirs here). The field is
+/// private: nothing outside this module read it.
+pub(super) struct Tmp(crate::test_support::ScratchDir);
 impl Tmp {
     pub(super) fn new(tag: &str) -> Self {
-        let d = std::env::temp_dir().join(format!("loop-policy-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        Self(d)
+        Self(crate::test_support::ScratchDir::in_env_temp(
+            "loop-policy-",
+            tag,
+        ))
     }
     pub(super) fn path(&self) -> &Path {
-        &self.0
-    }
-}
-impl Drop for Tmp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }

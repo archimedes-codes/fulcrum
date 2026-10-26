@@ -808,32 +808,31 @@ mod tests {
         }};
     }
 
-    /// A fresh dir under [`test_base`], REMOVED on drop (so a panicking
-    /// assertion does not litter `/dev/shm`).
-    struct TmpDir(PathBuf);
+    /// A fresh dir under [`test_base`], REMOVED on drop — the shared guard's
+    /// `Drop` also runs when a scope unwinds (see `test_support::ScratchDir`,
+    /// which is honest about what a per-test panic can pin; whether a FAILING
+    /// run left anything behind is task 09's census, not this type's promise).
+    /// The removal is the shared `test_support` guard's; the BASE is still
+    /// decided here, by [`test_base`] alone, because a sandbox fixture rooted
+    /// in `/tmp` would pass VACUOUSLY — see [`test_base`].
+    struct TmpDir(crate::test_support::ScratchDir);
 
     impl TmpDir {
         fn new(tag: &str) -> Option<Self> {
             let base = test_base()?;
-            let dir = base.join(format!("archimedes-sandbox-{tag}-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
-            // `/dev/shm` is `1777` with a sticky bit and the dir we just made
-            // is ours; nothing else to prepare.
-            Some(Self(dir))
+            Some(Self(crate::test_support::ScratchDir::in_dir(
+                &base,
+                "archimedes-sandbox-",
+                tag,
+            )?))
         }
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
         /// The dir as a shell-quotable string (the tags are uuid-derived, so
         /// no quoting characters can appear).
         fn display(&self) -> String {
-            self.0.display().to_string()
-        }
-    }
-
-    impl Drop for TmpDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.display()
         }
     }
 
@@ -1436,6 +1435,50 @@ mod tests {
         }
     }
 
+    /// The PREMISE of every behavioral test in this module: the base the
+    /// fixtures are rooted in is NOT inside the sandbox's own write
+    /// allow-list, so a successful denial is a denial and not an artefact of
+    /// the fixture's location. `/tmp` and `/var/tmp` are write-granted to a
+    /// confined child (`TEMP_DIRS` is fed to the ruleset as write roots), so a
+    /// fixture rooted there would see its "denial" succeed because the write
+    /// was ALLOWED — ~13 confinement tests turned into green no-ops.
+    ///
+    /// The assertion ties to the real `TEMP_DIRS` const, so making the
+    /// fixtures vacuous by editing the ruleset (adding `/dev/shm` to that
+    /// const is the only way) reddens THIS test instead of silencing the
+    /// suite. Runs on kernels without Landlock — the claim is structural, not
+    /// behavioral — and skips loudly, without touching `SKIPPED` (the same
+    /// shape `the_same_command_writes_freely_when_the_sandbox_is_off` uses),
+    /// when there is no `/dev/shm`.
+    #[test]
+    fn the_scratch_base_sits_outside_the_sandbox_write_allow_list() {
+        let Some(base) = test_base() else {
+            eprintln!("SKIP-SANDBOX: no /dev/shm on this machine");
+            return;
+        };
+        for tmp in TEMP_DIRS {
+            assert!(
+                !base.starts_with(tmp),
+                "the scratch base {base:?} is inside the sandbox write allow-list \
+                 (`TEMP_DIRS` holds `{tmp}`) — every confinement test below would \
+                 now pass VACUOUSLY"
+            );
+        }
+        assert!(
+            base.starts_with("/dev"),
+            "the scratch base {base:?} must sit under `/dev`, which the ruleset \
+             grants READ (REQUIRED_READ_DIRS) but never WRITE"
+        );
+        let d = TmpDir::new("base-proof").expect("base exists");
+        for tmp in TEMP_DIRS {
+            assert!(
+                !d.path().starts_with(tmp),
+                "a sandbox scratch dir landed inside the write allow-list: {:?}",
+                d.path()
+            );
+        }
+    }
+
     // ── confinement (behavioral; skipped on a kernel without Landlock) ───
 
     /// THE point of the tier: a confined command cannot WRITE outside the
@@ -1455,7 +1498,7 @@ mod tests {
         .await;
         assert!(r.is_error, "the write must fail: {:?}", text_of(&r));
         assert!(
-            !outside.0.join("payload.txt").exists(),
+            !outside.path().join("payload.txt").exists(),
             "the payload must not have landed outside the boundary"
         );
         let _ = base;
@@ -1596,14 +1639,14 @@ mod tests {
         let r = run(&ctx, &format!("ln -s /etc/passwd {link}")).await;
         assert!(r.is_error, "the symlink must fail: {:?}", text_of(&r));
         assert!(
-            !outside.0.join("planted").exists(),
+            !outside.path().join("planted").exists(),
             "a symlink was planted outside the boundary"
         );
         // And a hardlink (MAKE_REG + REFER) is equally refused.
         std::fs::write(outside.path().join("victim"), "v").unwrap();
         let r = run(&ctx, &format!("ln victim {}/hard", outside.display())).await;
         assert!(
-            r.is_error && !outside.0.join("hard").exists(),
+            r.is_error && !outside.path().join("hard").exists(),
             "a hardlink was created outside the boundary: {:?}",
             text_of(&r)
         );
@@ -1724,7 +1767,7 @@ mod tests {
             "an unconfined run writes anywhere: {:?}",
             text_of(&r)
         );
-        assert!(outside.0.join("payload.txt").exists());
+        assert!(outside.path().join("payload.txt").exists());
         let _ = base;
     }
 
