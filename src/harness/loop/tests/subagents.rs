@@ -772,16 +772,33 @@ async fn subagent_wait_a_resolving_completed_outcome_completes_the_tool() {
     .expect("the turn settled");
 }
 
-/// (issue #78) The end-to-end delivery of the unknown-param warning: a
-/// `subagent` call carrying `agent` instead of `agentName` STILL dispatches and
-/// STILL succeeds, and its result carries a SECOND text block naming both keys.
+/// (issue #93, narrowing issue #78) A `subagent` call carrying `agent` instead
+/// of `agentName` is REJECTED before dispatch: NO child is spawned, and the
+/// rejection sentence is the WHOLE tool result.
 ///
-/// Built on the `MockDispatcher` seam (not the `fake_worker` `WorkerManager`):
-/// the claim under test is the LOOP's delivery — the warning riding into the
-/// `tool_execution_end` payload and into the transcript `tool` message the model
-/// is re-sent — and the mock keeps the test off the process-spawn timing path.
+/// WHY THE PREMISE CHANGED. This test was
+/// `a_mis_named_subagent_param_still_dispatches_and_announces_itself`. #78
+/// pinned `!is_error` because its checker ran AFTER the child had been
+/// dispatched: failing the call would have destroyed an expensive, already
+/// COMPLETED delegation over a typo, so the only remedy #78 could reach was to
+/// dispatch anyway and ANNOUNCE the mis-named key as a second text block. #93
+/// moved that same verdict to a PRE-DISPATCH rejection — `run_tool_batch`
+/// (`harness/loop/turn.rs`) gates the subagent futures' `.filter()` on it, so
+/// the child is never spawned. A rejection therefore spends nothing: there is
+/// no completed delegation left to destroy, and #78's subagent exemption has no
+/// remaining justification (roadmap D1: "narrowed, not erased"). Hence the
+/// inverted `is_error` and the DELETED child-output assertions — there is no
+/// child output any more, the rejection IS the result.
+///
+/// Still on the `MockDispatcher` seam (not the `fake_worker` `WorkerManager`),
+/// now for a sharper reason: the mock's queue IS the no-dispatch proof —
+/// `dispatch()` pops one entry per child, so a queue that is still full after
+/// the turn proves the loop never spawned one. The queued outcome is deliberately
+/// RESOLVABLE (the sender is sent to, not forgotten): pre-change the child ran to
+/// `Completed { output: "the answer" }`, so this test fails for the right reason
+/// — a child that ran — instead of hanging on a dropped sender.
 #[tokio::test]
-async fn a_mis_named_subagent_param_still_dispatches_and_announces_itself() {
+async fn a_mis_named_subagent_param_is_rejected_and_never_dispatches_a_child() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (provider, _calls) = ScriptedProvider::new(vec![
         Some(vec![
@@ -798,9 +815,11 @@ async fn a_mis_named_subagent_param_still_dispatches_and_announces_itself() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+    let dispatcher = Arc::new(crate::agent::harness::dispatch::MockDispatcher::new());
     let (tx, rx) = tokio::sync::oneshot::channel();
     dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+    // A child that was never dispatched never pops this entry — see the doc
+    // comment for why it is resolvable rather than left hanging.
     tx.send(SubagentOutcome::Completed {
         output: "the answer".to_string(),
         metrics: crate::agent::subagent::SubagentMetrics {
@@ -821,7 +840,7 @@ async fn a_mis_named_subagent_param_still_dispatches_and_announces_itself() {
         Arc::new(TestSink {
             updates: Arc::new(StdMutex::new(Vec::new())),
         }),
-        Some(Arc::new(dispatcher) as Arc<dyn SubagentDispatcher>),
+        Some(dispatcher.clone() as Arc<dyn SubagentDispatcher>),
         vec![fake_model("m1")],
         None,
     );
@@ -840,26 +859,48 @@ async fn a_mis_named_subagent_param_still_dispatches_and_announces_itself() {
         unreachable!()
     };
     assert!(
-        !is_error,
-        "a mis-named param must not fail an otherwise-successful dispatch"
+        is_error,
+        "a mis-named param REJECTS the call (#93). #78's `!is_error` pinned a \
+         warning that could only announce a child it had already paid for; the \
+         verdict now lands before dispatch, so there is nothing to be lenient \
+         about: {result:?}"
     );
     assert_eq!(
-        result["content"][0]["text"], "the answer",
-        "the child's own output stays the FIRST block (append, never prepend)"
+        result["content"].as_array().unwrap().len(),
+        1,
+        "the rejection is the WHOLE result — no child output to append it to: {result:?}"
     );
-    let warning = result["content"][1]["text"]
+    let rejection = result["content"][0]["text"]
         .as_str()
-        .expect("the warning is the second text block");
+        .expect("the rejection is the first (only) text block");
     assert!(
-        warning.starts_with("⚠ unknown param(s) for `subagent`"),
-        "{warning}"
+        rejection.starts_with("unknown param(s) for `subagent`"),
+        "the rejection names the tool (no `⚠`, no `— ignored.` — it is no longer \
+         a warning riding inside a success): {rejection}"
     );
-    assert!(warning.contains("`agent`"), "{warning}");
-    assert!(warning.contains("agentName"), "{warning}");
-    assert!(warning.contains("— ignored."), "{warning}");
+    assert!(rejection.contains("`agent`"), "{rejection}");
+    assert!(
+        rejection.contains("agentName"),
+        "the suggestion is the useful half — the model needs the key to retry \
+         with: {rejection}"
+    );
+    assert!(
+        !result.to_string().contains("the answer"),
+        "no child output rides anywhere in a rejected call's result: {result:?}"
+    );
 
-    // The warning travels into the TRANSCRIPT (the message list the model is
-    // re-sent next turn), not just the UI event.
+    // THE load-bearing line: the child was NEVER DISPATCHED. `dispatch()` pops
+    // one queue entry per child, so a still-full queue is the no-spawn proof —
+    // the reason #78's "an expensive delegation would be wasted" premise no
+    // longer holds (nothing was spent).
+    assert_eq!(
+        dispatcher.outcomes.lock().unwrap().len(),
+        1,
+        "a rejected `subagent` call must not consume a dispatch queue entry"
+    );
+
+    // The rejection travels into the TRANSCRIPT (the message list the model is
+    // re-sent next turn), not just the UI event — and it travels ALONE.
     let tool_message = loop_
         .messages
         .iter()
@@ -870,10 +911,18 @@ async fn a_mis_named_subagent_param_still_dispatches_and_announces_itself() {
     };
     assert_eq!(
         blocks.len(),
-        2,
-        "the transcript keeps the child output AND the warning"
+        1,
+        "the transcript carries the rejection and nothing else — #78's two-block \
+         shape (child output + announcement) is gone with the child: {blocks:?}"
     );
-    assert!(matches!(blocks[1], ContentBlock::Text { .. }), "{blocks:?}");
+    let ContentBlock::Text { text } = &blocks[0] else {
+        panic!("the rejection is a text block: {blocks:?}")
+    };
+    assert_eq!(
+        text.as_str(),
+        rejection,
+        "the model reads the same sentence the UI event carried"
+    );
 
     wait_for_event(&mut events_rx, SETTLE_MS, |e| {
         matches!(e, RpcEvent::agent_settled)

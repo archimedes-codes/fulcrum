@@ -720,20 +720,30 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// The exact wire text the model reads on its next turn, pinned
-    /// byte-for-byte: the `⚠` (U+26A0, NO variation selector), the `(s)`, the
-    /// backticks, the em dash and the trailing `ignored` are all part of the
-    /// contract — a drift in any of them is a regression, because the model
-    /// learns the habit from this sentence.
+    /// byte-for-byte: the `(s)`, the backticks, the em dash and the closing
+    /// `fix the key and retry.` are all part of the contract — a drift in any
+    /// of them is a regression, because the model learns the habit from this
+    /// sentence. Both names are pinned on purpose: the UNKNOWN key (`` `agent` ``)
+    /// and the SUGGESTED one (`` `agentName` ``) — the suggestion is the half the
+    /// model needs to fix the call, so a `suggest()` that stopped firing would
+    /// redden this test rather than quietly degrade it.
+    ///
+    /// (issue #93) The sentence changed shape when the verdict did: the `⚠ `
+    /// prefix marked a warning riding inside a SUCCESS, and the `— ignored.`
+    /// suffix became a lie once the call was rejected instead of tolerated. T01
+    /// shipped the new wording and handed this pin to T02, which re-pinned it
+    /// byte-for-byte — the checker's own test is the single home of the literal
+    /// (`param_rejection.rs` asserts `starts_with`/`contains` only, on purpose).
     #[test]
     fn an_unknown_param_is_reported_with_a_suggestion() {
-        let warning = unknown_param_error(
+        let rejection = unknown_param_error(
             &tool_specs(),
             &call("subagent", json!({ "task": "t", "agent": "reviewer" })),
         );
         assert_eq!(
-            warning.as_deref(),
+            rejection.as_deref(),
             Some(
-                "⚠ unknown param(s) for `subagent`: `agent` (did you mean `agentName`?) — ignored."
+                "unknown param(s) for `subagent`: `agent` (did you mean `agentName`?) — the call was rejected, fix the key and retry."
             ),
             "the whole sentence is the wire text the model reads"
         );
