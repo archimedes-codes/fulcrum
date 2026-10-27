@@ -13,7 +13,7 @@ use crate::agent::is_bookkeeping_message_id;
 use crate::agent::session::resolve_composed_model;
 use crate::agent::subagent::{SubagentFailureReason, SubagentMetrics, SubagentOutcome};
 use crate::agent::types::mint_session_id;
-use crate::agent::worker::client::WorkerHandle;
+use crate::agent::worker::client::{WorkerHandle, WorkerInboundEvent};
 use crate::agent::worker::protocol::{Inbound, StartEnv, StartMode, SubagentDispatchWire};
 
 use super::pump::start_pump;
@@ -1228,10 +1228,19 @@ pub(crate) async fn finish_subagent(
     //
     // Why there is no double count: the child's OWN frames are keyed to the
     // CHILD id (they feed the child's own card), and this one is keyed to the
-    // PARENT — different store keys. And this emission goes directly to the
-    // parent's Tauri sink (`hooks.sink_for`), so it never passes the router's
-    // persistence arm (which gates on `!is_subagent` and only ever sees
-    // router-delivered frames): one delivery, no re-emission.
+    // PARENT — different store keys, and different `sessions` rows.
+    //
+    // It goes through `hooks.on_event` as a `SinkFrame` — i.e. through
+    // `SessionManager::route_event` — and NOT straight to the parent's Tauri
+    // sink. That is the issue #105 fix: persistence happens ONLY inside
+    // `route_event`'s `apply_interactive_event` call, so a frame emitted
+    // directly via `hooks.sink_for` reached the UI and never the DB, which made
+    // the parent's STORED total disagree with the figure displayed under its
+    // own title. `route_event` persists it and then re-emits the SAME payload
+    // verbatim (the `Value` is moved, not re-serialised), so the frontend
+    // contract is byte-identical to the old direct emission. `is_subagent:
+    // false` is correct: this frame is the PARENT's money, and the router's
+    // gate keys on that flag.
     //
     // The `> 0.0` guard is a FRAME-EXISTENCE gate, not a value filter: a child
     // that reported nothing contributes nothing. It is deliberately not `!= 0`
@@ -1242,10 +1251,12 @@ pub(crate) async fn finish_subagent(
         SubagentOutcome::Failed { metrics, .. } => metrics.cost,
     };
     if rollup_cost > 0.0 {
-        if let Some(sink) = state.hooks.sink_for(parent_session_id) {
-            sink.emit(
-                "interactive-event",
-                json!({
+        state.hooks.on_event(
+            parent_session_id,
+            false,
+            WorkerInboundEvent::SinkFrame {
+                event: "interactive-event".to_string(),
+                payload: json!({
                     "sessionId": parent_session_id,
                     "seq": 0,
                     "event": "cost_update",
@@ -1256,8 +1267,8 @@ pub(crate) async fn finish_subagent(
                     // invariant true at every writer of `costUsd`.
                     "payload": { "costUsd": rollup_cost + 0.0, "source": "subagent" },
                 }),
-            );
-        }
+            },
+        );
     }
     // The `reaping` flag is set FIRST (the `Exited` is EXPECTED: NO
     // `on_crash`).
@@ -1578,12 +1589,36 @@ mod rollup_tests {
         }
     }
 
+    /// The harness's `WorkerHooks`.
+    ///
+    /// `on_event` FORWARDS a `SinkFrame` into the same `RecordingSink` the
+    /// `sink_for` closure hands out. Production's `on_event` is
+    /// `SessionWorkerHooks::on_event` → `SessionManager::route_event`, whose
+    /// `SinkFrame` arm re-emits the payload verbatim to `self.sink` — so a
+    /// forwarding sink here is the faithful stand-in for that path (and
+    /// `sink_for` stays wired to the same collector, because the other
+    /// emissions in `finish_subagent` — `interactive-request-close` and
+    /// `subagent-closed` — still go straight to the sink).
+    ///
+    /// It is deliberately NOT the real router: `ManagerState` has no `db`
+    /// field (`registry.rs`), so nothing in this module can assert a write.
+    /// That half lives in `router.rs`'s
+    /// `a_parent_keyed_cost_frame_from_the_router_writes_the_parents_row`.
     fn state_with(collector: Arc<RecordingSink>) -> ManagerState {
+        let forwarded = collector.clone();
         ManagerState::new(
             Arc::new(NeverSpawns),
             Arc::new(ClosureHooks {
                 on_crash: Box::new(|_, _, _| {}),
-                on_event: Box::new(|_, _, _| {}),
+                on_event: Box::new(move |_, _, evt| {
+                    // The roll-up now reaches the UI through the ROUTER (the
+                    // `SinkFrame` re-emission), not through `sink_for`. A
+                    // no-op `on_event` here would silently swallow it and make
+                    // the `frames.len() == 1` assertions vacuous.
+                    if let WorkerInboundEvent::SinkFrame { event, payload } = evt {
+                        forwarded.emit(&event, payload);
+                    }
+                }),
                 sink_for: Box::new(move |_| Some(collector.clone() as Arc<dyn EventSink>)),
                 cwd_registrar: std::sync::OnceLock::new(),
             }),

@@ -841,6 +841,7 @@ fn temp_db() -> (Arc<Db>, tempfile::TempDir) {
         archived: false,
         title: None,
         context_usage: None,
+        cost_usd: None,
         is_subagent: false,
     })
     .expect("record_session");

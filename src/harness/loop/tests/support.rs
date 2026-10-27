@@ -332,6 +332,7 @@ pub(super) fn build_loop_with_sink(
         archived: false,
         title: None,
         context_usage: None,
+        cost_usd: None,
         is_subagent: false,
     })
     .expect("record_session");
