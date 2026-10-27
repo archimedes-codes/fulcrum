@@ -111,6 +111,26 @@ fn push_roots<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
     }
 }
 
+/// Append the paths of a `user_roots` result to the write DENY-LIST,
+/// canonicalized LENIENTLY: a directory that does not exist yet is KEPT and
+/// contributes its canonical nearest-existing ancestor plus the components
+/// that lead to it. This is the reverse of [`push_roots`], deliberately, and
+/// it is a separate function rather than a flag on that one because the flag
+/// would select a SECURITY policy: a lenient READ root silently WIDENS what
+/// is readable, and a seventh `push_roots` call could opt into it by
+/// accident. Here the leniency only ever DENIES more. A path that cannot be
+/// resolved at all (`$HOME` relative and absent, a protected dir on an
+/// unmounted drive) comes back with its raw spelling — see
+/// `protected_dirs_keeps_an_unresolvable_entry_raw`.
+fn push_protected<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
+    for (path, _scope) in roots {
+        let c = crate::agent::fs_backend::canonicalize_lenient(&path);
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+}
+
 /// The read boundary: `cwd` FIRST, then the discovery roots (user + space
 /// level, skills + agents). Every root is canonicalized; a root that fails
 /// to canonicalize (a missing dir) is simply not part of the boundary.
@@ -145,11 +165,27 @@ pub fn write_roots(cwd: &Path) -> Vec<PathBuf> {
 /// is under one of these is refused in EVERY policy (a deny, never a
 /// prompt, never widened by Trust): a model that can rewrite
 /// `~/.agents/skills/*/SKILL.md` rewrites its own instructions for every
-/// future session. Canonicalized; a missing dir is dropped.
+/// future session.
+///
+/// Entries are canonicalized LENIENTLY (see `push_protected`), which
+/// REPLACES the sentence this task reversed — *"Canonicalized; a missing dir
+/// is dropped."* (issue #92). A missing dir is now KEPT as its canonical
+/// nearest-existing ancestor plus the components that lead to it, because
+/// this list is frozen for the Session's life (`AgentLoop::new`) and a
+/// dropped entry silently unprotects the agent's own instructions until
+/// restart. The READ roots keep the opposite, strict rule on purpose —
+/// leniency there would widen what is readable; see `read_roots` and
+/// `a_nonexistent_root_is_dropped`.
+///
+/// The leniency is only half the protection: the comparison that consumes
+/// these entries must canonicalize its ENTRY side leniently too, or a
+/// still-missing entry matches nothing and this becomes a silent no-op — see
+/// `crate::agent::tools::exec::protected_refusal_text` and
+/// `a_write_into_a_still_missing_protected_dir_is_refused`.
 pub fn protected_dirs() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    push_roots(&mut out, crate::skills::user_roots());
-    push_roots(&mut out, crate::agents::user_roots());
+    push_protected(&mut out, crate::skills::user_roots());
+    push_protected(&mut out, crate::agents::user_roots());
     out
 }
 
@@ -371,10 +407,146 @@ mod tests {
         drop((restore, lock));
     }
 
+    /// (issue #92, D3 as amended) The DENY-LIST KEEPS a directory that does
+    /// not exist yet — this test REVERSES the sentence deleted from
+    /// `protected_dirs`'s doc (*"Canonicalized; a missing dir is dropped."*).
+    ///
+    /// Why the direction changed: a dropped entry silently UNPROTECTS the
+    /// agent's own instructions for the whole life of the Session, because
+    /// the list is frozen at `AgentLoop::new` — a user who recreates
+    /// `~/.pi/agent/agents` mid-session could write into it until restart,
+    /// which is exactly what #92 was filed for.
+    ///
+    /// The expectation is spelled through `canonicalize()` (the canonical
+    /// NEAREST EXISTING ANCESTOR, here `$HOME`, plus the re-applied trailing
+    /// components), never through the raw temp path: on macOS `temp_dir()`
+    /// lives under `/var` → `/private/var`, so a raw expectation would be a
+    /// platform accident. Same reason
+    /// `protected_dirs_are_the_four_user_level_dirs` canonicalizes its `want`.
+    ///
+    /// The READ side deliberately keeps the opposite rule — see
+    /// `a_nonexistent_root_is_dropped`, which pins that a missing root is
+    /// still dropped from the boundary because a lenient read root would
+    /// WIDEN what is readable.
     #[test]
-    fn protected_dirs_drop_a_missing_dir() {
-        let (lock, restore, _home) = pin_empty_home("protected-missing");
-        assert!(protected_dirs().is_empty());
+    fn protected_dirs_keep_a_missing_dir() {
+        let (lock, restore, home) = pin_empty_home("protected-missing");
+        let home_canon = home.path().canonicalize().unwrap();
+        let protected = protected_dirs();
+        let want: Vec<PathBuf> = [
+            ".agents/skills",
+            ".pi/agent/skills",
+            ".agents/agents",
+            ".pi/agent/agents",
+        ]
+        .iter()
+        .map(|d| home_canon.join(d))
+        .collect();
+        assert_eq!(
+            protected, want,
+            "a not-yet-existing protected dir is KEPT as the canonical nearest \
+             existing ancestor plus its trailing components"
+        );
+        // The direction of the change, on its own: every entry stays INSIDE
+        // the pinned home, so a lenient peel can never leak an entry out of
+        // the test's own tree (and never out of the user's `$HOME`).
+        assert!(
+            protected.iter().all(|p| p.starts_with(&home_canon)),
+            "the entries must stay inside $HOME: {protected:?}"
+        );
+        drop((restore, lock));
+    }
+
+    /// (issue #92, D3's RECORDED RESIDUE) When nothing on a protected dir's
+    /// path can be resolved at all, `canonicalize_lenient` hands the path
+    /// back UNCHANGED — and the entry is still KEPT, which is the "strictly
+    /// better than today's outright drop" half of the residue.
+    ///
+    /// WHAT THIS PROVES (the RED half, before the fix): the four entries
+    /// SURVIVE with their RAW spelling where no ancestor resolves, so the
+    /// Session still carries a deny-list where today it carried NONE.
+    ///
+    /// WHAT IT DOES NOT PROVE (the GREEN half, before AND after the fix — a
+    /// pin, deliberately not a failure, so the next reader does not "fix" it
+    /// into one): a RAW entry cannot prefix-match a CANONICAL resolved path,
+    /// so a write into such a dir is NOT refused. That is the residue D3
+    /// names, stated as an assertion so it cannot be quietly forgotten. It is
+    /// not fixed here because there is nothing to peel to.
+    ///
+    /// HOW THE MECHANISM IS REACHED: two ways in production — a `$HOME` set
+    /// to a RELATIVE path that does not exist relative to the process `cwd`,
+    /// and on Windows a `USERPROFILE` on a drive that is not currently
+    /// mounted (`Path::pop` on `Z:\` returns `false`). On unix an ABSOLUTE
+    /// `$HOME` always peels to at least `/`, so the "no ancestor at all" `Err`
+    /// arm is unreachable from it — this relative fixture is how the
+    /// raw-return path gets exercised at all. Note the fixture asserts the
+    /// RAW spelling rather than asking "did the result come back equal to the
+    /// input?": with an absent `~/.pi` and a present absolute `$HOME` the peel
+    /// SUCCEEDS at `$HOME` and re-appends three components, and on Linux that
+    /// re-applied spelling is textually identical to the input, so such a
+    /// check would read as "raw" and test nothing.
+    ///
+    /// WHY A RELATIVE `$HOME` IS SAFE HERE, and what would break it: the
+    /// unlocked readers of `$HOME` in this suite are `skills::home_dir`
+    /// (production, and the `user_roots` feeder), `sandbox.rs::git_config_files`,
+    /// `sandbox.rs::private_dir_outside_the_read_allow_list`, and
+    /// `tests/attention_alert_survives.rs::dirs_home`. Every one either
+    /// canonicalizes and discards on failure (the two `sandbox.rs` readers — a
+    /// relative, absent `$HOME` just drops one candidate from a candidate
+    /// list) or uses the value for a file-existence probe whose answer is
+    /// already "absent" in CI (`attention_alert_survives`, which gates a skip).
+    /// A future UNLOCKED reader that JOINS onto `$HOME` and writes would be
+    /// the one to break. And no `set_current_dir`: the suite runs
+    /// multi-threaded and `cwd` is process-global — this test's assertion
+    /// needs no `cwd`, because an absent relative path fails to canonicalize
+    /// from any working directory.
+    #[test]
+    fn protected_dirs_keeps_an_unresolvable_entry_raw() {
+        let lock = crate::test_support::env_lock();
+        // A relative `$HOME` that exists NOWHERE (no dir is created — that is
+        // the point). The name only has to be absent; a uuid keeps it from
+        // colliding with anything a developer actually has in their cwd.
+        let ghost = format!("archimedes-t06-ghost-{}", uuid::Uuid::new_v4());
+        let original = std::env::var_os("HOME");
+        // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore
+        // span; no other thread mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", &ghost) };
+        let restore = RestoreHome(original);
+
+        let protected = protected_dirs();
+        let want: Vec<PathBuf> = [
+            ".agents/skills",
+            ".pi/agent/skills",
+            ".agents/agents",
+            ".pi/agent/agents",
+        ]
+        .iter()
+        .map(|d| std::path::PathBuf::from(ghost.as_str()).join(d))
+        .collect();
+        assert_eq!(
+            protected, want,
+            "an entry whose whole path fails to resolve is KEPT with its raw \
+             spelling — the session still gets a deny-list (today it gets none)"
+        );
+
+        // THE RESIDUE (green before and after the fix): a raw entry cannot
+        // prefix-match a CANONICAL write target, so `protected_refusal_text`
+        // answers `None` for a canonical path elsewhere. On macOS
+        // (`/var` → `/private/var`) or Windows (`\\?\C:\…`) a write into such
+        // a dir is therefore NOT refused. Recorded, not hidden.
+        let target = Tmp::new("unresolvable-target");
+        let canonical_target = target.path().canonicalize().unwrap().join("SKILL.md");
+        assert_eq!(
+            crate::agent::tools::exec::protected_refusal_text(
+                &protected,
+                "write",
+                &canonical_target
+            ),
+            None,
+            "the recorded residue: a raw entry does not refuse a canonical \
+             target — {canonical_target:?} vs {protected:?}"
+        );
+
         drop((restore, lock));
     }
 

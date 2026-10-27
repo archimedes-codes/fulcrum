@@ -83,13 +83,24 @@ pub(crate) fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> O
 /// tests reddened macOS and Windows CI, where a canonical `\\?\C:\…` verbatim
 /// path never matched a raw `C:\…`).
 ///
-/// So each entry is canonicalized at comparison time. An entry that cannot be
-/// canonicalized (it does not exist) matches NOTHING — the same semantics
-/// `boundary::canon` / `push_roots` already give the production list, where a
-/// missing dir is simply not part of the deny-list. Already-canonical entries
-/// canonicalize to themselves, so the production path (and Linux CI) is
-/// unchanged. The REFUSAL still names the ORIGINAL entry: the message must
-/// show the caller the directory it actually registered, not a rewritten one.
+/// So each entry goes through the SAME lenient canonicalization as the
+/// compared path (issue #92). A strict `canonicalize()` on an entry that does
+/// not exist yet simply FAILS, and a failed compare is a silent NON-MATCH —
+/// which is the very hole `boundary::protected_dirs` now keeps the entry to
+/// close, so the two halves are one change and neither alone is a fix.
+/// Already-canonical entries canonicalize to themselves, so the production
+/// path (and Linux CI) is unchanged. The REFUSAL still names the ORIGINAL
+/// entry: the message must show the caller the directory it actually
+/// registered, not a rewritten one — hence `find` over the caller's slice,
+/// never a map onto the canonicalized form.
+///
+/// The recorded residue (#92, D3): an entry whose whole path cannot be
+/// resolved at all comes back RAW, and a raw entry cannot prefix-match a
+/// canonical resolved path — so on macOS (`/var` → `/private/var`) or Windows
+/// (`\\?\C:\…`) a write into such a dir is NOT refused. That is strictly
+/// better than the pre-#92 behaviour, where the dir was dropped from the list
+/// outright, and nothing fixes it by peeling harder because there is nothing
+/// to peel to. Pinned by `protected_dirs_keeps_an_unresolvable_entry_raw`.
 ///
 /// # The COMPARED path is canonicalized the same way
 ///
@@ -152,10 +163,14 @@ pub(crate) fn protected_refusal_text(
     resolved: &Path,
 ) -> Option<String> {
     let resolved = crate::agent::fs_backend::canonicalize_lenient(resolved);
-    let hit = protected.iter().find(|dir| {
-        dir.canonicalize()
-            .is_ok_and(|canon| resolved.starts_with(canon))
-    })?;
+    // BOTH sides lenient (issue #92): the entry may name a dir that does not
+    // exist yet, and a strict `canonicalize()` on it fails — which under
+    // `is_ok_and` matched NOTHING, silently no-opping the deny-list for
+    // exactly the entry `protected_dirs()` now keeps. `hit` stays the
+    // CALLER's entry so the message names the directory as registered.
+    let hit = protected
+        .iter()
+        .find(|dir| resolved.starts_with(crate::agent::fs_backend::canonicalize_lenient(dir)))?;
     Some(format!(
         "{tool}: {} is a protected agent-definition directory ({}) — writing there is refused in every policy. {PROTECTED_WRITE_ROUTE}",
         resolved.display(),

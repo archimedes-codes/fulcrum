@@ -390,6 +390,187 @@ fn a_raw_argument_still_refuses_against_canonical_protected_entries() {
     );
 }
 
+/// `HOME` restore guard for the session-snapshot tests below. A LOCAL copy
+/// of the small `Drop` guard (the way `boundary.rs` and `commands/agents.rs`
+/// each keep their own) rather than a new shared fixture — `exec/tests` had
+/// no `RestoreHome` before #92 and these are its only `$HOME` readers.
+struct RestoreHome(Option<std::ffi::OsString>);
+impl Drop for RestoreHome {
+    fn drop(&mut self) {
+        match self.0.take() {
+            // SAFETY: the `ENV_LOCK` is still held at drop time (this guard
+            // is declared after the lock guard and outlives it in reverse);
+            // no other thread mutates HOME concurrently.
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            // SAFETY: as above.
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
+/// (issue #92) THE SCENARIO THE ISSUE WAS FILED FOR: a protected dir is
+/// missing when the Session starts, the user recreates it mid-session, and
+/// the Session that never restarted must still refuse to write into it.
+///
+/// The fixture reproduces the SESSION-START SNAPSHOT, because that is where
+/// the bug lives: `ctx.protected` is computed once at `AgentLoop::new` (via
+/// `boundary::protected_dirs()`) and only cloned per tool call, so an entry
+/// dropped while the dir was absent stays dropped for the whole Session —
+/// today `push_roots`'s strict `canon` drops all four candidates when none
+/// exists, so the deny-list is EMPTY and the recreated dir is unprotected
+/// until restart.
+///
+/// Non-vacuity: the `cwd` is the hermetic `ctx`'s scratch dir and the target
+/// is an ABSOLUTE path OUTSIDE it, so under `writes: Allow` the boundary
+/// ADMITS the write and only the deny-list can refuse it — the same trick
+/// `write_into_a_protected_dir_is_refused_under_every_policy` uses, inverted
+/// from "inside the cwd" to "outside the cwd, refused by the list".
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_recreated_protected_dir_is_refused_without_a_new_session() {
+    use crate::agent::policy::{AccessPolicy, FilePolicy};
+
+    let home = temp_cwd("recreated-home");
+    let lock = crate::test_support::env_lock();
+    let original = std::env::var_os("HOME");
+    let restore = RestoreHome(original);
+    // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
+    unsafe { std::env::set_var("HOME", home.path()) };
+
+    // `.pi/agent` EXISTS and `.pi/agent/agents` does NOT, so the lenient peel
+    // lands on `.pi/agent` and the entry is canonical-with-one-trailing on
+    // every platform (the same reason the expectation below is spelled
+    // through `canonicalize()` and not the raw temp path: macOS `temp_dir()`
+    // is under `/var` → `/private/var`).
+    std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
+    let agents = home.path().join(".pi/agent/agents");
+
+    // 1. The snapshot, built while the dir is MISSING — exactly what
+    //    `AgentLoop::new` does for a real Session.
+    let protected = crate::agent::boundary::protected_dirs();
+
+    // 2. THE PREMISE (placed BEFORE the write attempt: a premise check
+    //    belongs ahead of the thing it makes non-vacuous, and because
+    //    `assert!` panics this ordering is what makes the HEAD red report the
+    //    premise instead of `is_error`). It names the SPECIFIC entry — a
+    //    `!protected.is_empty()` check passes on a list carrying the WRONG
+    //    entries, and the test would then pass on a refusal for an unrelated
+    //    reason while claiming to pin #92.
+    assert!(
+        protected.contains(&home.path().canonicalize().unwrap().join(".pi/agent/agents")),
+        "the snapshot must carry the not-yet-existing dir — that is the premise: {protected:?}"
+    );
+
+    // 3. The user recreates it. No restart.
+    std::fs::create_dir_all(&agents).unwrap();
+
+    // 4. The frozen snapshot goes to the executor as production does.
+    let cwd = temp_cwd("recreated-cwd");
+    let c = ToolCtx {
+        protected,
+        file_policy: FilePolicy {
+            writes: AccessPolicy::Allow,
+            ..FilePolicy::default()
+        },
+        ..ctx(&cwd)
+    };
+    let target = agents.join("SKILL.md");
+    let r = execute_tool(&c, "write", &json!({ "path": target, "content": "PWNED" })).await;
+
+    // 5. Refused — on `is_error`, NOT on the text alone: a test that asserted
+    //    only the wording stays green through this bug, which is the whole
+    //    reason the bug survived.
+    assert!(
+        r.is_error,
+        "a write into a protected dir recreated mid-session must be refused: {}",
+        text_of(&r)
+    );
+    let text = text_of(&r).to_string();
+    assert!(text.contains("protected"), "{text}");
+    assert!(
+        text.ends_with(PROTECTED_WRITE_ROUTE),
+        "the refusal must end with the sanctioned route: {text}"
+    );
+    assert!(
+        !target.exists(),
+        "the file must not have been created: {}",
+        target.display()
+    );
+
+    drop((restore, lock));
+}
+
+/// (issue #92) THE FALSIFIER for the second half of the fix — the test that
+/// makes `access.rs`'s entry-side leniency load-bearing.
+///
+/// Same fixture as
+/// `a_recreated_protected_dir_is_refused_without_a_new_session` MINUS the
+/// recreation: the snapshot is built while `$HOME/.pi/agent/agents` is
+/// missing and the dir is NEVER created, so at COMPARE TIME the entry is
+/// still missing. With change (1) alone (entries kept, comparison untouched)
+/// the entry sits on the list and `dir.canonicalize().is_ok_and(…)` fails on
+/// it, so it matches NOTHING: the boundary under `Allow` admits the path,
+/// `FsBackend::write` runs `create_dir_all`, and the file lands — the exact
+/// silent no-op D3 was corrected for. So: the session-snapshot tests pin
+/// change (1); THIS test pins change (2). A run where only change (1) landed
+/// reddens exactly this one test.
+///
+/// The premise assertion is inherited in its strengthened form and is MORE
+/// load-bearing here than next door: it is the half that proves the entry
+/// really is ON the list, which is what turns "and yet it matched nothing"
+/// into a finding instead of an assumption.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_write_into_a_still_missing_protected_dir_is_refused() {
+    use crate::agent::policy::{AccessPolicy, FilePolicy};
+
+    let home = temp_cwd("still-missing-home");
+    let lock = crate::test_support::env_lock();
+    let original = std::env::var_os("HOME");
+    let restore = RestoreHome(original);
+    // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
+    unsafe { std::env::set_var("HOME", home.path()) };
+
+    std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
+    let agents = home.path().join(".pi/agent/agents");
+
+    let protected = crate::agent::boundary::protected_dirs();
+    assert!(
+        protected.contains(&home.path().canonicalize().unwrap().join(".pi/agent/agents")),
+        "the snapshot must carry the not-yet-existing dir — that is the premise: {protected:?}"
+    );
+
+    let cwd = temp_cwd("still-missing-cwd");
+    let c = ToolCtx {
+        protected,
+        file_policy: FilePolicy {
+            writes: AccessPolicy::Allow,
+            ..FilePolicy::default()
+        },
+        ..ctx(&cwd)
+    };
+    let target = agents.join("SKILL.md");
+    let r = execute_tool(&c, "write", &json!({ "path": target, "content": "PWNED" })).await;
+
+    assert!(
+        r.is_error,
+        "a write into a protected dir that is STILL missing must be refused: {}",
+        text_of(&r)
+    );
+    let text = text_of(&r).to_string();
+    assert!(text.contains("protected"), "{text}");
+    assert!(
+        text.ends_with(PROTECTED_WRITE_ROUTE),
+        "the refusal must end with the sanctioned route: {text}"
+    );
+    assert!(
+        !agents.exists(),
+        "nothing was created, so the peel's not-yet-exists premise held"
+    );
+
+    drop((restore, lock));
+}
+
 /// `bash` IGNORES the boundary (its `Sandboxed` tier is Landlock, Task 5):
 /// a sandboxed read cannot reach a file that `bash` can happily cat, so
 /// the boundary must not pretend to bound the shell.
