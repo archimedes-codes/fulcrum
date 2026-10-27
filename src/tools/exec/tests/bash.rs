@@ -698,7 +698,7 @@ fn a_death_with_no_exit_code() -> std::process::ExitStatus {
 /// is a SUCCESS. Not an error, code 0, no note.
 #[test]
 fn bash_exit_report_success_is_not_an_error() {
-    let (code, is_error, note) = bash_exit_report(false, false, Some(exit_status_of(0)));
+    let (code, is_error, note) = bash_exit_report(false, false, Some(exit_status_of(0)), false);
     assert!(
         !is_error,
         "a successful run must NOT be reported as a failure"
@@ -711,7 +711,7 @@ fn bash_exit_report_success_is_not_an_error() {
 /// `bash_nonzero_exit_is_error` asserts on the wire).
 #[test]
 fn bash_exit_report_nonzero_exit_is_an_error_with_its_real_code() {
-    let (code, is_error, note) = bash_exit_report(false, false, Some(exit_status_of(3)));
+    let (code, is_error, note) = bash_exit_report(false, false, Some(exit_status_of(3)), false);
     assert!(is_error);
     assert_eq!(code, Some(3), "the real code, never a fabricated one");
     assert_eq!(note, None);
@@ -727,11 +727,11 @@ fn bash_exit_report_nonzero_exit_is_an_error_with_its_real_code() {
 /// to name and no status that IS a signal death. Un-gating this row would force
 /// it either into a tautology or into a Linux RED. The code-less half of the
 /// same idea does port, and does — see [`a_death_with_no_exit_code`] and
-/// `bash_exit_report_success_is_the_only_non_error_row`.
+/// `bash_exit_report_non_error_rows_are_exactly_two`.
 #[cfg(unix)]
 #[test]
 fn bash_exit_report_signal_death_names_the_signal() {
-    let (code, is_error, note) = bash_exit_report(false, false, Some(wait_status(9)));
+    let (code, is_error, note) = bash_exit_report(false, false, Some(wait_status(9)), false);
     assert!(is_error, "killed by a signal is a failure");
     assert_eq!(code, None, "a signal death has no exit code");
     let note = note.expect("the note names the signal");
@@ -748,7 +748,7 @@ fn bash_exit_report_signal_death_names_the_signal() {
 /// Unix by design, `exec/bash.rs`), so that row cannot port. The two statuses
 /// that DO port (no status, and exit 0) are covered on both platforms by
 /// `bash_exit_report_unknown_status_says_so_and_claims_no_code` and
-/// `bash_exit_report_success_is_the_only_non_error_row`.
+/// `bash_exit_report_non_error_rows_are_exactly_two`.
 #[cfg(unix)]
 #[test]
 fn bash_exit_report_cancelled_is_always_an_error() {
@@ -756,7 +756,7 @@ fn bash_exit_report_cancelled_is_always_an_error() {
     let statuses: [Option<std::process::ExitStatus>; 3] =
         [None, Some(wait_status(0 << 8)), Some(wait_status(9))];
     for status in statuses {
-        let (code, is_error, note) = bash_exit_report(true, false, status);
+        let (code, is_error, note) = bash_exit_report(true, false, status, false);
         assert!(is_error, "a cancelled run is an error (status {status:?})");
         assert!(
             note.is_some(),
@@ -771,19 +771,141 @@ fn bash_exit_report_cancelled_is_always_an_error() {
 /// from any other unknown outcome).
 #[test]
 fn bash_exit_report_timeout_is_an_error_that_says_timed_out() {
-    let (code, is_error, note) = bash_exit_report(false, true, None);
+    let (code, is_error, note) = bash_exit_report(false, true, None, false);
     assert!(is_error);
     assert_eq!(code, None, "no status was seen, so no code is claimed");
     let note = note.expect("the note says the deadline was hit");
     assert!(note.contains("timed out"), "got {note:?}");
-    // A timeout that DID see the status still reports it (the kill
-    // landed after the child had already exited).
-    let (code, is_error, _) = bash_exit_report(false, true, Some(exit_status_of(0)));
+    // A timeout that DID see the status still reports it, when the pipes
+    // were not what held the run open (a pipe-held exit 0 is R1, not this).
+    let (code, is_error, _) = bash_exit_report(false, true, Some(exit_status_of(0)), false);
     assert!(
         is_error,
-        "a timed-out run is an error even with a clean status"
+        "a timed-out run is an error even with a clean status, when the pipes \
+         were not what held the run open"
     );
     assert_eq!(code, Some(0));
+}
+
+// ── the fourth fact: were the output pipes still HELD at the deadline? ─
+//
+// Issue #94: a command whose FOREGROUND work finished and which was OBSERVED
+// exiting 0, but whose pipes were still held open by a background process, hit
+// its deadline and was reported as a TIMEOUT — so the model re-ran a
+// non-idempotent command that had already succeeded. The report must be able
+// to tell "we ended a hung command" from "it finished; a background process
+// was still holding the pipe when the deadline fired". These rows are the
+// whole sub-table, decided with no child and no clock.
+
+/// The do-not-re-run phrase, chosen ONCE and asserted by every test that
+/// asserts it (`bash_exit_report_pipe_held_exit_zero_is_a_success_that_forbids_rerun`
+/// and both end-to-end fixtures). The note is not pinned byte-for-byte — the
+/// file's convention is `contains` on a distinctive phrase — but this phrase is
+/// the whole point of the report, so it is the one that gets pinned.
+const DO_NOT_RERUN: &str = "DO NOT RE-RUN";
+
+/// THE BUG (#94): pipes held at the deadline + an exit 0 WE SAW → a SUCCESS.
+/// Not an error, code 0, and a note that forbids re-running.
+#[test]
+fn bash_exit_report_pipe_held_exit_zero_is_a_success_that_forbids_rerun() {
+    let (code, is_error, note) = bash_exit_report(false, true, Some(exit_status_of(0)), true);
+    assert!(
+        !is_error,
+        "#94: a command observed exiting 0 while a pipe was held must NOT be \
+         reported as a failure — that report is what sends models re-running \
+         non-idempotent commands. TEXT={note:?}"
+    );
+    assert_eq!(code, Some(0), "the real exit code, still 0");
+    let note = note.expect("a pipe-held completion explains itself to the model");
+    assert!(note.contains("0"), "the note names the exit code: {note:?}");
+    assert!(
+        note.contains(DO_NOT_RERUN),
+        "the note must forbid re-running: {note:?}"
+    );
+    assert!(
+        !note.contains("timed out"),
+        "a completed command is not reported as a timeout: {note:?}"
+    );
+    assert!(
+        !note.contains("in full"),
+        "the note must NEVER claim the output was captured in full — the \
+         drain after the kill is bounded by DRAIN_GRACE: {note:?}"
+    );
+}
+
+/// Held pipes rescue an exit 0 and NOTHING ELSE: a non-zero exit inside a
+/// deadline run is still an error carrying its real code, and its note must
+/// not read as a hang (or the model retries a command that genuinely failed).
+#[test]
+fn bash_exit_report_pipe_held_nonzero_exit_reports_its_real_code_and_never_says_timed_out() {
+    let (code, is_error, note) = bash_exit_report(false, true, Some(exit_status_of(3)), true);
+    assert!(is_error, "a real failure stays a failure");
+    assert_eq!(code, Some(3), "the real code, never a fabricated one");
+    let note = note.expect("the note carries the real exit code");
+    assert!(note.contains("3"), "the note names the code: {note:?}");
+    assert!(
+        !note.contains("timed out"),
+        "a genuine failure must not read as a hang (that is #94 wearing the \
+         other mask — the model retries it): {note:?}"
+    );
+}
+
+/// R3: pipes held + NO observed status → unchanged. Held pipes never rescue
+/// an exit we never saw — the run is still the unknown the UNKNOWN text
+/// describes.
+#[test]
+fn bash_exit_report_pipe_held_unknown_status_still_says_timed_out_and_unknown() {
+    let (code, is_error, note) = bash_exit_report(false, true, None, true);
+    assert!(is_error);
+    assert_eq!(code, None, "no status was seen, so no code is claimed");
+    let note = note.expect("the note says the deadline was hit");
+    assert!(note.contains("timed out"), "got {note:?}");
+    assert!(note.contains("unknown"), "got {note:?}");
+}
+
+/// R4: exit 0 inside a deadline run with the pipes NOT held → unchanged, still
+/// an error. This is the row that keeps the success row honest: held pipes are
+/// what distinguish the two, and without this assertion the success row would
+/// swallow every deadline run that exited 0.
+#[test]
+fn bash_exit_report_pipe_not_held_exit_zero_timeout_stays_an_error() {
+    let (code, is_error, note) = bash_exit_report(false, true, Some(exit_status_of(0)), false);
+    assert!(
+        is_error,
+        "a deadline run whose pipes were NOT held is still a timeout"
+    );
+    assert_eq!(code, Some(0), "the real exit code is still reported");
+    let note = note.expect("the note still tells the truth about the deadline");
+    assert!(note.contains("timed out"), "got {note:?}");
+}
+
+/// R5: a SIGNAL death inside a deadline run is still an error, names its
+/// signal, claims NO exit code, and still says "timed out". This is where
+/// every genuine hang lands — the loop breaks with no status, the group kill
+/// SIGKILLs the child, and the bounded post-loop reap then observes that
+/// signal death — so the deadline sentence must survive. Checking the signal
+/// BEFORE the code is what stops a status whose `code()` is `None` from being
+/// given a fabricated number, and it is what makes the success row
+/// unreachable for a command we had to kill.
+///
+/// ⚠ STAYS unix-gated for the same reason as
+/// `bash_exit_report_signal_death_names_the_signal`: `exit_signal` is `None`
+/// for EVERY status off Unix by design, so there is no signal to name there.
+#[cfg(unix)]
+#[test]
+fn bash_exit_report_pipe_held_signal_death_is_still_a_signal_death() {
+    let (code, is_error, note) = bash_exit_report(false, true, Some(wait_status(9)), true);
+    assert!(is_error, "a run we SIGKILLed is not a success");
+    assert_eq!(
+        code, None,
+        "a signal death has no exit code — never invent one"
+    );
+    let note = note.expect("the note names the signal");
+    assert!(note.contains("signal 9"), "got {note:?}");
+    assert!(
+        note.contains("timed out"),
+        "a genuine hang must still be called one: {note:?}"
+    );
 }
 
 /// The genuinely-unknowable case: NO status was captured. It stays an
@@ -792,7 +914,7 @@ fn bash_exit_report_timeout_is_an_error_that_says_timed_out() {
 /// the dangerous outcome this whole path exists to avoid).
 #[test]
 fn bash_exit_report_unknown_status_says_so_and_claims_no_code() {
-    let (code, is_error, note) = bash_exit_report(false, false, None);
+    let (code, is_error, note) = bash_exit_report(false, false, None, false);
     assert!(is_error, "an unknown outcome is NOT silently a success");
     assert_eq!(code, None, "no status known means no code invented");
     let note = note.expect("the note says the status is unknown");
@@ -803,34 +925,57 @@ fn bash_exit_report_unknown_status_says_so_and_claims_no_code() {
     );
 }
 
-/// The one non-error row of the table is (not cancelled, not timed out,
-/// exited 0) — everything else is an error. Asserted as a table so a
-/// future edit cannot widen the success case.
+/// THE NON-ERROR ROWS OF THE TABLE ARE EXACTLY TWO: (not cancelled, not timed
+/// out, exited 0) and the pipe-held completion — a deadline run whose exit
+/// status was OBSERVED as 0 while a pipe was still held (issue #94).
+/// Everything else is an error. Asserted as a table so a future edit cannot
+/// widen the success case.
 ///
-/// The third row is a death the report can give NO code to: on unix a SIGKILL
-/// death, on Windows a crash code (see [`a_death_with_no_exit_code`]). The
-/// table's claim is that **exactly one row is a success**, and `ok == vec![0]`
-/// holds on each platform for its own reason.
+/// WHY THE TABLE GREW: the report gained a fourth input (`pipes_held`), which
+/// adds a SUB-TABLE inside the `timed_out` arm — so a one-row census could no
+/// longer describe the truth table. Rows 6–8 are that sub-table (held + exit 0,
+/// held + non-zero, held + a death the report can give NO code to: on unix a
+/// SIGKILL death, which is R5 and names its signal; on Windows a crash code,
+/// which lands on R2 — the platform asymmetry [`a_death_with_no_exit_code`]
+/// insists on, `is_error: true` either way); row 9 shows the `cancelled` arm is
+/// checked first, so held pipes never rescue a cancelled run.
+///
+/// `ok == vec![0, 6]` is what gives the table its teeth: widening success
+/// anywhere — dropping `signal.is_none()` from the success guard, ignoring
+/// `pipes_held` (which turns row 5 into a SECOND success), or trusting a `None`
+/// status — adds an index and reddens this assert; narrowing the new row
+/// removes `6` and reddens it too. Rows 5 and 6 are the sharpest pair: they
+/// differ ONLY in `pipes_held`, and exactly one of them is a success.
+///
+/// The falsifier D2 records, kept here so the row stays falsifiable: if a run
+/// is ever observed where a pipe was held AND the killed background work
+/// mattered, row 6 was wrong.
 #[test]
-fn bash_exit_report_success_is_the_only_non_error_row() {
+fn bash_exit_report_non_error_rows_are_exactly_two() {
     let rows = [
-        (false, false, Some(exit_status_of(0))),
-        (false, false, Some(exit_status_of(1))),
-        (false, false, Some(a_death_with_no_exit_code())),
-        (false, false, None),
-        (true, false, Some(exit_status_of(0))),
-        (false, true, Some(exit_status_of(0))),
+        (false, false, Some(exit_status_of(0)), false),
+        (false, false, Some(exit_status_of(1)), false),
+        (false, false, Some(a_death_with_no_exit_code()), false),
+        (false, false, None, false),
+        (true, false, Some(exit_status_of(0)), false),
+        // exit 0 inside a deadline run, pipes NOT held — a real timeout.
+        (false, true, Some(exit_status_of(0)), false),
+        // …the same run with a pipe still held: the new success row (#94).
+        (false, true, Some(exit_status_of(0)), true),
+        (false, true, Some(exit_status_of(3)), true),
+        (false, true, Some(a_death_with_no_exit_code()), true),
+        (true, false, Some(exit_status_of(0)), true),
     ];
     let ok: Vec<usize> = rows
         .iter()
         .enumerate()
-        .filter(|(_, (c, t, s))| !bash_exit_report(*c, *t, *s).1)
+        .filter(|(_, (c, t, s, p))| !bash_exit_report(*c, *t, *s, *p).1)
         .map(|(i, _)| i)
         .collect();
     assert_eq!(
         ok,
-        vec![0],
-        "only the first row (exit 0, untouched) is a success"
+        vec![0, 6],
+        "the only successes are exit 0 untouched and exit 0 with the pipes held"
     );
 }
 
@@ -940,6 +1085,136 @@ async fn bash_nonzero_exit_after_closing_its_pipes_reports_its_real_code() {
             text_of(&r)
         );
     }
+}
+
+/// A6-a — THE BUG (#94), end-to-end: a command whose foreground work
+/// finished and which was OBSERVED exiting 0, while a background process
+/// still held the output pipe open, must come back as a SUCCESS with a
+/// do-not-re-run note — not as a timeout.
+///
+/// The shape is the DETERMINISTIC one and it is the truth of the two pipe-held
+/// fixtures (`bash_issue_94_repro_is_reported_as_success_not_a_timeout` is the
+/// issue's own repro, kept as the illustration):
+/// - `( sleep 25; exec >&- 2>&- ) &` leaves exactly ONE named holder of the
+///   write ends, and gives that holder an explicit fd close — the same
+///   `exec >&- 2>&-` idiom `bash_success_after_closing_its_pipes_is_not_an_error`
+///   uses to make pipe-close deterministic. `( sleep 25 & )` instead backgrounds
+///   a subshell that exits at once and leaves `sleep` orphaned and re-parented,
+///   so the pipes would be held at the deadline by a process the fixture never
+///   named.
+/// - NO foreground `wait`, and that is load-bearing: `wait` keeps the parent
+///   alive until the holder finishes (25 s), so the deadline would fire with
+///   `status.is_none()`, the kill gate would SIGKILL the group including the
+///   parent, and the bounded post-loop reap would hand the report a SIGKILL
+///   death — which is the signal row, not this one. Without `wait` the parent
+///   `sh` falls off the end of the script immediately, so the `child.wait()`
+///   select arm retires the exit status well before the deadline arm breaks the
+///   loop, and the run arrives at the report with its status already observed.
+/// - The holder's 25 s NEVER enters the wall clock: the deadline ends the run
+///   and the process-group kill reaps the holder, so this fixture costs
+///   `timeout_ms` plus the bounded drain.
+///
+/// Deliberately NOT asserted here: the grandchild's death.
+/// `bash_backgrounded_grandchild_killed_with_group` owns that claim and pays a
+/// real 3 s wait past the marker deadline to prove it; duplicating it would
+/// triple this test's cost for a fact already pinned. This fixture asserts the
+/// REPORT and nothing else.
+/// Both fixtures here are POSIX through and through (`( … ) &` backgrounding
+/// and the `>&-` fd close), so `cmd` cannot run them; the DECISION they gate is
+/// platform-neutral and stays covered everywhere by
+/// `bash_exit_report_pipe_held_exit_zero_is_a_success_that_forbids_rerun`.
+/// The #79 quoting fix does NOT make this fixture runnable on `cmd`: the gate is
+/// POSIX SYNTAX, not quoting.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_pipe_held_completion_is_reported_as_success_not_a_timeout() {
+    let cwd = temp_cwd("bash-pipe-held");
+    let r = execute_tool(
+        &ctx(&cwd),
+        "bash",
+        &json!({
+            "command": "echo PIPE-HELD-1; ( sleep 25; exec >&- 2>&- ) & echo PIPE-HELD-2",
+            "timeout_ms": 800,
+        }),
+    )
+    .await;
+    assert!(
+        !r.is_error,
+        "#94: a command observed exiting 0 while a background process held the \
+         pipe must be reported as COMPLETED, not as a timeout: TEXT={:?} DETAILS={:?}",
+        text_of(&r),
+        r.details
+    );
+    assert_eq!(
+        r.details.as_ref().unwrap()["exitCode"],
+        0,
+        "the real exit code, got {:?}",
+        r.details
+    );
+    assert_eq!(r.details.as_ref().unwrap()["cancelled"], false);
+    let text = text_of(&r);
+    assert!(
+        text.contains("PIPE-HELD-1") && text.contains("PIPE-HELD-2"),
+        "the output captured before the deadline is returned: {text:?}"
+    );
+    assert!(
+        !text.contains("timed out"),
+        "the text the model reads must not call this a timeout: {text:?}"
+    );
+    assert!(
+        text.contains(DO_NOT_RERUN),
+        "the text must forbid re-running a command that already succeeded: {text:?}"
+    );
+}
+
+/// A6-b — the SAME bug, reported by the issue itself: #94's repro block run
+/// verbatim. Kept for faithfulness to the report (the repro IS the spec) and
+/// because it costs the same `timeout_ms` + bounded drain as A6-a. Where the
+/// two disagree, `bash_pipe_held_completion_is_reported_as_success_not_a_timeout`
+/// is the truth and THIS one is the illustration — its `( sleep 25 & )` leaves
+/// an orphaned subshell holding the write ends, so it is the shape whose
+/// holder the fixture never named. Same assertion set, same gate (POSIX
+/// syntax), same reason for the `#[cfg(unix)]`.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_issue_94_repro_is_reported_as_success_not_a_timeout() {
+    let cwd = temp_cwd("bash-pipe-held-repro");
+    let r = execute_tool(
+        &ctx(&cwd),
+        "bash",
+        &json!({
+            "command": "echo PIPE-HELD-1; ( sleep 25 & ); echo PIPE-HELD-2",
+            "timeout_ms": 800,
+        }),
+    )
+    .await;
+    assert!(
+        !r.is_error,
+        "#94's repro, verbatim, must be reported as COMPLETED, not as a \
+         timeout: TEXT={:?} DETAILS={:?}",
+        text_of(&r),
+        r.details
+    );
+    assert_eq!(
+        r.details.as_ref().unwrap()["exitCode"],
+        0,
+        "the real exit code, got {:?}",
+        r.details
+    );
+    assert_eq!(r.details.as_ref().unwrap()["cancelled"], false);
+    let text = text_of(&r);
+    assert!(
+        text.contains("PIPE-HELD-1") && text.contains("PIPE-HELD-2"),
+        "the output captured before the deadline is returned: {text:?}"
+    );
+    assert!(
+        !text.contains("timed out"),
+        "the text the model reads must not call this a timeout: {text:?}"
+    );
+    assert!(
+        text.contains(DO_NOT_RERUN),
+        "the text must forbid re-running a command that already succeeded: {text:?}"
+    );
 }
 
 /// The flake's shape, reproduced on purpose: the executor pinned to ONE

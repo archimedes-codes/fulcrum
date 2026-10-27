@@ -296,6 +296,13 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
         }
     }
 
+    // LATCH the pipe fact BEFORE the kill, not at the report. `stdout_open`/
+    // `stderr_open` still mean "held at the deadline" only here: the group kill
+    // below kills the holder, and the drain below then reads the EOF that kill
+    // produced and clears both flags — so by the time the report is built the
+    // pair reads `false` for the exact run this fact exists to identify (#94).
+    let pipes_held = stdout_open || stderr_open;
+
     // Kill the WHOLE process group whenever anything may still be alive:
     // the loop broke on cancel/timeout with the child's exit unobserved
     // (`status.is_none()`), or with a pipe still open (a backgrounded
@@ -353,7 +360,10 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
             status = Some(s);
         }
     }
-    let (exit_code, is_error, note) = bash_exit_report(cancelled, timed_out, status);
+    // The fourth fact is the LATCHED one (`pipes_held`, above the kill gate) —
+    // never the live `stdout_open || stderr_open` pair, which the kill and the
+    // drain have already cleared by this point (#94).
+    let (exit_code, is_error, note) = bash_exit_report(cancelled, timed_out, status, pipes_held);
 
     let truncated = collector.is_truncated();
     let out = collector.into_bytes();
@@ -396,15 +406,25 @@ pub(crate) fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 
 /// What a `bash` run reports, given everything the executor actually knows.
 ///
-/// PURE on purpose — the three inputs are the only facts the run produces
+/// PURE on purpose — the four inputs are the only facts the run produces
 /// (was it cancelled, did it hit its deadline, was the child's exit status
-/// observed), so the whole truth table is unit-testable without a child and
-/// without timing. This is where the old code fabricated `exitCode: -1`:
+/// observed, were the output pipes still held), so the whole truth table is
+/// unit-testable without a child and without timing. This is where the old code
+/// fabricated `exitCode: -1`:
 /// a child that had already written all its output and closed both pipes
 /// was still alive for a few more microseconds (EOF on a pipe does NOT mean
 /// the process exited), and the unconditional `kill()` that followed turned
 /// a SUCCESS into a signal death reported as `-1` — a model watching a
 /// successful `git commit` fail, and retrying a non-idempotent command.
+///
+/// `pipes_held` is the fourth fact and its SAMPLING POINT is part of its
+/// meaning: it must say whether an output pipe was still held open **AT THE
+/// DEADLINE**, latched the moment the read loop breaks and BEFORE the
+/// process-group kill (`exec_bash`'s `pipes_held` binding). The live
+/// `stdout_open || stderr_open` pair CANNOT be passed here — the group kill
+/// kills the holder and the bounded drain then reads the EOF that kill
+/// produced and clears both flags, so by the time this function is called the
+/// pair reads `false` for the exact run this fact exists to identify (#94).
 ///
 /// Returns `(reported exit code, is_error, note)`: the code is `None` when
 /// it is genuinely unknowable (never a fabricated number), and the `note`
@@ -415,10 +435,50 @@ pub(crate) fn bash_exit_report(
     cancelled: bool,
     timed_out: bool,
     status: Option<std::process::ExitStatus>,
+    pipes_held: bool,
 ) -> (Option<i32>, bool, Option<String>) {
     /// The warning for an outcome that cannot be known: the model must not
     /// read silence as success, and must not re-run blind.
     const UNKNOWN: &str = "The command's exit status is unknown (the process was never reaped): it may have SUCCEEDED, and its side effects may already have landed — inspect the resulting state before re-running this command.";
+
+    /// The deadline sentence. It stays BYTE-IDENTICAL to the pre-#94 note
+    /// because `contains("timed out")` is asserted against it by the deadline
+    /// fixtures (`bash_timeout_kills_a_child_that_closed_its_pipes`) and by the
+    /// unknown-status and not-held guards — a GENUINE hang must still be called
+    /// one.
+    const DEADLINE: &str = "The command timed out and was killed at its deadline.";
+
+    /// R1's note: a pipe-held **SUCCESS** — exit 0 OBSERVED while a background
+    /// process held a pipe — is a completion, and the model must be told not to
+    /// re-run it (#94). Four claims, each deliberate: it completed, the code it
+    /// exited with, DO NOT RE-RUN, and what was lost (the drain after the kill
+    /// is bounded by [`DRAIN_GRACE`], so completeness is NOT a fact the run
+    /// holds — hence the last sentence, and hence this note never says the
+    /// output was captured in full).
+    ///
+    /// The kill clause claims the ACTION, not the FATE: "the process group was
+    /// killed" is literally true on Unix whatever happens next, whereas "every
+    /// background process was killed" is not — a descendant that called
+    /// `setpgid`/`setsid` escapes a negative-pid kill, which the drain's own
+    /// comment concedes.
+    #[cfg(unix)]
+    const PIPE_HELD_SUCCESS: &str = "The command COMPLETED and was observed exiting with code 0. The deadline was reached only because a background process still held the output pipe open; the command's process group was killed (SIGKILL) to end the capture. DO NOT RE-RUN this command — it already succeeded and its side effects have landed. Output written after the drain window is not captured here.";
+
+    /// The same note WITHOUT the process-group sentence, and WITHOUT any
+    /// replacement claim about the background process. On Windows there is no
+    /// `process_group(0)` at spawn and no negative-pid `SIGKILL` — see
+    /// [`kill_bash_process_group`], whose fallback kills the DIRECT CHILD only,
+    /// and R1 is only reachable when that child has already exited. So nothing
+    /// in the pipe-holding descendant is killed there, and "a background
+    /// process holding the pipe was killed" is a claim the platform does not
+    /// deliver. Nor may this say it "may still be running": R1 exists to stop
+    /// the model chasing a phantom, and the platform genuinely cannot tell.
+    /// Silence on the unverifiable fact is the honest option — both alternatives
+    /// assert something unobserved. The `is_error: false` verdict itself is
+    /// platform-neutral and ungated: the command exited 0 and was watched doing
+    /// it on every platform.
+    #[cfg(not(unix))]
+    const PIPE_HELD_SUCCESS: &str = "The command COMPLETED and was observed exiting with code 0. The deadline was reached only because a background process still held the output pipe open. DO NOT RE-RUN this command — it already succeeded and its side effects have landed. Output written after the drain window is not captured here.";
 
     let code = status.and_then(|s| s.code());
     let signal = status.and_then(|s| exit_signal(&s));
@@ -434,7 +494,47 @@ pub(crate) fn bash_exit_report(
         );
     }
     if timed_out {
-        let mut note = "The command timed out and was killed at its deadline.".to_string();
+        // R5 BEFORE any code is read: a status whose `code()` is `None` must
+        // never be handed a fabricated number, and this is where EVERY genuine
+        // hang lands — the loop broke with no status, the group kill SIGKILLed
+        // the child, and the bounded post-loop reap then observed that signal
+        // death. It keeps the deadline sentence (a real hang is still called
+        // one) and names the signal, claiming no code. It is also what makes
+        // R1 unreachable for a command we had to kill.
+        if let Some(sig) = signal {
+            return (
+                None,
+                true,
+                Some(format!(
+                    "{DEADLINE} The command died on signal {sig} rather than exiting with a code."
+                )),
+            );
+        }
+        // R1: pipes held at the deadline + an exit 0 WE SAW. `signal.is_none()`
+        // is a tautology this far down but stays in the guard as the safety
+        // argument made explicit: what distinguishes "it finished, we watched
+        // it" from "we ended it" is that we did NOT end it.
+        if pipes_held && code == Some(0) && signal.is_none() {
+            return (Some(0), false, Some(PIPE_HELD_SUCCESS.to_string()));
+        }
+        // R2: held pipes rescue an exit 0 and NOTHING ELSE. A non-zero exit is
+        // still an error carrying its real code, and its note must not read as
+        // a hang — that is #94 wearing the other mask, and it makes the model
+        // retry a command that genuinely failed.
+        if pipes_held {
+            if let Some(n) = code {
+                return (
+                    Some(n),
+                    true,
+                    Some(format!(
+                        "The command FAILED with exit code {n} — that is the command's own exit code, not a deadline. The run only reached its deadline because a background process still held the output pipe open after the command had exited."
+                    )),
+                );
+            }
+        }
+        // R3 (no status observed) and R4 (a deadline run whose pipes were NOT
+        // held): unchanged. R4 is the row that keeps R1 honest.
+        let mut note = DEADLINE.to_string();
         if status.is_none() {
             note.push(' ');
             note.push_str(UNKNOWN);

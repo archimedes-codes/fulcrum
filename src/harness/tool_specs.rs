@@ -331,7 +331,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                     // params.get("numResults"))`), plus `proxy`, which the
                     // handler reads and the spec never mentioned. Advertised ==
                     // accepted is what keeps the #78 unknown-param checker from
-                    // warning on a legal call; the aliases stay undocumented
+                    // rejecting a legal call; the aliases stay undocumented
                     // behaviour otherwise.
                     "numResults": { "type": "number", "description": "Alias for num_results" },
                     "provider": { "type": "string", "description": "Search provider to use (default: auto)" },
@@ -407,8 +407,10 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// (issue #78) The warning for a tool call that passes a key the model was
-/// never told about, or `None` when there is nothing to say.
+/// (issue #93) The rejection text for a tool call that passes a key the model
+/// was never told about, or `None` when there is nothing to say.
+/// `run_tool_batch` (`harness/loop/turn.rs`) consumes the text as a REJECTION:
+/// the call is not dispatched and the sentence becomes the whole tool result.
 ///
 /// WHY IT LIVES HERE: this file owns the advertised shapes, so the known-key
 /// set and the shape the model was shown stay in one place. Callers MUST pass
@@ -439,7 +441,7 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
 /// decided anything. Malformed JSON needs no branch — `parse_arguments`
 /// (`provider/openai.rs`) already collapses unparseable arguments to `{}`, and
 /// a non-object payload simply has no keys.
-pub(crate) fn unknown_param_warning(specs: &[ToolSpec], tc: &ToolCall) -> Option<String> {
+pub(crate) fn unknown_param_error(specs: &[ToolSpec], tc: &ToolCall) -> Option<String> {
     // The `dispatch_subagent` alias resolves to the `subagent` spec — the same
     // `effective_tool_name` `is_tool_enabled` gates on, so the alias is checked
     // against the shape the model was actually shown and the message names the
@@ -467,7 +469,7 @@ pub(crate) fn unknown_param_warning(specs: &[ToolSpec], tc: &ToolCall) -> Option
     // map type, which is what lets a test pin the message byte-for-byte.
     items.sort();
     Some(format!(
-        "⚠ unknown param(s) for `{}`: {} — ignored.",
+        "unknown param(s) for `{}`: {} — the call was rejected, fix the key and retry.",
         spec.name,
         items.join(", ")
     ))
@@ -552,16 +554,23 @@ mod tests {
         ]
     }
 
+    /// The loop-internal tools `exec_param_keys()` deliberately omits (their
+    /// handlers are not the `execute_tool` executors the census compares
+    /// against). The census-of-censuses
+    /// (`every_loop_internal_tool_is_covered_by_a_param_key_census`) closes the
+    /// union of the two tables, so a sixth loop-internal tool cannot escape
+    /// both.
+    const LOOP_INTERNAL_TOOLS: &[&str] = &[
+        "ask",
+        "sudo_exec",
+        "manage_todo_list",
+        "subagent",
+        "list_agents",
+        "mcp",
+    ];
+
     #[test]
     fn every_tool_spec_is_in_the_param_key_table() {
-        const LOOP_INTERNAL_TOOLS: &[&str] = &[
-            "ask",
-            "sudo_exec",
-            "manage_todo_list",
-            "subagent",
-            "list_agents",
-            "mcp",
-        ];
         let param_keys = exec_param_keys();
         for spec in tool_specs() {
             if LOOP_INTERNAL_TOOLS.contains(&spec.name.as_str()) {
@@ -597,26 +606,144 @@ mod tests {
         }
     }
 
+    /// The sibling of `exec_param_keys()` for the five loop-internal tools it
+    /// omits. As a WARNING the gap was cosmetic; as a REJECTION (issue #93) an
+    /// unadvertised-but-legal key breaks that tool's EVERY call, and by-hand
+    /// agreement between a spec and a handler is not a guard.
+    ///
+    /// Where each set was read from (at the commit this table was written):
+    /// see the per-tool comments. `list_agents` is deliberately absent — it is
+    /// a bare `{"type":"object"}` with NO `properties`, so rule 2 exempts it
+    /// from any check and there is nothing to census (its exemption is pinned
+    /// by `a_spec_with_no_properties_is_never_checked`; do not add it here).
+    fn suite_param_keys() -> [(&'static str, &'static [&'static str]); 5] {
+        [
+            // `questions` — harness/ask.rs (normalize_ask_params reads ONLY
+            // this at top level).
+            ("ask", &["questions"]),
+            // interactive/mod.rs: `command`, `reason`, `timeoutMs`. NOT
+            // `confirmed` / `password` — those ride the interactive RESPONSE
+            // value, never the tool args.
+            ("sudo_exec", &["command", "reason", "timeoutMs"]),
+            ("manage_todo_list", &["operation", "todoList"]),
+            // interactive::dispatch_params + dispatch::dispatch_subagent
+            // (`agentName`).
+            (
+                "subagent",
+                &[
+                    "task",
+                    "agentName",
+                    "model",
+                    "thinking",
+                    "systemPrompt",
+                    "tools",
+                ],
+            ),
+            // mcp/tool.rs.
+            (
+                "mcp",
+                &[
+                    "tool", "args", "search", "describe", "connect", "server", "action",
+                ],
+            ),
+        ]
+    }
+
+    /// (issue #93) The five loop-internal tools' specs advertise EXACTLY the
+    /// keys their handlers read — the same exact-set-equality shape as
+    /// `tool_specs_advertise_exactly_the_executor_param_keys`, so both a
+    /// dropped key and an unadvertised extra redden it.
+    #[test]
+    fn the_suite_tool_specs_advertise_every_key_their_handlers_read() {
+        let specs = tool_specs();
+        for (name, keys) in suite_param_keys() {
+            let spec = specs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no `tool_specs` entry for `{name}`"));
+            let advertised: BTreeSet<String> = spec
+                .parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            let expected: BTreeSet<String> = keys.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                advertised, expected,
+                "tool `{name}`: advertised {advertised:?} != handler keys {expected:?}"
+            );
+        }
+    }
+
+    /// The census-of-censuses: every tool `tool_specs()` advertises is covered
+    /// by exactly one of the two param-key tables, so a sixth loop-internal
+    /// tool cannot quietly escape both.
+    #[test]
+    fn every_loop_internal_tool_is_covered_by_a_param_key_census() {
+        // LOOP_INTERNAL_TOOLS (from `every_tool_spec_is_in_the_param_key_table`)
+        // minus the bare `{"type":"object"}` specs — `list_agents` /
+        // `list_skills` have NO `properties`, so rule 2 exempts them and there
+        // is nothing to census. Their exemption is pinned by
+        // `a_spec_with_no_properties_is_never_checked`; do not add them here.
+        const BARE_SPECS: &[&str] = &["list_agents", "list_skills"];
+        for name in LOOP_INTERNAL_TOOLS {
+            if BARE_SPECS.contains(name) {
+                continue;
+            }
+            assert!(
+                suite_param_keys().iter().any(|(tool, _)| tool == name),
+                "loop-internal tool `{name}` is in neither `exec_param_keys()` \
+                 nor `suite_param_keys()` — a rejection would then guard a shape \
+                 no census checks"
+            );
+        }
+        // And the union covers the whole advertised set: every spec is either
+        // in one of the two tables or is an exempt bare spec.
+        for spec in tool_specs() {
+            let covered = exec_param_keys().iter().any(|(name, _)| *name == spec.name)
+                || suite_param_keys()
+                    .iter()
+                    .any(|(name, _)| *name == spec.name)
+                || BARE_SPECS.contains(&spec.name.as_str());
+            assert!(
+                covered,
+                "tool `{}` from `tool_specs()` is covered by neither param-key \
+                 census and is not a bare spec",
+                spec.name
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------
-    // (issue #78) `unknown_param_warning` — the silently-dropped parameter
-    // announces itself in the tool result.
+    // (issue #93) `unknown_param_error` — an unadvertised top-level key
+    // REJECTS the call (the text names the key and the closest advertised one).
     // ---------------------------------------------------------------------
 
     /// The exact wire text the model reads on its next turn, pinned
-    /// byte-for-byte: the `⚠` (U+26A0, NO variation selector), the `(s)`, the
-    /// backticks, the em dash and the trailing `ignored` are all part of the
-    /// contract — a drift in any of them is a regression, because the model
-    /// learns the habit from this sentence.
+    /// byte-for-byte: the `(s)`, the backticks, the em dash and the closing
+    /// `fix the key and retry.` are all part of the contract — a drift in any
+    /// of them is a regression, because the model learns the habit from this
+    /// sentence. Both names are pinned on purpose: the UNKNOWN key (`` `agent` ``)
+    /// and the SUGGESTED one (`` `agentName` ``) — the suggestion is the half the
+    /// model needs to fix the call, so a `suggest()` that stopped firing would
+    /// redden this test rather than quietly degrade it.
+    ///
+    /// (issue #93) The sentence changed shape when the verdict did: the `⚠ `
+    /// prefix marked a warning riding inside a SUCCESS, and the `— ignored.`
+    /// suffix became a lie once the call was rejected instead of tolerated. T01
+    /// shipped the new wording and handed this pin to T02, which re-pinned it
+    /// byte-for-byte — the checker's own test is the single home of the literal
+    /// (`param_rejection.rs` asserts `starts_with`/`contains` only, on purpose).
     #[test]
     fn an_unknown_param_is_reported_with_a_suggestion() {
-        let warning = unknown_param_warning(
+        let rejection = unknown_param_error(
             &tool_specs(),
             &call("subagent", json!({ "task": "t", "agent": "reviewer" })),
         );
         assert_eq!(
-            warning.as_deref(),
+            rejection.as_deref(),
             Some(
-                "⚠ unknown param(s) for `subagent`: `agent` (did you mean `agentName`?) — ignored."
+                "unknown param(s) for `subagent`: `agent` (did you mean `agentName`?) — the call was rejected, fix the key and retry."
             ),
             "the whole sentence is the wire text the model reads"
         );
@@ -630,7 +757,7 @@ mod tests {
     /// the control that proves the `agent_name` half is not passing by accident.
     #[test]
     fn an_unknown_param_without_a_close_match_is_still_reported() {
-        let warning = unknown_param_warning(
+        let warning = unknown_param_error(
             &tool_specs(),
             &call("subagent", json!({ "task": "t", "agent_name": "reviewer" })),
         )
@@ -643,7 +770,7 @@ mod tests {
              separator-blind): {warning}"
         );
 
-        let warning = unknown_param_warning(
+        let warning = unknown_param_error(
             &tool_specs(),
             &call("subagent", json!({ "task": "t", "zzzz": 1 })),
         )
@@ -663,7 +790,7 @@ mod tests {
     fn a_spec_with_no_properties_is_never_checked() {
         for bare in ["list_agents", "list_skills"] {
             assert_eq!(
-                unknown_param_warning(&tool_specs(), &call(bare, json!({ "anything": 1 }))),
+                unknown_param_error(&tool_specs(), &call(bare, json!({ "anything": 1 }))),
                 None,
                 "`{bare}` is a bare `{{\"type\":\"object\"}}` — no properties, no check"
             );
@@ -676,7 +803,7 @@ mod tests {
             parameters: json!({ "type": "object", "properties": "not-an-object" }),
         }];
         assert_eq!(
-            unknown_param_warning(&odd, &call("odd", json!({ "anything": 1 }))),
+            unknown_param_error(&odd, &call("odd", json!({ "anything": 1 }))),
             None,
             "a non-object `properties` must disable the check, not enable it"
         );
@@ -688,7 +815,7 @@ mod tests {
     #[test]
     fn an_unknown_tool_name_is_never_checked() {
         assert_eq!(
-            unknown_param_warning(
+            unknown_param_error(
                 &tool_specs(),
                 &call("no_such_tool", json!({ "whatever": 1 }))
             ),
@@ -703,7 +830,7 @@ mod tests {
     #[test]
     fn a_well_formed_call_produces_no_warning() {
         assert_eq!(
-            unknown_param_warning(
+            unknown_param_error(
                 &tool_specs(),
                 &call(
                     "subagent",
@@ -720,7 +847,7 @@ mod tests {
             None,
             "every key here is advertised, so nothing may be reported"
         );
-        let warning = unknown_param_warning(
+        let warning = unknown_param_error(
             &tool_specs(),
             &call("dispatch_subagent", json!({ "task": "t", "agent": "x" })),
         )

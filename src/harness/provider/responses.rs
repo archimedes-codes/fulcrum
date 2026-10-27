@@ -18,8 +18,8 @@ use serde_json::Value;
 use super::openai::{parse_arguments, LineAssembler};
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
-    ChatRole, FinishReason, MessageContent, ModelRequest, Provider, ProviderError, ProviderEvent,
-    ToolCall, ToolCallDelta, Usage,
+    cost_usd_from_usage, ChatRole, FinishReason, MessageContent, ModelRequest, Provider,
+    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
 };
 use crate::agent::tools::ContentBlock;
 
@@ -273,7 +273,11 @@ impl ResponsesStream {
                 // The terminal event: the `usage` (when at least one side
                 // is present) PRECEDES the `Done`.
                 if let Some(usage) = self.response_usage(v) {
-                    self.pending.push_back(ProviderEvent::Usage(usage));
+                    // The cost rides the SAME terminal `response.usage`
+                    // object the counts came from — one more element on
+                    // this push, no new emission path.
+                    self.pending
+                        .push_back(ProviderEvent::Usage(usage, self.response_cost(v)));
                 }
                 self.terminated = true;
                 if v.get("response")
@@ -287,7 +291,11 @@ impl ResponsesStream {
             }
             Some("response.incomplete") => {
                 if let Some(usage) = self.response_usage(v) {
-                    self.pending.push_back(ProviderEvent::Usage(usage));
+                    // The cost rides the SAME terminal `response.usage`
+                    // object the counts came from — one more element on
+                    // this push, no new emission path.
+                    self.pending
+                        .push_back(ProviderEvent::Usage(usage, self.response_cost(v)));
                 }
                 self.terminated = true;
                 // `max_output_tokens` → `Length`; any other reason (or an
@@ -306,7 +314,11 @@ impl ResponsesStream {
             }
             Some("response.failed") => {
                 if let Some(usage) = self.response_usage(v) {
-                    self.pending.push_back(ProviderEvent::Usage(usage));
+                    // The cost rides the SAME terminal `response.usage`
+                    // object the counts came from — one more element on
+                    // this push, no new emission path.
+                    self.pending
+                        .push_back(ProviderEvent::Usage(usage, self.response_cost(v)));
                 }
                 self.terminated = true;
                 self.pending
@@ -367,6 +379,19 @@ impl ResponsesStream {
             }),
             (None, None) => None,
         }
+    }
+
+    /// The per-call cost (USD) of a terminal event's `response` object
+    /// (D4, AMENDED: the money rides the BODY's usage object, not a
+    /// header). A SIBLING of [`Self::response_usage`] rather than folded
+    /// into it, so that helper's ADR 0046 arithmetic — including its
+    /// "absent side becomes 0" arms and its `(None, None) => None` — stays
+    /// textually untouched. `None` when the provider reported no figure:
+    /// not zero, never a clamp.
+    fn response_cost(&self, v: &Value) -> Option<f64> {
+        v.get("response")
+            .and_then(|r| r.get("usage"))
+            .and_then(cost_usd_from_usage)
     }
 
     /// Emit the accumulated tool calls as complete `ToolCall` events
@@ -716,10 +741,13 @@ mod tests {
             vec![
                 ProviderEvent::TextDelta("He".to_string()),
                 ProviderEvent::TextDelta("llo".to_string()),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
@@ -744,10 +772,13 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 1000,
-                    output_tokens: 0,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 1000,
+                        output_tokens: 0,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
@@ -774,10 +805,13 @@ mod tests {
                 ProviderEvent::ThinkingDelta("think".to_string()),
                 ProviderEvent::ThinkingDelta("ing".to_string()),
                 ProviderEvent::TextDelta("done".to_string()),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 3,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
@@ -875,10 +909,13 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 32000,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 32000,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Length),
             ]
         );
@@ -893,6 +930,162 @@ mod tests {
         ]))
         .await;
         assert_eq!(events, vec![ProviderEvent::Done(FinishReason::Error)]);
+    }
+
+    // ── the per-call cost off the BODY's usage object (D4, AMENDED) ─────
+
+    /// The cost rides the terminal event's `response.usage` — confirmed
+    /// live on this wire by probe P3 (`cost` AND an equal
+    /// `cost_details.upstream_inference_cost`, WITHOUT the client asking:
+    /// the Responses wire sends usage unconditionally).
+    #[tokio::test]
+    async fn responses_sse_cost_rides_the_completed_response_usage() {
+        let events = collect(responses_stream(&[
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cost\":2.122e-05}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    Some(2.122e-05)
+                ),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
+    /// An INCOMPLETE terminal still costed its tokens (the model was
+    /// called and the provider priced it) — the cost rides all three
+    /// terminal arms, not just the happy one.
+    #[tokio::test]
+    async fn responses_sse_cost_rides_the_incomplete_terminal() {
+        let events = collect(responses_stream(&[
+            "event: response.incomplete\n\
+             data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":32000,\"cost\":0.25}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 32000,
+                    },
+                    Some(0.25)
+                ),
+                ProviderEvent::Done(FinishReason::Length),
+            ]
+        );
+    }
+
+    /// … and so does a FAILED one (a failed call is still a call the
+    /// provider may have priced).
+    #[tokio::test]
+    async fn responses_sse_cost_rides_the_failed_terminal() {
+        let events = collect(responses_stream(&[
+            "event: response.failed\n\
+             data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cost\":0.003}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 1,
+                    },
+                    Some(0.003)
+                ),
+                ProviderEvent::Done(FinishReason::Error),
+            ]
+        );
+    }
+
+    /// A terminal `usage` with counts and no money is `None`, not `0.0`
+    /// (D5: an unpriced call renders NOTHING, not a free `$0.00`).
+    #[tokio::test]
+    async fn responses_sse_absent_cost_is_none_not_zero() {
+        let events = collect(responses_stream(&[
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
+    /// A malformed money value is `None` — no panic, no clamp — and the
+    /// token counts still arrive.
+    #[tokio::test]
+    async fn responses_sse_malformed_cost_is_none() {
+        for malformed in [json!("abc"), Value::Null, json!({}), json!(-0.5)] {
+            let payload = json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": { "input_tokens": 10, "output_tokens": 5, "cost": malformed },
+                },
+            });
+            let events = collect(responses_stream(&[&format!(
+                "event: response.completed\ndata: {payload}\n\n"
+            )]))
+            .await;
+            assert_eq!(
+                events,
+                vec![
+                    ProviderEvent::Usage(
+                        Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                        },
+                        None
+                    ),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ],
+                "a malformed cost ({malformed}) is None, not a panic"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (a recorded residue, not a RED pin): a terminal
+    /// event whose `response.usage` carries a cost and NEITHER token count
+    /// emits NO `Usage` — `response_usage`'s `(None, None) => None` arm
+    /// still returns `None`, so the money has no event to ride. This is
+    /// this wire's share of the "a cost with no token counts is dropped"
+    /// residue; `responses_sse_failed` does NOT cover it (that fixture has
+    /// no `usage` object at all, so it exercises the missing-`usage` early
+    /// return, not the count arm). Asserts an ABSENCE, so it is green
+    /// before the change as well as after.
+    #[tokio::test]
+    async fn responses_sse_cost_with_no_token_counts_emits_no_usage_event() {
+        let events = collect(responses_stream(&[
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"cost\":0.003}}}\n\n",
+        ]))
+        .await;
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Usage(..))),
+            "a cost with no counts emits NO Usage (got {events:?})"
+        );
     }
 
     #[tokio::test]

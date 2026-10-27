@@ -19,8 +19,8 @@ use super::openai::{parse_arguments, LineAssembler};
 use super::overflow::is_context_overflow_text;
 use super::transport::{build_client, litellm_headers, map_response, ANTHROPIC_API_VERSION};
 use super::types::{
-    ChatRole, FinishReason, MessageContent, ModelRequest, Provider, ProviderError, ProviderEvent,
-    ToolCall, ToolCallDelta, Usage,
+    cost_usd_from_usage, ChatRole, FinishReason, MessageContent, ModelRequest, Provider,
+    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
 };
 use crate::agent::tools::ContentBlock;
 
@@ -168,6 +168,16 @@ struct AnthropicStream {
     /// The last `message_delta` `usage.output_tokens` seen (cumulative on
     /// the wire — the FINAL `message_delta` carries the full count).
     last_output_tokens: Option<u32>,
+    /// The last usage object's cost (USD) seen — read at BOTH places this
+    /// parser reads a usage object (`message_start`'s input side and
+    /// `message_delta`'s output side), LAST-NON-`None`-WINS: a later usage
+    /// object that PRICES the call supersedes the earlier figure (the
+    /// final `message_delta` carries the final number, as
+    /// `last_output_tokens` does), and one that omits the cost does NOT
+    /// erase an earlier figure — an absent field is neither a zero nor a
+    /// retraction. `None` means the provider reported NO money, which is
+    /// not zero (D5).
+    cost_usd: Option<f64>,
     /// A `message_delta` with a `stop_reason` was seen (no synthetic
     /// `Done` at end).
     finished: bool,
@@ -188,6 +198,7 @@ impl AnthropicStream {
             tool_acc: BTreeMap::new(),
             input_tokens: None,
             last_output_tokens: None,
+            cost_usd: None,
             finished: false,
             usage_emitted: false,
             exhausted: false,
@@ -277,6 +288,12 @@ impl AnthropicStream {
                         whole_prompt = Some(whole_prompt.unwrap_or(0).saturating_add(n));
                     }
                     self.input_tokens = whole_prompt;
+                    // The same usage object may carry the money (D4,
+                    // AMENDED: the cost rides the BODY's usage object, not
+                    // a header). Read here too — which usage object a
+                    // gateway prices is deployment-dependent, so both
+                    // places this parser reads a usage object are read.
+                    self.record_cost(cost_usd_from_usage(u));
                 }
             }
             Some("content_block_start") => {
@@ -362,6 +379,13 @@ impl AnthropicStream {
                 {
                     self.last_output_tokens = Some(u32::try_from(t).unwrap_or(u32::MAX));
                 }
+                // The same usage object may carry the money (D4, AMENDED).
+                // The FINAL `message_delta` is where a gateway that prices
+                // after streaming reports, so this is the Anthropic
+                // analogue of the OpenAI-shaped final usage chunk.
+                if let Some(u) = v.get("usage") {
+                    self.record_cost(cost_usd_from_usage(u));
+                }
                 if let Some(reason) = v
                     .get("delta")
                     .and_then(|d| d.get("stop_reason"))
@@ -397,11 +421,30 @@ impl AnthropicStream {
         self.event = None;
     }
 
+    /// Record a cost seen on a usage object: LAST-NON-`None`-WINS. A
+    /// `None` (absent, malformed or negative — the reader's verdict) never
+    /// overwrites a figure an earlier usage object carried, because an
+    /// absent field is not a retraction of the money.
+    fn record_cost(&mut self, cost: Option<f64>) {
+        if cost.is_some() {
+            self.cost_usd = cost;
+        }
+    }
+
     /// Emit the combined `Usage` ONCE (the input from `message_start` —
     /// already the WHOLE prompt, cached prefix included, ADR 0046 — plus
     /// the last `output_tokens` seen; a `None` side becomes `0` — an
     /// absent count is reported as zero, NOT dropped: a `Usage` with one
     /// real side is more useful than none).
+    ///
+    /// The guard below is deliberately **counts-only**: it must NOT gain a
+    /// `|| self.cost_usd.is_some()` term. A cost with no token counts on
+    /// either side would push `Usage(0, 0, Some(money))`, and
+    /// `Compactor::record_usage` would write a ZERO **Anchor** — a
+    /// compaction regression bought for a figure (pinned by
+    /// `anthropic_sse_cost_with_no_token_counts_emits_no_usage_event`).
+    /// The cost is one more argument on this ONE push, so the
+    /// `usage_emitted` exactly-once property is unchanged by it.
     fn emit_usage(&mut self) {
         if self.usage_emitted {
             return;
@@ -410,10 +453,13 @@ impl AnthropicStream {
             return;
         }
         self.usage_emitted = true;
-        self.pending.push_back(ProviderEvent::Usage(Usage {
-            input_tokens: self.input_tokens.unwrap_or(0),
-            output_tokens: self.last_output_tokens.unwrap_or(0),
-        }));
+        self.pending.push_back(ProviderEvent::Usage(
+            Usage {
+                input_tokens: self.input_tokens.unwrap_or(0),
+                output_tokens: self.last_output_tokens.unwrap_or(0),
+            },
+            self.cost_usd,
+        ));
     }
 
     /// Emit the accumulated tool calls as complete `ToolCall` events
@@ -1020,10 +1066,13 @@ mod tests {
             vec![
                 ProviderEvent::TextDelta("He".to_string()),
                 ProviderEvent::TextDelta("llo".to_string()),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
@@ -1107,10 +1156,13 @@ mod tests {
                     name: None,
                     arguments: Some("h\":\"/x\"}".to_string()),
                 }),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 7,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 7,
+                    },
+                    None
+                ),
                 ProviderEvent::ToolCall(ToolCall {
                     id: "tu_1".to_string(),
                     name: "read".to_string(),
@@ -1250,10 +1302,13 @@ mod tests {
             events,
             vec![
                 ProviderEvent::TextDelta("x".to_string()),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 0,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 0,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Error),
             ]
         );
@@ -1275,10 +1330,13 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 7,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 7,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
@@ -1304,10 +1362,13 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 175,
-                    output_tokens: 7,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 175,
+                        output_tokens: 7,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
@@ -1328,10 +1389,13 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 100,
-                    output_tokens: 7,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 100,
+                        output_tokens: 7,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
@@ -1363,8 +1427,233 @@ mod tests {
             ]
         );
         assert!(
-            !events.iter().any(|e| matches!(e, ProviderEvent::Usage(_))),
+            !events.iter().any(|e| matches!(e, ProviderEvent::Usage(..))),
             "a stream with no counts on either side emits NO Usage (got {events:?})"
+        );
+    }
+
+    // ── the per-call cost off the BODY's usage object (D4, AMENDED) ─────
+
+    /// The cost rides the `message_delta` `usage` — the object that
+    /// carries the FINAL output count, and the Anthropic analogue of the
+    /// OpenAI-shaped final usage chunk where LiteLLM injects.
+    #[tokio::test]
+    async fn anthropic_sse_cost_rides_the_message_delta_usage() {
+        let events = collect(anthropic_stream(&[
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"cost\":0.002}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 7,
+                    },
+                    Some(0.002)
+                ),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
+    /// … and it rides the `message_start` `usage` too (the input side):
+    /// both places the parser already reads a usage object are read for a
+    /// cost, because which one a gateway prices is deployment-dependent.
+    #[tokio::test]
+    async fn anthropic_sse_cost_rides_the_message_start_usage() {
+        let events = collect(anthropic_stream(&[
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cost\":0.001}}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 7,
+                    },
+                    Some(0.001)
+                ),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
+    /// LAST-NON-`None`-WINS, in both directions of "later": a later usage
+    /// object that PRICES the call supersedes the earlier figure (the
+    /// final `message_delta` carries the final number, exactly as
+    /// `last_output_tokens` does), and a later usage object that omits
+    /// cost does NOT erase an earlier figure — an absent field is not a
+    /// zero and not a retraction.
+    #[tokio::test]
+    async fn anthropic_sse_cost_is_the_last_non_none_usage_object() {
+        // A later cost supersedes.
+        let events = collect(anthropic_stream(&[
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cost\":0.001}}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3,\"cost\":0.004}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"cost\":0.009}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 7,
+                    },
+                    Some(0.009)
+                ),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+
+        // A later usage object WITHOUT a cost keeps the earlier figure.
+        let events = collect(anthropic_stream(&[
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cost\":0.001}}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 7,
+                    },
+                    Some(0.001)
+                ),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
+    /// Exactly-once survives the cost: a figure present on BOTH usage
+    /// objects still yields ONE `Usage` event — the cost is one more
+    /// argument on the single push behind the unchanged `usage_emitted`
+    /// guard, so exactly-once holds by construction rather than by a new
+    /// invariant.
+    #[tokio::test]
+    async fn anthropic_sse_cost_is_emitted_exactly_once() {
+        let events = collect(anthropic_stream(&[
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cost\":0.001}}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3,\"cost\":0.004}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7,\"cost\":0.009}}\n\n",
+        ]))
+        .await;
+        let with_cost: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::Usage(..)))
+            .collect();
+        assert_eq!(
+            with_cost.len(),
+            1,
+            "a cost seen twice still emits ONE Usage (got {events:?})"
+        );
+    }
+
+    /// The honest live case (probe P4: this proxy's `/v1/messages` stream
+    /// reports token counts and NO money). Absent is `None` — NOT `0.0`,
+    /// which the UI would render as a free `$0.00`.
+    #[tokio::test]
+    async fn anthropic_sse_absent_cost_is_none_not_zero() {
+        let events = collect(anthropic_stream(&[
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":91}}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":91,\"output_tokens\":8}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 91,
+                        output_tokens: 8,
+                    },
+                    None
+                ),
+                ProviderEvent::Done(FinishReason::Stop),
+            ]
+        );
+    }
+
+    /// A provider that sends a cost that is not a number gets NO figure:
+    /// `None`, not a panic and not a clamp.
+    #[tokio::test]
+    async fn anthropic_sse_malformed_cost_is_none() {
+        // Built with `json!` so the malformed value is inserted VERBATIM
+        // (a hand-escaped format! string is how this pin first shipped a
+        // truncated fixture and reddened for the wrong reason).
+        for malformed in [json!("abc"), Value::Null, json!({}), json!(-0.5)] {
+            let payload = json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 7, "cost": malformed },
+            });
+            let events = collect(anthropic_stream(&[
+                "event: message_start\n\
+                 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                &format!("event: message_delta\ndata: {payload}\n\n"),
+            ]))
+            .await;
+            assert_eq!(
+                events,
+                vec![
+                    ProviderEvent::Usage(
+                        Usage {
+                            input_tokens: 10,
+                            output_tokens: 7,
+                        },
+                        None
+                    ),
+                    ProviderEvent::Done(FinishReason::Stop),
+                ],
+                "a malformed cost ({malformed}) is None, not a panic"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (a recorded residue, not a RED pin): the
+    /// `emit_usage` guard must NOT gain a cost term. A cost with no token
+    /// counts on either side emits NO `Usage` — inventing a cost-only
+    /// emission would push `Usage(0, 0, Some(money))`, and
+    /// `Compactor::record_usage` would then write a ZERO **Anchor**: a
+    /// compaction regression bought for a figure. This asserts the ABSENCE
+    /// of an event, so it is green before the change as well as after.
+    #[tokio::test]
+    async fn anthropic_sse_cost_with_no_token_counts_emits_no_usage_event() {
+        let events = collect(anthropic_stream(&[
+            "event: message_start\n\
+             data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"cost\":0.001}}}\n\n\
+             event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n\
+             event: message_delta\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"cost\":0.002}}\n\n",
+        ]))
+        .await;
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Usage(..))),
+            "a cost with no counts on either side emits NO Usage (got {events:?})"
         );
     }
 

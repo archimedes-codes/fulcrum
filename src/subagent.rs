@@ -286,12 +286,27 @@ impl SubagentCancel {
     }
 }
 
-/// The metrics captured for a subagent session (the accumulated
-/// `cost_update` usage + the wall-clock duration). The suite self-emits a
-/// per-turn `cost_update` (source `main` — `subagent-metrics-cost-push`
-/// Task 1); the token/cost fields are real when the session pushed usage (0
-/// when it didn't — the `CostAccumulator` default) and `duration_ms` is
-/// always the wall clock (see the wire contract's metrics note).
+/// The metrics captured for a subagent session (the child's reported cost +
+/// its token usage + the wall-clock duration).
+///
+/// The cost mechanism is REAL as of issue #87, and it is **per model CALL, not
+/// per turn**: the child's own loop emits one `cost_update` frame for every
+/// provider call that reported a cost, the Supervisor's `SubagentCapture` sums
+/// those frames (see `worker/manager/subagent_flow.rs`), and this field carries
+/// that sum. The earlier text here claimed the suite "self-emits a per-turn
+/// `cost_update`" derived from a model `turn_end` usage; no such mechanism ever
+/// existed, and the grain was wrong besides — a turn spans several model calls.
+///
+/// **What `cost == 0.0` means here:** no call reported a cost, OR a call
+/// reported a real zero. Those two states are genuinely different and this
+/// field cannot tell them apart — the capture holds `Option<f64>` right up to
+/// the hand-off, and the collapse happens at `unwrap_or(0.0)`. Promoting this
+/// to `Option<f64>` requires moving the TypeScript `metrics` declaration
+/// (`src/lib/tauri/types.ts`) and the card's read in the SAME change, so the
+/// field stays `f64` and the collapse is documented rather than hidden. Both
+/// consumers render nothing for a zero, so a `0.0` never displays as a figure.
+///
+/// `duration_ms` is always the wall clock (see the wire contract's metrics note).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentMetrics {
     /// The last message's accumulated text ("" when the turn produced no
@@ -299,6 +314,8 @@ pub struct SubagentMetrics {
     pub output: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// The child's summed per-call cost in USD (see the struct's doc — `0.0`
+    /// means "no figure arrived", a collapse of the capture's `Option`).
     pub cost: f64,
     pub duration_ms: u64,
 }

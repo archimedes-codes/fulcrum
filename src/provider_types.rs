@@ -301,8 +301,13 @@ pub enum ProviderEvent {
     ToolCallDelta(ToolCallDelta),
     /// A complete tool call (accumulated `name` + `arguments`).
     ToolCall(ToolCall),
-    /// The token usage (usually a trailing chunk).
-    Usage(Usage),
+    /// The token usage (usually a trailing chunk) plus, when the provider
+    /// priced the call, its cost in USD. `None` cost means the provider
+    /// reported NONE — it is NOT zero and must never be rendered as
+    /// `$0.00`; a `Some(0.0)` IS a figure and renders `$0.00` (D5). Cost
+    /// rides the EVENT, not the `Usage` struct, so the Anchor type (ADR
+    /// 0046) keeps its fields, its `Eq` and its doc comment untouched.
+    Usage(Usage, Option<f64>),
     /// The turn is over.
     Done(FinishReason),
     /// A mid-stream error (the stream ends after this).
@@ -347,4 +352,141 @@ pub trait Provider: Send + Sync {
         &self,
         req: &ModelRequest,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError>;
+}
+
+/// Read the per-call cost (USD) out of a wire `usage` object (D4,
+/// AMENDED: money arrives in the response **BODY**, on the usage object
+/// each parser already reads — NOT the `x-litellm-response-cost` header,
+/// which commits before a stream ends and so carries a pre-stream value).
+///
+/// Field order is D4's own, with no invented precedence: `cost` (LiteLLM's
+/// injection into the final usage chunk, and OpenRouter's field) first,
+/// then the two known variants — `cost_details.upstream_inference_cost`
+/// and `estimated_cost` (DeepInfra). A later field is consulted only when
+/// the earlier one is ABSENT.
+///
+/// Anything absent, non-numeric, negative or non-finite is `None` — never
+/// `0.0`, never a clamp, never a panic. `None` means the provider reported
+/// NO figure and must render as nothing; a real `0` from the provider is
+/// `Some(0.0)` and renders `$0.00` (D5).
+///
+/// `is_finite()` is defence-in-depth, not the load-bearing filter: with
+/// `arbitrary_precision` OFF (the resolved feature set here),
+/// `as_f64()`'s non-arbitrary arm is a bare `Some(n)` with no finite
+/// check, so `>= 0.0` alone would let an `inf` through. Today a non-finite
+/// literal never reaches this reader at all — serde_json rejects the
+/// WHOLE chunk with `number out of range`, which each parser swallows
+/// (pinned as a no-event case on the OpenAI side) — but one comparison is
+/// a cheap barrier between a future dependency change and an `$inf` on
+/// screen, so it stays.
+pub(crate) fn cost_usd_from_usage(usage: &Value) -> Option<f64> {
+    // The FIRST PRESENT field answers, in D4's order (`.flatten()` skips
+    // only the ABSENT ones).
+    let value = [
+        usage.get("cost"),
+        usage
+            .get("cost_details")
+            .and_then(|d| d.get("upstream_inference_cost")),
+        usage.get("estimated_cost"),
+    ]
+    .into_iter()
+    .flatten()
+    .next()?;
+    // A PRESENT field is answered even when it is unusable: a malformed
+    // `cost` is `None`, not a licence to fall through to a different
+    // field's figure (which would report a number the primary did not
+    // carry).
+    match value.as_f64() {
+        Some(v) if v.is_finite() && v >= 0.0 => Some(v),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cost_usd_from_usage;
+    use serde_json::json;
+
+    #[test]
+    fn cost_usd_from_usage_reads_the_primary_cost_field() {
+        // `usage.cost` — LiteLLM's injection into the final usage chunk,
+        // and OpenRouter's field (D4's primary).
+        let usage = json!({"prompt_tokens": 10, "cost": 0.000011662});
+        assert_eq!(cost_usd_from_usage(&usage), Some(0.000011662));
+    }
+
+    #[test]
+    fn cost_usd_from_usage_falls_back_to_the_upstream_inference_cost_detail() {
+        // `usage.cost_details.upstream_inference_cost` — the known
+        // variant D4 names, read only when the primary is ABSENT.
+        let usage = json!({"cost_details": {"upstream_inference_cost": 0.005}});
+        assert_eq!(cost_usd_from_usage(&usage), Some(0.005));
+    }
+
+    #[test]
+    fn cost_usd_from_usage_reads_the_estimated_cost_variant() {
+        // `usage.estimated_cost` — DeepInfra's field (D4's other named
+        // variant). Never observed on a wire reachable from here; pinned
+        // by canned JSON only (the plan records that).
+        let usage = json!({"estimated_cost": 0.00042});
+        assert_eq!(cost_usd_from_usage(&usage), Some(0.00042));
+    }
+
+    #[test]
+    fn cost_usd_from_usage_prefers_the_gateway_cost_over_the_upstream_detail() {
+        // Both present → the PRIMARY wins. D4: "Read `cost` first; do not
+        // invent a precedence rule between a gateway's figure and an
+        // upstream's" — first-present IS D4's order, and the values here
+        // are deliberately DIFFERENT so a swapped order cannot pass.
+        // (On the live gateway both fields are numerically identical, so
+        // only a differing fixture can pin the order.)
+        let usage = json!({
+            "cost": 0.002,
+            "cost_details": {"upstream_inference_cost": 0.009},
+            "estimated_cost": 0.007,
+        });
+        assert_eq!(cost_usd_from_usage(&usage), Some(0.002));
+    }
+
+    #[test]
+    fn cost_usd_from_usage_returns_none_when_no_cost_field_is_present() {
+        // The ordinary case on a direct Anthropic / OpenAI endpoint, and
+        // on a LiteLLM cache hit (probe P6). Absence is NOT zero.
+        assert_eq!(
+            cost_usd_from_usage(&json!({"prompt_tokens": 10, "completion_tokens": 5})),
+            None
+        );
+        assert_eq!(cost_usd_from_usage(&json!({})), None);
+    }
+
+    #[test]
+    fn cost_usd_from_usage_returns_none_for_a_non_numeric_or_negative_cost() {
+        // A provider that is not telling the truth about money gets NO
+        // figure: never a panic, never a clamp, never `Some(0.0)`.
+        for usage in [
+            json!({"cost": "abc"}),                  // a string
+            json!({"cost": null}),                   // an explicit null
+            json!({"cost": -0.5}),                   // negative
+            json!({"cost": {}}),                     // an object
+            json!({"cost": true}),                   // a bool
+            json!({"cost_details": "nope"}),         // a non-object detail
+            json!({"cost_details": {"other": 1.0}}), // the named key absent
+            json!({"estimated_cost": "abc"}),        // the variant, non-numeric
+        ] {
+            assert_eq!(
+                cost_usd_from_usage(&usage),
+                None,
+                "expected None for {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn cost_usd_from_usage_keeps_a_real_zero_as_some_zero() {
+        // D5: `0` from the provider IS a figure (it renders `$0.00`);
+        // only ABSENCE is `None`. A `0.0` sentinel for absence would make
+        // an unpriced call look free.
+        assert_eq!(cost_usd_from_usage(&json!({"cost": 0})), Some(0.0));
+        assert_eq!(cost_usd_from_usage(&json!({"cost": 0.0})), Some(0.0));
+    }
 }

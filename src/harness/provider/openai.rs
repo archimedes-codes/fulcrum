@@ -20,8 +20,8 @@ use serde_json::Value;
 
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
-    ChatRole, FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent, ToolCall,
-    ToolCallDelta, Usage, WireToolCall,
+    cost_usd_from_usage, ChatRole, FinishReason, ModelRequest, Provider, ProviderError,
+    ProviderEvent, ToolCall, ToolCallDelta, Usage, WireToolCall,
 };
 /// A client for the OpenAI-compatible chat-completions API (OpenAI,
 /// OpenRouter, `tama`, …).
@@ -247,10 +247,22 @@ impl SseStream {
                 .and_then(|t| t.as_u64())
                 .zip(u.get("completion_tokens").and_then(|t| t.as_u64()))
         }) {
-            self.pending.push_back(ProviderEvent::Usage(Usage {
-                input_tokens: u32::try_from(u.0).unwrap_or(u32::MAX),
-                output_tokens: u32::try_from(u.1).unwrap_or(u32::MAX),
-            }));
+            // The GATE above is unchanged and deliberate: both counts must
+            // be present, so a chunk carrying a cost and no token pair
+            // emits NO event — a cost-only emission path would make this a
+            // SECOND `Usage` producer and hand T09 money detached from the
+            // counts D4 pairs it with (pinned by
+            // `sse_cost_only_usage_chunk_emits_no_usage_event`).
+            // The money rides the SAME usage object the counts were read
+            // from (D4, AMENDED: the body, not a header). Purely ADDITIVE
+            // — the token arithmetic above is untouched.
+            self.pending.push_back(ProviderEvent::Usage(
+                Usage {
+                    input_tokens: u32::try_from(u.0).unwrap_or(u32::MAX),
+                    output_tokens: u32::try_from(u.1).unwrap_or(u32::MAX),
+                },
+                v.get("usage").and_then(cost_usd_from_usage),
+            ));
         }
         let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
             return;
@@ -756,10 +768,13 @@ mod tests {
             events,
             vec![
                 ProviderEvent::TextDelta("x".to_string()),
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Error),
             ]
         );
@@ -787,10 +802,13 @@ mod tests {
                 // A `usage`-only chunk carries an EMPTY `choices`, so the
                 // only events are the `Usage` and the synthetic `Done`
                 // (no `finish_reason` arrived).
-                ProviderEvent::Usage(Usage {
-                    input_tokens: 1000,
-                    output_tokens: 5,
-                }),
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 1000,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
                 ProviderEvent::Done(FinishReason::Error),
             ]
         );
@@ -937,12 +955,148 @@ mod tests {
         ]))
         .await;
         match &events[0] {
-            ProviderEvent::Usage(u) => {
+            ProviderEvent::Usage(u, _) => {
                 assert_eq!(u.input_tokens, u32::MAX, "saturated, not truncated");
                 assert_eq!(u.output_tokens, 5);
             }
             other => panic!("expected a Usage event, got {other:?}"),
         }
+    }
+
+    // ── the per-call cost off the BODY's usage object (D4, AMENDED) ─────
+
+    /// The cost rides the SAME trailing usage chunk the token counts come
+    /// from — the field LiteLLM injects when the client asks for the usage
+    /// chunk (`stream_options.include_usage`, which this client already
+    /// sends), confirmed live by probe P1.
+    #[tokio::test]
+    async fn sse_usage_chunk_carries_the_provider_cost() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost\":0.000011662}}\n\n\
+             data: [DONE]\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    Some(0.000011662)
+                ),
+                ProviderEvent::Done(FinishReason::Error),
+            ]
+        );
+    }
+
+    /// A usage chunk with counts and NO money is `None` — the ordinary
+    /// case on a direct OpenAI endpoint, and on a LiteLLM CACHE HIT even
+    /// on a cooperative proxy (probe P6). Absence is per-CALL and is not
+    /// zero.
+    #[tokio::test]
+    async fn sse_usage_chunk_without_cost_reports_none() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+             data: [DONE]\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
+                ProviderEvent::Done(FinishReason::Error),
+            ]
+        );
+    }
+
+    /// A malformed money value is `None` — never a panic, never a clamp,
+    /// and never a `Some(0.0)` that the UI would render as a free `$0.00`.
+    /// The token counts still arrive: a provider that lies about money
+    /// still told the truth about tokens.
+    #[tokio::test]
+    async fn sse_usage_malformed_cost_is_none_not_a_panic() {
+        for malformed in [json!("abc"), Value::Null, json!({}), json!(-0.5)] {
+            let payload = json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cost": malformed,
+                },
+            });
+            let events = collect(sse_stream(&[&format!("data: {payload}\n\n")])).await;
+            assert_eq!(
+                events,
+                vec![
+                    ProviderEvent::Usage(
+                        Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                        },
+                        None
+                    ),
+                    ProviderEvent::Done(FinishReason::Error),
+                ],
+                "a malformed cost ({malformed}) is None, not a panic"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD (a recorded residue, not a RED pin): the existing
+    /// `prompt_tokens` × `completion_tokens` gate is UNCHANGED, so a usage
+    /// chunk carrying a cost and no token pair emits NO `Usage` event.
+    /// Inventing a cost-only emission would make this parser a SECOND
+    /// `Usage` producer and feed T09 money detached from the counts D4
+    /// pairs it with. Asserts an ABSENCE, so it is green before the change
+    /// as well as after.
+    #[tokio::test]
+    async fn sse_cost_only_usage_chunk_emits_no_usage_event() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[],\"usage\":{\"cost\":0.000011662}}\n\n\
+             data: [DONE]\n\n",
+        ]))
+        .await;
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Usage(..))),
+            "a cost with no token pair emits NO Usage (got {events:?})"
+        );
+    }
+
+    /// The honest non-finite case, pinned where it is OBSERVABLE (the
+    /// wire, not the reader): a `1e999` cost is rejected by serde_json at
+    /// the CHUNK level (`number out of range`), the parser's `let Ok(…)
+    /// else` swallows it, and the effect is NO event at all — not
+    /// `Some(inf)`. A reader-level "non-finite → None" pin would be a
+    /// tautology (a non-finite cannot exist as a `serde_json::Number`),
+    /// which is why the claim lives here instead.
+    #[tokio::test]
+    async fn sse_usage_chunk_with_an_unparsable_number_emits_no_usage_event() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cost\":1e999}}\n\n\
+             data: [DONE]\n\n",
+        ]))
+        .await;
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Usage(..))),
+            "the whole chunk fails to parse, so NO Usage is emitted (got {events:?})"
+        );
+        // The chunk that DID parse still delivered its text — the failure
+        // is scoped to the one bad line, not to the stream.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "x")),
+            "the good chunk is unaffected (got {events:?})"
+        );
     }
 
     // ── request-body mapping ───────────────────────────────────────────

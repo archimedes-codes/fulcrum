@@ -638,6 +638,100 @@ async fn a_gate_denial_of_a_protected_dir_uses_the_protected_wording() {
     );
 }
 
+/// (issue #92) The GATE seam, driven through the REAL `AgentLoop::new`
+/// snapshot: a protected dir that was missing when the Session started and
+/// was recreated mid-session must be refused by the gate WITHOUT a restart.
+///
+/// No symlink fixture here, unlike
+/// `a_gate_denial_of_a_protected_dir_uses_the_protected_wording`: that test's
+/// bug was on the ARGUMENT side (a raw `$HOME` vs canonical entries), which
+/// is what the `link -> real` dance manufactures. This test's bug is on the
+/// ENTRY side — the entry is dropped from the list entirely — so a plain
+/// `$HOME` spelling is the right fixture, and the dance was not forgotten.
+///
+/// `writes: sandboxed`, because under `allow` the verdict is `Allow`,
+/// `deny_tool_result` never runs, and the gate's copy of the wording is what
+/// is under test. (The neighbouring test's inline comment says otherwise
+/// while its own call passes `"sandboxed"` — that comment is stale relative
+/// to its argument, so it is deliberately not copied here.)
+///
+/// WHICH ASSERTION DISCRIMINATES, stated because it is not the obvious one:
+/// `is_error` and `!target.exists()` are GREEN at HEAD — with an empty
+/// deny-list the write is still refused, as a BOUNDARY escape. The
+/// discriminating assertions are the WORDING ones: the refusal comes back
+/// `write: path escapes the session sandbox: …` instead of the deny-list
+/// sentence, so the `protected agent-definition directory` assertion fails.
+/// The wording is the bug's second half — a model sent hunting for a boundary
+/// that is not the problem — so an `is_error`-only test would be green before
+/// and after.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_recreated_protected_dir_is_refused_by_the_gate_without_a_new_session() {
+    let home = Tmp::new("gate-recreated-home");
+    let _lock = crate::test_support::env_lock();
+    let original = std::env::var_os("HOME");
+    let _restore = RestoreHome(original.clone());
+    // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
+    unsafe { std::env::set_var("HOME", home.path()) };
+
+    // `.pi/agent` exists, `.pi/agent/agents` does NOT — the snapshot the
+    // Session starts with.
+    std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
+    let target = home.path().join(".pi/agent/agents/SKILL.md");
+
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "write".to_string(),
+                arguments: json!({ "path": target.display().to_string(), "content": "PWNED" }),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    // The snapshot is computed HERE, inside `AgentLoop::new`, while the dir
+    // is still missing.
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "sandboxed", "allow")),
+    );
+
+    // The user recreates the dir AFTER the snapshot exists. No restart.
+    std::fs::create_dir_all(home.path().join(".pi/agent/agents")).unwrap();
+
+    bounded_prompt(&mut loop_, "go").await;
+    assert!(
+        permission_requests(&sink_events.lock().unwrap()).is_empty(),
+        "a protected write is a Deny, never a prompt"
+    );
+    let ends = tool_ends(&mut events_rx);
+    let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+    assert!(is_error, "the protected write is refused: {result:?}");
+    let text = result["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        text.contains("protected agent-definition directory"),
+        "the refusal names the real reason, got {text:?}"
+    );
+    assert!(
+        text.ends_with(crate::agent::tools::exec::access::PROTECTED_WRITE_ROUTE),
+        "the gate's refusal must end with the sanctioned route, got {text:?}"
+    );
+    assert!(
+        !target.exists(),
+        "and nothing was written (the gate stopped it before the executor)"
+    );
+}
+
 /// (ADR 0030) A TRUSTED Space suppresses an `Ask` at the GATE: the
 /// verdict itself is `Allow` (so no `PendingPermissions` entry is ever
 /// registered), and the out-of-boundary `read` runs. Asserted on
