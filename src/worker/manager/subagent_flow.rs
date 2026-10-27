@@ -104,6 +104,18 @@ pub struct SubagentCapture {
     /// `outputTokens` fields — the MAX across the frames: a turn's
     /// usage is cumulative per message, the last is the largest).
     usage: StdMutex<(u64, u64)>,
+    /// The child's **cost** accumulation (issue #87, T09): the SUM of the
+    /// `costUsd` figures on the child's own `cost_update` interactive-event
+    /// frames. `None` until a priced frame arrives — the distinction between
+    /// "no call reported a cost" and "a call reported zero" is preserved HERE
+    /// (the `SubagentMetrics.cost: f64` hand-off collapses it; that collapse is
+    /// a named follow-up, not a decision to invent money).
+    ///
+    /// A SUM, deliberately NOT a `max` like the token fields next door: a
+    /// turn's token usage is cumulative per message (so the last frame is the
+    /// largest), but money accumulates across calls — copying the `max` rule
+    /// here would report one call's cost for a ten-call child.
+    cost: StdMutex<Option<f64>>,
 }
 
 impl Default for SubagentCapture {
@@ -118,16 +130,52 @@ impl SubagentCapture {
             text: StdMutex::new(HashMap::new()),
             last_message_id: StdMutex::new(None),
             usage: StdMutex::new((0, 0)),
+            cost: StdMutex::new(None),
         }
     }
 
-    /// Observe one `SinkFrame` (the `session-update`
-    /// `agent_message_chunk` frames — the ENVELOPED shape:
-    /// `{ sessionId, update }`; the `update`'s `sessionUpdate`
-    /// discriminator is `agent_message_chunk`). A `session-update`
-    /// `message_retracted` frame (ADR 0048) ERASES the Abandoned
-    /// attempt's text for the `messageId` it names.
+    /// Observe one `SinkFrame`.
+    ///
+    /// Two event names matter, and nothing else does:
+    /// - `session-update` — the `agent_message_chunk` frames that are the
+    ///   final-text source (the ENVELOPED shape: `{ sessionId, update }`; the
+    ///   `update`'s `sessionUpdate` discriminator is `agent_message_chunk`),
+    ///   and a `message_retracted` frame (ADR 0048) which ERASES the Abandoned
+    ///   attempt's text for the `messageId` it names.
+    /// - `interactive-event` — the child's own `cost_update` frames (issue #87,
+    ///   T09), whose `payload.costUsd` sums into this capture's cost. Without
+    ///   this branch a child's money reached the parent's Supervisor and was
+    ///   dropped ON THE FLOOR here, which is why `SubagentMetrics.cost` was a
+    ///   hardcoded `0.0` and why the roadmap's "rolls up through the existing
+    ///   path" was false.
     pub fn observe_sink_frame(&self, event: &str, payload: &Value) {
+        // (issue #87, T09) The child's money, BEFORE the `session-update`
+        // early return — the cost frames are `interactive-event`s and would
+        // otherwise never be read at all. Scoped to the ONE event name (pin:
+        // `observe_sink_frame_still_ignores_unrelated_interactive_frames`), so
+        // the `todos_update` push on the same channel cannot move a figure.
+        if event == "interactive-event" {
+            if payload.get("event").and_then(Value::as_str) == Some("cost_update") {
+                // The SAME sanitising rule the provider readers use: a malformed
+                // or negative figure is not money. `is_finite()` is defence in
+                // depth (`as_f64` does not self-filter). `>= 0.0` and NOT
+                // `!= 0.0`: a real `Some(0.0)` IS a figure and a filter on zero
+                // would eat it.
+                let reported = payload
+                    .get("payload")
+                    .and_then(|p| p.get("costUsd"))
+                    .and_then(Value::as_f64)
+                    .filter(|c| c.is_finite() && *c >= 0.0);
+                if let Some(cost) = reported {
+                    // Sign-normalised (`-0.0 + 0.0` is `+0.0`) so the roll-up
+                    // can never carry a signed zero onto the wire.
+                    let cost = cost + 0.0;
+                    let mut held = self.cost.lock().unwrap_or_else(|p| p.into_inner());
+                    *held = Some(held.unwrap_or(0.0) + cost);
+                }
+            }
+            return;
+        }
         if event != "session-update" {
             return;
         }
@@ -233,6 +281,13 @@ impl SubagentCapture {
 
     pub fn output_tokens(&self) -> u64 {
         self.usage().1
+    }
+
+    /// The child's summed cost (`None` when NO frame carried a figure — a
+    /// different state from `Some(0.0)`, which means a call reported a real
+    /// zero). Issue #87, T09.
+    pub fn cost_usd(&self) -> Option<f64> {
+        *self.cost.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -939,7 +994,14 @@ async fn drive_subagent(
                 output: output.clone(),
                 input_tokens,
                 output_tokens,
-                cost: 0.0,
+                // (issue #87, T09) The child's REAL summed cost — was a
+                // hardcoded `0.0`, which reported a priced child as free.
+                // `unwrap_or(0.0)` is the "nothing was reported" collapse the
+                // `f64` hand-off forces; the capture keeps the `Option` right
+                // up to this line, and the promotion of this field to
+                // `Option<f64>` is a named follow-up (it needs the TypeScript
+                // `metrics` declaration and the card's read in the same change).
+                cost: capture.cost_usd().unwrap_or(0.0),
                 duration_ms,
             };
             SubagentOutcome::Completed { output, metrics }
@@ -1029,7 +1091,10 @@ fn failed_with_salvage(
             output,
             input_tokens,
             output_tokens,
-            cost: 0.0,
+            // (issue #87, T09) The REAL cost — a child that died after four
+            // priced calls spent real money, and the salvage exists precisely
+            // so its work is not reported as free.
+            cost: capture.cost_usd().unwrap_or(0.0),
             duration_ms,
         },
     }
@@ -1151,6 +1216,49 @@ pub(crate) async fn finish_subagent(
             }
         }
     }
+    // (issue #87, T09) THE SUBAGENT ROLL-UP: the child's summed cost, emitted
+    // as ONE `cost_update` DELTA keyed to the PARENT.
+    //
+    // Why it must be emitted HERE rather than by the parent's loop: the parent
+    // loop structurally cannot know a child's cost — `dispatch.rs` discards the
+    // metrics (`let _ = (reason, metrics);`) and the parent's only view of a
+    // child is the `ToolResult` text. So a parent-owned total could never
+    // include children; a store-side sum can, provided the figure reaches the
+    // store at all. This is that route.
+    //
+    // Why there is no double count: the child's OWN frames are keyed to the
+    // CHILD id (they feed the child's own card), and this one is keyed to the
+    // PARENT — different store keys. And this emission goes directly to the
+    // parent's Tauri sink (`hooks.sink_for`), so it never passes the router's
+    // persistence arm (which gates on `!is_subagent` and only ever sees
+    // router-delivered frames): one delivery, no re-emission.
+    //
+    // The `> 0.0` guard is a FRAME-EXISTENCE gate, not a value filter: a child
+    // that reported nothing contributes nothing. It is deliberately not `!= 0`
+    // (which would eat a real zero) and it is NOT the loop's own emission path
+    // — the loop emits per call from the `Usage` arm with no such gate.
+    let rollup_cost = match &outcome {
+        SubagentOutcome::Completed { metrics, .. } => metrics.cost,
+        SubagentOutcome::Failed { metrics, .. } => metrics.cost,
+    };
+    if rollup_cost > 0.0 {
+        if let Some(sink) = state.hooks.sink_for(parent_session_id) {
+            sink.emit(
+                "interactive-event",
+                json!({
+                    "sessionId": parent_session_id,
+                    "seq": 0,
+                    "event": "cost_update",
+                    // `+ 0.0` is defence in depth, not the load-bearing guard:
+                    // `rollup_cost > 0.0` already excludes a `-0.0` (a negative
+                    // zero compares equal to zero), and the capture rejects
+                    // negatives. It keeps the wire's "never a signed zero"
+                    // invariant true at every writer of `costUsd`.
+                    "payload": { "costUsd": rollup_cost + 0.0, "source": "subagent" },
+                }),
+            );
+        }
+    }
     // The `reaping` flag is set FIRST (the `Exited` is EXPECTED: NO
     // `on_crash`).
     {
@@ -1239,4 +1347,410 @@ enum Race {
     /// The `SubagentCancel` handle fired (a user / caller cancel —
     /// `cancel_subagent` flipped it).
     Cancelled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One child-side `cost_update` frame, as the child's own loop emits it
+    /// (`emit_cost_update`) and as the pump hands it to `observe_sink_frame`
+    /// after `IpcEventSink`'s catch-all wrapped it in a `SinkFrame`.
+    fn child_cost_frame(session: &str, cost: Value) -> Value {
+        json!({
+            "sessionId": session,
+            "seq": 0,
+            "event": "cost_update",
+            "payload": { "costUsd": cost, "source": "main" },
+        })
+    }
+
+    /// A child's money accumulates ACROSS calls — a SUM, not the `max` the
+    /// neighbouring token fields use. A turn's token usage is cumulative per
+    /// message (so the largest frame wins), but money is spent per call, and
+    /// copying the `max` rule here would report one call's cost for a
+    /// ten-call child. This pin is what discriminates the two rules.
+    #[test]
+    fn a_child_cost_frame_accumulates_across_calls() {
+        let capture = SubagentCapture::new();
+        capture.observe_sink_frame(
+            "interactive-event",
+            &child_cost_frame("child-1", json!(0.001)),
+        );
+        capture.observe_sink_frame(
+            "interactive-event",
+            &child_cost_frame("child-1", json!(0.002)),
+        );
+        let cost = capture.cost_usd().expect("two priced frames were observed");
+        assert!(
+            (cost - 0.003).abs() < f64::EPSILON,
+            "the child's cost is the SUM of its frames (0.001 + 0.002), got {cost} — \
+             a `max` copy of the token rule would report 0.002"
+        );
+    }
+
+    /// No frames means NO FIGURE (`None`), not `Some(0.0)` — and a malformed
+    /// frame cannot invent money. `SubagentMetrics.cost` is an `f64`, so the
+    /// capture is the only place that can still tell "nothing was reported"
+    /// apart from "a call cost zero"; if a bad wire value collapsed that to a
+    /// number, a free child would arrive with a figure attached.
+    #[test]
+    fn a_child_that_reported_no_cost_reports_no_cost() {
+        // Nothing observed at all.
+        assert_eq!(SubagentCapture::new().cost_usd(), None);
+
+        // A frame whose `costUsd` is a string / null / an object / absent.
+        for bad in [
+            json!("0.5"),
+            json!(null),
+            json!({ "amount": 0.5 }),
+            Value::Null,
+        ] {
+            let capture = SubagentCapture::new();
+            capture.observe_sink_frame("interactive-event", &child_cost_frame("c", bad.clone()));
+            assert_eq!(
+                capture.cost_usd(),
+                None,
+                "a non-number `costUsd` ({bad}) must not become money"
+            );
+        }
+
+        // A NEGATIVE figure is rejected (the same sanitising rule the provider
+        // readers use). Deliberately NOT `-0.0`: `-0.0 >= 0.0` is true, so a
+        // negative zero is ACCEPTED and normalised to `+0.0` — writing it here
+        // as a "negative" case would push the guard toward a `!= 0.0` filter
+        // that eats a legitimate real zero.
+        let capture = SubagentCapture::new();
+        capture.observe_sink_frame("interactive-event", &child_cost_frame("c", json!(-0.5)));
+        assert_eq!(capture.cost_usd(), None, "a negative cost is not money");
+
+        // A REAL zero IS a figure and is kept (the filter this pin forbids).
+        let capture = SubagentCapture::new();
+        capture.observe_sink_frame("interactive-event", &child_cost_frame("c", json!(0)));
+        assert_eq!(
+            capture.cost_usd(),
+            Some(0.0),
+            "`Some(0.0)` is a reported figure, not an absence"
+        );
+    }
+
+    /// A `-0.0` the child reports is normalised to `+0.0` at the capture's parse
+    /// seam, so the roll-up can never carry a signed zero onto the wire (the
+    /// emitter-side normalisation covers the loop's own frames; this covers the
+    /// sum). A real zero stays a real figure.
+    #[test]
+    fn a_negative_zero_child_cost_is_normalised_to_positive_zero() {
+        let capture = SubagentCapture::new();
+        capture.observe_sink_frame("interactive-event", &child_cost_frame("c", json!(-0.0)));
+        let cost = capture
+            .cost_usd()
+            .expect("a negative zero is still a reported figure");
+        let wire = serde_json::to_string(&cost).expect("serialisable");
+        assert!(
+            !wire.contains('-'),
+            "the captured cost carries no sign, got {wire}"
+        );
+    }
+
+    /// The new branch is scoped to the ONE event name: an unrelated
+    /// interactive-event frame (the `todos_update` push rides the same channel)
+    /// must not move the child's cost.
+    #[test]
+    fn observe_sink_frame_still_ignores_unrelated_interactive_frames() {
+        let capture = SubagentCapture::new();
+        capture.observe_sink_frame(
+            "interactive-event",
+            &json!({
+                "sessionId": "child-1",
+                "seq": 0,
+                "event": "todos_update",
+                "payload": { "source": "main", "todos": [] },
+            }),
+        );
+        // A frame that merely LOOKS like ours but names a different event.
+        capture.observe_sink_frame(
+            "interactive-event",
+            &json!({
+                "sessionId": "child-1",
+                "seq": 0,
+                "event": "cost_estimate",
+                "payload": { "costUsd": 5.0, "source": "main" },
+            }),
+        );
+        assert_eq!(
+            capture.cost_usd(),
+            None,
+            "only `event == \"cost_update\"` moves the money"
+        );
+        // And the text capture still ignores interactive frames entirely.
+        assert_eq!(capture.captured_text(), "");
+    }
+
+    /// The `metrics` wire shape is UNCHANGED by this task (D4): the key set is
+    /// exactly `{output, inputTokens, outputTokens, cost, durationMs}`. A real
+    /// cost replaces a hardcoded `0.0` at the SAME key — the card and the
+    /// transcript read it today and nothing on the frontend is owned here.
+    /// REGRESSION GUARD: the shape is already correct, so this passes on write;
+    /// it exists to catch a later "just add a `costUsd` too" edit.
+    #[test]
+    fn metrics_json_keeps_the_wire_shape_exact() {
+        let m = SubagentMetrics {
+            output: "text".to_string(),
+            input_tokens: 10,
+            output_tokens: 3,
+            cost: 0.0000341,
+            duration_ms: 900,
+        };
+        let v = metrics_json(&m);
+        let object = v.as_object().expect("an object");
+        let mut keys: Vec<&String> = object.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "cost",
+                "durationMs",
+                "inputTokens",
+                "output",
+                "outputTokens"
+            ],
+            "the key set is byte-identical to the pinned contract"
+        );
+    }
+
+    /// The child's real cost rides `metrics.cost` (the sole child→parent money
+    /// hand-off — `dispatch.rs` discards the metrics, so the parent loop can
+    /// never total a child itself).
+    #[test]
+    fn metrics_json_carries_the_childs_cost() {
+        let m = SubagentMetrics {
+            output: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0000341,
+            duration_ms: 0,
+        };
+        let v = metrics_json(&m);
+        assert_eq!(
+            v["cost"].as_f64(),
+            Some(0.0000341),
+            "the sub-cliff figure survives the metrics object intact — the \
+             formatter is the frontend's problem, not the wire's"
+        );
+        assert!(v["cost"].is_number(), "a number, never null");
+    }
+}
+
+/// The roll-up half of issue #87 driven end to end through `finish_subagent`
+/// (the capture pins above cannot see the emission, and the emission is the
+/// other half of the roll-up).
+#[cfg(test)]
+mod rollup_tests {
+    use super::*;
+    use crate::agent::events::EventSink;
+    use crate::agent::worker::client::{WorkerError, WorkerErrorKind};
+    use crate::agent::worker::manager::registry::ManagerState;
+    use crate::agent::worker::manager::{ClosureHooks, WorkerFactory};
+
+    /// A sink that records every `(name, payload)` it is given.
+    struct RecordingSink {
+        events: Arc<StdMutex<Vec<(String, Value)>>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((event.to_string(), payload));
+        }
+    }
+
+    /// A `WorkerFactory` that refuses to spawn — this test never starts a
+    /// process (`drives` has no entry, so `finish_subagent` skips the reap).
+    struct NeverSpawns;
+
+    impl WorkerFactory for NeverSpawns {
+        fn spawn(&self) -> Result<crate::agent::worker::client::WorkerHandle, WorkerError> {
+            Err(WorkerError {
+                kind: WorkerErrorKind::SpawnFailed,
+            })
+        }
+    }
+
+    fn state_with(collector: Arc<RecordingSink>) -> ManagerState {
+        ManagerState::new(
+            Arc::new(NeverSpawns),
+            Arc::new(ClosureHooks {
+                on_crash: Box::new(|_, _, _| {}),
+                on_event: Box::new(|_, _, _| {}),
+                sink_for: Box::new(move |_| Some(collector.clone() as Arc<dyn EventSink>)),
+                cwd_registrar: std::sync::OnceLock::new(),
+            }),
+        )
+    }
+
+    fn wire() -> crate::agent::worker::protocol::SubagentDispatchWire {
+        crate::agent::worker::protocol::SubagentDispatchWire {
+            id: "d1".to_string(),
+            parent_session_id: "parent-1".to_string(),
+            parent_cwd: "/tmp".to_string(),
+            parent_enabled_tools: Vec::new(),
+            agent_name: "tester".to_string(),
+            name_resolution: crate::agent::subagent::AgentNameResolution::Matched,
+            launch: crate::agent::subagent::LaunchConfig::default(),
+            task: "t".to_string(),
+            model_key: "fake/m1".to_string(),
+        }
+    }
+
+    fn rollups(events: &StdMutex<Vec<(String, Value)>>) -> Vec<Value> {
+        events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(name, frame)| name == "interactive-event" && frame["event"] == "cost_update")
+            .map(|(_, frame)| frame.clone())
+            .collect()
+    }
+
+    /// The roll-up frame is keyed to the **PARENT**, never to the child — which
+    /// is what makes it additive rather than a double count. The child's OWN
+    /// frames carry the CHILD id (pinned loop-side by
+    /// `a_priced_call_emits_one_cost_update_frame_carrying_that_calls_cost`,
+    /// where the envelope's `sessionId` is the emitting loop's own id), so the
+    /// two land in DIFFERENT store keys and the parent's sum gains the child's
+    /// money exactly once. Also pins the envelope, the `source`, and that the
+    /// `subagent-closed` hand-off still carries the same figure.
+    #[tokio::test]
+    async fn the_rollup_frame_is_keyed_to_the_parent_not_the_child() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let collector = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let state = state_with(collector);
+        finish_subagent(
+            &state,
+            "child-1",
+            "parent-1",
+            &wire(),
+            SubagentOutcome::Completed {
+                output: "done".to_string(),
+                metrics: SubagentMetrics {
+                    output: "done".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    // T08's measured band: four priced calls summed.
+                    cost: 0.0000341,
+                    duration_ms: 5,
+                },
+            },
+            &SubagentOutcomeSink::Oneshot(Arc::new(StdMutex::new(None))),
+        )
+        .await;
+
+        let frames = rollups(&events);
+        assert_eq!(frames.len(), 1, "exactly ONE roll-up frame per child");
+        assert_eq!(
+            frames[0]["sessionId"], "parent-1",
+            "the roll-up is keyed to the PARENT — the child's own frames carry \
+             the CHILD id, so the two never share a store key (no double count)"
+        );
+        assert_ne!(
+            frames[0]["sessionId"], "child-1",
+            "the roll-up must NOT re-key the child's money to the child"
+        );
+        assert_eq!(frames[0]["seq"], 0);
+        assert_eq!(frames[0]["event"], "cost_update");
+        assert_eq!(frames[0]["payload"]["source"], "subagent");
+        assert_eq!(
+            frames[0]["payload"]["costUsd"].as_f64().expect("a number"),
+            0.0000341,
+            "the child's summed cost, whole (the sub-cliff figure survives the wire)"
+        );
+
+        // The `subagent-closed` hand-off still fires, still CHILD-keyed, with
+        // the SAME figure — the roll-up is an addition, not a relocation.
+        let closed = {
+            let held = events.lock().unwrap_or_else(|p| p.into_inner());
+            held.iter()
+                .find(|(name, _)| name == "subagent-closed")
+                .map(|(_, p)| p.clone())
+        }
+        .expect("the `subagent-closed` still fires");
+        assert_eq!(closed["sessionId"], "child-1", "closed stays CHILD-keyed");
+        assert_eq!(closed["metrics"]["cost"].as_f64(), Some(0.0000341));
+    }
+
+    /// A child that reported NO figure contributes NO frame — the `> 0.0` guard
+    /// is a frame-EXISTENCE gate, and the wire spelling of "no figure" is the
+    /// key being absent, never a `costUsd: 0` that the summing store would turn
+    /// into a phantom `$0.00`.
+    #[tokio::test]
+    async fn a_child_that_spent_nothing_emits_no_rollup_frame() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let collector = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let state = state_with(collector);
+        finish_subagent(
+            &state,
+            "child-2",
+            "parent-1",
+            &wire(),
+            // `preflight_failed` — the child never started, nothing was spent.
+            preflight_failed("never started".to_string()),
+            &SubagentOutcomeSink::Oneshot(Arc::new(StdMutex::new(None))),
+        )
+        .await;
+
+        assert!(
+            rollups(&events).is_empty(),
+            "a child that spent nothing contributes NO frame at all"
+        );
+    }
+
+    /// A FAILED child's money still rolls up: the salvage exists so a child's
+    /// real work is not reported as free, and the same applies to its cost.
+    #[tokio::test]
+    async fn a_failed_childs_cost_still_rolls_up() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let collector = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let state = state_with(collector);
+        let capture = Arc::new(SubagentCapture::new());
+        capture.observe_sink_frame(
+            "interactive-event",
+            &json!({
+                "sessionId": "child-3",
+                "seq": 0,
+                "event": "cost_update",
+                "payload": { "costUsd": 0.00001243, "source": "main" },
+            }),
+        );
+        let outcome = failed_with_salvage(
+            crate::agent::subagent::SubagentFailureReason::Unresponsive,
+            "unresponsive".to_string(),
+            &capture,
+            100,
+        );
+        finish_subagent(
+            &state,
+            "child-3",
+            "parent-1",
+            &wire(),
+            outcome,
+            &SubagentOutcomeSink::Oneshot(Arc::new(StdMutex::new(None))),
+        )
+        .await;
+
+        let frames = rollups(&events);
+        assert_eq!(frames.len(), 1, "a dead child's money is still money spent");
+        assert_eq!(frames[0]["sessionId"], "parent-1");
+        assert_eq!(
+            frames[0]["payload"]["costUsd"].as_f64().expect("a number"),
+            0.00001243
+        );
+    }
 }

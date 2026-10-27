@@ -188,7 +188,7 @@ impl AgentLoop {
                                 args: display_tc.arguments.clone(),
                             });
                         }
-                        ProviderEvent::Usage(u, _) => {
+                        ProviderEvent::Usage(u, cost) => {
                             acc.usage = Some(u);
                             self.compactor.record_usage(&u, &self.messages);
                             self.last_context_tokens = self.compactor.context_tokens();
@@ -197,6 +197,14 @@ impl AgentLoop {
                                 usage: acc.usage_value(),
                                 assistant_message_event: Value::Object(Default::default()),
                             });
+                            // Issue #87: the provider's per-call cost rides the
+                            // SAME event, so it is emitted HERE — where usage
+                            // already accumulates — and NOT at a settle point.
+                            // An attempt that reported a `Usage` and then died
+                            // was still billed, and its money must not be
+                            // forfeited by a turn that never settles.
+                            // `None` emits nothing (see `emit_cost_update`).
+                            self.emit_cost_update(cost);
                         }
                         ProviderEvent::Done(f) => acc.finish = Some(f),
                         ProviderEvent::Error(e) => mid_stream_error = Some(e),

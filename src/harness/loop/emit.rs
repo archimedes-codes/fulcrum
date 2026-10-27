@@ -36,6 +36,44 @@ impl AgentLoop {
         );
     }
 
+    /// Emit one `cost_update` frame (issue #87, T09): the provider's cost for
+    /// the model call whose `Usage` event is being handled.
+    ///
+    /// DIRECT on the sink, like `emit_context_usage` — this is an
+    /// **interactive-event**, NOT an `RpcEvent` (D5 + the grounding's §8.5): the
+    /// Client routes it off the `interactive-event` payload's `event`
+    /// discriminant (`App.tsx`), and an unlisted name is dropped, so an
+    /// `events.rs` variant would reach no UI and force a `kind()` arm for a
+    /// phantom event. The envelope is the `todos_update` shape.
+    ///
+    /// THE CONTRACT (shared with the frontend task, pinned in both plans):
+    /// - **A `None` cost emits NOTHING at all.** Absence is the wire spelling of
+    ///   "no figure"; the phantom `$0.00` is created by *emitting a zero*, so the
+    ///   only defence is not to emit. Rust never puts `null` on this bus.
+    /// - **The value is ONE call's DELTA, never a running total.** The frontend
+    ///   store sums the frames, so re-emitting a total would double-count — and
+    ///   a Worker re-incarnation / `Resume` (which rebuilds this loop with no
+    ///   memory of the old figure) would make that unrecoverable. Hence there is
+    ///   deliberately no accumulator on `AgentLoop`.
+    /// - **`-0.0` is normalised here.** `c + 0.0` maps `-0.0 -> +0.0` and leaves
+    ///   a real `0.0` untouched, so the bus never carries a signed zero (which
+    ///   the frontend would render as `$0.00`, since JS treats `-0 === 0`). This
+    ///   is NOT the `!= 0.0` filter that would eat a legitimate `Some(0.0)` — a
+    ///   real zero is still a figure and still gets its frame.
+    pub(super) fn emit_cost_update(&self, cost: Option<f64>) {
+        let Some(cost) = cost else { return };
+        let cost = cost + 0.0;
+        self.sink.emit(
+            "interactive-event",
+            json!({
+                "sessionId": self.session_id,
+                "seq": 0,
+                "event": "cost_update",
+                "payload": { "costUsd": cost, "source": "main" },
+            }),
+        );
+    }
+
     /// Re-estimate the context size (the prompt-time / post-tool-batch
     /// metric). If the estimate MOVED, emits `context_usage_update`.
     ///
