@@ -49,10 +49,13 @@ async fn a_usage_event_emits_a_context_usage_update_frame() {
     });
     let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
         ProviderEvent::TextDelta("hi".to_string()),
-        ProviderEvent::Usage(Usage {
-            input_tokens: 4321,
-            output_tokens: 100,
-        }),
+        ProviderEvent::Usage(
+            Usage {
+                input_tokens: 4321,
+                output_tokens: 100,
+            },
+            None,
+        ),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
     let (_space, mut loop_) = build_loop_with_dispatcher(
@@ -143,10 +146,13 @@ async fn a_usage_less_turn_never_lowers_the_context_accounting() {
     let (provider, _calls) = ScriptedProvider::new(vec![
         Some(vec![
             ProviderEvent::TextDelta("one".to_string()),
-            ProviderEvent::Usage(Usage {
-                input_tokens: 40_000,
-                output_tokens: 100,
-            }),
+            ProviderEvent::Usage(
+                Usage {
+                    input_tokens: 40_000,
+                    output_tokens: 100,
+                },
+                None,
+            ),
             ProviderEvent::Done(FinishReason::Stop),
         ]),
         Some(vec![
@@ -457,10 +463,13 @@ async fn a_turn_that_reported_usage_emits_the_context_frame_once() {
     });
     let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
         ProviderEvent::TextDelta("hi".to_string()),
-        ProviderEvent::Usage(Usage {
-            input_tokens: 4321,
-            output_tokens: 100,
-        }),
+        ProviderEvent::Usage(
+            Usage {
+                input_tokens: 4321,
+                output_tokens: 100,
+            },
+            None,
+        ),
         ProviderEvent::Done(FinishReason::Stop),
     ])]);
     let (_space, mut loop_) = build_loop_with_dispatcher(
@@ -586,10 +595,13 @@ impl Provider for CancelAfterUsageProvider {
             async move {
                 match s {
                     0 => Some((
-                        ProviderEvent::Usage(Usage {
-                            input_tokens: 90,
-                            output_tokens: 50,
-                        }),
+                        ProviderEvent::Usage(
+                            Usage {
+                                input_tokens: 90,
+                                output_tokens: 50,
+                            },
+                            None,
+                        ),
                         1u8,
                     )),
                     // The loop asks for the NEXT event: that is when the
@@ -641,10 +653,13 @@ async fn a_failed_turn_still_measures_the_next_prompt() {
     // reply.
     let (provider, calls) = ScriptedProvider::new(vec![
         Some(vec![
-            ProviderEvent::Usage(Usage {
-                input_tokens: 90,
-                output_tokens: 50,
-            }),
+            ProviderEvent::Usage(
+                Usage {
+                    input_tokens: 90,
+                    output_tokens: 50,
+                },
+                None,
+            ),
             ProviderEvent::Done(FinishReason::Error),
         ]),
         Some(vec![
@@ -821,10 +836,13 @@ async fn a_retried_model_call_does_not_compact_for_the_reply_it_threw_away() {
     // pushed. Call 2: the retry succeeds.
     let (provider, calls) = ScriptedProvider::new(vec![
         Some(vec![
-            ProviderEvent::Usage(Usage {
-                input_tokens: 90,
-                output_tokens: 50,
-            }),
+            ProviderEvent::Usage(
+                Usage {
+                    input_tokens: 90,
+                    output_tokens: 50,
+                },
+                None,
+            ),
             ProviderEvent::Done(FinishReason::Error),
         ]),
         Some(vec![

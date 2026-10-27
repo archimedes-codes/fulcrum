@@ -188,7 +188,7 @@ impl AgentLoop {
                                 args: display_tc.arguments.clone(),
                             });
                         }
-                        ProviderEvent::Usage(u) => {
+                        ProviderEvent::Usage(u, _) => {
                             acc.usage = Some(u);
                             self.compactor.record_usage(&u, &self.messages);
                             self.last_context_tokens = self.compactor.context_tokens();
