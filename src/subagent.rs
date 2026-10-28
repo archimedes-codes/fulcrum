@@ -297,14 +297,16 @@ impl SubagentCancel {
 /// `cost_update`" derived from a model `turn_end` usage; no such mechanism ever
 /// existed, and the grain was wrong besides — a turn spans several model calls.
 ///
-/// **What `cost == 0.0` means here:** no call reported a cost, OR a call
-/// reported a real zero. Those two states are genuinely different and this
-/// field cannot tell them apart — the capture holds `Option<f64>` right up to
-/// the hand-off, and the collapse happens at `unwrap_or(0.0)`. Promoting this
-/// to `Option<f64>` requires moving the TypeScript `metrics` declaration
-/// (`src/lib/tauri/types.ts`) and the card's read in the SAME change, so the
-/// field stays `f64` and the collapse is documented rather than hidden. Both
-/// consumers render nothing for a zero, so a `0.0` never displays as a figure.
+/// **What `cost` says here:** it is an `Option<f64>`, so the field CAN tell the
+/// two states apart. `None` means **no call reported a cost** (a preflight
+/// failure — a child that never started — or a child whose every call came back
+/// unpriced); `Some(0.0)` means **a call reported a real zero**, which is a
+/// figure. The wire spells the first `"cost": null` (present-and-null, exactly
+/// the `SessionInfo.cost_usd` rule) and the second `0.0`, and the two are never
+/// collapsed — a renderer prints nothing for the first and `$0.00` for the
+/// second (ADR 0082 / D5). The old `f64` field collapsed both into `0.0` at
+/// `unwrap_or(0.0)`; that collapse is what issue #107 removed, and the capture's
+/// `Option` now reaches the hand-off untouched.
 ///
 /// `duration_ms` is always the wall clock (see the wire contract's metrics note).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -314,9 +316,11 @@ pub struct SubagentMetrics {
     pub output: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// The child's summed per-call cost in USD (see the struct's doc — `0.0`
-    /// means "no figure arrived", a collapse of the capture's `Option`).
-    pub cost: f64,
+    /// The child's summed per-call cost in USD (see the struct's doc). `None` =
+    /// "no call reported a cost" — NOT zero; `Some(0.0)` = a call reported a
+    /// real zero, which IS a figure. Serde has no `skip_serializing_if` here, so
+    /// `None` crosses as `"cost": null` (present-and-null) on both wires.
+    pub cost: Option<f64>,
     pub duration_ms: u64,
 }
 

@@ -597,7 +597,7 @@ impl AgentLoop {
     /// blocks — when images are present; a text-only prompt keeps the
     /// `Text` shape).
     pub async fn handle_prompt(&mut self, prompt: &PromptTurn) {
-        // (ADR 0030 Task 3, Deviation 4) The policy and web config are
+        // (ADR 0030 Deviation 4) The policy and web config are
         // re-read from `settings.json` ONCE per turn — the same in-process read
         // `launch.rs` does per dispatch, so a user who flips a select in
         // Settings affects an ALREADY-RUNNING session at its next prompt
@@ -811,8 +811,11 @@ impl AgentLoop {
     /// The compaction (the `compact.rs` orchestration — the OLDER messages
     /// summarized and replaced by the summary, the transcript REWRITTEN) +
     /// the `compaction_start` / `compaction_end` `RpcEvent` emission (which
-    /// needs the loop's `normalize` / display-persistence pipeline) and the
-    /// post-compaction `context_usage_update` frame.
+    /// needs the loop's `normalize` / display-persistence pipeline), the
+    /// post-compaction `context_usage_update` frame, and the summary call's
+    /// own `cost_update` frame (issue #106 — the summariser's provider figure
+    /// goes through `emit_cost_update`, so a priced summary call reaches the
+    /// cost channel like any other priced call, and a `None` emits nothing).
     ///
     /// `reason` is the TRIGGER (`manual` for `/compact`, `threshold` for the
     /// context-pressure check, `overflow` for a provider context-overflow
@@ -895,6 +898,7 @@ impl AgentLoop {
             compact::CompactionOutcome::Compacted {
                 context_tokens,
                 summary,
+                cost,
             } => {
                 ran = CompactionRan::Compacted;
                 // The summary is the compaction's OUTPUT — the one thing worth
@@ -909,6 +913,14 @@ impl AgentLoop {
                 // pre-compaction value).
                 self.last_context_tokens = context_tokens;
                 self.emit_context_usage();
+                // Issue #106: the summary call's own provider figure reaches
+                // the cost channel through the SAME emitter the turn's `Usage`
+                // arm uses — one frame, this call's DELTA, keyed to
+                // `self.session_id` by the emitter. A `None` cost emits nothing
+                // (the emitter's own gate), never a phantom `$0.00`. Emitted
+                // HERE, inside the arm, so no other outcome can carry it and no
+                // early exit can skip it.
+                self.emit_cost_update(cost);
             }
             compact::CompactionOutcome::Failed { error } => {
                 ran = CompactionRan::Failed;

@@ -19,9 +19,14 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use super::super::CompactionRan;
 use super::support::*;
 use crate::agent::events::{EventSink, RpcEvent};
-use crate::agent::harness::provider::{FinishReason, ProviderError, ProviderEvent, Usage};
+use crate::agent::harness::catalog::CompactionConfig;
+use crate::agent::harness::compact::Compactor;
+use crate::agent::harness::provider::{
+    ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, Usage,
+};
 use crate::agent::harness::retry::RetryPolicy;
 
 /// The `cost_update` frames a run emitted, in order (the payloads WITH their
@@ -545,5 +550,195 @@ async fn a_negative_zero_cost_emits_positive_zero() {
     assert_eq!(
         wire, "0.0",
         "a real zero is still emitted (the normalisation is `+ 0.0`, never a filter)"
+    );
+}
+
+/// The compaction summariser's own call reaches the cost channel like any
+/// other priced call (issue #106).
+///
+/// Before this change `compact.rs::summarize` swallowed the provider's
+/// `Usage` event in its catch-all arm, so a compaction's money was invisible:
+/// the figure under-stated by one summariser call per compaction (ADR 0082
+/// limit 2, follow-up F2). `summarize` now reads the cost off the stream and
+/// returns it, and `AgentLoop::run_compaction` emits it through the SAME
+/// `emit_cost_update` the turn's `Usage` arm uses — one frame, the summary
+/// call's own DELTA, keyed to the loop's own session id (no child id, no
+/// synthetic id), `"source": "main"` (the label is inert — ADR 0041).
+#[tokio::test]
+async fn a_priced_compaction_emits_one_cost_update_frame_carrying_that_calls_cost() {
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(AllEventsSink {
+        events: events.clone(),
+    });
+    // The summary call's stream: the priced `Usage` PRECEDES `Done` (the wire
+    // order ADR 0082 records), so the figure is on the stream the compaction
+    // drains.
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("the summary".to_string()),
+        ProviderEvent::Usage(
+            Usage {
+                input_tokens: 1000,
+                output_tokens: 50,
+            },
+            Some(0.0042),
+        ),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (_space, mut loop_) = build_loop_with_dispatcher(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        sink,
+        None,
+        vec![fake_model("m1")],
+        None,
+    );
+    // Force a REAL compaction: replace the compactor so the keep-recent budget
+    // lands where production reads it (the `context_usage.rs` fixture's seam).
+    loop_.compactor = Compactor::new(
+        CompactionConfig {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        },
+        128_000,
+    );
+    loop_.load_transcript(vec![
+        ChatMessage {
+            role: ChatRole::User,
+            content: MessageContent::Text("u1".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text("a1".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMessage {
+            role: ChatRole::User,
+            content: MessageContent::Text("u2".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text("a2".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+    ]);
+    // Precondition: the compaction REALLY ran (a `Skipped` would make the
+    // frame assertion below a test that never reached the summariser).
+    assert_eq!(
+        loop_
+            .run_compaction("threshold", false, None, &CancellationToken::new())
+            .await,
+        CompactionRan::Compacted,
+        "the fixture really compacted, so the summary call really happened"
+    );
+
+    let frames = cost_frames(&events);
+    assert_eq!(
+        frames.len(),
+        1,
+        "exactly one `cost_update` frame for the summary call (got {})",
+        frames.len()
+    );
+    let frame = &frames[0];
+    assert_eq!(
+        frame["sessionId"], "s1",
+        "the loop's OWN session id — the same id the turn figures use"
+    );
+    assert_eq!(frame["seq"], 0, "the emitter's dedupe-free convention");
+    assert_eq!(frame["event"], "cost_update");
+    assert_eq!(
+        frame["payload"]["costUsd"], 0.0042,
+        "the summary call's own per-call DELTA, never a total"
+    );
+}
+
+/// A compaction whose summary reported NO cost emits no frame at all.
+///
+/// REGRESSION GUARD, not a RED pin: it asserts an absence, so it passes before
+/// the change too (nothing emitted anything at all then). Its discriminating
+/// moment is AFTER the change — it proves the `None` cost survived the
+/// `summarize` → `CompactionOutcome` → `emit_cost_update` hand-off as `None`
+/// and never collapsed into a `Some(0.0)` frame, which would manufacture the
+/// phantom `$0.00` the cost channel's whole contract exists to prevent.
+#[tokio::test]
+async fn a_compaction_whose_summary_reported_no_cost_emits_no_frame_at_all() {
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(AllEventsSink {
+        events: events.clone(),
+    });
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("the summary".to_string()),
+        ProviderEvent::Usage(
+            Usage {
+                input_tokens: 1000,
+                output_tokens: 50,
+            },
+            None,
+        ),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (_space, mut loop_) = build_loop_with_dispatcher(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        sink,
+        None,
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.compactor = Compactor::new(
+        CompactionConfig {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        },
+        128_000,
+    );
+    loop_.load_transcript(vec![
+        ChatMessage {
+            role: ChatRole::User,
+            content: MessageContent::Text("u1".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text("a1".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMessage {
+            role: ChatRole::User,
+            content: MessageContent::Text("u2".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text("a2".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        },
+    ]);
+    assert_eq!(
+        loop_
+            .run_compaction("threshold", false, None, &CancellationToken::new())
+            .await,
+        CompactionRan::Compacted,
+        "precondition: the compaction really ran and the summary call really happened"
+    );
+
+    assert!(
+        cost_frames(&events).is_empty(),
+        "a `None` summary cost emits NOTHING — not a null, not a zero"
     );
 }

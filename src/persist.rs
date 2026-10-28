@@ -26,9 +26,14 @@
 //! overlooked: the doubling is PINNED rather than prevented, by
 //! `a_replayed_cost_frame_doubles_the_stored_figure` (`db.rs`), which
 //! must be DELETED rather than adjusted if a future change ever makes
-//! the write idempotent. The exposure is bounded by `emit_cost_update`
-//! having exactly one production call site (`turn.rs`, the `Usage` arm),
-//! so a `Resume` cannot re-emit history.
+//! the write idempotent. The exposure is bounded by `emit_cost_update`'s
+//! production call sites — today `turn.rs`'s `Usage` arm and `loop.rs`'s
+//! `run_compaction` (the compaction summary's own call), neither of which
+//! is a Resume-replay path — so a `Resume` cannot re-emit history.
+//! Deliberately not stated as a count: the `CONTEXT.md` Cost channel
+//! entry's rule is that a count here goes stale the moment a third emitter
+//! lands (the stale claim is issue #110's defect class); the bound that
+//! matters is that no call site replays history, which neither site does.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn access_policy_default_is_allow_not_sandboxed() {
-        // The derived default is `Allow` (pi's posture, plan Deviation 2).
+        // The derived default is `Allow` (pi's posture, ADR 0030 Deviation 2).
         // Guards against a regression that puts `#[default]` back on
         // `Sandboxed` — that would silently re-tighten every policy.
         assert_eq!(AccessPolicy::default(), AccessPolicy::Allow);

@@ -727,7 +727,7 @@ async fn subagent_wait_a_resolving_completed_outcome_completes_the_tool() {
             output: "the answer".to_string(),
             input_tokens: 10,
             output_tokens: 5,
-            cost: 0.0,
+            cost: Some(0.0),
             duration_ms: 1,
         },
     })
@@ -826,7 +826,7 @@ async fn a_mis_named_subagent_param_is_rejected_and_never_dispatches_a_child() {
             output: "the answer".to_string(),
             input_tokens: 10,
             output_tokens: 5,
-            cost: 0.0,
+            cost: Some(0.0),
             duration_ms: 1,
         },
     })
@@ -996,7 +996,7 @@ impl SubagentDispatcher for ConcurrentCountingDispatcher {
                     output: "done".to_string(),
                     input_tokens: 1,
                     output_tokens: 1,
-                    cost: 0.0,
+                    cost: Some(0.0),
                     duration_ms: 1,
                 },
             });
@@ -1172,7 +1172,7 @@ impl SubagentDispatcher for OutOfOrderDispatcher {
                     output: task.clone(),
                     input_tokens: 1,
                     output_tokens: 1,
-                    cost: 0.0,
+                    cost: Some(0.0),
                     duration_ms: 1,
                 },
             });
@@ -1422,7 +1422,7 @@ impl SubagentDispatcher for PartialResolveDispatcher {
                         output: "t1-done".to_string(),
                         input_tokens: 1,
                         output_tokens: 1,
-                        cost: 0.0,
+                        cost: Some(0.0),
                         duration_ms: 1,
                     },
                 });

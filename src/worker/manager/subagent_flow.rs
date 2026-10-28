@@ -108,8 +108,9 @@ pub struct SubagentCapture {
     /// `costUsd` figures on the child's own `cost_update` interactive-event
     /// frames. `None` until a priced frame arrives — the distinction between
     /// "no call reported a cost" and "a call reported zero" is preserved HERE
-    /// (the `SubagentMetrics.cost: f64` hand-off collapses it; that collapse is
-    /// a named follow-up, not a decision to invent money).
+    /// and carried through the `SubagentMetrics.cost: Option<f64>` hand-off
+    /// (issue #107) — no `unwrap_or(0.0)`, no named follow-up, not a decision
+    /// to invent money.
     ///
     /// A SUM, deliberately NOT a `max` like the token fields next door: a
     /// turn's token usage is cumulative per message (so the last frame is the
@@ -994,14 +995,15 @@ async fn drive_subagent(
                 output: output.clone(),
                 input_tokens,
                 output_tokens,
-                // (issue #87, T09) The child's REAL summed cost — was a
-                // hardcoded `0.0`, which reported a priced child as free.
-                // `unwrap_or(0.0)` is the "nothing was reported" collapse the
-                // `f64` hand-off forces; the capture keeps the `Option` right
-                // up to this line, and the promotion of this field to
-                // `Option<f64>` is a named follow-up (it needs the TypeScript
-                // `metrics` declaration and the card's read in the same change).
-                cost: capture.cost_usd().unwrap_or(0.0),
+                // (issue #87, T09 / #107) The child's REAL summed cost, as the
+                // capture reports it: `Option<f64>` straight through, with no
+                // `unwrap_or(0.0)`. That collapse used to live here and it made
+                // a child that never reported a figure indistinguishable from
+                // one whose calls reported a genuine zero; the capture already
+                // holds the `Option` (`SubagentCapture::cost_usd()` returns it,
+                // and its `>= 0.0` filter already preserves a real zero), so the
+                // hand-off now carries the distinction instead of erasing it.
+                cost: capture.cost_usd(),
                 duration_ms,
             };
             SubagentOutcome::Completed { output, metrics }
@@ -1091,10 +1093,12 @@ fn failed_with_salvage(
             output,
             input_tokens,
             output_tokens,
-            // (issue #87, T09) The REAL cost — a child that died after four
-            // priced calls spent real money, and the salvage exists precisely
-            // so its work is not reported as free.
-            cost: capture.cost_usd().unwrap_or(0.0),
+            // (issue #87, T09 / #107) The REAL cost, `Option` straight through
+            // — a child that died after four priced calls spent real money, and
+            // the salvage exists precisely so its work is not reported as free.
+            // No `unwrap_or(0.0)` here either: a child that died BEFORE any call
+            // reported a figure reports `None` ("no figure"), not a zero.
+            cost: capture.cost_usd(),
             duration_ms,
         },
     }
@@ -1242,15 +1246,27 @@ pub(crate) async fn finish_subagent(
     // false` is correct: this frame is the PARENT's money, and the router's
     // gate keys on that flag.
     //
-    // The `> 0.0` guard is a FRAME-EXISTENCE gate, not a value filter: a child
-    // that reported nothing contributes nothing. It is deliberately not `!= 0`
-    // (which would eat a real zero) and it is NOT the loop's own emission path
-    // — the loop emits per call from the `Usage` arm with no such gate.
+    // The gate is the `Option` itself (the `emit_cost_update` mirror — the same
+    // rule the main path uses): `None` → NO frame, `Some(0.0)` → frame. It is
+    // still a FRAME-EXISTENCE gate and never a value filter: a child that
+    // reported nothing contributes nothing, and a child whose calls reported a
+    // REAL zero is a figure and its frame lands, keyed to the PARENT. The old
+    // `> 0.0` test could not express that (it ate the real zero, which is the
+    // filter `emit.rs`'s doc names as the bug), and the `f64` hand-off left it
+    // no `Option` to match on. There is no `!= 0` filter either — the roll-up's
+    // only writer is the capture's `filter(c.is_finite() && *c >= 0.0)`, so a
+    // non-negative figure is all that can ever arrive, and a real zero reaches
+    // the wheel.
     let rollup_cost = match &outcome {
         SubagentOutcome::Completed { metrics, .. } => metrics.cost,
         SubagentOutcome::Failed { metrics, .. } => metrics.cost,
     };
-    if rollup_cost > 0.0 {
+    // The gate is an `if let` and NOT a `let … else { return }`: `finish_subagent`
+    // CONTINUES after this block (the reap, the `drives` removal, the
+    // `SubagentResult` delivery), so an early `return` would silently skip the
+    // child's teardown and never answer the parent's wait. The `if let` scopes
+    // the gate to the ONE frame, which is all a frame-existence gate may do.
+    if let Some(rollup_cost) = rollup_cost {
         state.hooks.on_event(
             parent_session_id,
             false,
@@ -1261,10 +1277,9 @@ pub(crate) async fn finish_subagent(
                     "seq": 0,
                     "event": "cost_update",
                     // `+ 0.0` is defence in depth, not the load-bearing guard:
-                    // `rollup_cost > 0.0` already excludes a `-0.0` (a negative
-                    // zero compares equal to zero), and the capture rejects
-                    // negatives. It keeps the wire's "never a signed zero"
-                    // invariant true at every writer of `costUsd`.
+                    // the capture rejects negatives, so no `-0.0` can reach
+                    // here. It keeps the wire's "never a signed zero" invariant
+                    // true at every writer of `costUsd`.
                     "payload": { "costUsd": rollup_cost + 0.0, "source": "subagent" },
                 }),
             },
@@ -1401,10 +1416,11 @@ mod tests {
     }
 
     /// No frames means NO FIGURE (`None`), not `Some(0.0)` — and a malformed
-    /// frame cannot invent money. `SubagentMetrics.cost` is an `f64`, so the
-    /// capture is the only place that can still tell "nothing was reported"
-    /// apart from "a call cost zero"; if a bad wire value collapsed that to a
-    /// number, a free child would arrive with a figure attached.
+    /// frame cannot invent money. If a bad wire value collapsed that to a
+    /// number, a free child would arrive with a figure attached; the hand-off
+    /// (`SubagentMetrics.cost`) now carries this `Option` through untouched
+    /// (issue #107), so the capture is no longer the only place that can tell
+    /// "nothing was reported" apart from "a call cost zero".
     #[test]
     fn a_child_that_reported_no_cost_reports_no_cost() {
         // Nothing observed at all.
@@ -1497,19 +1513,26 @@ mod tests {
         assert_eq!(capture.captured_text(), "");
     }
 
-    /// The `metrics` wire shape is UNCHANGED by this task (D4): the key set is
-    /// exactly `{output, inputTokens, outputTokens, cost, durationMs}`. A real
-    /// cost replaces a hardcoded `0.0` at the SAME key — the card and the
-    /// transcript read it today and nothing on the frontend is owned here.
+    /// The `metrics` wire shape is pinned here: the key set is exactly
+    /// `{output, inputTokens, outputTokens, cost, durationMs}`.
     /// REGRESSION GUARD: the shape is already correct, so this passes on write;
     /// it exists to catch a later "just add a `costUsd` too" edit.
+    ///
+    /// EDITED by issue #107, with the reason: the sibling test
+    /// `metrics_json_carries_the_childs_cost` used to pin the collapse
+    /// (`"a number, never null"`), and this key-set pin sat next to it. That
+    /// contract is REPLACED — `null` is now legal, and is the ONLY legal
+    /// spelling of ABSENT; `0.0` is a legal FIGURE. What stays pinned is that
+    /// the `cost` KEY is always present (absence is spelled by the value
+    /// `null`, never by dropping the key), and that a `Some` figure is not
+    /// emitted as `null`.
     #[test]
     fn metrics_json_keeps_the_wire_shape_exact() {
         let m = SubagentMetrics {
             output: "text".to_string(),
             input_tokens: 10,
             output_tokens: 3,
-            cost: 0.0000341,
+            cost: Some(0.0000341),
             duration_ms: 900,
         };
         let v = metrics_json(&m);
@@ -1527,18 +1550,31 @@ mod tests {
             ],
             "the key set is byte-identical to the pinned contract"
         );
+        assert!(
+            !v["cost"].is_null(),
+            "a `Some` figure is a number on the wire, never `null` (`null` is \
+             the spelling of ABSENT — see the sibling pins)"
+        );
     }
 
     /// The child's real cost rides `metrics.cost` (the sole child→parent money
     /// hand-off — `dispatch.rs` discards the metrics, so the parent loop can
     /// never total a child itself).
+    ///
+    /// EDITED by issue #107, with the reason: its old assertion
+    /// (`is_number(), "a number, never null"`) PINNED THE COLLAPSE — it forbade
+    /// the one spelling of "no figure". The contract is REPLACED: `null` is now
+    /// legal and is the ONLY legal spelling of ABSENT, and `0.0` is a legal
+    /// FIGURE (see `distinguishes_a_real_zero_child_from_a_never_priced_child`,
+    /// which pins both ends). What stays pinned here is that a `Some` figure is
+    /// never emitted as `null`.
     #[test]
     fn metrics_json_carries_the_childs_cost() {
         let m = SubagentMetrics {
             output: String::new(),
             input_tokens: 0,
             output_tokens: 0,
-            cost: 0.0000341,
+            cost: Some(0.0000341),
             duration_ms: 0,
         };
         let v = metrics_json(&m);
@@ -1548,7 +1584,60 @@ mod tests {
             "the sub-cliff figure survives the metrics object intact — the \
              formatter is the frontend's problem, not the wire's"
         );
-        assert!(v["cost"].is_number(), "a number, never null");
+        assert!(
+            !v["cost"].is_null(),
+            "a REPORTED figure is never spelled `null` (a `null` means no \
+             figure arrived — the other end of the #107 rule)"
+        );
+    }
+
+    /// A real-zero child and a never-priced child are **NOT interchangeable**
+    /// on the wire (issue #107): a child whose calls reported a genuine `$0.00`
+    /// hand-offs `"cost": 0.0` (a FIGURE), and a child whose calls reported
+    /// nothing hand-offs `"cost": null` (the wire spelling of "no figure").
+    /// The `SubagentCapture` already tells the two apart; the hand-off must not
+    /// collapse them again, because a renderer that cannot tell them apart
+    /// prints `$0.00` for a child that never cost anything (ADR 0082 / D5).
+    #[test]
+    fn distinguishes_a_real_zero_child_from_a_never_priced_child() {
+        // A child whose ONE call reported a real zero.
+        let priced = SubagentCapture::new();
+        priced.observe_sink_frame("interactive-event", &child_cost_frame("child-1", json!(0)));
+        let real_zero = metrics_json(&SubagentMetrics {
+            output: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: priced.cost_usd(),
+            duration_ms: 0,
+        });
+
+        // A child that never had a priced frame at all.
+        let silent = SubagentCapture::new();
+        let never_priced = metrics_json(&SubagentMetrics {
+            output: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: silent.cost_usd(),
+            duration_ms: 0,
+        });
+
+        assert_eq!(
+            real_zero["cost"].as_f64(),
+            Some(0.0),
+            "a call that reported a real zero is a FIGURE and rides the wire \
+             as the number 0.0 — never as `null`"
+        );
+        assert!(
+            never_priced["cost"].is_null(),
+            "a child that never reported a cost is `\"cost\": null` (PRESENT \
+             AND NULL — the `SessionInfo.costUsd` spelling), got {:?}",
+            never_priced["cost"]
+        );
+        assert_ne!(
+            real_zero["cost"], never_priced["cost"],
+            "the two states are NOT interchangeable: collapsing them is the \
+             defect #107 exists to end"
+        );
     }
 }
 
@@ -1676,7 +1765,7 @@ mod rollup_tests {
                     input_tokens: 10,
                     output_tokens: 2,
                     // T08's measured band: four priced calls summed.
-                    cost: 0.0000341,
+                    cost: Some(0.0000341),
                     duration_ms: 5,
                 },
             },
@@ -1717,10 +1806,10 @@ mod rollup_tests {
         assert_eq!(closed["metrics"]["cost"].as_f64(), Some(0.0000341));
     }
 
-    /// A child that reported NO figure contributes NO frame — the `> 0.0` guard
-    /// is a frame-EXISTENCE gate, and the wire spelling of "no figure" is the
-    /// key being absent, never a `costUsd: 0` that the summing store would turn
-    /// into a phantom `$0.00`.
+    /// A child that reported NO figure contributes NO frame — the gate is the
+    /// `Option` itself, and the wire spelling of "no figure" on the hand-off is
+    /// `"cost": null` (present-and-null), never a `costUsd: 0` that the summing
+    /// store would turn into a phantom `$0.00`.
     #[tokio::test]
     async fn a_child_that_spent_nothing_emits_no_rollup_frame() {
         let events = Arc::new(StdMutex::new(Vec::new()));
@@ -1786,6 +1875,53 @@ mod rollup_tests {
         assert_eq!(
             frames[0]["payload"]["costUsd"].as_f64().expect("a number"),
             0.00001243
+        );
+    }
+
+    /// A child that NEVER reported a figure contributes NO roll-up frame, and
+    /// its `subagent-closed` hand-off says `"cost": null` — the wire spelling
+    /// of "no figure" (issue #107). Under the old `f64` hand-off this same
+    /// child arrived with `"cost": 0.0`, which is a FIGURE: the card could not
+    /// tell a child that never cost anything from one whose calls reported a
+    /// genuine `$0.00`, and the summing store would have turned a phantom zero
+    /// into a phantom `$0.00`. The frame-EXISTENCE gate is now the `Option`
+    /// itself: `None` → no frame, `Some(0.0)` → frame.
+    #[tokio::test]
+    async fn a_never_priced_child_emits_no_rollup_frame() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let collector = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let state = state_with(collector);
+        finish_subagent(
+            &state,
+            "child-4",
+            "parent-1",
+            &wire(),
+            // `preflight_failed` — the child never started, so NO frame of the
+            // capture's was ever observed: `cost_usd()` is `None`.
+            preflight_failed("never started".to_string()),
+            &SubagentOutcomeSink::Oneshot(Arc::new(StdMutex::new(None))),
+        )
+        .await;
+
+        assert!(
+            rollups(&events).is_empty(),
+            "a child that reported NO figure contributes NO `cost_update` \
+             frame to the parent — absence is spelled by NOT emitting"
+        );
+        let closed = {
+            let held = events.lock().unwrap_or_else(|p| p.into_inner());
+            held.iter()
+                .find(|(name, _)| name == "subagent-closed")
+                .map(|(_, p)| p.clone())
+        }
+        .expect("the `subagent-closed` still fires");
+        assert!(
+            closed["metrics"]["cost"].is_null(),
+            "the hand-off says `\"cost\": null` (present-and-null, the \
+             `SessionInfo.costUsd` spelling), got {:?}",
+            closed["metrics"]["cost"]
         );
     }
 }

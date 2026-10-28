@@ -2020,7 +2020,150 @@ async fn the_subagent_ui_lifecycle_events_fire_on_the_parent_sink() {
     assert!(metrics["output"].is_string(), "the captured final text");
     assert!(metrics["inputTokens"].is_u64());
     assert!(metrics["outputTokens"].is_u64());
-    assert!(metrics["cost"].is_number());
+    // (issue #107) This pin used to be `metrics["cost"].is_number()`, which
+    // pinned the COLLAPSE: a `f64` hand-off could only ever say `0.0`, so
+    // "number" was guaranteed. The contract is REPLACED — `null` is now legal
+    // and is the ONLY legal spelling of ABSENT. This child
+    // (`__subagent__` → `emit_canned_turn`) emits NO `cost_update` frame, so it
+    // is the NEVER-PRICED case and arrives as `"cost": null`. `null` is legal
+    // and is the ONLY legal spelling of ABSENT — it is NOT the collapse, because
+    // a real zero still arrives as the number `0.0` (pinned by
+    // `a_real_zero_child_emits_null_metrics_and_a_parent_costs_zero`). What this
+    // pin holds is that the key is PRESENT: the wire never omits it
+    // (present-and-null, the `SessionInfo.costUsd` spelling).
+    assert!(
+        metrics.get("cost").is_some(),
+        "`cost` is PRESENT on the hand-off — absence is spelled `null`, never a \
+         missing key: {metrics:?}"
+    );
+    assert!(
+        metrics["cost"].is_null(),
+        "a child whose frames carried NO figure hand-offs `\"cost\": null`, not \
+         the collapsed `0.0`: {metrics:?}"
+    );
+}
+
+/// (issue #107) A REAL-ZERO child, end to end: the `__subagent_cost_0__`
+/// fixture emits ONE child-keyed `cost_update` frame carrying `costUsd: 0.0`,
+/// so the Supervisor's `SubagentCapture` sums it to `Some(0.0)` — the spelling
+/// that is a FIGURE — and BOTH consequences of the `Option` hand-off are
+/// observable on real processes:
+///
+/// 1. the `subagent-closed` hand-off carries the NUMBER `0.0`, not `null` (the
+///    never-priced child of the test above proves the other half — the two are
+///    NOT interchangeable);
+/// 2. a real-zero child CONTRIBUTES a parent-keyed `cost_update` frame: the
+///    roll-up gate is the `Option`, not a `> 0.0` value filter, so a real zero
+///    still reaches the parent's money (the spec's "`$0.00` for a real zero"
+///    claim, pinned Rust-side at the emitter).
+///
+/// The frame is asserted on the `on_event` observation point (this harness's
+/// `on_event` collector — production's `on_event` is `SessionManager::
+/// route_event`, which persists the frame and re-emits the SAME payload to the
+/// parent's UI sink; the harness has no router, so the sink leg is the
+/// production-only half and the `route_event` write is pinned in `router.rs`).
+///
+/// (On the name: the plan's title for this test, kept verbatim. The "null
+/// metrics" half is NOT what it asserts — this child's hand-off is the NUMBER
+/// `0.0`; the `null` spelling belongs to the never-priced test above. Read the
+/// two together: the pair is what proves the two states are not interchangeable.)
+#[tokio::test]
+async fn a_real_zero_child_emits_null_metrics_and_a_parent_costs_zero() {
+    let (manager, _crashes, events, sinks) = make_manager(Some(Duration::from_secs(30)));
+    let sink_events = register_sink(&sinks, "u2");
+    manager
+        .attach("u2", &test_env("u2", Some(vec!["bash".to_string()])))
+        .await
+        .expect("the parent attach completes");
+    // The CHILD's task is its initial prompt (`subagent_flow.rs`'s
+    // `send_prompt(&wire.task, &[])`), so this reaches the fixture's
+    // `__subagent_cost_0__` arm and the frame rides the CHILD's stream — the
+    // only stream `SubagentCapture` reads.
+    dispatch_child_task(&manager, "u2", "__subagent_cost_0__");
+
+    let child_id = wait_for_child_id(&sink_events).await;
+    let closed = wait_for_closed(&sink_events).await;
+
+    // 1. The hand-off: a REAL zero, as a JSON NUMBER (never `null`).
+    assert_eq!(
+        closed["metrics"]["cost"].as_f64(),
+        Some(0.0),
+        "the child's real `Some(0.0)` reached the capture sum and the wire: {:?}",
+        closed["metrics"]
+    );
+    assert!(
+        closed["metrics"]["cost"].is_number(),
+        "a real zero is a FIGURE and is never spelled `null`: {:?}",
+        closed["metrics"]
+    );
+    // CHILD-keyed, as every `subagent-closed` is.
+    assert_eq!(
+        closed["sessionId"], child_id,
+        "the hand-off stays keyed to the CHILD"
+    );
+
+    // 2. The roll-up: EXACTLY ONE parent-keyed `cost_update` frame. The child's
+    // OWN frame rides the same channel (the pump delivers a child's frames to
+    // the PARENT's id, flagged `is_subagent: true`, and keyed to the CHILD) —
+    // that is the no-double-count half: different store keys. The roll-up is the
+    // `is_subagent: false`, PARENT-keyed frame.
+    let got = wait_for_event(&events, "u2", |e| {
+        matches!(e, WorkerInboundEvent::SinkFrame { event, payload }
+            if event == "interactive-event"
+                && payload["event"] == "cost_update"
+                && payload["sessionId"] == "u2")
+    })
+    .await;
+    let rollups: Vec<&WorkerInboundEvent> = got
+        .iter()
+        .filter(|(is_sub, e)| {
+            !is_sub
+                && matches!(e, WorkerInboundEvent::SinkFrame { event, payload }
+                    if event == "interactive-event"
+                        && payload["event"] == "cost_update"
+                        && payload["sessionId"] == "u2")
+        })
+        .map(|(_, e)| e)
+        .collect();
+    let child_frames = got
+        .iter()
+        .filter(|(is_sub, e)| {
+            *is_sub
+                && matches!(e, WorkerInboundEvent::SinkFrame { event, payload }
+                    if event == "interactive-event" && payload["event"] == "cost_update")
+        })
+        .count();
+    assert_eq!(
+        rollups.len(),
+        1,
+        "a real-zero child contributes exactly ONE PARENT-keyed roll-up frame: {got:?}"
+    );
+    assert_eq!(
+        child_frames, 1,
+        "the child's OWN frame is the other one (CHILD-keyed, `is_subagent: \
+         true`) — the two never share a store key: {got:?}"
+    );
+    let frame = match rollups[0] {
+        WorkerInboundEvent::SinkFrame { payload, .. } => payload.clone(),
+        _ => unreachable!("filtered above"),
+    };
+    assert_eq!(
+        frame["sessionId"], "u2",
+        "the roll-up is keyed to the PARENT, never the child"
+    );
+    assert_ne!(
+        frame["sessionId"], child_id,
+        "the roll-up must NOT re-key the child's money to the child"
+    );
+    assert_eq!(frame["payload"]["source"], "subagent");
+    assert_eq!(
+        frame["payload"]["costUsd"].as_f64(),
+        Some(0.0),
+        "a real zero IS a figure and its frame lands on the parent's money"
+    );
+
+    drop(sink_events);
+    manager.detach("u2");
 }
 
 /// (issue #47) The `subagent-session-started` payload names a resolve MISS, and

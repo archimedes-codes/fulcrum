@@ -757,35 +757,41 @@ mod tests {
     /// the control that proves the `agent_name` half is not passing by accident.
     #[test]
     fn an_unknown_param_without_a_close_match_is_still_reported() {
-        let warning = unknown_param_error(
+        let agent_name_rejection = unknown_param_error(
             &tool_specs(),
             &call("subagent", json!({ "task": "t", "agent_name": "reviewer" })),
         )
         .expect("`agent_name` is not an advertised property, so it is reported");
-        assert!(warning.contains("`subagent`"), "{warning}");
-        assert!(warning.contains("`agent_name`"), "{warning}");
         assert!(
-            !warning.contains("did you mean"),
+            agent_name_rejection.contains("`subagent`"),
+            "{agent_name_rejection}"
+        );
+        assert!(
+            agent_name_rejection.contains("`agent_name`"),
+            "{agent_name_rejection}"
+        );
+        assert!(
+            !agent_name_rejection.contains("did you mean"),
             "`agent_name` must get NO suggestion (suggest is deliberately \
-             separator-blind): {warning}"
+             separator-blind): {agent_name_rejection}"
         );
 
-        let warning = unknown_param_error(
+        let zzzz_rejection = unknown_param_error(
             &tool_specs(),
             &call("subagent", json!({ "task": "t", "zzzz": 1 })),
         )
         .expect("`zzzz` is not an advertised property, so it is reported");
-        assert!(warning.contains("`zzzz`"), "{warning}");
+        assert!(zzzz_rejection.contains("`zzzz`"), "{zzzz_rejection}");
         assert!(
-            !warning.contains("did you mean"),
-            "a key with no substring relation at all gets no suggestion: {warning}"
+            !zzzz_rejection.contains("did you mean"),
+            "a key with no substring relation at all gets no suggestion: {zzzz_rejection}"
         );
     }
 
     /// A spec whose `parameters.properties` is absent or not an object is
     /// NEVER checked. Load-bearing: `list_agents` / `list_skills` are a bare
     /// `{"type":"object"}`, so treating "no properties" as "nothing allowed"
-    /// would flag EVERY key on EVERY call and turn the warning into noise.
+    /// would flag EVERY key on EVERY call and turn the rejection into noise.
     #[test]
     fn a_spec_with_no_properties_is_never_checked() {
         for bare in ["list_agents", "list_skills"] {
@@ -828,7 +834,7 @@ mod tests {
     /// `subagent` spec — the `effective_tool_name` lookup is what makes this
     /// non-vacuous, and the message names the canonical tool.
     #[test]
-    fn a_well_formed_call_produces_no_warning() {
+    fn a_well_formed_call_produces_no_rejection() {
         assert_eq!(
             unknown_param_error(
                 &tool_specs(),
@@ -847,14 +853,14 @@ mod tests {
             None,
             "every key here is advertised, so nothing may be reported"
         );
-        let warning = unknown_param_error(
+        let alias_rejection = unknown_param_error(
             &tool_specs(),
             &call("dispatch_subagent", json!({ "task": "t", "agent": "x" })),
         )
         .expect("`dispatch_subagent` is an ALIAS of `subagent`, not an unknown tool");
-        assert!(warning.contains("`subagent`"), "{warning}");
-        assert!(warning.contains("`agent`"), "{warning}");
-        assert!(warning.contains("`agentName`"), "{warning}");
+        assert!(alias_rejection.contains("`subagent`"), "{alias_rejection}");
+        assert!(alias_rejection.contains("`agent`"), "{alias_rejection}");
+        assert!(alias_rejection.contains("`agentName`"), "{alias_rejection}");
     }
 
     /// The `subagent` spec advertises exactly the set of keys the executor
@@ -895,8 +901,9 @@ mod tests {
 
     /// (issue #82, interim) The three web tools' handlers accept camelCase
     /// aliases and `proxy` that the specs must advertise — the checker added
-    /// for #78 is generic, so an unadvertised-but-legal key would be warned on
-    /// every web call. `exec_param_keys()` is the census this test shares with
+    /// for #78 is generic, so an unadvertised-but-legal key would be rejected
+    /// on every web call — the misspelled call would fail instead of riding
+    /// along. `exec_param_keys()` is the census this test shares with
     /// `tool_specs_advertise_exactly_the_executor_param_keys`; it must list
     /// EVERY key the handler reads (`.get("…")`, including the
     /// `.or_else(|| params.get("…"))` alias arms) in `agent/web/tools.rs`.

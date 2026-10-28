@@ -412,6 +412,11 @@ pub(crate) enum CompactionOutcome {
     Compacted {
         context_tokens: u64,
         summary: String,
+        /// The summary call's provider-reported cost (issue #106) — `None`
+        /// when the provider priced nothing; the CALLER emits it through the
+        /// cost channel (`emit_cost_update`), because emission is the loop's
+        /// sink concern and this module holds no sink.
+        cost: Option<f64>,
     },
     /// The summary failed: the transcript is UNCHANGED (a failed
     /// compaction is never a lost context).
@@ -465,7 +470,7 @@ pub(crate) async fn run_compaction(
         return CompactionOutcome::Skipped;
     }
     match summarize(ctx, &summarized, dropped, turn).await {
-        Ok(summary) => {
+        Ok((summary, cost)) => {
             // The record of the trim travels IN the summary (ADR 0047): the
             // harness knows the exact count, so the stored row states it —
             // and so does the model, because this same message is replayed.
@@ -518,6 +523,7 @@ pub(crate) async fn run_compaction(
             CompactionOutcome::Compacted {
                 context_tokens,
                 summary: format!("{summary}{record}"),
+                cost,
             }
         }
         Err(e) => {
@@ -565,8 +571,11 @@ fn summary_system_prompt(instructions: Option<&str>, dropped: usize) -> String {
 }
 
 /// The summary model call (a "summarize these messages" system prompt
-/// over the older messages — NO tools; the stream is consumed
-/// silently — the summary is internal, like pi's). The call + stream
+/// over the older messages — NO tools; the stream is consumed for the
+/// summary text AND the provider's `Usage` cost is read and returned, so
+/// the summariser's call reaches the cost channel like any other priced
+/// call (issue #106 — the summary is internal to the model, like pi's, but
+/// its MONEY is not). The call + stream
 /// race the turn's cancel (a cancelled turn must not wait out the
 /// summary — the compaction is aborted; the turn settles at the top
 /// of the loop). A stream that ends with `Done(Error)` (the provider
@@ -585,7 +594,7 @@ pub(crate) async fn summarize(
     older: &[ChatMessage],
     dropped: usize,
     turn: &CancellationToken,
-) -> Result<String, ProviderError> {
+) -> Result<(String, Option<f64>), ProviderError> {
     let system = ChatMessage {
         role: ChatRole::System,
         content: MessageContent::Text(summary_system_prompt(ctx.instructions.as_deref(), dropped)),
@@ -621,6 +630,13 @@ pub(crate) async fn summarize(
     };
     let mut summary = String::new();
     let mut finished: Option<FinishReason> = None;
+    // (issue #106) The provider's per-call figure rides the `Usage` EVENT, so
+    // the summariser's money is read HERE — the arm this call used to swallow.
+    // Only a `Some(_)` overwrites: a later `None` is neither a zero nor a
+    // retraction and must not erase an earlier figure (the same last-non-
+    // `None`-wins rule ADR 0082 records for the Anthropic wire). Defensive —
+    // the wires send one trailing `Usage`.
+    let mut summary_cost: Option<f64> = None;
     loop {
         tokio::select! {
             ev = stream.next() => {
@@ -632,6 +648,7 @@ pub(crate) async fn summarize(
                         break;
                     }
                     ProviderEvent::Error(e) => return Err(e),
+                    ProviderEvent::Usage(_, c @ Some(_)) => summary_cost = c,
                     _ => {}
                 }
             }
@@ -657,7 +674,7 @@ pub(crate) async fn summarize(
         Some(FinishReason::Length) => Err(ProviderError::Retryable(
             "the summary hit the output token limit".to_string(),
         )),
-        Some(_) => Ok(summary),
+        Some(_) => Ok((summary, summary_cost)),
         None => Err(ProviderError::Retryable(
             "the summary stream ended without a finish_reason".to_string(),
         )),
@@ -845,7 +862,7 @@ mod tests {
         let model = fake_model("m1");
         let mut compactor = Compactor::new(CompactionConfig::default(), model.context_window);
         let older = vec![text_msg("history")];
-        let summary = {
+        let (summary, _cost) = {
             let ctx = CompactionCtx {
                 session_id: "s1",
                 model: &model,
@@ -1866,7 +1883,7 @@ mod tests {
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = SessionRecordingProvider::new(recorded.clone());
         let older = vec![text_msg("history")];
-        let summary = call_summarize(&provider, &older)
+        let (summary, _cost) = call_summarize(&provider, &older)
             .await
             .expect("summarize succeeds");
         assert_eq!(summary, "ok");
@@ -1884,7 +1901,7 @@ mod tests {
         let provider = RequestRecordingProvider {
             recorded: recorded.clone(),
         };
-        let summary = call_summarize(&provider, &[text_msg("history")])
+        let (summary, _cost) = call_summarize(&provider, &[text_msg("history")])
             .await
             .expect("summarize succeeds");
         assert_eq!(summary, "ok");
@@ -1893,6 +1910,64 @@ mod tests {
         // `call_summarize` builds its Compactor with `CompactionConfig::default()`
         // (reserve 16 384) → min(floor(0.8 × 16 384), 8 192).
         assert_eq!(reqs[0].options.max_tokens, Some(8_192));
+    }
+
+    /// (issue #106) `summarize` reads the provider's `Usage` cost off the
+    /// stream and returns it ALONGSIDE the summary — the summariser's call is
+    /// a priced call like any other, and its money reaches the cost channel
+    /// through the caller's `emit_cost_update` (ADR 0082 limit 2, closed by
+    /// this change).
+    #[tokio::test]
+    async fn summarize_returns_the_usage_cost_alongside_the_summary() {
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("ok".to_string()),
+            ProviderEvent::Usage(
+                Usage {
+                    input_tokens: 1000,
+                    output_tokens: 50,
+                },
+                Some(0.0042),
+            ),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let older = vec![text_msg("history")];
+        let (summary, cost) = call_summarize(&provider, &older)
+            .await
+            .expect("summarize succeeds");
+        assert_eq!(summary, "ok", "the summary text is unchanged by the change");
+        assert_eq!(
+            cost,
+            Some(0.0042),
+            "the provider's per-call figure rides the return, not a sink"
+        );
+    }
+
+    /// A provider that priced nothing returns `None` — never a `Some(0.0)`.
+    /// The `None` is what the caller's `emit_cost_update` gate reads as "emit
+    /// NOTHING at all"; collapsing it to a zero here would manufacture the
+    /// phantom `$0.00` at the summariser (D5).
+    #[tokio::test]
+    async fn summarize_reports_none_when_the_provider_priced_nothing() {
+        let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+            ProviderEvent::TextDelta("ok".to_string()),
+            ProviderEvent::Usage(
+                Usage {
+                    input_tokens: 1000,
+                    output_tokens: 50,
+                },
+                None,
+            ),
+            ProviderEvent::Done(FinishReason::Stop),
+        ])]);
+        let older = vec![text_msg("history")];
+        let (summary, cost) = call_summarize(&provider, &older)
+            .await
+            .expect("summarize succeeds");
+        assert_eq!(summary, "ok");
+        assert_eq!(
+            cost, None,
+            "an unpriced summary call reports ABSENCE, never a zero"
+        );
     }
 
     /// A trimmed summary SAYS it is trimmed: the model is told the range is
@@ -1970,7 +2045,7 @@ mod tests {
     async fn call_summarize(
         provider: &dyn Provider,
         older: &[ChatMessage],
-    ) -> Result<String, ProviderError> {
+    ) -> Result<(String, Option<f64>), ProviderError> {
         let (_dir, _db, store) = temp_store();
         let model = fake_model("m1");
         let mut compactor = Compactor::new(CompactionConfig::default(), model.context_window);
