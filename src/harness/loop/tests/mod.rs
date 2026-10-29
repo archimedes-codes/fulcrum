@@ -3,6 +3,7 @@ mod context_usage;
 mod cost;
 mod param_rejection;
 mod policy_gate;
+mod provider_switch;
 mod subagents;
 pub(super) mod support;
 mod tools_enabled;

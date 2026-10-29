@@ -34,6 +34,7 @@ use crate::agent::events::RpcEvent;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
 use crate::agent::harness::compact::{self, Compactor};
 use crate::agent::harness::dispatch::SubagentDispatcher;
+use crate::agent::harness::model_key::ModelKey;
 use crate::agent::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest, Provider,
     ProviderError, ToolSpec,
@@ -459,6 +460,10 @@ impl AgentLoop {
     /// smaller window would defer a compaction that is already due by a whole
     /// model call (the call that has to send the oversized context).
     pub fn set_model(&mut self, model: Model) {
+        let switched = ModelKey::from(&self.model) != ModelKey::from(&model);
+        if switched {
+            self.provider = crate::agent::harness::provider::build_provider(&model);
+        }
         self.compactor = Compactor::new(self.catalog.compaction, model.context_window);
         self.model = model;
         self.compactor.reestimate(&self.messages);
