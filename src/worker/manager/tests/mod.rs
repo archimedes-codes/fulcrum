@@ -653,6 +653,61 @@ async fn a_crashed_worker_fires_on_crash_exactly_once() {
     );
 }
 
+/// (issue #122) A child that SETTLED with NO text at all must NOT deliver
+/// `Completed { output: "" }` to the parent. An empty `Completed` becomes a
+/// `tool` message with `Text("")` in the parent's transcript (dispatch.rs's
+/// `Completed` arm builds `ToolResult { content: [Text { text: output }] }`, and
+/// unlike the `Failed` arm it has no `salvage_text` shield), and that row is
+/// what puts `"content": ""` on the parent's NEXT OpenAI request — the exact wire
+/// LiteLLM's `_sanitize_empty_text_content` rewrites into the
+/// `[System: Empty message content sanitised to satisfy protocol]` banner this
+/// issue is about. It arrives as the honest `Failed` instead.
+///
+/// The fixture path is the REAL settle, not a stub: `dispatch_child_task` sends
+/// `__subagent__` as the CHILD's initial prompt, and that fixture arm emits a
+/// `SubagentDispatch` + `agent_settled` with NO `agent_message_chunk` — so the
+/// `SubagentCapture` yields `captured_text() == ""` and the `Race::Settled` arm
+/// is the thing under test. The observation point is the requester's
+/// `subagent-result-ack` (the outcome rides it verbatim).
+#[tokio::test]
+async fn a_silent_child_that_settled_is_not_completed_empty() {
+    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    manager
+        .attach("p1", &test_env("p1", Some(vec!["bash".to_string()])))
+        .await
+        .expect("the parent attach completes");
+    dispatch_child_task(&manager, "p1", "__subagent__");
+    let outcome = subagent_result_outcome_after_ack(&events, "p1").await;
+    match outcome {
+        SubagentOutcome::Completed { output, .. } => panic!(
+            "an empty-result child is never `Completed` (an empty `Completed` \
+             becomes a parent `tool` row with empty text and a `content: \"\"` \
+             on the parent's next request), got output {output:?}"
+        ),
+        SubagentOutcome::Failed {
+            reason,
+            error,
+            output,
+            ..
+        } => {
+            assert_eq!(
+                reason,
+                SubagentFailureReason::Other,
+                "`Other`, NOT `Cancelled` — the child was not stopped, it settled \
+                 (`Cancelled` is reserved for a parent/user Stop)"
+            );
+            assert_eq!(
+                error, "the subagent settled with no output",
+                "the marker text names the condition honestly"
+            );
+            assert!(
+                output.is_empty(),
+                "no partial to salvage — the child produced nothing, got {output:?}"
+            );
+        }
+    }
+}
+
 /// The `dispatch_subagent` flow: a `SubagentDispatch` from a
 /// main-session `fake_worker` (the `__subagent__` prompt) spawns a
 /// subagent `fake_worker` (a fresh ephemeral session — the canned

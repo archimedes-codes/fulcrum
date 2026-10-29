@@ -2534,8 +2534,10 @@ async fn per_pattern_rules_leave_the_verdict_untouched() {
 /// * `edit:` and `bash:` are PATTERN objects (`whole_tool: false`), so they carry
 ///   NO tool-wide verdict and the posture stands. Enforcing those rows needs a
 ///   command/path matcher nothing has validated — B1 parses them and announces
-///   `UnsupportedUnvalidatedMatcher(BashPatternRules)` for exactly this reason,
-///   and this task's scope line keeps that decision (the redirect trap:
+///   `UnsupportedUnvalidatedMatcher(BashPatternRules | PathPatternRules)` for
+///   exactly this reason (the bash rows and the `edit:` path rows each announce
+///   their own class — #124), and this task's scope line keeps that decision (the
+///   redirect trap:
 ///   `grep x file 2>/dev/null` contains a `>`). Note the file's own bash catch-all
 ///   is `"*": allow`, so even a perfect matcher would ALLOW a read-only command.
 ///
@@ -2577,6 +2579,16 @@ async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones(
             UnsupportedReason::BashPatternRules
         )),
         "the real block announces its bash pattern rows: {notes:?}"
+    );
+    // #124: the SAME file's `edit:` map is a per-pattern PATH map, and it now
+    // announces its OWN reason. Both reasons are asserted by name so this
+    // gate-adjacent record keeps naming the FULL announcement set the real file
+    // earns — a regression to bash-only silence for the path rows reddens here.
+    assert!(
+        notes.contains(&FrontmatterNote::UnsupportedUnvalidatedMatcher(
+            UnsupportedReason::PathPatternRules
+        )),
+        "the real block announces its edit path-pattern rows: {notes:?}"
     );
     assert!(
         block
@@ -2649,5 +2661,38 @@ async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones(
         None,
         "`task: deny` has no policed twin, so the gate answers `None` (the named \
          limitation) rather than inventing a verdict"
+    );
+}
+
+/// #124 — minimum bar: if the bash-only guard ever comes back, this test
+/// REDDENS. The modal reads the SAME note data this reader produces, so a
+/// silent parse here is a silently silent modal there — the exact defect
+/// class #101 exists to fix.
+#[test]
+fn a_path_tool_pattern_map_announces_itself_unsupported() {
+    use crate::agent::definition_permission::{FrontmatterNote, UnsupportedReason};
+
+    let fm = "name: p\npermission:\n  edit: {\"*\": deny, \"*.md\": allow}\n";
+    let lines: Vec<&str> = fm.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| l.starts_with("permission:"))
+        .unwrap();
+    let (block, notes) =
+        crate::agent::definition_permission::parse_permission_block(&lines, idx, "");
+    let block = block.expect("a pattern map on a path tool must PARSE");
+    assert!(!block.tools[0].1.whole_tool, "an object is per-pattern");
+    assert!(
+        notes.contains(&FrontmatterNote::UnsupportedUnvalidatedMatcher(
+            UnsupportedReason::PathPatternRules
+        )),
+        "a path-tool pattern map ANNOUNCES itself unsupported: {notes:?}"
+    );
+    assert!(
+        notes.iter().all(|n| !matches!(
+            n,
+            FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::BashPatternRules)
+        )),
+        "the path-tool announcement is its OWN reason, never bash's: {notes:?}"
     );
 }

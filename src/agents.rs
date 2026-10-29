@@ -70,8 +70,10 @@ pub struct AgentDefinition {
     /// the rules this file CARRIES; enforcement is the follow-up task's.
     pub permission: Option<crate::agent::definition_permission::PermissionBlock>,
     /// The frontmatter-READ notes (unknown top-level keys, unrecognised
-    /// tool keys, unsupported bash-pattern rows — issue #101's announce
-    /// half; #78's principle applied to files). A REPORT, never an error:
+    /// tool keys, unsupported pattern rows — a `bash` command-text pattern
+    /// object and a path-taking tool's path-pattern map each announce their own
+    /// reason, issue #101's announce half plus #124's; #78's principle applied
+    /// to files). A REPORT, never an error:
     /// discovery stays total. The two `parse_value` copies are NOT
     /// affected. Additive: an empty vec is the ordinary case.
     /// **Wire/UI surfacing is the follow-up task's hand-off, mirroring the
@@ -1306,6 +1308,10 @@ mod tests {
     /// branch, so the loop just stops); copying that here would truncate a
     /// legal, readable permission block MID-RULESET. A blank line inside the
     /// block is therefore skipped, never a terminator.
+    ///
+    /// #124: the `edit:` map is a per-pattern PATH map and now announces itself
+    /// unsupported at the DISCOVERY layer too — exactly one note, and the
+    /// whole-tool `bash: deny` stays silent.
     #[test]
     fn a_permission_block_with_a_blank_line_between_tool_groups_parses_in_full() {
         let d = discover_one(
@@ -1326,7 +1332,15 @@ mod tests {
             "BOTH tool groups survive the blank line between them: {block:?}"
         );
         assert_eq!(block.tools[0].1.patterns.len(), 2, "and in full");
-        assert!(d.frontmatter_notes.is_empty(), "{:?}", d.frontmatter_notes);
+        assert_eq!(
+            d.frontmatter_notes,
+            vec![FrontmatterNote::UnsupportedUnvalidatedMatcher(
+                UnsupportedReason::PathPatternRules
+            )],
+            "the `edit:` path map announces itself unsupported (#124) — and the \
+             whole-tool `bash: deny` next to it stays silent: {:?}",
+            d.frontmatter_notes
+        );
     }
 
     /// T7b — the comment-line SKIP rule at the DISCOVERY layer, with the fixture
@@ -1340,7 +1354,8 @@ mod tests {
     /// every colon-free comment becomes an `UnknownKey` carrying the whole
     /// sentence — so the file that motivated the issue would still not parse,
     /// and its announcements would be noise. The ONLY notes this file may
-    /// produce are the two its content earns.
+    /// produce are the three its content earns (and after #124, the first of
+    /// them is the `edit:` map's own path-pattern announcement).
     #[test]
     fn a_permission_block_with_comments_reports_only_real_tools_and_real_notes() {
         let d = discover_one(
@@ -1403,6 +1418,10 @@ mod tests {
         assert_eq!(
             d.frontmatter_notes,
             vec![
+                // #124: `edit:` comes FIRST in file order, and its nested map is
+                // a per-pattern PATH map — so its announcement lands first,
+                // before `task` and `bash` are even read.
+                FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::PathPatternRules),
                 FrontmatterNote::UnrecognizedToolKey("task".to_string()),
                 FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::BashPatternRules),
             ],
@@ -1412,7 +1431,10 @@ mod tests {
 
     /// T8 — the whole 8-field parse: a real opencode-shaped block (an inline
     /// pattern map + a whole-tool verdict + a NESTED pattern map) lands on the
-    /// typed, ordered ruleset, with nothing announced.
+    /// typed, ordered ruleset. Since #124 the two PATTERN MAPS announce their
+    /// path-pattern rows as unsupported (the whole-tool verdict does not), so
+    /// this fixture is no longer an "announces nothing" case — the typed
+    /// ruleset below is the point, and the notes are asserted exactly.
     #[test]
     fn a_permission_block_is_parsed_into_the_typed_ruleset() {
         let d = discover_one(
@@ -1459,9 +1481,20 @@ mod tests {
             "three tools, FILE ORDER, both the inline-map and the nested spelling \
              read — and the explicit `\"*\"` row stays per-pattern, not tool-wide"
         );
-        assert!(
-            d.frontmatter_notes.is_empty(),
-            "a `permission:` key is NOT an unknown key: {:?}",
+        // #124: BOTH pattern maps here (`edit:` inline, `read:` nested) are
+        // per-pattern PATH maps, so each announces its own reason — in FILE
+        // ORDER, `edit` before `read`. The whole-tool `bash: deny` between them
+        // announces nothing. The sentence this assert used to carry stays true:
+        // a `permission:` key is NOT an unknown key, and no `UnknownKey` note
+        // appears anywhere in this vec.
+        assert_eq!(
+            d.frontmatter_notes,
+            vec![
+                FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::PathPatternRules),
+                FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::PathPatternRules),
+            ],
+            "the two path-pattern maps announce themselves unsupported (#124), and \
+             a `permission:` key is still NOT an unknown key: {:?}",
             d.frontmatter_notes
         );
     }

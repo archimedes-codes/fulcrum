@@ -1637,3 +1637,86 @@ async fn a_stop_mid_mcp_call_cancels() {
     );
     assert_eq!(result["content"][0]["text"], "cancelled");
 }
+
+/// (issue #122) The upstream sanitisation placeholder —
+/// `[System: Empty message content sanitised to satisfy protocol]`, injected by
+/// LiteLLM's `_sanitize_empty_text_content` when empty string content passes
+/// through it — must never reach the UI, the transcript, or the store.
+///
+/// The scripted provider plays the two-turn production shape: a placeholder-only
+/// reply, then the retry that answers properly. After the filter, the
+/// placeholder-only attempt accumulates NOTHING into `acc.text`, so it is the
+/// genuine empty-turn condition of issue #64 (`Stop` + no text + no tool call)
+/// and is retried on the shared budget — persisting nothing.
+#[tokio::test]
+async fn a_placeholder_stream_is_never_emitted_or_persisted() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // The placeholder-only attempt, then the retry that answers properly
+    // (issue #64: after the filter `acc.text` is empty, so `handle_empty_turn`
+    // retries on the shared budget — the SAME shape the empty-turn tests use).
+    let (provider, calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::TextDelta(
+                "[System: Empty message content sanitised to satisfy protocol]".to_string(),
+            ),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("ok".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("hi")).await;
+    let events = drain_events(&mut events_rx);
+    // The placeholder must never be EMITTED as a `text_delta` (the frontend
+    // renders exactly these deltas, so "never emitted" is "never in the UI").
+    let leaked: Vec<&RpcEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(e, RpcEvent::message_update { assistant_message_event, .. }
+                if assistant_message_event["type"] == "text_delta"
+                    && assistant_message_event["delta"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("Empty message")))
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the placeholder delta is never emitted to the UI, got {leaked:?}"
+    );
+    // The placeholder-only attempt was retried (an empty turn), exactly once.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the placeholder attempt + the retry"
+    );
+    // No stored row ever contains the placeholder…
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert!(
+        loaded.iter().all(|m| !serde_json::to_string(m)
+            .unwrap_or_default()
+            .contains("Empty message")),
+        "no stored row carries the placeholder, got {loaded:?}"
+    );
+    // …and the abandoned attempt persisted NO assistant row (only the retry's).
+    assert_eq!(
+        loaded
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Assistant))
+            .count(),
+        1,
+        "exactly ONE assistant row (the retry's), got {loaded:?}"
+    );
+}

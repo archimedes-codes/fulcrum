@@ -555,6 +555,117 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
     );
 }
 
+/// (issue #79 residual (a)) cmd's own `timeout /t` error — "ERROR: Input redirection is not
+/// supported" — is a DOCUMENTED consequence of this tool's child policy, not a real defect:
+/// `childproc::closed_stdin` forces stdin to NULL and `CREATE_NO_WINDOW` leaves the child with
+/// no console input, so `timeout` cannot sleep. The bare sentence reads like a real error; this
+/// test pins that a pure translator turns it into a diagnostic naming the policy and the workaround.
+#[test]
+fn cmd_input_redirection_is_diagnosed_as_the_no_console_input_tool_policy() {
+    let cmd_error = "ERROR: Input redirection is not supported, exiting the process immediately";
+    let note = crate::agent::tools::exec::bash::cmd_input_redirection_diagnostic(cmd_error);
+    let note = note.unwrap_or_else(|| panic!("cmd's own error sentence must be translated"));
+    assert!(
+        note.contains("no console input"),
+        "the cause is named: {note}"
+    );
+    assert!(
+        note.contains("ping -n 20 127.0.0.1 > NUL"),
+        "the workaround the description already recommends is restated: {note}"
+    );
+    // A line without cmd's sentence is untouched (a shape pin, not the effect).
+    assert_eq!(
+        crate::agent::tools::exec::bash::cmd_input_redirection_diagnostic("echo hi"),
+        None
+    );
+    // The negative is pinned against FAILURE text, not just a success line
+    // (reviewer round 2): a NON-ZERO-exit run whose text carries none of the
+    // trigger sentences must stay untranslated too — the translator keys on
+    // cmd's sentence alone, never on the exit code (that decision belongs to
+    // `bash_exit_report`, whose plain `(Some(n), None)` arm keeps the run an
+    // `is_error` with no note).
+    assert_eq!(
+        crate::agent::tools::exec::bash::cmd_input_redirection_diagnostic(
+            "grep: cannot open 'missing.txt': No such file or directory"
+        ),
+        None,
+        "a failing run's text with no trigger sentence must not be translated"
+    );
+}
+
+// ── the no-console-input diagnostic, on the shell that prints the error ─
+//
+// `#[cfg(windows)]` for the same reason the quoting tests below carry it: only `cmd.exe` prints
+// the sentence this test feeds the translator, so the test cannot exist on another platform and
+// runs ONLY on CI's `windows-latest` leg (locally compile-verified by
+// `cargo check --target x86_64-pc-windows-gnu --all-targets`). The host-side half of the same
+// claim — that `exec_bash` attaches the diagnostic at all — is the cross-platform
+// [`a_run_whose_text_carries_the_cmd_redirect_error_gets_the_diagnostic_as_its_first_line`].
+
+/// (issue #79 residual (a), end-to-end) The real `timeout /t` run on Windows surfaces cmd's
+/// raw error — and the tool result must ALSO carry the diagnostic the pure translator emits
+/// (the no-console-input policy + the `ping` workaround). Deterministic on the CI runner:
+/// `closed_stdin` + `CREATE_NO_WINDOW` guarantee the "Input redirection is not supported" path
+/// (see the childproc module docs); a GREEN here means the diagnostic was attached to a real
+/// run, not to a fixture line.
+///
+/// WHAT `is_error` ACTUALLY IS (reviewer round 2 — traced from `exec_bash`, not assumed):
+/// the TIMEOUT command exits AT ONCE with the error (it cannot sleep without console input —
+/// confirmed by MS/Broadcom/IBM write-ups), so `timeout_ms` NEVER fires: the read loop breaks on
+/// the observed exit, `timed_out` stays `false`, and the report is built as
+/// `bash_exit_report(false, false, Some(status), pipes_held)`. `cancelled` is false, the
+/// `timed_out` arm is skipped, and the final `match (code, signal)` arm
+/// `(Some(n), None) => (Some(n), true, None)` — "a normal non-zero exit needs no note — the
+/// code IS the report" — is the ACTUAL arm handling it (the same arm the Linux `exit 3`
+/// fixture drills).
+///
+/// ACTUAL RESULTING TEXT: `is_error: true`; `details.exitCode` = whatever NON-ZERO code this
+/// `cmd` build's `timeout.exe` returned (the arm passes the real code through, no fabrication);
+/// NO exit-report note (the arm's note is `None`); `cancelled: false`; and the model-facing
+/// text is `cmd`'s own sentence followed by the diagnostic line.
+///
+/// WHY THE ASSERTION INSISTS ONLY ON NON-ZERO: the report's `(Some(n), None)` arm is an
+/// ERROR for EVERY non-zero code, and the specific number `timeout` returns on this abort is
+/// not pinned by any authoritative source available from Linux (MS's `timeout` docs list no
+/// errorlevel for the redirect-abort; community write-ups say only "exits immediately"). A
+/// guessed constant would RED on the CI leg the first time it disagreed with some `cmd` build —
+/// exactly the blind spot the "match reality" review is guarding against. `is_error` + a
+/// non-zero `exitCode` is what the arm ACTUALLY guarantees on every Windows build; if the
+/// implementer observes a specific code on the CI leg, the assertion may be STRENGTHENED to it
+/// in the implementing PR, citing the observed value.
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_timeout_t_reports_a_no_console_input_diagnostic() {
+    let cwd = temp_cwd("bash-timeout-diag");
+    let r = execute_tool(&ctx(&cwd), "bash", &json!({ "command": "timeout /t 1" })).await;
+    let text = text_of(&r);
+    assert!(
+        r.is_error,
+        "a failed `timeout /t` run is an error — the report's `(Some(n), None)` arm \
+         (the wait did not happen): TEXT={text:?}"
+    );
+    assert_eq!(r.details.as_ref().unwrap()["cancelled"], false);
+    let code = &r.details.as_ref().unwrap()["exitCode"];
+    assert!(
+        code.is_i64() && code.as_i64().unwrap() != 0,
+        "the exit code is the child's REAL non-zero code (never fabricated, never 0): \
+         DETAILS={:?}",
+        r.details
+    );
+    assert!(
+        text.contains("Input redirection is not supported"),
+        "the repro itself must appear (cmd's own sentence): {text:?}"
+    );
+    assert!(
+        text.contains("no console input"),
+        "the diagnostic must name the no-console-input policy to the model: {text:?}"
+    );
+    assert!(
+        text.contains("ping -n 20 127.0.0.1 > NUL"),
+        "the diagnostic must restate the workaround: {text:?}"
+    );
+}
+
 // ── the quoting contract, on the shell that actually re-parses it ─────
 //
 // `#[cfg(windows)]` rather than `#[cfg(not(unix))]`: these spawn `cmd.exe`,
@@ -639,6 +750,48 @@ async fn bash_an_inline_quoted_path_still_takes_the_branch() {
         "the quoted operand must reach `cmd` un-escaped or the branch is silently \
          skipped WHILE STILL EXITING 0 — issue #79's false success: {:?}",
         text_of(&r)
+    );
+}
+
+/// (issue #79 residual (a), the WIRING) The pure translator is pinned by
+/// [`cmd_input_redirection_is_diagnosed_as_the_no_console_input_tool_policy`] and the presence of
+/// cmd's sentence in a REAL run is pinned on the Windows CI leg by
+/// [`bash_timeout_t_reports_a_no_console_input_diagnostic`]. THIS pins the middle fact — that
+/// `exec_bash` ATTACHES the diagnostic to a real run's captured text, as the first thing the model
+/// sees and on its own line — on a host that has no `cmd.exe`, by emitting cmd's exact sentence
+/// from a plain `printf`. Cross-platform on purpose: the wiring in `exec_bash` is not `cfg`-gated,
+/// so it must not rest on a CI-only test.
+///
+/// The run itself SUCCEEDS (this is `printf`, not `timeout`): the diagnostic is a TEXT-axis fact and
+/// never an exit-status claim — `bash_exit_report` decides `is_error`, untouched.
+#[tokio::test]
+async fn a_run_whose_text_carries_the_cmd_redirect_error_gets_the_diagnostic_as_its_first_line() {
+    let cwd = temp_cwd("bash-redirect-wiring");
+    let r = execute_tool(
+        &ctx(&cwd),
+        "bash",
+        &json!({ "command": "printf 'ERROR: Input redirection is not supported, exiting the process immediately\\n'" }),
+    )
+    .await;
+    assert!(
+        !r.is_error,
+        "the command SUCCEEDED (printf exits 0) — the diagnostic adds no error and no note: {:?}",
+        text_of(&r)
+    );
+    let text = text_of(&r);
+    let first_line = text.lines().next().unwrap_or_default();
+    assert!(
+        first_line.starts_with("(note) `timeout /t` cannot wait here")
+            && first_line.contains("no console input")
+            && first_line.ends_with("`ping -n 20 127.0.0.1 > NUL`."),
+        "the diagnostic is the FIRST LINE of the result (prefixed, complete, on a line of its \
+         own — the deliverable is a diagnostic LINE, so it must not glue onto the captured \
+         text): {text:?}"
+    );
+    assert!(
+        text.contains("\nERROR: Input redirection is not supported"),
+        "the captured text is kept (never replaced) and still starts its own line after the \
+         diagnostic: {text:?}"
     );
 }
 

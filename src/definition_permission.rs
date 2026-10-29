@@ -143,6 +143,14 @@ impl Rules {
 /// name verbatim (opencode has keys this desktop has no policed twin for —
 /// `glob`, `grep`, `list`, `task`, `skill`, `lsp`; an unrecognised key is
 /// announced via [`FrontmatterNote::UnrecognizedToolKey`], NEVER dropped).
+/// The two announcement spellings name the two CLASSES of unenforced pattern
+/// object: [`UnsupportedReason::BashPatternRules`] for `bash` command text and
+/// [`UnsupportedReason::PathPatternRules`] for the ten recognised path-taking
+/// keys. An `Unrecognized` key gets NEITHER: its path semantics are unknown to
+/// this desktop, so a per-pattern object under `glob:` / `task:` / `lsp:` is
+/// announced only as an [`FrontmatterNote::UnrecognizedToolKey`] — claiming
+/// "path patterns unenforced" about a key whose semantics are unknown would
+/// announce a falsehood.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ToolKey {
@@ -187,9 +195,13 @@ impl ToolKey {
     }
 }
 
-/// WHY a block could not be used. Only produced for `bash`-style per-command
-/// pattern blocks (the scope line: parse + announce as unsupported — never
-/// enforce with a matcher nothing has validated).
+/// WHY a block could not be used. Produced for a per-pattern pattern OBJECT on
+/// a RECOGNISED tool — `bash`-style per-command patterns (reason
+/// [`UnsupportedReason::BashPatternRules`]) and path-taking-tool path patterns
+/// (reason [`UnsupportedReason::PathPatternRules`]). The scope line: parse +
+/// announce as unsupported — never enforce with a matcher nothing has
+/// validated. A [`ToolKey::Unrecognized`] key gets NO reason: its path semantics
+/// are unknown, so naming either class about it would be a falsehood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum UnsupportedReason {
@@ -200,6 +212,14 @@ pub enum UnsupportedReason {
     /// [`Action`]) has NO patterns and IS supported — only a bash object with
     /// ≥1 pattern row is unsupported.
     BashPatternRules,
+    /// A PATH-PATTERN map on a recognised path-taking tool (`edit:` / `read:` /
+    /// `write:` / `find:` / `grep:` / `ls:` / `read_skill:` / `ask:` /
+    /// `web_search:` / `fetch_content:`): parsed, announced, and NOT enforced.
+    /// The gate's `definition_verdict` reads only [`Rules::catch_all_action`]
+    /// (whole-tool) and answers `AsSelf` for a per-pattern ruleset (gate.rs),
+    /// and the definition layer deliberately does NO path resolution (ADR 0081 /
+    /// ADR 0029 one-canonicalizer rule; ADR 0084).
+    PathPatternRules,
 }
 
 /// The FULL ordered aggregate: every tool the block speaks about, in FILE
@@ -237,8 +257,12 @@ pub enum FrontmatterNote {
     /// A recognised-but-unpoliced tool name, kept verbatim (`glob`, `task`,
     /// `lsp`, `subagent`, …).
     UnrecognizedToolKey(String),
-    /// A `bash`-style per-command pattern block: parsed (`Some(block)`) but
-    /// announced unsupported — never enforced by a matcher nothing validated.
+    /// A per-pattern pattern OBJECT on a recognised tool: parsed
+    /// (`Some(block)`) but announced unsupported — never enforced by a matcher
+    /// nothing validated. The payload names WHICH class it is: bash command-text
+    /// rows announce [`UnsupportedReason::BashPatternRules`], a path-taking
+    /// tool's path-pattern rows announce
+    /// [`UnsupportedReason::PathPatternRules`].
     UnsupportedUnvalidatedMatcher(UnsupportedReason),
     /// An action/verdict the parser does not recognise (`allow`/`ask`/`deny`
     /// are the only accepted spellings). The row is dropped and the note
@@ -411,14 +435,33 @@ pub fn parse_permission_block(fm: &[&str], idx: usize, rest: &str) -> Permission
             }
         };
 
-        // The scope line: a bash OBJECT with ≥1 pattern row parses (it must) and
-        // announces itself unsupported — command text carries its redirects, so
-        // no matcher here has any business deciding it. A whole-tool `bash: deny`
-        // needs no matcher and is therefore SUPPORTED (no note).
-        if tool == ToolKey::Bash && !rules.whole_tool && !rules.patterns.is_empty() {
-            notes.push(FrontmatterNote::UnsupportedUnvalidatedMatcher(
-                UnsupportedReason::BashPatternRules,
-            ));
+        // The scope line: a PATTERN OBJECT with ≥1 row parses (it must) and
+        // announces itself unsupported with a reason that says WHY. bash
+        // command-text patterns keep their dedicated reason; a recognised
+        // PATH-TAKING tool's path patterns announce as path patterns (no
+        // matcher here has any business deciding them — ADR 0084, one-
+        // canonicalizer rule). A whole-tool bare verdict needs no matcher and
+        // is therefore SUPPORTED (no note). An UNRECOGNISED key is not known
+        // to be path-taking, so it is excluded — announcing "path patterns
+        // unenforced" for `glob:` would be a falsehood.
+        if !rules.whole_tool && !rules.patterns.is_empty() {
+            let reason = match tool {
+                ToolKey::Bash => Some(UnsupportedReason::BashPatternRules),
+                ToolKey::Edit
+                | ToolKey::Read
+                | ToolKey::Write
+                | ToolKey::Find
+                | ToolKey::Grep
+                | ToolKey::Ls
+                | ToolKey::ReadSkill
+                | ToolKey::Ask
+                | ToolKey::WebSearch
+                | ToolKey::FetchContent => Some(UnsupportedReason::PathPatternRules),
+                ToolKey::Unrecognized(_) => None,
+            };
+            if let Some(reason) = reason {
+                notes.push(FrontmatterNote::UnsupportedUnvalidatedMatcher(reason));
+            }
         }
 
         // FIRST-WINS per tool key — the same rule the top-level scan runs. The
@@ -635,6 +678,9 @@ mod tests {
 
     /// The block half of a fixture, panicking with the notes on `None` so a
     /// reader that drops the block fails LOUDLY instead of vacuously.
+    /// THE ZERO-NOTE CASE of [`block_announcing`]: a fixture that must announce
+    /// NOTHING (a whole-tool bare verdict, an unreadable row, an `Unrecognized`
+    /// key's per-pattern map).
     fn block(fm_text: &str) -> PermissionBlock {
         let (block, notes) = parse_block(fm_text);
         assert!(
@@ -642,6 +688,24 @@ mod tests {
             "this fixture announces nothing: {notes:?}"
         );
         block.expect("the fixture must parse to Some(block)")
+    }
+
+    /// The block half of a fixture that announces a KNOWN set of notes. The
+    /// notes are asserted EXACTLY — the announce contract is part of the
+    /// fixture's meaning, never a by-product — before the block is unwrapped.
+    /// #124: a per-pattern pattern OBJECT on a recognised tool announces
+    /// itself unsupported, so every such fixture names its note here instead of
+    /// riding `block()`'s unconditional empty-note assert.
+    fn block_announcing(fm_text: &str, expected: Vec<FrontmatterNote>) -> PermissionBlock {
+        let (block, notes) = parse_block(fm_text);
+        assert_eq!(notes, expected, "the fixture announces EXACTLY this");
+        block.expect("the fixture must parse to Some(block)")
+    }
+
+    /// The one note a per-pattern pattern object on a recognised PATH-TAKING
+    /// tool must announce (#124: parsed, announced, NOT enforced).
+    fn path_note() -> FrontmatterNote {
+        FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::PathPatternRules)
     }
 
     fn rule(pattern: &str, action: Action) -> Rule {
@@ -699,10 +763,14 @@ mod tests {
 
     /// T3 — the last-matching-rule-wins contract is an ORDERED list, typed as
     /// one. A set/sorted/HashMap representation fails this.
+    ///
+    /// #124: this `edit:` object is a per-pattern PATH map, so it announces
+    /// itself unsupported — the ORDERED-row contract below is unchanged by that.
     #[test]
     fn last_matching_rule_wins_parse_and_type() {
-        let b = block(
+        let b = block_announcing(
             "name: t3\npermission:\n  edit: {\"*\": deny, \"*.md\": allow, \"src/lib/*.ts\": deny}\n",
+            vec![path_note()],
         );
         assert_eq!(b.tools.len(), 1, "{b:?}");
         let (key, rules) = &b.tools[0];
@@ -729,6 +797,11 @@ mod tests {
 
     /// T4 — pattern rows are typed for the path-taking tools (and the two
     /// no-path tools are the SAME arm: the reader parses, the matcher decides).
+    ///
+    /// #124: ALL TEN keys here are recognised path-taking tools, so every
+    /// iteration announces its own `PathPatternRules` — parsed, announced, not
+    /// enforced. The note is asserted per key (exactly one) so a silent arm
+    /// cannot hide behind the loop.
     #[test]
     fn pattern_matching_applies_to_path_taking_tools_only() {
         for (key, variant) in [
@@ -743,9 +816,12 @@ mod tests {
             ("web_search", ToolKey::WebSearch),
             ("fetch_content", ToolKey::FetchContent),
         ] {
-            let b = block(&format!(
-                "name: t4\npermission:\n  {key}: {{\"*.rs\": deny, \"docs/**\": allow}}\n"
-            ));
+            let b = block_announcing(
+                &format!(
+                    "name: t4\npermission:\n  {key}: {{\"*.rs\": deny, \"docs/**\": allow}}\n"
+                ),
+                vec![path_note()],
+            );
             assert_eq!(b.tools.len(), 1, "{key}: {b:?}");
             let (got, rules) = &b.tools[0];
             assert_eq!(got, &variant, "`{key}` maps to its own variant");
@@ -760,10 +836,15 @@ mod tests {
 
     /// T5 — THE silent-drop regression: a real file declares THREE tools in one
     /// `permission:` block. A shape that holds one tool per block fails here.
+    ///
+    /// #124: the `edit:` object is a per-pattern path map (one note); the
+    /// whole-tool `bash: deny` / `read: ask` verdicts stay SILENT — a bare
+    /// verdict needs no matcher and is therefore supported.
     #[test]
     fn a_multitool_block_is_fully_representable_and_preserved_order() {
-        let b = block(
+        let b = block_announcing(
             "name: t5\npermission:\n  edit: {\"*\": deny, \"*.md\": allow}\n  bash: deny\n  read: ask\n",
+            vec![path_note()],
         );
         let keys: Vec<&ToolKey> = b.tools.iter().map(|(k, _)| k).collect();
         assert_eq!(
@@ -814,10 +895,14 @@ mod tests {
     /// The blank-line rule, at the reader level (the discovery-level twin is
     /// `agents.rs`'s `a_permission_block_with_a_blank_line_between_tool_groups_parses_in_full`).
     /// A `parse_value`-style break-on-blank loop fails this.
+    ///
+    /// #124: the `edit:` object announces its path patterns (one note); the
+    /// whole-tool `bash:` / `read:` verdicts stay silent.
     #[test]
     fn a_blank_line_between_tool_groups_is_skipped_not_a_terminator() {
-        let b = block(
+        let b = block_announcing(
             "name: blank\npermission:\n  edit: {\"*\": deny, \"*.md\": allow}\n\n  bash: deny\n   \n  read: ask\n",
+            vec![path_note()],
         );
         let keys: Vec<&ToolKey> = b.tools.iter().map(|(k, _)| k).collect();
         assert_eq!(
@@ -829,10 +914,18 @@ mod tests {
 
     /// A blank line INSIDE a nested pattern map is skipped too — the rule is
     /// about the block, not about one nesting level.
+    ///
+    /// #124 — THE PINNED SILENCE, now broken on purpose. This fixture used to
+    /// ride `block()`'s unconditional "announces nothing" assert, which is
+    /// exactly the silence issue #124 exists to end: a nested `edit:` path map
+    /// parsed, rendered as rules in the Agents modal, refused nothing, and never
+    /// said so. It now announces ONE `PathPatternRules` note, and the blank-line
+    /// contract below is unchanged.
     #[test]
     fn a_blank_line_inside_a_nested_pattern_map_is_skipped_too() {
-        let b = block(
+        let b = block_announcing(
             "name: nested\npermission:\n  edit:\n    \"*\": deny\n\n    \"*.md\": allow\n  bash: deny\n",
+            vec![path_note()],
         );
         assert_eq!(b.tools.len(), 2, "{b:?}");
         assert_eq!(
@@ -850,7 +943,8 @@ mod tests {
     /// without a comment rule turns prose into `ToolKey::Unrecognized("# Known
     /// gap")` and `UnknownKey("<entire sentence>")`.
     ///
-    /// The ONLY notes this block may announce are the two its CONTENT carries:
+    /// The ONLY notes this block may announce are the THREE its CONTENT carries:
+    /// the `edit:` nested map announces its unenforced path patterns (#124),
     /// `task` has no policed twin, and a `bash` pattern object is unsupported.
     /// The expected-note list below is written OUT LONG so a comment-derived
     /// note cannot sneak past a `notes.is_empty()` shortcut.
@@ -926,10 +1020,14 @@ subtask: "true"
         assert_eq!(
             notes,
             vec![
+                // `edit:` is read FIRST (file order), and its nested map is a
+                // per-pattern PATH map — #124's announcement, before `task` and
+                // `bash` are even reached.
+                FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::PathPatternRules),
                 FrontmatterNote::UnrecognizedToolKey("task".to_string()),
                 FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::BashPatternRules),
             ],
-            "the ONLY two notes are the ones the block's CONTENT earns: no \
+            "the ONLY three notes are the ones the block's CONTENT earns: no \
              comment sentence is announced as an unknown key or a tool"
         );
         for note in &notes {
@@ -960,7 +1058,11 @@ subtask: "true"
                   # a lone hash:\n  #\n   \n  \
                   bash: deny\n  \
                   # after the last tool: trailing prose\n";
-        let b = block(fm);
+        // #124: the nested `read:` map is a per-pattern PATH map → exactly one
+        // `PathPatternRules` note. `edit: deny` and `bash: deny` are whole-tool
+        // verdicts (silent), and NO comment anywhere in this fixture announces
+        // itself — the comment contract below is unchanged.
+        let b = block_announcing(fm, vec![path_note()]);
         let keys: Vec<&ToolKey> = b.tools.iter().map(|(k, _)| k).collect();
         assert_eq!(
             keys,
@@ -1062,7 +1164,17 @@ subtask: "true"
         // And the flip side, which the comment rule MUST NOT break: a `#` that
         // is not the first non-whitespace character of the LINE is content. A
         // pattern naming a real file with a `#` in it is a rule, not a comment.
-        let b = block("name: hash\npermission:\n  edit:\n    \"build#1/*.rs\": deny\n");
+        //
+        // #124: this flip-side `edit:` map has ONE readable pattern row, so it is
+        // a per-pattern path map and announces itself unsupported — the note is
+        // asserted rather than absorbed by `block()`'s empty-note assert. The
+        // MAIN half above stays silent-by-shape (every row unreadable → no
+        // pattern rows → nothing to announce) and keeps its three-`UnknownAction`
+        // vec untouched: an unreadable row announces the verdict, not the class.
+        let b = block_announcing(
+            "name: hash\npermission:\n  edit:\n    \"build#1/*.rs\": deny\n",
+            vec![path_note()],
+        );
         assert_eq!(
             b.tools[0].1.patterns,
             vec![rule("build#1/*.rs", Action::Deny)],
@@ -1072,10 +1184,14 @@ subtask: "true"
 
     /// The quote rule this reader owns: ONE surrounding pair off an
     /// exactly-quoted token, nothing else — no un-doubling, no partial strip.
+    ///
+    /// #124: the `edit:` map is a per-pattern path map → one note; the
+    /// `unquote_token` asserts below are untouched.
     #[test]
     fn an_exactly_quoted_token_loses_one_quote_pair_and_nothing_else() {
-        let b = block(
+        let b = block_announcing(
             "name: q\npermission:\n  edit: {'*.md': 'deny', \"*.rs\": allow, \"a b\": deny}\n",
+            vec![path_note()],
         );
         assert_eq!(
             b.tools[0].1.patterns,
@@ -1106,6 +1222,12 @@ subtask: "true"
     /// NOT reach this reader. A trailing `#`, a doubled `''` and a `: ` inside a
     /// quoted pattern all stay verbatim here, where `skills.rs`'s copy would
     /// have stripped, un-doubled or dropped them.
+    ///
+    /// #124 adds a SECOND note here, AFTER the first: two of the three rows
+    /// parsed into real pattern rows, so this `edit:` map is a per-pattern path
+    /// map and announces itself unsupported. ORDER is load-bearing — the row
+    /// reader pushes the `UnknownAction` while reading rows, and the guard runs
+    /// after the rows are in hand.
     #[test]
     fn a_pattern_row_keeps_verbatim_what_the_scalar_readers_would_drop() {
         let (b, notes) = parse_block(
@@ -1122,12 +1244,15 @@ subtask: "true"
         );
         assert_eq!(
             notes,
-            vec![FrontmatterNote::UnknownAction(
-                "deny # trailing".to_string()
-            )],
+            vec![
+                FrontmatterNote::UnknownAction("deny # trailing".to_string()),
+                FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::PathPatternRules),
+            ],
             "the trailing `#` is NOT stripped (that strip belongs to `skills.rs`'s \
              yaml-backed copy alone), so the token is not a verdict and is \
-             ANNOUNCED verbatim instead of silently dropped"
+             ANNOUNCED verbatim instead of silently dropped — and the map the two \
+             readable rows built then announces its own unenforced path patterns \
+             (#124), pushed AFTER the row note because rows are read first"
         );
     }
 

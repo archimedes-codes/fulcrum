@@ -9,6 +9,7 @@ use super::AgentLoop;
 use super::CompactionRan;
 use super::CompactionTrigger;
 use crate::agent::events::RpcEvent;
+use crate::agent::harness::provider::openai::content_is_the_sanitise_placeholder;
 use crate::agent::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
 };
@@ -141,15 +142,53 @@ impl AgentLoop {
                     let Some(ev) = item else { break };
                     match ev {
                         ProviderEvent::TextDelta(d) => {
-                            acc.text.push_str(&d);
-                            self.emit(RpcEvent::message_update {
-                                usage: acc.usage_value(),
-                                assistant_message_event: json!({
-                                    "type": "text_delta",
-                                    "contentIndex": 0,
-                                    "delta": d,
-                                }),
-                            });
+                            // (issue #122) The upstream sanitisation placeholder
+                            // must never enter the transcript, the store, or the
+                            // user's eyes. FILTER HERE: this is the ONE choke
+                            // point every inbound text delta crosses, whatever
+                            // the wire — the Anthropic (`anthropic.rs`) and
+                            // Responses (`responses.rs`) parsers emit their text
+                            // as whole `TextDelta`s and never pass through the
+                            // OpenAI SSE parser, so this bolt is their filter.
+                            //
+                            // EXACT-MATCH ONLY, and deliberately NOT the
+                            // empty-check: a whitespace-only delta (`" "`,
+                            // `"\n"`) is a chunk providers really send between
+                            // words, and dropping it would weld words and
+                            // paragraphs together in the transcript — so only
+                            // the placeholder itself is dropped, never mere
+                            // emptiness (see `content_is_the_sanitise_placeholder`).
+                            // A dropped delta is neither EMITTED (the frontend
+                            // never sees it) nor ACCUMULATED (it is never
+                            // persisted — `acc.text` is the only thing that
+                            // becomes the assistant row's content).
+                            //
+                            // A placeholder SPLIT across deltas is reassembled
+                            // and silenced by the OpenAI wire's SSE parser
+                            // (`openai.rs::handle_chunk` — the filter of record,
+                            // which sees the whole delta stream). Partial
+                            // fragments of the literal are never matched HERE: a
+                            // run like `"[Sys"` streams, and a banner quoted
+                            // inside a longer line streams too.
+                            //
+                            // Ordering with issue #64: a placeholder-only reply
+                            // now accumulates NO text, so it settles as the
+                            // genuine empty-turn condition (`Stop` + empty text
+                            // + no tool call) and `handle_empty_turn` retries it
+                            // on the shared budget, persisting nothing. That is
+                            // the desired reading — a placeholder-only model
+                            // reply is not a successful turn.
+                            if !content_is_the_sanitise_placeholder(&d) {
+                                acc.text.push_str(&d);
+                                self.emit(RpcEvent::message_update {
+                                    usage: acc.usage_value(),
+                                    assistant_message_event: json!({
+                                        "type": "text_delta",
+                                        "contentIndex": 0,
+                                        "delta": d,
+                                    }),
+                                });
+                            }
                         }
                         ProviderEvent::ThinkingDelta(d) => {
                             acc.thinking.push_str(&d);

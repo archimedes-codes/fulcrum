@@ -24,12 +24,14 @@ use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::prompt::{build_main_prompt, PromptContext};
 use crate::agent::harness::provider::build_provider;
+use crate::agent::harness::provider::openai::content_is_effectively_empty;
 use crate::agent::harness::r#loop::{AgentLoop, ControlCmd, PromptTurn, SudoDeps};
 use crate::agent::harness::retry::RetryPolicy;
 use crate::agent::harness::store::Store;
 use crate::agent::harness::trust::{StaticTrustSource, TrustSource};
 use crate::agent::interactive::{interactive_key, PendingInteractive, PendingSudo};
 use crate::agent::permission::{permission_key, PendingPermissions, PermissionOutcome};
+use crate::agent::subagent::SubagentOutcome;
 use crate::agent::todo::TodoStore;
 use crate::agent::worker::dispatch::{IpcDispatcher, SubagentWaiters};
 use crate::agent::worker::protocol::{Inbound, Outbound, StartEnv, StartMode};
@@ -665,6 +667,40 @@ impl WorkerCore {
                 Vec::new()
             }
             Inbound::SubagentResult { id, outcome } => {
+                // (issue #122) Defence in depth on the inbound edge: 5.4's
+                // `Race::Settled` guard is the normal path, but a WAITER must
+                // never be resolved with an empty `Completed` — not by a stale
+                // Worker, not by a race with the settle, not by a future caller.
+                // An empty `Completed` becomes a parent `tool` message with empty
+                // text (dispatch.rs's `Completed` arm has no `salvage_text`
+                // shield) and that row is what puts `"content": ""` on the
+                // parent's next OpenAI request — the wire LiteLLM rewrites into
+                // the sanitisation placeholder.
+                //
+                // EXACT-MATCH only (`content_is_effectively_empty` is empty-ish
+                // or the WHOLE placeholder, never a substring): a child that
+                // legitimately ends its answer with the banner sentence keeps it.
+                let outcome = match outcome {
+                    SubagentOutcome::Completed {
+                        output,
+                        mut metrics,
+                    } if content_is_effectively_empty(&output) => {
+                        // The metrics ride the `Failed` path (the child's real
+                        // tokens and money are not forfeited by its empty
+                        // answer); only the `output` mirror is cleared, so no
+                        // placeholder-shaped string survives here either.
+                        metrics.output = String::new();
+                        SubagentOutcome::Failed {
+                            // `Other`, NOT `Cancelled` — the child settled; it was
+                            // not stopped (`Cancelled` is a parent/user Stop).
+                            reason: crate::agent::subagent::SubagentFailureReason::Other,
+                            error: "the subagent settled with no output".to_string(),
+                            output: String::new(),
+                            metrics,
+                        }
+                    }
+                    other => other,
+                };
                 // Resolve the `IpcDispatcher` waiter (the loop's oneshot
                 // gets the outcome — the `SubagentWait` select sees it).
                 let mut waiters = self
@@ -1408,6 +1444,99 @@ mod tests {
             core.subagent_waiters.lock().unwrap().is_empty(),
             "the waiter is removed after the resolution"
         );
+    }
+
+    /// (issue #122) The inbound belt: a `Completed { output: "" }` that reaches
+    /// a WAITER anyway (a stale Worker, a race with the `Race::Settled` guard, a
+    /// future caller) is reclassified into the honest `Failed` — an empty
+    /// `Completed` would become a parent `tool` row with empty text and put
+    /// `"content": ""` on the parent's next OpenAI request, the wire LiteLLM
+    /// rewrites into the sanitisation placeholder. The waiter STILL resolves (the
+    /// guard never swallows the delivery).
+    #[tokio::test]
+    async fn subagent_result_reclassifies_an_empty_completed() {
+        let (mut core, _out_rx, _in_tx) = stub_core();
+        let env = test_env(StartMode::Fresh, None, None);
+        core.handle(Inbound::from(&env)).await;
+        for empty in [
+            String::new(),
+            "  \n ".to_string(),
+            crate::agent::harness::provider::openai::EMPTY_CONTENT_SANITISE_PLACEHOLDER.to_string(),
+        ] {
+            let (stx, srx) = oneshot::channel::<SubagentOutcome>();
+            core.subagent_waiters
+                .lock()
+                .unwrap()
+                .insert("sub1".to_string(), stx);
+            core.handle(Inbound::SubagentResult {
+                id: "sub1".to_string(),
+                outcome: SubagentOutcome::Completed {
+                    output: empty.clone(),
+                    metrics: crate::agent::subagent::SubagentMetrics::default(),
+                },
+            })
+            .await;
+            let outcome = srx
+                .await
+                .expect("the waiter still resolves (the guard never drops the delivery)");
+            match outcome {
+                SubagentOutcome::Failed {
+                    reason,
+                    error,
+                    output,
+                    ..
+                } => {
+                    assert_eq!(
+                        reason,
+                        crate::agent::subagent::SubagentFailureReason::Other,
+                        "`Other`, NOT `Cancelled` — the child settled, it was not \
+                         stopped (for empty output {empty:?})"
+                    );
+                    assert_eq!(error, "the subagent settled with no output");
+                    assert!(output.is_empty(), "no placeholder survives, got {output:?}");
+                }
+                other => panic!("an empty `Completed` never reaches the loop, got {other:?}"),
+            }
+        }
+        assert!(
+            core.subagent_waiters.lock().unwrap().is_empty(),
+            "the waiter is removed after the resolution"
+        );
+    }
+
+    /// The don't-filter-too-much rail on the same arm: a `Completed` with REAL
+    /// output — including one that merely ENDS with the banner sentence — rides
+    /// through untouched. The guard is a whole-output check, never a substring
+    /// match.
+    #[tokio::test]
+    async fn subagent_result_passes_through_a_completed_with_real_output() {
+        let (mut core, _out_rx, _in_tx) = stub_core();
+        let env = test_env(StartMode::Fresh, None, None);
+        core.handle(Inbound::from(&env)).await;
+        let real = format!(
+            "the answer is 42. {}",
+            crate::agent::harness::provider::openai::EMPTY_CONTENT_SANITISE_PLACEHOLDER
+        );
+        let (stx, srx) = oneshot::channel::<SubagentOutcome>();
+        core.subagent_waiters
+            .lock()
+            .unwrap()
+            .insert("sub1".to_string(), stx);
+        core.handle(Inbound::SubagentResult {
+            id: "sub1".to_string(),
+            outcome: SubagentOutcome::Completed {
+                output: real.clone(),
+                metrics: crate::agent::subagent::SubagentMetrics::default(),
+            },
+        })
+        .await;
+        let outcome = srx.await.expect("the waiter resolved");
+        match outcome {
+            SubagentOutcome::Completed { output, .. } => {
+                assert_eq!(output, real, "a real child answer is never rewritten")
+            }
+            other => panic!("a `Completed` with real output stays `Completed`, got {other:?}"),
+        }
     }
 
     /// `Close` sets the closed flag AND cancels BOTH the session token

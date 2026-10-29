@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::agent::debuglog;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::catalog::Model;
+use crate::agent::harness::provider::openai::EMPTY_CONTENT_SANITISE_PLACEHOLDER;
 use crate::agent::hostenv::EnvPatch;
 use crate::agent::permission::PermissionOutcome;
 use crate::agent::tools::ImageRef;
@@ -740,6 +741,56 @@ impl WorkerHandle {
     }
 }
 
+/// (issue #122) The store-row belt, PARSE-FREE: an `assistant` row whose
+/// serialized `content` is the upstream sanitisation placeholder is rewritten to
+/// the canonical empty-`Text` row content (`"content":""`) before it reaches the
+/// Supervisor's SQLite. A placeholder row that gets persisted is a row a Resume
+/// re-reads and re-sends to the model, which is how the banner survives a restart.
+///
+/// Why a byte match on the serialized row is exact rather than sloppy:
+///   * it matches the WHOLE value region `"content":"<placeholder>"` — a row
+///     whose content merely CONTAINS the banner (a real answer quoting it) does
+///     not match, because the closing `"` of the needle must follow the `]`
+///     immediately, and because a leading `"content":"[` cannot land mid-string;
+///   * the placeholder needs no JSON escaping (letters, spaces, `[`, `]`, `:`),
+///     so `serde_json::escape` is the identity here and is used anyway to keep
+///     that true if the literal ever changes;
+///   * serde's field order for `ChatMessage` is declaration order and stable for
+///     this type (`role`, `content`, then the two `skip_serializing_if` fields),
+///     and `content` is always written (never skipped).
+///
+/// Deliberately narrow, and that narrowness is the point (ADR 0054: durable rows
+/// are never re-labelled for a wire's sake):
+///   * ONLY the placeholder literal is clamped — an `assistant` row whose content
+///     is an empty string is NOT touched here. That shape is either today's
+///     legitimate tool-call row (whose fix is the outbound `request_body` guard)
+///     or the empty-turn case `handle_empty_turn` already retries without
+///     persisting; rewriting it would be editing durable state for a wire's sake.
+///   * non-`assistant` rows are untouched (a `tool` row's content pairs with its
+///     `tool_call_id`).
+///   * the `TranscriptReplace` (compaction) arm is NOT clamped in this task —
+///     recorded as follow-up F3.
+fn clamp_placeholder_row(role: &str, content_json: String) -> String {
+    if role != "assistant" {
+        return content_json;
+    }
+    // `Value::String(..).to_string()` IS serde_json's escaper (the crate exposes
+    // no free `escape`), and it emits the surrounding quotes — so the needle is
+    // the byte-exact `"content":"…"` region as `persist_transcript_message`
+    // writes it. The placeholder needs no escaping today (letters, spaces, `[`,
+    // `]`, `:`); going through the serializer keeps that true if the literal
+    // ever changes.
+    let needle = format!(
+        "\"content\":{}",
+        Value::String(EMPTY_CONTENT_SANITISE_PLACEHOLDER.to_string())
+    );
+    if content_json.contains(&needle) {
+        content_json.replace(&needle, "\"content\":\"\"")
+    } else {
+        content_json
+    }
+}
+
 /// Route one `Outbound` frame into the `WorkerInboundEvent` vocabulary
 /// (the 4 store-frame variants → `Store(StoreFrame::…)`; the control
 /// frames verbatim; `Unknown` → `None` — the surface is unversioned,
@@ -753,12 +804,26 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
             seq,
             role,
             content_json,
-        } => WorkerInboundEvent::Store(StoreFrame::Insert {
-            session_id,
-            seq,
-            role,
-            content_json,
-        }),
+        } => {
+            // (issue #122) BELT AT THE STORE SEAM. This is the one seam outside
+            // the harness that can observe a transport-carrying child's poisoned
+            // row, and the durable row is what a Resume re-reads
+            // (`core.rs`'s `(Resume, _)` arm -> `load_transcript`) — so a
+            // placeholder row persisted here would be re-sent onto the wire and
+            // rendered again in the room. Clamp it on the way in.
+            //
+            // PARSE-FREE on purpose (see `clamp_placeholder_row`): the row is
+            // opaque `content_json` here, and the only shape the upstream
+            // sanitizer produces is an `assistant` row whose WHOLE content value
+            // is the placeholder literal.
+            let content_json = clamp_placeholder_row(&role, content_json);
+            WorkerInboundEvent::Store(StoreFrame::Insert {
+                session_id,
+                seq,
+                role,
+                content_json,
+            })
+        }
         Outbound::TranscriptReplace { session_id, rows } => {
             WorkerInboundEvent::Store(StoreFrame::Replace { session_id, rows })
         }
@@ -820,6 +885,85 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── (issue #122) the store-row belt ────────────────────────────────
+
+    /// The belt clamps an `assistant` row whose WHOLE content is the upstream
+    /// sanitisation placeholder: a row persisted like that is a row a Resume
+    /// re-reads (`load_transcript`) and re-sends to the model, so the banner
+    /// would survive a restart and be re-rendered in the room.
+    #[test]
+    fn clamp_placeholder_row_rewrites_an_assistant_placeholder_row() {
+        let row = format!(
+            r#"{{"role":"assistant","content":"{}"}}"#,
+            EMPTY_CONTENT_SANITISE_PLACEHOLDER
+        );
+        let clamped = clamp_placeholder_row("assistant", row);
+        assert_eq!(
+            clamped, r#"{"role":"assistant","content":""}"#,
+            "the placeholder content becomes the canonical empty-`Text` row, and \
+             the row stays valid JSON with its `role` intact"
+        );
+        // It still parses as a `ChatMessage`, and its content is now empty.
+        let parsed: crate::agent::harness::provider::ChatMessage =
+            serde_json::from_str(&clamped).expect("the clamped row is a valid row");
+        assert_eq!(
+            parsed.content,
+            crate::agent::harness::provider::MessageContent::Text(String::new()),
+            "the clamped row round-trips to an empty `Text`"
+        );
+    }
+
+    /// The guard rails — the belt is a whole-value match on ONE literal and
+    /// nothing else. Every one of these rows must come back BYTE-IDENTICAL:
+    /// a real answer (including one that merely starts with the placeholder's
+    /// `[`, and one that QUOTES the banner inside a longer line), an empty
+    /// `Text` row (deliberately NOT clamped — durable rows are not re-labelled
+    /// for a wire's sake, ADR 0054), a row with `tool_calls`, and the non-
+    /// `assistant` roles.
+    #[test]
+    fn clamp_placeholder_row_leaves_everything_else_byte_identical() {
+        let placeholder = EMPTY_CONTENT_SANITISE_PLACEHOLDER;
+        let rows = [
+            // A real answer.
+            r#"{"role":"assistant","content":"the file is at /x"}"#.to_string(),
+            // A real answer that merely STARTS like the placeholder.
+            r#"{"role":"assistant","content":"["}"#.to_string(),
+            // A real answer QUOTING the banner inside a longer line — the
+            // don't-filter-too-much case (the belt is a whole-value match).
+            format!(
+                r#"{{"role":"assistant","content":"what does {placeholder} mean?"}}"#
+            ),
+            // The placeholder with a real sentence BEFORE it: not the whole value.
+            format!(r#"{{"role":"assistant","content":"note: {placeholder}"}}"#),
+            // An EMPTY `Text` assistant row — deliberately NOT clamped (the
+            // legitimate tool-call shape; its wire fix is `request_body`).
+            r#"{"role":"assistant","content":""}"#.to_string(),
+            // An empty-`Text` assistant row that DOES carry tool calls (the
+            // shape the outbound guard omits `content` for).
+            r#"{"role":"assistant","content":"","tool_calls":[{"id":"c1","name":"read","arguments":{}}]}"#
+                .to_string(),
+            // The placeholder on a NON-assistant role: untouched (a `tool` row's
+            // content pairs with its `tool_call_id`; a `user` row is what the
+            // user typed).
+            format!(r#"{{"role":"tool","content":"{placeholder}","tool_call_id":"c1"}}"#),
+            format!(r#"{{"role":"user","content":"{placeholder}"}}"#),
+            format!(r#"{{"role":"system","content":"{placeholder}"}}"#),
+        ];
+        for row in rows {
+            let role = serde_json::from_str::<serde_json::Value>(&row)
+                .expect("the canned row is JSON")
+                .get("role")
+                .and_then(Value::as_str)
+                .expect("a role")
+                .to_string();
+            assert_eq!(
+                clamp_placeholder_row(&role, row.clone()),
+                row,
+                "a row the belt must not touch came back changed"
+            );
+        }
+    }
 
     /// Every line of a piped stream reaches the sink WHOLE and IN ORDER,
     /// however the writer chunks it (the same partial-delivery hazard that

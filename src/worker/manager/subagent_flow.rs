@@ -7,6 +7,7 @@ use tokio::sync::watch;
 
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::prompt::build_child_system_message;
+use crate::agent::harness::provider::openai::content_is_effectively_empty;
 use crate::agent::harness::r#loop::tool_specs;
 use crate::agent::harness::{ModelKey, ModelRef};
 use crate::agent::is_bookkeeping_message_id;
@@ -117,6 +118,21 @@ pub struct SubagentCapture {
     /// largest), but money accumulates across calls — copying the `max` rule
     /// here would report one call's cost for a ten-call child.
     cost: StdMutex<Option<f64>>,
+    /// (issue #122) Did the child announce ANY tool call? Set on the first
+    /// `tool_execution_start` the pump feeds.
+    ///
+    /// It exists because "no text" and "no output" are NOT the same claim. A
+    /// child that ran a tool (or was parked on a permission gate — which is a
+    /// tool call held open) and then settled without a closing message did REAL
+    /// WORK, and ADR 0055 requires that to stay a `Completed`: a bash call that
+    /// fixed a file has nothing to say afterwards, and its parent must not be
+    /// told the child failed (pinned by
+    /// `manager::tests::a_child_inside_a_tool_call_is_never_reaped` and
+    /// `manager::tests::an_answered_gates_card_is_not_closed_again_at_teardown`).
+    /// Only a child that produced NEITHER text NOR a tool boundary settled with
+    /// nothing at all — and only that is the empty-`Completed` the #122 guard
+    /// reclassifies.
+    saw_tool_activity: std::sync::atomic::AtomicBool,
 }
 
 impl Default for SubagentCapture {
@@ -132,6 +148,7 @@ impl SubagentCapture {
             last_message_id: StdMutex::new(None),
             usage: StdMutex::new((0, 0)),
             cost: StdMutex::new(None),
+            saw_tool_activity: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -236,6 +253,13 @@ impl SubagentCapture {
     /// Observe one `RpcEvent` (the `message_update` `usage` field —
     /// the metrics' token fields; the other events are ignored).
     pub fn observe_event(&self, event: &RpcEvent) {
+        // (issue #122) The tool-activity marker (see `saw_tool_activity`): a
+        // child that announced a tool call DID something, even if it never
+        // streamed a word, so its empty settle is not the #122 shape.
+        if matches!(event, RpcEvent::tool_execution_start { .. }) {
+            self.saw_tool_activity
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let RpcEvent::message_update { usage, .. } = event {
             let input = usage
                 .get("inputTokens")
@@ -278,6 +302,15 @@ impl SubagentCapture {
 
     pub fn input_tokens(&self) -> u64 {
         self.usage().0
+    }
+
+    /// (issue #122) Did the child announce a tool call at any point? The
+    /// settle guard reads this to tell a child that DID work and had nothing to
+    /// say (a legitimate `Completed` — ADR 0055) from one that produced neither
+    /// text nor a tool boundary (the empty-`Completed` this guard reclassifies).
+    pub fn saw_tool_activity(&self) -> bool {
+        self.saw_tool_activity
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn output_tokens(&self) -> u64 {
@@ -1014,7 +1047,46 @@ async fn drive_subagent(
                 cost: capture.cost_usd(),
                 duration_ms,
             };
-            SubagentOutcome::Completed { output, metrics }
+            // (issue #122) A child that SETTLED with no output at all (nothing
+            // streamed, or only the upstream sanitisation placeholder) is NOT a
+            // `Completed { output: "" }`: dispatch.rs's `Completed` arm builds
+            // `ToolResult { content: [Text { text: output }] }` with no
+            // `salvage_text` shield (only the `Failed` arm has one), so an empty
+            // `Completed` lands in the parent's transcript as a `tool` row with
+            // empty text and puts `"content": ""` on the parent's NEXT request —
+            // the wire LiteLLM rewrites into the placeholder. It becomes the
+            // honest `Failed`, with the child's metrics preserved on that path
+            // and `subagent-closed` still firing `status: "failed"`.
+            //
+            // EXACT-MATCH ONLY (`content_is_effectively_empty` is empty-ish or
+            // the whole placeholder, never a substring): a child that ends a real
+            // answer with the banner sentence keeps it — don't-filter-too-much.
+            //
+            // Pinned end-to-end through this real settle by
+            // `manager::tests::a_silent_child_that_settled_is_not_completed_empty`.
+            if content_is_effectively_empty(&output) && !capture.saw_tool_activity() {
+                // The metrics ride the `Failed` path UNCHANGED (the child's real
+                // tokens and money are not forfeited by its empty answer); only
+                // the `output` mirror is emptied, so nothing placeholder-shaped
+                // survives into the parent.
+                let mut metrics = metrics;
+                metrics.output = String::new();
+                SubagentOutcome::Failed {
+                    // `Other`, NOT `Cancelled`: the child was not stopped — it
+                    // SETTLED. `Cancelled` is the parent/user-Stop meaning (ADR
+                    // 0055) and a `Failed` here must never read as one.
+                    reason: SubagentFailureReason::Other,
+                    error: "the subagent settled with no output".to_string(),
+                    // No partial to salvage: `captured_text()` IS the empty (or
+                    // placeholder-only) run this guard rejects, and forwarding
+                    // the placeholder into the parent's `output` / `error` fields
+                    // would re-leak the very banner this fix silences.
+                    output: String::new(),
+                    metrics,
+                }
+            } else {
+                SubagentOutcome::Completed { output, metrics }
+            }
         }
         Race::Dead => failed_with_salvage(
             SubagentFailureReason::Unresponsive,
@@ -1397,6 +1469,60 @@ mod tests {
             "event": "cost_update",
             "payload": { "costUsd": cost, "source": "main" },
         })
+    }
+
+    /// (issue #122) The CAPTURE half of the settle guard, pinned at the input:
+    /// a child whose capture holds ONLY the upstream sanitisation placeholder is
+    /// what `captured_text()` hands the `Race::Settled` guard, byte-for-byte.
+    /// The capture applies no value filter of its own (by design — it records
+    /// what the child said), which is exactly why the guard has to live at the
+    /// settle, and why it can be an EXACT match: the string it judges is this
+    /// one. GREEN before the guard existed (it pins the guard's INPUT, not its
+    /// decision; the decision is pinned end-to-end by
+    /// `manager::tests::a_silent_child_that_settled_is_not_completed_empty`).
+    #[test]
+    fn a_settled_placeholder_only_capture_is_captured_text_placeholder() {
+        let capture = SubagentCapture::new();
+        capture.observe_sink_frame(
+            "session-update",
+            &json!({
+                "sessionId": "child-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "m1",
+                    "content": { "type": "text",
+                        "text": "[System: Empty message content sanitised to satisfy protocol]" }
+                }
+            }),
+        );
+        assert_eq!(
+            capture.captured_text(),
+            "[System: Empty message content sanitised to satisfy protocol]",
+            "the capture records the placeholder byte-for-byte, so the settle \
+             guard sees exactly what it filters"
+        );
+        // And the guard's predicate agrees it is "no output" — the whole-output
+        // check, never a substring match.
+        assert!(content_is_effectively_empty(&capture.captured_text()));
+        // The don't-filter-too-much rail: a child that ENDS its real answer with
+        // the banner sentence keeps it (the whole output is not the placeholder).
+        let real = SubagentCapture::new();
+        real.observe_sink_frame(
+            "session-update",
+            &json!({
+                "sessionId": "child-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "m1",
+                    "content": { "type": "text",
+                        "text": "the file is empty [System: Empty message content sanitised to satisfy protocol]" }
+                }
+            }),
+        );
+        assert!(
+            !content_is_effectively_empty(&real.captured_text()),
+            "a real answer that merely mentions the banner is never reclassified"
+        );
     }
 
     /// A child's money accumulates ACROSS calls — a SUM, not the `max` the

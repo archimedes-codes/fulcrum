@@ -65,6 +65,35 @@ impl OutputCollector {
     }
 }
 
+/// (issue #79 residual (a)) The one-line diagnostic for cmd's documented "no console input"
+/// error, or `None`.
+///
+/// `timeout /t N` requires console input; a Tool child gets stdin forced to NULL
+/// (`childproc::closed_stdin`) plus `CREATE_NO_WINDOW` — so `cmd` prints `ERROR: Input
+/// redirection is not supported` and cannot sleep. That is the intended Tool-child policy, not a
+/// defect in the tool — but the bare sentence reads like a real error, and the issue's residual
+/// ask is precisely that it be DIAGNOSABLE. This function translates it.
+///
+/// PURE and cross-platform on purpose: the trigger is a byte match on cmd's own sentence (the
+/// stable prefix; a modern `cmd` appends `, exiting the process immediately`), so the
+/// translation is proven on Linux/macOS by the unit test, and the Windows leg proves the
+/// sentence actually appears in a real run
+/// (`bash_timeout_t_reports_a_no_console_input_diagnostic`, CI-only).
+///
+/// Deliberately NOT a child change, NOT a `bash_exit_report` change, NOT a new stdin rule:
+/// the child policy is shipped and shipping — this explains its output to the model.
+pub(crate) fn cmd_input_redirection_diagnostic(text: &str) -> Option<&'static str> {
+    if text.contains("ERROR: Input redirection is not supported") {
+        Some(
+            "(note) `timeout /t` cannot wait here: this child has no console input (the tool \
+             nulls its stdin and sets CREATE_NO_WINDOW), which is the documented Tool-child \
+             policy and not a defect. Wait with `ping -n 20 127.0.0.1 > NUL`.",
+        )
+    } else {
+        None
+    }
+}
+
 /// Execute a shell command (`sh -c` on Unix, `cmd /d /s /c` on Windows) inside
 /// `ctx.cwd`, bounded by an optional `timeout_ms` (default 300 s, max 15 min;
 /// clamped by [`clamp_timeout_ms`]).
@@ -372,6 +401,19 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // the wire is invisible to it, and "unknown — check before re-running"
     // is exactly the thing it must not have to guess.
     let mut text = String::from_utf8_lossy(&out).into_owned();
+    // (issue #79 residual (a)) translate cmd's bare "Input redirection is not supported" into
+    // the documented no-console-input policy BEFORE the report note: the sentence they see
+    // now carries the cause and the workaround. PURE — see the unit test.
+    if let Some(diagnostic) = cmd_input_redirection_diagnostic(&text) {
+        // The diagnostic leads (it is the FIRST thing the model reads) and the captured text is
+        // KEPT, never replaced. The newline after the diagnostic is what makes it a LINE rather
+        // than a prefix glued onto cmd's sentence (pinned by
+        // `a_run_whose_text_carries_the_cmd_redirect_error_gets_the_diagnostic_as_its_first_line`).
+        // Built by re-assignment rather than `insert_str(0, …)` + an index-based insert: no byte
+        // index is computed, so a non-ASCII character in the diagnostic could never panic on a
+        // char boundary.
+        text = format!("{diagnostic}\n{text}\n");
+    }
     if let Some(note) = note {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');

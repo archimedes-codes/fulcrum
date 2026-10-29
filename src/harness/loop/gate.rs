@@ -256,10 +256,13 @@ impl AgentLoop {
     /// class, so there is none.
     ///
     /// A per-pattern ruleset (`whole_tool: false`, e.g. the motivating
-    /// `researcher.md`'s `bash:` object) is `AsSelf` by design: enforcing those
-    /// rows needs a command matcher nothing has validated (B1 parses them and
-    /// announces `UnsupportedUnvalidatedMatcher(BashPatternRules)`), so the
-    /// posture stands — announced-unsupported, never silently mis-enforced.
+    /// `researcher.md`'s `edit:` and `bash:` objects) is `AsSelf` by design:
+    /// enforcing those rows needs a command/path matcher nothing has validated
+    /// (B1 parses them and announces
+    /// `UnsupportedUnvalidatedMatcher(BashPatternRules | PathPatternRules)` —
+    /// bash command-text rows and a path-taking tool's path-pattern rows each
+    /// announce their own class, #124), so the posture stands —
+    /// announced-unsupported, never silently mis-enforced.
     ///
     /// FIRST matching tool key wins (B1's FIRST-WINS per key inside a block).
     fn definition_verdict(&self, tool: &str) -> DefinitionVerdict {

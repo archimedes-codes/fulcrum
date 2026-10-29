@@ -42,8 +42,11 @@ const BASH_DESCRIPTION: &str = "Run a shell command (cmd.exe /d /s /c; the strin
     cmd.exe EXACTLY as written, so write quoting the way cmd.exe expects it), capturing \
     interleaved stdout+stderr. Two traps: `start` takes its FIRST quoted token as a window \
     title, so never pass `\"\"` there, and a background launch is verified by the log file \
-    appearing — never by the launcher's exit code; `timeout /t` cannot run here (this child \
-    has no console input) — wait with `ping -n 20 127.0.0.1 > NUL`.";
+    appearing — never by the launcher's exit code; and `start` of a batch file can fail with \
+    \"The process cannot access the file because it is being used by another process\" — a \
+    known, not-yet-understood limitation, not proof the command \
+    failed; `timeout /t` cannot run here (this child has no console input) — wait with \
+    `ping -n 20 127.0.0.1 > NUL`.";
 
 /// The tool specs sent to the model (the built-ins + the suite tools —
 /// the schemas mirror the `tools.ts` override). `pub(crate)` so the
@@ -1011,6 +1014,21 @@ mod tests {
                 !d.contains("sh -c"),
                 "the Windows description must not promise `sh -c` (that was #79's \
                  lie: the model trusted a sentence about a shell it never got), got {d:?}"
+            );
+            assert!(
+                d.contains("being used by another process"),
+                "the Windows description must RECORD the `start /B` file-lock \
+                 limitation as a SYMPTOM — the error text it can actually meet, and \
+                 the conclusion to draw from it (not proof the command failed), \
+                 got {d:?}"
+            );
+            assert!(
+                !d.contains("issue #"),
+                "this literal is printed into every Windows session's <tools> prompt \
+                 and persisted as seq 0 of every session, so it must carry NO \
+                 project-tracker identifier — a number the model cannot follow and \
+                 the user has no way to open is noise in shipped model text, and it \
+                 goes stale the moment the tracker moves, got {d:?}"
             );
         }
     }
