@@ -256,9 +256,55 @@ pub struct AgentLoop {
     /// frozen for the session's life: a skill dir created mid-session must
     /// not silently widen it). Handed to every `ToolCtx`.
     read_boundary: Vec<PathBuf>,
-    /// (ADR 0030) The write DENY-LIST (`boundary::protected_dirs()` — the
-    /// user-level agent-definition dirs), frozen with the boundary.
+    /// (ADR 0030) The write GUARD-MEMBERSHIP list (`boundary::protected_dirs()`
+    /// — the four user-level agent-definition dirs), frozen with the boundary.
+    /// Since the permissions spec's round-3 correction this is NOT a rule set:
+    /// a write under one of these with no rule matching is the guard's ROW-3
+    /// ASK, not a deny. It is also the list the Landlock subtraction consumes,
+    /// which is why it is a plain four-path list and never rule-derived.
     protected: Vec<PathBuf>,
+    /// (T03) The DEFAULT rule set (`policy::default_rules()` — EMPTY since the
+    /// round-3 correction: the four agent dirs are the guard-membership set on
+    /// [`Self::protected`], not default deny rules, so the spec's single
+    /// behavioural change — "today's hardcoded deny becomes an ask" — is
+    /// reachable), computed ONCE at construction exactly like `protected` (the
+    /// same `$HOME` read: `skills::home_dir()`), frozen for the session's life.
+    /// The USER half lives in `file_policy.rules` (per-turn by Deviation 4);
+    /// the two halves are concatenated per turn into [`Self::rules`]. The
+    /// defaults-first concat shape stays even with the default half empty: it
+    /// is the contract, and it protects whatever the defaults become next.
+    default_rules: Vec<crate::agent::policy::AccessRule>,
+    /// (T03) The home `rule_for` expands a leading `~` against — the SAME
+    /// value `default_rules()`/`protected_dirs()` go through, captured in
+    /// `new` so no per-call `$HOME` read happens. `None` = no home: a `~`
+    /// rule matches NOTHING (silently — `rule_for`'s `expand_rule_path`
+    /// expands nothing against `None`; the CONSEQUENCE is pinned by
+    /// `a_tilde_rule_with_home_none_matches_nothing_and_with_a_real_home_matches_and_decides`).
+    rules_home: Option<std::path::PathBuf>,
+    /// (T03) The rule list IN FORCE for the current turn:
+    /// `default_rules() ++ file_policy.rules` — defaults FIRST, the
+    /// CONCATENATION CONTRACT of [`crate::agent::policy::default_rules`] (an
+    /// exact-tie user `allow` must beat a rule listed before it; concatenated
+    /// the other way round the allow-directory action silently no-ops),
+    /// reassembled at the top of every `handle_prompt` next to the
+    /// `file_policy` re-read (ONE concat per turn, so every tool call in a
+    /// turn agrees). Handed to every `ToolCtx` so the gate and the
+    /// executors' rule check judge the SAME list.
+    ///
+    /// The default half is EMPTY today ([`Self::default_rules`]), so in
+    /// practice this is the user rules — but the concat keeps the contract's
+    /// SHAPE so a rule the user set (or a default reintroduced) lands in the
+    /// documented order rather than by accident of there being one list.
+    ///
+    /// INITIAL VALUE (before the first `handle_prompt`): `Vec::new()` — the
+    /// same construction-time stance as `file_policy` (`FilePolicy::default()`
+    /// until the first prompt; there are no tool calls before a prompt, so
+    /// the empty value is inert). The concat first runs at the top of the
+    /// FIRST `handle_prompt`, so the first turn's calls always see
+    /// `default_rules() ++ user rules` — never `vec![]` once a prompt was
+    /// handled, which is why the concat site needs no "was a turn handled
+    /// yet?" branch.
+    rules: Vec<crate::agent::policy::AccessRule>,
     /// (ADR 0030 Task 3) The file-access policy IN FORCE for the current
     /// turn — refreshed from `settings.json` at the top of every
     /// `handle_prompt` (Deviation 4: one read per turn, so every tool call
@@ -323,6 +369,12 @@ impl AgentLoop {
         // process already does it for MCP and for skill discovery.
         let read_boundary = crate::agent::boundary::read_roots(&space_cwd);
         let protected = crate::agent::boundary::protected_dirs();
+        // (T03) The rule layer's frozen half. `default_rules()` goes through
+        // the SAME `skills::home_dir()` chain `protected_dirs()` just walked,
+        // so ONE binding serves both the rule set and the `~`-expansion home
+        // `rule_for` needs — no second `$HOME` read after construction.
+        let rules_home = crate::skills::home_dir();
+        let default_rules = crate::agent::policy::default_rules();
         Self {
             session_id,
             space_cwd,
@@ -361,6 +413,14 @@ impl AgentLoop {
             last_context_tokens: 0,
             read_boundary,
             protected,
+            // (T03) The frozen default rule set + the `~`-expansion home, both
+            // computed above from the ONE `$HOME` read this construction does.
+            default_rules,
+            rules_home,
+            // (T03) The per-turn rule list. `Vec::new()` mirrors the
+            // `file_policy` default below: the concat first runs at the top
+            // of `handle_prompt`, and there is no tool call before a prompt.
+            rules: Vec::new(),
             // Refreshed per turn by `handle_prompt` (Deviation 4); the
             // construction value only covers a tool call made BEFORE the
             // first prompt, of which there are none.
@@ -606,7 +666,29 @@ impl AgentLoop {
         // be a policy the user never chose. `config_dir: None` → the
         // all-`Allow` default (no settings layer) + env-only web config.
         let settings = self.config_dir.as_deref().map(crate::config::load_settings);
-        self.file_policy = settings.as_ref().map(|s| s.file_policy).unwrap_or_default();
+        self.file_policy = settings
+            .as_ref()
+            .map(|s| s.file_policy.clone())
+            .unwrap_or_default();
+        // (T03) The rules IN FORCE for this turn: the frozen defaults FIRST,
+        // the user rules SECOND — the CONCATENATION CONTRACT of
+        // `policy::default_rules()` (an exact-tie appended `allow` must beat a
+        // rule listed before it; inverted, the allow-directory action silently
+        // no-ops). The default half is EMPTY today (the four agent dirs are the
+        // guard-membership set, not rules), so this is the user rules — but the
+        // shape stays, because it is the contract and it is what protects the
+        // order of whatever the defaults become. ONE concat per turn, next to
+        // the `file_policy` re-read, so the gate and the executors judge the
+        // SAME list for the whole turn and a mid-turn hand-edit lands at the
+        // NEXT prompt (Deviation 4).
+        // UNCONDITIONAL — `self.rules` starts as `Vec::new()` and is
+        // overwritten here on every prompt, so it is never the empty init
+        // again once a prompt has been handled.
+        self.rules = {
+            let mut rules = self.default_rules.clone();
+            rules.extend(self.file_policy.rules.iter().cloned());
+            rules
+        };
         self.web = crate::agent::web::config::WebConfig::from_web_settings(
             settings.as_ref().map(|s| &s.web),
         );

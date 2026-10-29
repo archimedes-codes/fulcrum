@@ -470,7 +470,15 @@ impl AgentLoop {
             } else {
                 match self.policy_verdict(tc) {
                     Some(Decision::Ask) => {
-                        if self.gate_tool(tc, turn).await {
+                        // (T03) `guard_target` is `Some` exactly for a ROW-3
+                        // guard ask (no rule matched, the write lands in an
+                        // agent-definition dir, the Space is untrusted) — the
+                        // boundary ask stays `None` and keeps its
+                        // `trust-space` option list. The value is the RESOLVED
+                        // target, so the prompt can name the real directory
+                        // `allow-directory` would allow.
+                        let guard = self.guard_target(tc);
+                        if self.gate_tool(tc, turn, guard.as_deref()).await {
                             self.dispatch_tool(tc, turn).await
                         } else {
                             ToolResult {

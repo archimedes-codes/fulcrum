@@ -48,8 +48,24 @@ use crate::agent::harness::trust::TrustSource;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOutcome {
-    /// The user selected one of the offered options; `option_id` is its id.
-    Selected { option_id: String },
+    /// The user selected one of the offered options; `option_id` is its id
+    /// and `value` is the option's optional payload (`path` — copied back
+    /// verbatim by the frontend).
+    Selected {
+        option_id: String,
+        /// The option's payload (`path` for `allow-directory`). The serde
+        /// PAIR: `default` (a previously-serialized outcome — one with NO
+        /// `value` — still parses; the `SubagentOutcome::Failed` model; the
+        /// deliberate contrast is `SubagentDispatch::name_resolution`, which
+        /// refuses defaults because every default for it is a LIE — `None`
+        /// here is not a lie, it is the honest "no directory") +
+        /// `skip_serializing_if = "Option::is_none"` (`None` OMITS the key on
+        /// the wire — byte-identical to today's `{"selected":{…}}`, which
+        /// bare `default` alone would NOT be: it would serialize
+        /// `"value": null`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
     /// The user dismissed the prompt (or the turn / session was cancelled).
     Cancelled,
 }
@@ -116,6 +132,66 @@ pub fn permission_title(tool: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// The `options` array of a `permission-request` payload, per prompt kind.
+/// `boundary: true` — the old three (`allow` "Allow" / `reject` "Block" /
+/// `trust-space` "Don't ask again for this Space"), byte-identical to the
+/// pre-per-prompt shape; `boundary: false` — the GUARD's three (`allow`
+/// "Allow once" / `allow-directory` "Always allow this directory" carrying
+/// its `"path"` / `reject` "Block"). A prompt is one kind or the other (the
+/// old claim — "always three options, since a prompt only ever appears for an
+/// untrusted Space, so `trust-space` is always actionable" — breaks the day
+/// the guard prompts: a guard ask is an ask, and an ask can appear for a
+/// Space that is trusted enough to make `trust-space` a one-click way to
+/// disable the protection the prompt exists to provide).
+///
+/// `pub(crate)` because Task 3's CALLER picks the kind: the guard ask is
+/// raised from the harness gate, which knows the target path this module's
+/// gate signature does not carry.
+pub(crate) fn permission_options(boundary: bool) -> Vec<serde_json::Value> {
+    if boundary {
+        vec![
+            json!({ "optionId": "allow", "name": "Allow", "kind": "allow" }),
+            json!({ "optionId": "reject", "name": "Block", "kind": "reject" }),
+            json!({
+                "optionId": "trust-space",
+                "name": "Don't ask again for this Space",
+                "kind": "allow"
+            }),
+        ]
+    } else {
+        vec![
+            json!({ "optionId": "allow", "name": "Allow once", "kind": "allow" }),
+            // THE guard's distinctive option: `allow-directory` carries the
+            // resolved path as `path` (echoed back by the frontend as the
+            // outcome's `value`). `""` is a PLACEHOLDER — the real
+            // nearest-existing-ancestor path is computed at the guard's call
+            // site (Task 3), whose prompt signature carries the target path
+            // that `native_permission_gate`'s does not.
+            //
+            // `trust-space` is DELIBERATELY ABSENT here. The guard prompt
+            // offers ONE kind of option list: `allow` / `allow-directory`
+            // (carrying the resolved path as `path`) / `reject`. Trust still
+            // SUPPRESSES the guard — trusting a Space from Space settings
+            // silences it, consistent with the precedence table. What is
+            // removed is the shortcut INSIDE the guard's own prompt: the
+            // guard protects the agent's own instruction directories, and its
+            // third option today is a one-click, permanent way to disable the
+            // protection the prompt exists to provide — the most likely click
+            // when a prompt recurs. Deliberate trust stays available from
+            // Space settings; accidental trust does not. (Boundary prompts,
+            // which ask about the user's own files beyond the read boundary,
+            // keep `trust-space`.)
+            json!({
+                "optionId": "allow-directory",
+                "name": "Always allow this directory",
+                "path": "",
+                "kind": "allow"
+            }),
+            json!({ "optionId": "reject", "name": "Block", "kind": "reject" }),
+        ]
+    }
+}
+
 /// The handle-free permission gate for the native `AgentLoop`: it
 /// registers a `PendingPermissions` oneshot, emits a `permission-request`
 /// event via the `sink`, and RETURNS the `PermissionOutcome` to the
@@ -143,6 +219,7 @@ pub async fn native_permission_gate(
     trust: Option<&dyn TrustSource>,
     cwd: &std::path::Path,
     cancel: &CancellationToken,
+    options: Vec<serde_json::Value>,
 ) -> PermissionOutcome {
     // A CANCELLED turn must not auto-approve (finding 8a): the cancel
     // token is consulted BEFORE the trusted short-circuit (a Stop beats
@@ -159,6 +236,7 @@ pub async fn native_permission_gate(
     if trusted {
         return PermissionOutcome::Selected {
             option_id: "allow".to_string(),
+            value: None,
         };
     }
 
@@ -172,9 +250,12 @@ pub async fn native_permission_gate(
         map.insert(key.clone(), tx);
     }
 
-    // (b) Tell the UI to show the prompt (always three options, since a
-    // prompt only ever appears for an untrusted Space, so `trust-space`
-    // is always actionable).
+    // (b) Tell the UI to show the prompt. The option list is PER-PROMPT and
+    // PER-CALLER (`permission_options`, passed in): the boundary caller emits
+    // the old three, the guard caller (Task 3's harness gate) emits the
+    // guard's three with a real `allow-directory` path. The old claim that a
+    // prompt is always three options because it only ever appears for an
+    // untrusted Space dies with the guard prompt: see `permission_options`.
     sink.emit(
         "permission-request",
         json!({
@@ -183,15 +264,7 @@ pub async fn native_permission_gate(
             "request": {
                 "sessionId": session_id,
                 "toolCall": { "title": title },
-                "options": [
-                    { "optionId": "allow", "name": "Allow", "kind": "allow" },
-                    { "optionId": "reject", "name": "Block", "kind": "reject" },
-                    {
-                        "optionId": "trust-space",
-                        "name": "Don't ask again for this Space",
-                        "kind": "allow"
-                    },
-                ],
+                "options": options,
             },
         }),
     );
@@ -337,6 +410,9 @@ mod tests {
                 None,
                 &c,
                 &cancel,
+                // The BOUNDARY list (this gate's caller picks the option set —
+                // Task 3's parameter; the guard list is the other kind).
+                permission_options(true),
             )
             .await
         });
@@ -371,6 +447,7 @@ mod tests {
             .expect("the prompt is still pending")
             .send(PermissionOutcome::Selected {
                 option_id: "allow".to_string(),
+                value: None,
             })
             .expect("the gate is listening");
         assert_eq!(
@@ -379,7 +456,8 @@ mod tests {
                 .expect("the answer resolves the gate")
                 .expect("the gate did not panic"),
             PermissionOutcome::Selected {
-                option_id: "allow".to_string()
+                option_id: "allow".to_string(),
+                value: None,
             }
         );
     }
@@ -433,13 +511,15 @@ mod tests {
             Some(&SqliteTrustSource::new(db)),
             &cwd,
             &cancel,
+            permission_options(true),
         )
         .await;
 
         assert_eq!(
             outcome,
             PermissionOutcome::Selected {
-                option_id: "allow".into()
+                option_id: "allow".into(),
+                value: None,
             },
             "a trusted Space is auto-approved (ADR 0010)"
         );
@@ -478,6 +558,7 @@ mod tests {
                 Some(&SqliteTrustSource::new(task_db)),
                 &task_cwd,
                 &task_cancel,
+                permission_options(true),
             )
             .await
         });
@@ -495,6 +576,14 @@ mod tests {
         assert_eq!(payload["requestId"], "r1");
         assert_eq!(payload["request"]["toolCall"]["title"], "Allow bash?");
         assert_eq!(payload["request"]["options"].as_array().unwrap().len(), 3);
+        // The EMISSION path pins the boundary list: `trust-space` is the
+        // third option of the payload the UI actually receives.
+        assert_eq!(payload["request"]["options"][0]["optionId"], "allow");
+        assert_eq!(payload["request"]["options"][1]["optionId"], "reject");
+        assert_eq!(
+            payload["request"]["options"][2]["optionId"], "trust-space",
+            "the boundary prompt offers `trust-space`"
+        );
 
         // Resolve with `allow` (the `respond_permission` path).
         let key = permission_key("s1", "r1");
@@ -506,12 +595,14 @@ mod tests {
         sender
             .send(PermissionOutcome::Selected {
                 option_id: "allow".into(),
+                value: None,
             })
             .unwrap();
         assert_eq!(
             task.await.unwrap(),
             PermissionOutcome::Selected {
-                option_id: "allow".into()
+                option_id: "allow".into(),
+                value: None,
             }
         );
         // The entry is removed after the answer.
@@ -543,6 +634,7 @@ mod tests {
                 Some(&SqliteTrustSource::new(task_db)),
                 &task_cwd,
                 &task_cancel,
+                permission_options(true),
             )
             .await
         });
@@ -563,12 +655,14 @@ mod tests {
             .unwrap()
             .send(PermissionOutcome::Selected {
                 option_id: "trust-space".into(),
+                value: None,
             })
             .unwrap();
         assert_eq!(
             task.await.unwrap(),
             PermissionOutcome::Selected {
-                option_id: "trust-space".into()
+                option_id: "trust-space".into(),
+                value: None,
             },
             "the outcome is the user's selection (the caller maps it to allow)"
         );
@@ -580,6 +674,150 @@ mod tests {
             !db.space_trusted(&cwd).unwrap(),
             "the gate no longer writes the trust flag (the Supervisor does — ADR 0025)"
         );
+    }
+
+    /// The BOUNDARY prompt emits the old three options, in order, with
+    /// `trust-space` still offered (the boundary prompt asks about the USER's
+    /// own files beyond the read boundary, so "Don't ask again for this Space"
+    /// stays actionable there — unlike the guard prompt).
+    #[test]
+    fn a_boundary_prompt_emits_the_old_three_options_with_trust_space() {
+        let options = permission_options(true);
+        let ids: Vec<&str> = options
+            .iter()
+            .map(|o| o["optionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["allow", "reject", "trust-space"]);
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0]["name"], "Allow");
+        assert_eq!(options[1]["name"], "Block");
+        assert_eq!(options[2]["name"], "Don't ask again for this Space");
+        // The boundary list carries NO `path` payload (nothing to persist).
+        assert!(options.iter().all(|o| o.get("path").is_none()));
+    }
+
+    /// The GUARD prompt offers exactly `allow` / `allow-directory` (carrying
+    /// the `path` key) / `reject`, and NEVER `trust-space`: the guard protects
+    /// the agent's own instruction directories, and a one-click permanent
+    /// "trust this Space" inside its own prompt is the most likely click when
+    /// the prompt recurs — deliberate trust stays available from Space
+    /// settings, accidental trust does not.
+    #[test]
+    fn a_guard_prompt_offers_exactly_allow_allow_directory_reject_and_no_trust_space() {
+        let options = permission_options(false);
+        let ids: Vec<&str> = options
+            .iter()
+            .map(|o| o["optionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["allow", "allow-directory", "reject"]);
+        let names: Vec<&str> = options
+            .iter()
+            .map(|o| o["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Allow once", "Always allow this directory", "Block",]
+        );
+        assert!(
+            options[1].get("path").is_some(),
+            "`allow-directory` carries the `path` key (the placeholder the \
+             guard's call site replaces with the resolved ancestor — Task 3)"
+        );
+        assert!(
+            options.iter().all(|o| o["optionId"] != "trust-space"),
+            "the guard prompt NEVER offers `trust-space`: {options:?}"
+        );
+    }
+
+    /// (Cross-version guard, the `SubagentOutcome::Failed` model in
+    /// `worker/protocol.rs`) An OLD-shape `Selected` — the pre-`value`
+    /// `{"selected":{"option_id":"allow"}}`, with NO `value` — still
+    /// DECODES, to `value: None`.
+    ///
+    /// This is not a nicety: `"permission-response"` is in
+    /// `decode_inbound`'s EXPLICIT allow-list, so a structural mismatch is a
+    /// hard `ProtoError::Json` and NOT the permissive `Unknown { raw }`
+    /// fallback. The asymmetry the serde PAIR on `value` encodes is exactly
+    /// what this pins: a missing `option_id` stays a hard error (it has no
+    /// default and never will), while a missing `value` is absorbed by
+    /// `default` — a stale Worker (or an already-serialized outcome) keeps
+    /// working, and the deliberate contrast is
+    /// `SubagentDispatch::name_resolution`, which refuses a default because
+    /// every default for it would be a LIE. `None` here is not a lie: it is
+    /// the honest "no directory carried".
+    #[test]
+    fn before_value_selected_still_deserializes() {
+        let old: PermissionOutcome = serde_json::from_str(r#"{"selected":{"option_id":"allow"}}"#)
+            .expect("an OLD shape parses");
+        assert_eq!(
+            old,
+            PermissionOutcome::Selected {
+                option_id: "allow".to_string(),
+                value: None,
+            },
+            "the missing `value` falls back to the `serde(default)`"
+        );
+        // The same shape for the other boundary id.
+        let old: PermissionOutcome =
+            serde_json::from_str(r#"{"selected":{"option_id":"trust-space"}}"#)
+                .expect("an OLD `trust-space` shape parses");
+        assert_eq!(
+            old,
+            PermissionOutcome::Selected {
+                option_id: "trust-space".to_string(),
+                value: None,
+            }
+        );
+    }
+
+    /// `value: None` OMITS the key on the wire — the serialized outcome is
+    /// byte-identical to today's `{"selected":{"option_id":"allow"}}`.
+    ///
+    /// This is the `skip_serializing_if = "Option::is_none"` proof, the
+    /// SECOND half of the pair: bare `#[serde(default)]` alone governs
+    /// DESERIALIZATION only and would emit `"value": null`, breaking the
+    /// "payload byte-identical to today's wire" claim.
+    #[test]
+    fn a_selected_without_value_serializes_without_the_key() {
+        let encoded = serde_json::to_value(&PermissionOutcome::Selected {
+            option_id: "allow".to_string(),
+            value: None,
+        })
+        .unwrap();
+        assert_eq!(
+            encoded,
+            json!({ "selected": { "option_id": "allow" } }),
+            "a `None` value must NOT appear on the wire"
+        );
+        assert!(
+            encoded["selected"].get("value").is_none(),
+            "no `value` key at all (not `\"value\": null`): {encoded}"
+        );
+    }
+
+    /// The new shape round-trips: a `Selected` carrying a `value` serializes
+    /// WITH the key and parses back to the same value (the `allow-directory`
+    /// prompt's `path` rides this field to the Supervisor, which persists it
+    /// — Task 4).
+    #[test]
+    fn a_selected_with_value_round_trips() {
+        let outcome = PermissionOutcome::Selected {
+            option_id: "allow-directory".to_string(),
+            value: Some("/home/u/.pi/agent/agents".to_string()),
+        };
+        let encoded = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "selected": {
+                    "option_id": "allow-directory",
+                    "value": "/home/u/.pi/agent/agents",
+                }
+            }),
+            "the payload key is `value` inside the `selected` variant key"
+        );
+        let decoded: PermissionOutcome = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, outcome, "the `value` round-trips");
     }
 
     #[tokio::test]
@@ -600,6 +838,7 @@ mod tests {
             Some(&SqliteTrustSource::new(db)),
             &cwd,
             &cancel,
+            permission_options(true),
         )
         .await;
         assert_eq!(

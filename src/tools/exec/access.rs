@@ -38,18 +38,112 @@ pub(crate) fn write_backend(ctx: &ToolCtx) -> FsBackend {
 /// (ADR 0030: a guard-rail, not a security boundary), but the refusal is read
 /// at the moment of decision, and naming an elevated route there is what sent
 /// the reporting agent reaching for one over a markdown file (issue #33).
-/// Pinned negative by `write_into_a_protected_dir_is_refused_under_every_policy`
-/// and by the gate's `a_gate_denial_of_a_protected_dir_uses_the_protected_wording`.
+/// Pinned by `a_user_deny_rule_refuses_an_agent_dir_write_with_the_unchanged_protected_wording`
+/// (executor half) and the gate's twin `a_gate_denial_of_a_deny_rule_uses_the_protected_wording`
+/// — the two halves of the pair this spec renamed, whose old names asserted the
+/// every-policy claim this change removes.
 pub(crate) const PROTECTED_WRITE_ROUTE: &str = "This is by design: these directories are the agent's own instructions. Write the file under your session directory instead and ask the user to move it into place (the `ask` tool).";
 
 /// The write DENY-LIST check (ADR 0030 Deviation 3): a resolved path under
-/// one of `ctx.protected` (the user-level agent-definition dirs) is refused
-/// in EVERY policy — including `writes: Allow` — because a model that can
-/// rewrite `~/.agents/skills/*/SKILL.md` rewrites its own instructions for
-/// every future session. Independent of `roots` (it is a deny, not a
-/// boundary). `Some(message)` is the refusal, worded like an `FsError`.
+/// one of `ctx.protected` (the user-level agent-definition dirs).
+///
+/// # What this is AFTER the permissions spec's round-3 correction
+///
+/// It is no longer an unconditional refusal. A write under one of the four
+/// dirs with NO rule matching is the GATE's row-3 ASK (the guard prompt) — the
+/// spec's single behavioural change, "today's hardcoded deny becomes an ask" —
+/// and the executor must not refuse what the gate was entitled to ask about, or
+/// the prompt would be a lie. This function is therefore the WORDING of a deny,
+/// reached only once a rule has already decided `Deny` (precedence row 1: a
+/// USER deny — the defaults are empty) and the target falls under the
+/// guard-membership list. It is also the membership compare the gate's
+/// `is_guard_path` mirrors, so the two layers cannot disagree about "under an
+/// agent dir".
+///
+/// Independent of `roots` (it is a deny, not a boundary). `Some(message)` is
+/// the refusal, worded like an `FsError`.
 pub(crate) fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> Option<String> {
     protected_refusal_text(&ctx.protected, tool, resolved)
+}
+
+/// (T03 rows 1–2) The rule verdict for one RESOLVED WRITE target, consulted by
+/// `exec_write` and `exec_edit` BEFORE any deny-list wording — the ONE resolver
+/// the harness gate's twin calls. Quoting `policy.rs`'s module doc: *"per ADR
+/// 0029/0030's one-canonicalizer rule the gate and the executor must both go
+/// through [`crate::agent::policy::rule_for`], never a second matcher."* The
+/// path fed here is the SAME `&resolved` the write itself uses
+/// (`FsBackend::resolve` under the `write_backend(ctx)` roots, bound straight
+/// after `validate`), and `ctx.home` is what expands a leading `~` in a rule
+/// (`None` = no expansion, so a `~` rule matches nothing — the pinned
+/// consequence).
+///
+/// `Some(text)` refuses; `None` DISPATCHES. Three cases reach `None`:
+/// * an `Allow` rule (row 2) — proceed silently, past the guard-membership
+///   wording: the ONE place a rule overrides the old unconditional floor, and
+///   what makes an `allow-directory` answer mean something;
+/// * NO rule matching, even under a protected dir (rows 3/4) — the GATE owns
+///   that decision (row 3 → `Ask` → the user answered → dispatch; a Trusted
+///   Space proceeds silently, "Trust suppresses the guard"). The executor's job
+///   is to agree with the gate's RULE rows, never to second-guess its ask or
+///   its allow;
+/// * a rule that does not govern the `Write` direction.
+pub(crate) fn write_rule_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> Option<String> {
+    match crate::agent::policy::rule_for(
+        &ctx.rules,
+        crate::agent::policy::RuleDirection::Write,
+        resolved,
+        ctx.home.as_deref(),
+    ) {
+        // Row 1: the DENY is real; only the SENTENCE varies with whether the
+        // target also falls under the guard-membership list.
+        Some(rule) if rule.decision == crate::agent::policy::RuleDecision::Deny => {
+            protected_refusal(ctx, tool, resolved)
+                .or_else(|| Some(rule_deny_text(tool, rule, resolved)))
+        }
+        // Row 2 (allow) and rows 3/4 (no rule) both dispatch.
+        _ => None,
+    }
+}
+
+/// (T03 rows 1–2) The READ-direction twin of [`write_rule_refusal`], for
+/// `read` / `find` / `grep` / `ls`. A `deny` rule refuses a read exactly as it
+/// refuses a write (row 1 is about the access, not the direction); an `allow`
+/// rule and the absence of one both proceed to the boundary check, which is
+/// what the `Ask`/`Allow` widening already implements.
+///
+/// There is NO read-side guard ASK anywhere — not here and not at the gate
+/// (`gate::is_guard_path` is write-only) — so this function can only refuse or
+/// stay out of the way. A defaulted `path` (`"."` for `find`/`grep`/`ls`)
+/// resolves inside the `cwd`, which no user rule names, so an absent-path call
+/// matches nothing and falls to row 4.
+pub(crate) fn read_rule_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> Option<String> {
+    crate::agent::policy::rule_for(
+        &ctx.rules,
+        crate::agent::policy::RuleDirection::Read,
+        resolved,
+        ctx.home.as_deref(),
+    )
+    .filter(|rule| rule.decision == crate::agent::policy::RuleDecision::Deny)
+    .map(|rule| rule_deny_text(tool, rule, resolved))
+}
+
+/// (T03 row 1) The refusal for a rule `Deny` whose target is NOT under the
+/// guard-membership list (a user deny on an ordinary dir): the same "state the
+/// reason" shape as [`protected_refusal_text`]'s sentence — a denied write must
+/// explain, not say "escapes the sandbox" and send the model hunting for a
+/// boundary that is not the problem — but naming the RULE's path, which is the
+/// thing the user actually wrote and the thing they can go edit.
+pub(crate) fn rule_deny_text(
+    tool: &str,
+    rule: &crate::agent::policy::AccessRule,
+    resolved: &Path,
+) -> String {
+    format!(
+        "{tool}: {} is denied by the access rule `{}` (direction {:?}) you configured — refusing. Edit the rule in Settings if this access should be allowed.",
+        resolved.display(),
+        rule.path,
+        rule.direction,
+    )
 }
 
 /// The refusal text itself, split out so the GATE (`loop.rs`) refuses a
@@ -112,25 +206,22 @@ pub(crate) fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> O
 /// `/var/…` never prefix-matches the canonical `/private/var/…` entry (macOS),
 /// and a raw `C:\…` never matches the verbatim `\\?\C:\…` one (Windows).
 ///
-/// What that mismatch costs is worth stating exactly, because the obvious story
-/// is wrong. The DENY-LIST is not one of the things the policy moves: both
-/// executors call [`protected_refusal`] unconditionally, straight after
-/// `validate` and with no test of `ctx.file_policy.writes`, so a protected write
-/// is refused by the EXECUTOR in every mode — `writes: Allow` included. What the
-/// widening moves is the BOUNDARY check and nothing else: `write_backend` builds
-/// its `roots` from `ctx.file_policy.writes`, so under `Allow` the roots go
-/// unrestricted and `validate` stops refusing, while the deny-list (independent
-/// of `roots`) keeps refusing. And under `Allow` the gate's copy of this
-/// function is not even reached — the verdict is `Allow`, so `dispatch_tool`
-/// runs and `deny_tool_result`, which only answers a `Deny`, never fires.
+/// What that mismatch costs is worth stating exactly, because the obvious
+/// story is wrong. The DENY-LIST is no longer one of the things the policy
+/// moves — and since the permissions spec's round-3 correction it is not one
+/// of the things that moves AT ALL on its own: the executors consult
+/// [`write_rule_refusal`] first, and this sentence is reached only for a rule
+/// `Deny` (row 1) whose target falls under the list. What the widening moves is
+/// the BOUNDARY check: `write_backend` builds its `roots` from
+/// `ctx.file_policy.writes`, so under `Allow` the roots go unrestricted and
+/// `validate` stops refusing.
 ///
 /// The gate's copy exists for the DENY path, where it decides WHICH refusal the
-/// model reads (the deny-list sentence, or "escapes the sandbox"). So a raw
-/// protected path reaching that seam slipped the deny-list MATCH and came back
-/// worded as a boundary escape — the model sent hunting for a boundary that is
-/// not the problem, which is precisely the drift the shared text exists to
-/// prevent. That is the bug this canonicalization closes from the gate side; the
-/// executor-side refusal itself has been policy-independent since 3fd702f.
+/// model reads (the guard-membership sentence, or "escapes the sandbox"). So a
+/// raw protected path reaching that seam slipped the membership MATCH and came
+/// back worded as a boundary escape — the model sent hunting for a boundary that
+/// is not the problem, which is precisely the drift the shared text exists to
+/// prevent. That is the bug this canonicalization closes from the gate side.
 ///
 /// So the compared path goes through
 /// [`crate::agent::fs_backend::canonicalize_lenient`] — the peel-to-deepest-

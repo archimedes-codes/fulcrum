@@ -82,8 +82,10 @@ pub enum Inbound {
     Compact { instructions: Option<String> },
     #[serde(rename = "close")]
     Close,
-    /// The REAL outcome (3-option UI: `Selected { option_id }` ∈
-    /// allow / reject / trust-space, or `Cancelled`) — NOT a bool.
+    /// The REAL outcome (the per-prompt option UI: `Selected { option_id,
+    /// value }` — the boundary prompt's allow / reject / trust-space, or the
+    /// guard prompt's allow / allow-directory / reject, `value` carrying the
+    /// option's payload — or `Cancelled`) — NOT a bool.
     #[serde(rename = "permission-response", rename_all = "camelCase")]
     PermissionResponse {
         id: String,
@@ -545,11 +547,22 @@ mod tests {
                 id: "r1".to_string(),
                 outcome: PermissionOutcome::Selected {
                     option_id: "trust-space".to_string(),
+                    value: None,
                 },
             },
             Inbound::PermissionResponse {
                 id: "r2".to_string(),
                 outcome: PermissionOutcome::Cancelled,
+            },
+            // The guard prompt's `allow-directory` carries the directory as
+            // the outcome's `value` (the Supervisor persists it — Task 4), so
+            // the NEW shape is part of the crate-wide round-trip pin.
+            Inbound::PermissionResponse {
+                id: "r2b".to_string(),
+                outcome: PermissionOutcome::Selected {
+                    option_id: "allow-directory".to_string(),
+                    value: Some("/home/u/.pi/agent/agents".to_string()),
+                },
             },
             Inbound::InteractiveResponse {
                 id: "r3".to_string(),
@@ -620,6 +633,40 @@ mod tests {
             },
             "the missing fields fall back to the `serde(default)`s"
         );
+    }
+
+    /// (Cross-version guard, the `a_failed_subagent_result_in_the_old_shape_still_decodes`
+    /// twin) An OLD-shape `permission-response` — the pre-`value`
+    /// `{"selected":{"option_id":"allow"}}`, with NO `value` — still DECODES,
+    /// to `value: None`.
+    ///
+    /// `"permission-response"` is in `decode_inbound`'s EXPLICIT allow-list,
+    /// so a missing `option_id` (or any structural mismatch) is a hard
+    /// `ProtoError::Json`, NOT the permissive `Unknown { raw }` fallback — but
+    /// a missing `value` is NOT an error: that is exactly the field
+    /// `#[serde(default)]` exists to absorb. A stale Worker binary (one that
+    /// survived an app update) keeps answering prompts.
+    #[test]
+    fn before_value_permission_response_still_decodes() {
+        let line = concat!(
+            "{\"type\":\"permission-response\",\"id\":\"r1\",",
+            "\"outcome\":{\"selected\":{\"option_id\":\"allow\"}}}\n"
+        );
+        let decoded = decode_inbound(line).expect("an OLD-shape `permission-response` decodes");
+        assert_eq!(
+            decoded,
+            Inbound::PermissionResponse {
+                id: "r1".to_string(),
+                outcome: PermissionOutcome::Selected {
+                    option_id: "allow".to_string(),
+                    value: None,
+                },
+            },
+            "the missing `value` falls back to the `serde(default)`"
+        );
+        // And the decode is byte-stable: re-encoding the decoded frame yields
+        // the SAME old line (`skip_serializing_if` keeps `None` off the wire).
+        assert_eq!(encode_inbound(&decoded), line);
     }
 
     /// The `SubagentFailureReason`'s wire spelling (the `subagent-closed`

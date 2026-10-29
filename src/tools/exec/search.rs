@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::access::read_backend;
+use super::access::{read_backend, read_rule_refusal};
 use crate::agent::tools::types::{ToolCtx, ToolResult};
 
 /// The default `max_results` for `exec_find` / `exec_grep`.
@@ -69,6 +69,13 @@ pub async fn exec_find(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("find: {e}"), None),
     };
+    // (T03 rows 1-2, read direction) A rule `deny` refuses a search too. An
+    // absent `path` defaulted to "." above, so it resolves inside the `cwd` and
+    // matches no rule: an absent-path call never reaches a rule refusal, let
+    // alone a guard ask (the guard is write-only).
+    if let Some(msg) = read_rule_refusal(ctx, "find", &resolved) {
+        return ToolResult::fail(msg, None);
+    }
 
     // Prefer `fd` when it is installed (the spawn fails with NotFound
     // otherwise — that is the availability check, no `which` needed).
@@ -343,6 +350,11 @@ pub async fn exec_grep(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("grep: {e}"), None),
     };
+    // (T03 rows 1-2, read direction) See `exec_find` — same rule consult, same
+    // defaulted-path note.
+    if let Some(msg) = read_rule_refusal(ctx, "grep", &resolved) {
+        return ToolResult::fail(msg, None);
+    }
 
     // The env scrub AND the Space cwd, both decided in the builder (issue
     // #81) — see the note above the `fd` spawn in `exec_find` for the env half

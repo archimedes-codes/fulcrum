@@ -483,8 +483,13 @@ mod tests {
                 reads: crate::agent::policy::AccessPolicy::Sandboxed,
                 writes: crate::agent::policy::AccessPolicy::Sandboxed,
                 shell: crate::agent::policy::AccessPolicy::Allow,
+                rules: Vec::new(),
             },
             protected: vec![],
+            // (T03) The two new `ToolCtx` fields (churn-only): no rules, no
+            // home — the hermetic value every direct fixture passes.
+            rules: Vec::new(),
+            home: None,
             web: crate::agent::web::config::WebConfig::default(),
             render_requester: None,
         }

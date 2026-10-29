@@ -111,26 +111,6 @@ fn push_roots<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
     }
 }
 
-/// Append the paths of a `user_roots` result to the write DENY-LIST,
-/// canonicalized LENIENTLY: a directory that does not exist yet is KEPT and
-/// contributes its canonical nearest-existing ancestor plus the components
-/// that lead to it. This is the reverse of [`push_roots`], deliberately, and
-/// it is a separate function rather than a flag on that one because the flag
-/// would select a SECURITY policy: a lenient READ root silently WIDENS what
-/// is readable, and a seventh `push_roots` call could opt into it by
-/// accident. Here the leniency only ever DENIES more. A path that cannot be
-/// resolved at all (`$HOME` relative and absent, a protected dir on an
-/// unmounted drive) comes back with its raw spelling — see
-/// `protected_dirs_keeps_an_unresolvable_entry_raw`.
-fn push_protected<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
-    for (path, _scope) in roots {
-        let c = crate::agent::fs_backend::canonicalize_lenient(&path);
-        if !out.contains(&c) {
-            out.push(c);
-        }
-    }
-}
-
 /// The read boundary: `cwd` FIRST, then the discovery roots (user + space
 /// level, skills + agents). Every root is canonicalized; a root that fails
 /// to canonicalize (a missing dir) is simply not part of the boundary.
@@ -159,23 +139,65 @@ pub fn write_roots(cwd: &Path) -> Vec<PathBuf> {
     canon(cwd).map(|c| vec![c]).unwrap_or_default()
 }
 
-/// The write DENY-LIST (ADR 0030, Deviation 3): the four user-level
-/// discovery dirs — `~/.agents/skills`, `~/.pi/agent/skills`,
-/// `~/.agents/agents`, `~/.pi/agent/agents`. A write whose resolved path
-/// is under one of these is refused in EVERY policy (a deny, never a
-/// prompt, never widened by Trust): a model that can rewrite
-/// `~/.agents/skills/*/SKILL.md` rewrites its own instructions for every
-/// future session.
+/// Append the LENIENTLY-canonicalized paths of a `user_roots` result as the
+/// write GUARD-MEMBERSHIP list, dropping duplicates and preserving the
+/// feeder's order. Generic over the scope enum (`SkillScope` vs
+/// `AgentScope`) for the same reason [`push_roots`] is: the two feeders share
+/// the shape, not the tag.
 ///
-/// Entries are canonicalized LENIENTLY (see `push_protected`), which
-/// REPLACES the sentence this task reversed — *"Canonicalized; a missing dir
-/// is dropped."* (issue #92). A missing dir is now KEPT as its canonical
-/// nearest-existing ancestor plus the components that lead to it, because
-/// this list is frozen for the Session's life (`AgentLoop::new`) and a
-/// dropped entry silently unprotects the agent's own instructions until
-/// restart. The READ roots keep the opposite, strict rule on purpose —
-/// leniency there would widen what is readable; see `read_roots` and
-/// `a_nonexistent_root_is_dropped`.
+/// Lenient, not strict (issue #92): a missing dir is KEPT as its canonical
+/// nearest-existing ancestor plus the components that lead to it, because this
+/// list is frozen for the Session's life (`AgentLoop::new`) and a dropped entry
+/// silently unprotects the agent's own instructions until restart. The leniency
+/// only ever DENIES more, which is why it is safe here and deliberately NOT
+/// applied to the read roots — leniency there would silently WIDEN what is
+/// readable; see [`read_roots`] and `a_nonexistent_root_is_dropped`.
+///
+/// A path that cannot be resolved at all (`$HOME` relative and absent, a
+/// protected dir on an unmounted drive) comes back with its raw spelling — see
+/// `protected_dirs_keeps_an_unresolvable_entry_raw`.
+fn push_protected<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
+    for (path, _scope) in roots {
+        let c = crate::agent::fs_backend::canonicalize_lenient(&path);
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+}
+
+/// The write GUARD-MEMBERSHIP list (ADR 0030 Deviation 3, as the permissions
+/// spec corrects it): the four user-level discovery dirs — `~/.agents/skills`,
+/// `~/.pi/agent/skills`, `~/.agents/agents`, `~/.pi/agent/agents`. A WRITE
+/// whose resolved path is under one of these, with NO rule matching, is the
+/// ROW-3 ASK (the guard prompt) — never the silent hardcoded deny ADR 0030
+/// shipped, because the spec's one behavioural change is precisely
+/// "today's hardcoded deny becomes an ask".
+///
+/// NOT a rule set. This list feeds three consumers and none of them is a
+/// resolver:
+/// * [`crate::agent::harness::loop::gate`]'s row-3 membership (`is_guard_path`),
+/// * the executor's guard/deny wording (`protected_refusal_text`), and
+/// * the Landlock subtraction in [`crate::agent::tools::sandbox`] — the ONLY
+///   reason a confined `bash` cannot write the agent's own instructions, since
+///   Landlock rules are ADD-ONLY and cannot take a right back from an ancestor.
+///
+/// That third consumer is why this stays a PLAIN four-path list and is never
+/// derived from [`crate::agent::policy::default_rules`]: a rule change must not
+/// be able to silently empty the subtraction and widen the shell. User rules
+/// never apply to `bash`, and a user `allow` rule naming one of these dirs
+/// never drops it from this list — pinned by
+/// `protected_dirs_ignore_user_rules_because_bash_never_applies_them`.
+///
+/// Because the guard set and the rule set are now DIFFERENT sets, the row-3
+/// condition (`rule_for` answers `None` AND the target is under one of these)
+/// is reachable by construction — it is the ordinary default posture, not an
+/// override.
+///
+/// Entries are canonicalized LENIENTLY (see [`push_protected`]): a missing dir
+/// is KEPT as its canonical nearest-existing ancestor plus its trailing
+/// components, because this list is frozen at `AgentLoop::new` and a dropped
+/// entry silently unprotects the agent's own instructions until restart
+/// (issue #92). The READ roots keep the opposite, strict rule on purpose.
 ///
 /// The leniency is only half the protection: the comparison that consumes
 /// these entries must canonicalize its ENTRY side leniently too, or a
@@ -548,6 +570,166 @@ mod tests {
         );
 
         drop((restore, lock));
+    }
+
+    /// The guard-membership list is its OWN four-path list, NOT a view of the
+    /// rule set — and this pins the two halves of that sentence separately,
+    /// because the previous revision derived one from the other and made the
+    /// spec's row 3 (`no rule matches AND under an agent dir`) unreachable.
+    ///
+    /// Half one: the LITERAL four dirs (skills first), spelled here
+    /// independently of the code so a derivation that drifted cannot pass by
+    /// agreeing with itself.
+    ///
+    /// Half two — the ROUND-3 CORRECTION: `default_rules()` is EMPTY, so a list
+    /// derived from it would be EMPTY too. The four entries surviving an empty
+    /// rule set IS the assertion that the guard set and the rule set are
+    /// different sets, which is what makes a default-posture write into one of
+    /// these dirs the row-3 ASK instead of a silent deny.
+    #[test]
+    fn protected_dirs_are_the_plain_four_dir_guard_membership_list() {
+        let (lock, restore, home) = pin_home("protected-guard-list");
+        let dirs = protected_dirs();
+
+        // HALF ONE (ground truth): the four dirs, skills first, in exactly
+        // today's order — spelled here independently of the code.
+        let literal: Vec<PathBuf> = [
+            ".agents/skills",
+            ".pi/agent/skills",
+            ".agents/agents",
+            ".pi/agent/agents",
+        ]
+        .iter()
+        .map(|d| home.path().join(d).canonicalize().unwrap())
+        .collect();
+        assert_eq!(
+            dirs, literal,
+            "the guard-membership list must equal the literal four dirs"
+        );
+
+        // HALF TWO: the rule set is EMPTY (the spec's pre-filled defaults are a
+        // Settings draft pre-fill, not code defaults, and the four dirs are not
+        // rules at all) — and the guard list is NOT empty alongside it.
+        let rules = crate::agent::policy::default_rules();
+        assert!(
+            rules.is_empty(),
+            "`default_rules()` is EMPTY: the four dirs are the guard-membership \
+             set, not default deny rules (the spec: \"today's hardcoded deny \
+             becomes an ask\"); got {rules:?}"
+        );
+        assert_eq!(
+            dirs.len(),
+            4,
+            "the guard list keeps all four dirs WHILE the rule set is empty — \
+             a rule-derived list would be empty here and a confined `bash` \
+             could write the agent's own instructions"
+        );
+        // And no rule names any of them, so `rule_for` answers `None` for a
+        // plain write into one: the row-3 precondition, reached by construction.
+        let target = home.path().join(".pi/agent/agents/SKILL.md");
+        assert_eq!(
+            crate::agent::policy::rule_for(
+                &rules,
+                crate::agent::policy::RuleDirection::Write,
+                &target,
+                Some(home.path()),
+            ),
+            None,
+            "at defaults no rule speaks to an agent-dir write (row 3 is reachable)"
+        );
+        // BOTH SIDES OF THE PREFIX COMPARE ARE CANONICAL, because that is what
+        // production compares. `dirs` comes from `protected_dirs()`, which
+        // canonicalizes through `push_protected`; `target` is the RAW temp
+        // `$HOME` spelling. On Linux `temp_dir()` is already canonical so the
+        // two agree by luck; on macOS it is a symlink (`/var` → `/private/var`)
+        // and on Windows `canonicalize` rewrites `C:\…` into the verbatim
+        // `\\?\C:\…`, so a raw `target` is NOT `starts_with` a canonical entry
+        // and this assertion reddens on both while staying green here. The
+        // gate and the executor both feed `rule_for` / the guard-membership
+        // compare a value already put through `canonicalize_lenient`, so the
+        // lenient form is the faithful one — and the target file does not
+        // exist, which strict `canonicalize()` would fail on.
+        let target = crate::agent::fs_backend::canonicalize_lenient(&target);
+        assert!(
+            dirs.iter().any(|root| target.starts_with(root)),
+            "…and the target IS under the guard-membership set: row 3 is the ask"
+        );
+        drop((restore, lock));
+    }
+
+    /// (the honest limit, recorded NOT hidden — and the PIN that replaces the
+    /// one that could not exist) An EMPTY rule set matches nothing, so
+    /// [`crate::agent::policy::rule_for`] answers `None` and the caller falls
+    /// through — to the guard's row-3 ASK for a write under one of the four
+    /// dirs, and to the posture select ([`crate::agent::policy::decision_for`])
+    /// everywhere else — whereas an empty `protected_dirs()` means "deny
+    /// nothing".
+    ///
+    /// **THE EMPTY SET IS NOW THE DEFAULT, not a no-home edge.** Since the
+    /// round-3 spec correction, [`crate::agent::policy::default_rules`] returns
+    /// an EMPTY list by design (the four agent dirs are the guard-membership
+    /// set on `protected_dirs()`, not default deny rules), so this is the shape
+    /// EVERY session starts with, not the degenerate case of an unresolvable
+    /// `$HOME`. The consequence at the gate is
+    /// `default_posture_agent_dir_write_is_an_ask_not_a_silent_deny`.
+    ///
+    /// THE LIMIT ITSELF CANNOT BE PINNED FROM A TEST PROCESS, and that is
+    /// measured, not assumed: `skills::home_dir()`'s third link is
+    /// `std::env::home_dir()`, and on unix that falls back to the PASSWD
+    /// DATABASE — with both `HOME` and `USERPROFILE` removed this process
+    /// still resolves `Some("/home/<user>")`, so `user_roots()` is NON-empty.
+    /// Verified in standalone binaries running the identical three-link chain,
+    /// once with the two vars removed and once under a fully scrubbed
+    /// environment (`env -i`): both resolve the passwd home. On Windows the
+    /// third link is a known-folder query that does not read the environment
+    /// at all. So no environment manipulation available to an in-process test
+    /// can make it yield `None`; the earlier `#[ignore]`d attempt failed red
+    /// under `--ignored` and has been deleted rather than left as a landmine.
+    ///
+    /// WHAT THE LIMIT COSTS is what this test DOES pin, and it needs no home
+    /// trickery: an EMPTY rule set matches nothing, so `rule_for` answers
+    /// `None` and the caller falls through to the posture select (an ask under
+    /// the guard) — whereas an empty `protected_dirs()` means "deny nothing".
+    /// Recorded so anyone tempted to "fix" the empty case into a silent
+    /// fallback default has to do it as a visible decision. The practical
+    /// exposure is nil either way: a no-home process cannot write the four
+    /// user dirs — it has no home to write into.
+    ///
+    /// (`protected_dirs()`'s own no-home case is covered by the unchanged
+    /// residue test above; this nails the RULES side of the same edge.)
+    #[test]
+    fn an_empty_rule_set_matches_nothing_so_the_posture_select_decides() {
+        use crate::agent::policy::{rule_for, RuleDirection};
+        let home = Tmp::new("empty-rule-set");
+        let target = home.path().join(".pi/agent/agents/SKILL.md");
+
+        // THE LIMIT: no rules at all ⇒ no verdict, so the caller reaches the
+        // posture select (`decision_for`).
+        assert_eq!(
+            rule_for(&[], RuleDirection::Write, &target, Some(home.path())),
+            None,
+            "an empty rule set answers `None` — the absence of a verdict, \
+             which is what an unresolvable home dir hands the caller"
+        );
+
+        // NON-VACUITY: the SAME path with ONE rule naming its directory does
+        // get a verdict, so the `None` above came from the empty list and not
+        // from a fixture nothing can ever match.
+        let deny = crate::agent::policy::AccessRule {
+            path: home
+                .path()
+                .join(".pi/agent/agents")
+                .to_string_lossy()
+                .into_owned(),
+            direction: RuleDirection::Write,
+            decision: crate::agent::policy::RuleDecision::Deny,
+        };
+        let rules = [deny.clone()];
+        assert_eq!(
+            rule_for(&rules, RuleDirection::Write, &target, Some(home.path())),
+            Some(&deny),
+            "a non-empty rule set DOES answer this path (the contrast)"
+        );
     }
 
     #[test]

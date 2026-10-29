@@ -1917,6 +1917,7 @@ async fn an_answered_gates_card_is_not_closed_again_at_teardown() {
             "p1",
             &crate::agent::permission::PermissionOutcome::Selected {
                 option_id: "allow".to_string(),
+                value: None,
             },
         )
         .expect("the permission response encodes");

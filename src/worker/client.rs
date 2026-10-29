@@ -589,8 +589,11 @@ impl WorkerHandle {
     }
 
     /// A permission response (the REAL `PermissionOutcome` verbatim —
-    /// the 3-option `Selected { option_id }` or `Cancelled`; resolves
-    /// the `round_trips` oneshot of the request `id`).
+    /// the `Selected { option_id, value }` (the optional `value` is the
+    /// option's payload, e.g. `allow-directory`'s `path`) or `Cancelled`;
+    /// resolves the `round_trips` oneshot of the request `id`). The outcome
+    /// rides its own serde attrs — no wrapper — so a `None` `value` never
+    /// reaches the wire.
     pub fn send_permission_response(
         &self,
         id: &str,
@@ -1214,6 +1217,7 @@ mod tests {
                 "p1",
                 &PermissionOutcome::Selected {
                     option_id: "trust-space".to_string(),
+                    value: None,
                 },
             )
             .expect("the response encodes");

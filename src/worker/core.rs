@@ -627,7 +627,7 @@ impl WorkerCore {
                     // auto-approves, matching today's live-lookup behavior;
                     // the Supervisor's `db.set_space_trusted` write — Task
                     // 4 — is the persistence half).
-                    if let PermissionOutcome::Selected { option_id } = &outcome {
+                    if let PermissionOutcome::Selected { option_id, .. } = &outcome {
                         if option_id == "trust-space" {
                             if let Some(s) = &self.trust {
                                 s.set(true);
@@ -1195,6 +1195,7 @@ mod tests {
             id: "r1".to_string(),
             outcome: PermissionOutcome::Selected {
                 option_id: "allow".to_string(),
+                value: None,
             },
         })
         .await;
@@ -1204,7 +1205,8 @@ mod tests {
         assert_eq!(
             outcome,
             PermissionOutcome::Selected {
-                option_id: "allow".to_string()
+                option_id: "allow".to_string(),
+                value: None,
             },
             "the outcome rides verbatim"
         );
@@ -1244,6 +1246,7 @@ mod tests {
             id: "r2".to_string(),
             outcome: PermissionOutcome::Selected {
                 option_id: "trust-space".to_string(),
+                value: None,
             },
         })
         .await;

@@ -898,8 +898,12 @@ mod tests {
                 reads,
                 writes: AccessPolicy::Sandboxed,
                 shell: AccessPolicy::Sandboxed,
+                rules: Vec::new(),
             },
             protected: Vec::new(),
+            // (T03) HERMETIC: no rules, no home (see `confined_ctx`'s doc).
+            rules: Vec::new(),
+            home: None,
             web: Default::default(),
             render_requester: None,
         }
@@ -1547,6 +1551,7 @@ mod tests {
                 reads: AccessPolicy::Allow,
                 writes: AccessPolicy::Allow,
                 shell: AccessPolicy::Allow,
+                rules: Vec::new(),
             },
             ..confined_ctx(cwd.path(), AccessPolicy::Allow)
         };
@@ -1719,6 +1724,7 @@ mod tests {
                 reads: AccessPolicy::Allow,
                 writes: AccessPolicy::Allow,
                 shell: AccessPolicy::Allow,
+                rules: Vec::new(),
             },
             ..confined_ctx(cwd.path(), AccessPolicy::Allow)
         };
@@ -1754,6 +1760,7 @@ mod tests {
                 reads: AccessPolicy::Allow,
                 writes: AccessPolicy::Allow,
                 shell: AccessPolicy::Allow,
+                rules: Vec::new(),
             },
             ..confined_ctx(cwd.path(), AccessPolicy::Allow)
         };
@@ -2230,5 +2237,148 @@ mod tests {
             text_of(&r)
         );
         let _ = base;
+    }
+
+    /// (T03, spec: "rules never apply to `bash`") The Landlock subtraction
+    /// keeps using `boundary::protected_dirs()` — the four-dir GUARD-MEMBERSHIP
+    /// list, which is BY CONSTRUCTION unable to see a user rule — so a user
+    /// `allow` rule for a protected dir can NEVER widen a confined `bash`'s
+    /// write set.
+    ///
+    /// This is the load-bearing half of the round-2 blocker's fix: while
+    /// `protected_dirs()` was derived from `default_rules().filter(Deny)`, a
+    /// change to the rule set could (and did, under the corrected reading) empty
+    /// the subtraction and hand the shell write access to the agent's own
+    /// instructions. It is a plain four-path list now, so no rule can reach it.
+    ///
+    /// NOT VACUOUS: the contrast half applies the SAME rule to the RESOLVER and
+    /// asserts it DOES change the path tools' answer. Without that half,
+    /// "unchanged" would also hold if the list were never consulted at all.
+    #[test]
+    fn protected_dirs_ignore_user_rules_because_bash_never_applies_them() {
+        let pin = match PinnedHome::new("rules-never-widen") {
+            Some(pin) => pin,
+            None => panic!("no /dev/shm"),
+        };
+        std::fs::create_dir_all(pin.path().join(".agents/skills")).unwrap();
+
+        let before = crate::agent::boundary::protected_dirs();
+        assert_eq!(
+            before.len(),
+            4,
+            "the guard-membership list is the four dirs: {before:?}"
+        );
+
+        // A user `allow` rule naming one of the four — the exact exclusion a
+        // rules-derived subtraction WOULD honor.
+        let user_allow = crate::agent::policy::AccessRule {
+            path: "~/.agents/skills".to_string(),
+            direction: crate::agent::policy::RuleDirection::ReadWrite,
+            decision: crate::agent::policy::RuleDecision::Allow,
+        };
+        let after = crate::agent::boundary::protected_dirs();
+        assert_eq!(
+            before, after,
+            "a user rule must not change the Landlock subtraction list"
+        );
+
+        // THE CONTRAST (so the assertion above is not vacuous): the SAME rule
+        // applied to the RESOLVER — as `default_rules() ++ [user_allow]`, the
+        // concatenation contract — DOES decide the write. The path tools honor
+        // it; `bash` does not. That asymmetry is the bash exclusion doing its
+        // job, not a dead assertion.
+        let rules = crate::agent::policy::default_rules()
+            .into_iter()
+            .chain(std::iter::once(user_allow.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crate::agent::policy::rule_for(
+                &rules,
+                crate::agent::policy::RuleDirection::Write,
+                &pin.path().join(".agents/skills/anything"),
+                Some(pin.path()),
+            ),
+            Some(&user_allow),
+            "on the PATH side the allow WINS — the contrast this pin needs"
+        );
+    }
+
+    /// (T03 acceptance 7, the executable half of the non-widening pin) A
+    /// confined `exec_bash` whose `ctx.rules` carry a user `allow` for a
+    /// protected dir STILL cannot write that dir.
+    ///
+    /// `Sandbox::create` takes ONLY the `cwd` — there is no rules parameter to
+    /// thread, deliberately (DD2) — which is exactly why an allow rule cannot
+    /// widen the shell. So the observable assertion is the executable one: the
+    /// same context whose WRITE TOOL would obey the allow runs a shell whose
+    /// write is refused.
+    ///
+    /// The fixture is `a_session_cwd_inside_a_protected_dir_cannot_write_there`'s
+    /// tightest case (the session `cwd` IS the protected dir) plus the allow rule
+    /// in `ctx.rules`. It lives HERE rather than in `exec/tests/policy.rs`
+    /// because this module's fixtures are rooted at `/dev/shm`: `exec/tests`'
+    /// base is `/tmp`, which the sandbox allow-list grants write on
+    /// (`TEMP_DIRS`), so a confinement DENIAL observed there would be a green
+    /// no-op — the exact vacuity this module's `test_base` exists to prevent.
+    #[tokio::test]
+    async fn an_allow_rule_for_a_protected_dir_never_widens_a_sandboxed_bash() {
+        let _base = require_sandbox!();
+        let pin = match PinnedHome::new("allow-no-widen") {
+            Some(pin) => pin,
+            None => panic!("no /dev/shm"),
+        };
+        let skills = pin.path().join(".agents/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("SKILL.md"), "original instructions").unwrap();
+        assert!(
+            crate::agent::boundary::protected_dirs()
+                .iter()
+                .any(|p| skills.starts_with(p)),
+            "premise: the pinned `$HOME` must protect the skill dir"
+        );
+
+        let user_allow = crate::agent::policy::AccessRule {
+            path: "~/.agents/skills".to_string(),
+            direction: crate::agent::policy::RuleDirection::Write,
+            decision: crate::agent::policy::RuleDecision::Allow,
+        };
+        // The SAME context, one field wider than `confined_ctx`: the rule list
+        // carries the allow, and `home` is set so the `~` really expands — a
+        // rule that could not even match would make this test vacuous.
+        let ctx = ToolCtx {
+            rules: crate::agent::policy::default_rules()
+                .into_iter()
+                .chain(std::iter::once(user_allow.clone()))
+                .collect(),
+            home: Some(pin.path().to_path_buf()),
+            ..confined_ctx(&skills, AccessPolicy::Allow)
+        };
+
+        // THE CONTRAST, asserted FIRST: the resolver DOES answer this write with
+        // the allow, so the path tools would let it through. The shell's refusal
+        // below is therefore the exclusion, not a rule that never matched.
+        assert_eq!(
+            crate::agent::policy::rule_for(
+                &ctx.rules,
+                crate::agent::policy::RuleDirection::Write,
+                &skills.join("SKILL.md"),
+                ctx.home.as_deref(),
+            ),
+            Some(&user_allow),
+            "the allow must genuinely rule this write on the PATH side"
+        );
+
+        let r = run(&ctx, "echo PWNED > SKILL.md").await;
+        assert!(
+            r.is_error,
+            "the confined shell must NOT be able to write the allowed-and-protected \
+             dir (an allow rule must never widen `bash`): {:?}",
+            text_of(&r)
+        );
+        assert_eq!(
+            std::fs::read_to_string(skills.join("SKILL.md")).unwrap(),
+            "original instructions",
+            "the confined shell rewrote its own instructions (self-modification)"
+        );
     }
 }

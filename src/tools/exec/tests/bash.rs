@@ -265,6 +265,7 @@ async fn a_sandboxed_shell_runs_confined_or_fails_closed_visibly() {
             reads: AccessPolicy::Allow,
             writes: AccessPolicy::Allow,
             shell: AccessPolicy::Sandboxed,
+            rules: Vec::new(),
         },
     );
     let r = execute_tool(&confined, "bash", &json!({ "command": "touch marker.txt" })).await;
@@ -312,6 +313,7 @@ async fn a_sandboxed_shell_does_not_touch_the_path_tools() {
             reads: AccessPolicy::Allow,
             writes: AccessPolicy::Allow,
             shell: AccessPolicy::Sandboxed,
+            rules: Vec::new(),
         },
     );
     let r = execute_tool(&confined, "read", &json!({ "path": "a.txt" })).await;
@@ -354,6 +356,9 @@ async fn bash_cancel_kills_child() {
         boundary: vec![cwd.to_path_buf()],
         file_policy: crate::agent::policy::FilePolicy::default(),
         protected: Vec::new(),
+        // (T03) The two new `ToolCtx` fields (churn-only): no rules, no home.
+        rules: Vec::new(),
+        home: None,
         web: Default::default(),
         render_requester: None,
     };
@@ -514,6 +519,9 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
         boundary: vec![cwd.to_path_buf()],
         file_policy: crate::agent::policy::FilePolicy::default(),
         protected: Vec::new(),
+        // (T03) The two new `ToolCtx` fields (churn-only): no rules, no home.
+        rules: Vec::new(),
+        home: None,
         web: Default::default(),
         render_requester: None,
     };

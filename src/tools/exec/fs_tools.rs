@@ -3,7 +3,7 @@ use std::path::Path;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use super::access::{protected_refusal, read_backend, write_backend};
+use super::access::{read_backend, read_rule_refusal, write_backend, write_rule_refusal};
 use crate::agent::tools::types::{ContentBlock, ImageRef, ToolCtx, ToolResult};
 
 /// The max lines `exec_read` returns for a text file with no `limit`.
@@ -26,6 +26,13 @@ pub async fn exec_read(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("read: {e}"), None),
     };
+    // (T03 rows 1–2, read direction) A rule `deny` refuses a READ too — the
+    // row is about the access, not the direction. There is NO read-side guard
+    // ask anywhere (the gate's `is_guard_path` is write-only), so this can only
+    // refuse or stay out of the way.
+    if let Some(msg) = read_rule_refusal(ctx, "read", &resolved) {
+        return ToolResult::fail(msg, None);
+    }
 
     if let Some(mime) = image_mime(resolved.extension().and_then(|e| e.to_str())) {
         let bytes = match backend.read_bytes(&resolved) {
@@ -97,8 +104,14 @@ pub async fn exec_write(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("write: {e}"), None),
     };
-    // The deny-list (ADR 0030): unconditional, independent of `roots`.
-    if let Some(msg) = protected_refusal(ctx, "write", &resolved) {
+    // (T03 rows 1–2) The rules, consulted through the ONE resolver BEFORE any
+    // guard-membership wording, on the SAME `&resolved` the write below uses.
+    // A rule `deny` refuses (with the guard-membership sentence when the target
+    // is under one of the four dirs); a rule `allow` proceeds; NO rule matching
+    // also proceeds — the guard's row-3 ASK is the GATE's decision and the user
+    // has already answered it (or the Space is trusted and the spec says the
+    // write lands silently). Refusing here would make the prompt a lie.
+    if let Some(msg) = write_rule_refusal(ctx, "write", &resolved) {
         return ToolResult::fail(msg, None);
     }
     let bytes = content.len();
@@ -144,8 +157,9 @@ pub async fn exec_edit(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("edit: {e}"), None),
     };
-    // The deny-list (ADR 0030): an edit is a write.
-    if let Some(msg) = protected_refusal(ctx, "edit", &resolved) {
+    // (T03 rows 1–2) `edit` is a write, so it consults the SAME resolver on
+    // the SAME resolved target — see `exec_write` for the row semantics.
+    if let Some(msg) = write_rule_refusal(ctx, "edit", &resolved) {
         return ToolResult::fail(msg, None);
     }
     let old = match backend.read(&resolved) {
@@ -233,6 +247,13 @@ pub async fn exec_ls(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::fail(format!("ls: {e}"), None),
     };
+    // (T03 rows 1–2, read direction) See `exec_read`. An absent `path`
+    // defaulted to `"."` above, so it resolves inside the `cwd` and matches no
+    // rule — an absent-path call never reaches a rule refusal, let alone a
+    // guard ask.
+    if let Some(msg) = read_rule_refusal(ctx, "ls", &resolved) {
+        return ToolResult::fail(msg, None);
+    }
     // `read_dir` is BLOCKING (a big directory would stall a tokio
     // worker): it runs on the blocking thread pool.
     let (names, error) = match tokio::task::spawn_blocking(move || {
