@@ -1915,3 +1915,739 @@ async fn a_rule_deny_on_an_ordinary_dir_uses_the_rule_wording_not_an_escape_clai
         "and it is not a guard dir either: {text}"
     );
 }
+
+// ── (issue #101 task05b) the per-agent `permission:` layer in the gate ─────
+//
+// The block is the DEFINITION's declared ruleset (the file's `permission:`
+// frontmatter, carried by `LaunchConfig.permission` → `StartEnv.permission` →
+// `AgentLoop::set_permission`). Three properties every test below pins:
+//
+//   * NARROWING ONLY — `Allow` is the identity of the merge, so a definition can
+//     never widen a posture `Deny`/`Confine`, a row-1 rule `Deny` or the row-3
+//     guard `Ask` (ADR 0030's "trust suppresses prompts but never widens a deny"
+//     applied to definitions);
+//   * `Confine` is NOT a midpoint — it is a RUNNING sandbox, ranked
+//     `Allow < Confine < Ask < Deny`, so a per-agent `Allow` cannot un-confine a
+//     `Sandboxed` shell and a per-agent `Ask` still tightens one;
+//   * a per-agent `Deny` renders through `deny_tool_result` UNCHANGED, so the
+//     model's recovery cannot tell which layer said no.
+use crate::agent::definition_permission::{Action, PermissionBlock, Rule, Rules, ToolKey};
+
+/// A one-tool whole-tool ruleset (the bare `read: deny` spelling — the shape
+/// the gate can decide WITHOUT any pattern matcher).
+fn whole_tool_block(tool: ToolKey, action: Action) -> PermissionBlock {
+    PermissionBlock {
+        tools: vec![(tool, Rules::whole_tool(action))],
+    }
+}
+
+/// A `bash` tool call (the shell direction has no `path`).
+fn bash_call(id: &str, command: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: "bash".to_string(),
+        arguments: json!({ "command": command }),
+    }
+}
+
+/// A `write` tool call.
+fn write_call(id: &str, path: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: "write".to_string(),
+        arguments: json!({ "path": path, "content": "PWNED" }),
+    }
+}
+
+/// (issue #101) A definition `read: ask` on a file whose `filePolicy` is all
+/// `Allow`: the definition alone creates the prompt. Without the block the very
+/// same access is silent (the widening ADR 0030 intends), so the prompt below
+/// can only come from the definition.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_definition_narrowing_an_allow_to_an_ask_prompts() {
+    let (_lock, _restore, _home) = pin_guard_home("def-ask");
+    let outside = Tmp::new("def-ask-outside");
+    std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+    let path = outside.path().join("secret.txt");
+    let (provider, _calls) = ScriptedProvider::new(read_scripts(&path.display().to_string()));
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        // The user's posture WOULD allow this read.
+        Some(&policy_settings("allow", "allow", "allow")),
+    );
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Read, Action::Ask)));
+    let pending = loop_.pending_permissions.clone();
+    let answer = tokio::spawn(answer_permission(pending, "s1", "allow", None));
+    bounded_prompt(&mut loop_, "go").await;
+    answer.await.unwrap();
+
+    let tc = read_call("t1", &path.display().to_string());
+    assert_eq!(
+        loop_.policy_verdict(&tc),
+        Some(Decision::Ask),
+        "the definition narrowed the posture `Allow` to an `Ask`"
+    );
+    let prompts = permission_requests(&sink_events.lock().unwrap());
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the definition is what made the prompt exist: {prompts:?}"
+    );
+    assert_eq!(prompts[0]["requestId"], "t1");
+    let ends = tool_ends(&mut events_rx);
+    let (result, is_error) = ends.get("t1").expect("the read dispatched").clone();
+    assert!(!is_error, "the answered read runs: {result:?}");
+    assert_eq!(result["content"][0]["text"], "OUTSIDE-CONTENT");
+}
+
+/// (issue #101) A definition `write: deny` refuses with the EXISTING
+/// `deny_tool_result` wording — the protected-agent-directory sentence, because
+/// the target is under `$HOME/.pi/agent/agents`. No new renderer, no new
+/// sentence: a definition denial and a user-rule denial are byte-identical to
+/// the model (ADR 0030).
+///
+/// WHY THE SPACE IS TRUSTED HERE (and untrusted in the guard pins): the row-3
+/// guard `Ask` returns EARLY, so on an untrusted Space a no-rule protected write
+/// is the guard's prompt and the per-agent layer is never consulted (pinned by
+/// [`the_row_precedence_cells_are_untouched_by_the_definition_layer`]). Trust
+/// suppresses the guard, which is what lets the verdict fall to row 4 — where
+/// ONLY the definition refuses. So the refusal below cannot come from the guard
+/// or the posture (both allow); it can only come from the block.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_definition_deny_refuses_with_the_rule_or_protected_wording() {
+    let (_lock, _restore, home) = pin_guard_home("def-deny-protected");
+    let target = home.path().join(".pi/agent/agents/pwn/SKILL.md");
+    let (provider, _calls) =
+        ScriptedProvider::new(write_scripts(&target.display().to_string(), "PWNED"));
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "allow", "allow")),
+    );
+    trust_the_space(&mut loop_, home.path());
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Write, Action::Deny)));
+    bounded_prompt(&mut loop_, "go").await;
+
+    let tc = write_call("t1", &target.display().to_string());
+    assert_eq!(
+        loop_.policy_verdict(&tc),
+        Some(Decision::Deny),
+        "the definition's `deny` beats the posture's `Allow` (a Deny never prompts)"
+    );
+    assert!(
+        permission_requests(&sink_events.lock().unwrap()).is_empty(),
+        "a Deny emits no permission-request"
+    );
+    let ends = tool_ends(&mut events_rx);
+    let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+    assert!(is_error, "the denied write is refused: {result:?}");
+    let text = result["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        text.contains("protected agent-definition directory"),
+        "the refusal is the EXISTING protected-dir sentence, not an invented one: {text:?}"
+    );
+    assert!(
+        !target.exists(),
+        "and nothing was written (the gate stopped it before the executor)"
+    );
+}
+
+/// (issue #101) The `Allow` identity, posture half: `reads: sandboxed` denies an
+/// out-of-boundary `read` and a definition `read: allow` cannot widen it back.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_definition_cannot_widen_a_user_deny() {
+    let (_lock, _restore, _home) = pin_guard_home("def-no-widen");
+    let outside = Tmp::new("def-no-widen-outside");
+    std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+    let path = outside.path().join("secret.txt");
+    let (provider, _calls) = ScriptedProvider::new(read_scripts(&path.display().to_string()));
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("sandboxed", "sandboxed", "sandboxed")),
+    );
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Read, Action::Allow)));
+    bounded_prompt(&mut loop_, "go").await;
+
+    assert_eq!(
+        loop_.policy_verdict(&read_call("t1", &path.display().to_string())),
+        Some(Decision::Deny),
+        "the posture `Deny` beats the definition's `Allow` — the layer narrows, never widens"
+    );
+    assert!(
+        permission_requests(&sink_events.lock().unwrap()).is_empty(),
+        "and no prompt appears on the way"
+    );
+    let ends = tool_ends(&mut events_rx);
+    let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+    assert!(is_error, "the read stays refused: {result:?}");
+    let text = result["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        text.contains("escapes the session sandbox"),
+        "the refusal is the boundary sentence the executor would produce: {text:?}"
+    );
+}
+
+/// (issue #101) The precedence rows 1–3 are UNTOUCHED by the per-agent layer —
+/// both directions of the non-bypass claim, in one place.
+///
+/// * row 1 (a user `deny` rule) + a definition `write: allow` → still `Deny`;
+/// * row 3 (the protected-dir guard) + a definition `write: allow` → still `Ask`
+///   (a definition can never silence the guard — the widening the whole design
+///   forbids);
+/// * row 3 + a definition `write: deny` → still `Ask`. The guard returns EARLY,
+///   so the per-agent layer (row 4) never sees it: a definition's `deny` cannot
+///   turn the guard's prompt into a silent refusal either. RECORDED, not silent:
+///   the user still approves that write by hand, so nothing is granted that the
+///   guard would have stopped;
+/// * row 2 (a user `allow` rule) + a definition `write: deny` → `Allow`. The
+///   user's own explicit rule is the WIDER layer and rows 1–2 return before the
+///   per-agent consult. This is the layer's honest boundary: the definition sits
+///   BELOW the user's rule list, above the posture.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn the_row_precedence_cells_are_untouched_by_the_definition_layer() {
+    let (_lock, _restore, home) = pin_guard_home("def-rows");
+    std::fs::create_dir_all(home.path().join(".agents/skills")).unwrap();
+    let ordinary = home.path().join("work");
+    std::fs::create_dir_all(&ordinary).unwrap();
+    let protected_target = home.path().join(".pi/agent/agents/pwn/SKILL.md");
+
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings_with_rules(
+            "allow",
+            "allow",
+            "allow",
+            &deny_rule("~/.agents/skills"),
+        )),
+    );
+    // ONE turn first: `rules` / `file_policy` are freshened at the top of
+    // `handle_prompt`, so a verdict probed before any prompt would read the
+    // construction defaults and the rule below would not be in the list at all
+    // (the existing verdict-pin pattern). The turn is TEXT-ONLY so no tool is
+    // gated while the verdicts are probed by hand.
+    bounded_prompt(&mut loop_, "go").await;
+
+    // Row 1: a USER `deny` rule vs a definition `allow`.
+    let rule_target = home.path().join(".agents/skills/pwn/SKILL.md");
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Write, Action::Allow)));
+    assert_eq!(
+        loop_.policy_verdict(&write_call("t1", &rule_target.display().to_string())),
+        Some(Decision::Deny),
+        "a definition `allow` cannot bypass a row-1 user `deny`"
+    );
+
+    // Row 3: the guard vs a definition `allow` (untrusted — the guard's home).
+    assert_eq!(
+        loop_.policy_verdict(&write_call("t2", &protected_target.display().to_string())),
+        Some(Decision::Ask),
+        "a definition `allow` cannot bypass the row-3 protected-dir guard"
+    );
+    // Row 3, the OTHER direction: a definition `deny` cannot rewrite the guard's
+    // prompt into a silent refusal either (row 4 is never consulted).
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Write, Action::Deny)));
+    assert_eq!(
+        loop_.policy_verdict(&write_call("t3", &protected_target.display().to_string())),
+        Some(Decision::Ask),
+        "the guard's `Ask` survives a definition `deny` — the layer enters at row 4"
+    );
+
+    // Row 2: a USER `allow` rule vs a definition `deny` (the recorded boundary).
+    let allow_rule_dir = ordinary.join("allowed");
+    std::fs::create_dir_all(&allow_rule_dir).unwrap();
+    let loop2_settings =
+        policy_settings_with_rules("allow", "allow", "allow", &allow_rule("~/.agents/skills"));
+    let (provider2, _c2) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (events_tx2, _rx2) = mpsc::unbounded_channel();
+    let (_space2, mut loop2, _cfg2) = build_policy_loop(
+        Box::new(provider2),
+        events_tx2,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&loop2_settings),
+    );
+    loop2.set_permission(Some(whole_tool_block(ToolKey::Write, Action::Deny)));
+    // The same turn-first requirement as `loop_` above: the rule list is
+    // freshened at the top of a prompt, and this turn is text-only.
+    bounded_prompt(&mut loop2, "go").await;
+    assert_eq!(
+        loop2.policy_verdict(&write_call("t4", &rule_target.display().to_string())),
+        Some(Decision::Allow),
+        "a row-2 user `allow` rule is the WIDER layer and returns before row 4 \
+         (the per-agent layer sits below the user's rule list)"
+    );
+}
+
+/// (issue #101) **`Confine` is not a midpoint.** `shell: sandboxed` + a
+/// definition `bash: allow` → `Confine`, not `Allow`: a definition cannot
+/// un-confine a `Sandboxed` shell policy. This is the pin a naive `min` over the
+/// three per-agent actions would fail (it ranks `Allow` below everything and
+/// would let the `allow` win by being "less restrictive than `Ask`").
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_definition_cannot_unconfine_a_sandboxed_shell() {
+    let (_lock, _restore, _home) = pin_guard_home("def-confine");
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(bash_call("t1", "true")),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "allow", "sandboxed")),
+    );
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Bash, Action::Allow)));
+    bounded_prompt(&mut loop_, "go").await;
+
+    assert_eq!(
+        loop_.policy_verdict(&bash_call("t1", "true")),
+        Some(Decision::Confine),
+        "`Allow` is the identity of `Allow < Confine < Ask < Deny` — it cannot un-confine"
+    );
+    assert!(
+        permission_requests(&sink_events.lock().unwrap()).is_empty(),
+        "and confining asks nothing"
+    );
+}
+
+/// (issue #101) The other half of the ordering: `Confine` ranks BELOW `Ask`, so a
+/// definition `bash: ask` tightens a confined shell into a prompt (a per-agent
+/// `Ask` beats the posture's `Confine`).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_definition_ask_tightens_a_confined_shell() {
+    let (_lock, _restore, _home) = pin_guard_home("def-confine-ask");
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(bash_call("t1", "true")),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "allow", "sandboxed")),
+    );
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Bash, Action::Ask)));
+    let pending = loop_.pending_permissions.clone();
+    // The turn is answered (with a `reject`, so nothing runs): the tightening is
+    // asserted BOTH on the verdict and on the prompt the turn really raised.
+    let answer = tokio::spawn(answer_permission(pending, "s1", "reject", None));
+    bounded_prompt(&mut loop_, "go").await;
+    answer.await.unwrap();
+    assert_eq!(
+        loop_.policy_verdict(&bash_call("t1", "true")),
+        Some(Decision::Ask),
+        "`Ask` outranks `Confine` — a confined shell can be tightened to a prompt"
+    );
+    assert_eq!(
+        permission_requests(&sink_events.lock().unwrap()).len(),
+        1,
+        "and the tightening is LIVE: the turn raised the prompt the sandbox alone never would"
+    );
+    let ends = tool_ends(&mut events_rx);
+    let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+    assert!(is_error, "the rejected command did not run: {result:?}");
+}
+
+/// (issue #101) A definition `ask`/`deny` still tightens a TRUST-widened
+/// `Allow`: Trust suppresses the posture's prompt, but it is not a grant — the
+/// definition's `read: ask` produces the `Ask` again on the trusted Space.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_definition_ask_tightens_a_trust_widened_allow() {
+    let (_lock, _restore, home) = pin_guard_home("def-trust");
+    let outside = Tmp::new("def-trust-outside");
+    std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-CONTENT").unwrap();
+    let path = outside.path().join("secret.txt");
+    let (provider, _calls) = ScriptedProvider::new(read_scripts(&path.display().to_string()));
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "allow", "allow")),
+    );
+    trust_the_space(&mut loop_, home.path());
+    let tc = read_call("t1", &path.display().to_string());
+    // The contrast that keeps the assertion below from passing vacuously: with
+    // NO block the trusted Space runs this read silently.
+    assert_eq!(loop_.policy_verdict(&tc), Some(Decision::Allow));
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Read, Action::Ask)));
+    bounded_prompt(&mut loop_, "go").await;
+    assert_eq!(
+        loop_.policy_verdict(&tc),
+        Some(Decision::Ask),
+        "the definition's `Ask` beats the `Allow` Trust produced (Trust suppresses \
+         prompts, it does not grant past a definition)"
+    );
+    // The trusted gate auto-approves the `Ask` (ADR 0010) — no prompt, and the
+    // read still lands, so the tightening is a DECISION and not a stall.
+    assert!(
+        permission_requests(&sink_events.lock().unwrap()).is_empty(),
+        "a trusted Space auto-approves the `Ask` (no prompt event)"
+    );
+    let ends = tool_ends(&mut events_rx);
+    let (result, is_error) = ends.get("t1").expect("the read dispatched").clone();
+    assert!(!is_error, "and the read runs: {result:?}");
+}
+
+/// (issue #101, THE motivating shape) A definition with NO `tools:` key and a
+/// whole-tool `bash: deny`: the advertisement filter has no list to narrow, so
+/// `bash` is still OFFERED, and the GATE is the only layer that can refuse it.
+/// The refusal is a tool-result error in the shell's own words, with no prompt.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_whole_tool_bash_deny_refuses_at_the_gate_when_the_tool_is_still_offered() {
+    let (_lock, _restore, _home) = pin_guard_home("def-bash-deny");
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(bash_call("t1", "touch should-not-exist.txt")),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "allow", "allow")),
+    );
+    // `enabled_tools: None` (the fixture's default) — the ABSENT-list leg: the
+    // tool is advertised, the gate is the only refusal available.
+    assert_eq!(loop_.enabled_tools(), None, "nothing was filtered out");
+    loop_.set_permission(Some(whole_tool_block(ToolKey::Bash, Action::Deny)));
+    bounded_prompt(&mut loop_, "go").await;
+
+    assert_eq!(
+        loop_.policy_verdict(&bash_call("t1", "true")),
+        Some(Decision::Deny),
+        "the definition denies the shell even at an all-`Allow` posture"
+    );
+    assert!(
+        permission_requests(&sink_events.lock().unwrap()).is_empty(),
+        "a deny never prompts"
+    );
+    let ends = tool_ends(&mut events_rx);
+    let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+    assert!(
+        is_error,
+        "the still-offered bash call is refused: {result:?}"
+    );
+    let text = result["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        text.contains("refused by the file-access policy"),
+        "the EXISTING shell refusal wording, unchanged: {text:?}"
+    );
+    assert!(
+        !_space.path().join("should-not-exist.txt").exists(),
+        "and the command never ran"
+    );
+}
+
+/// (issue #101, the NAMED LIMITATION, pinned so it cannot regress into a panic
+/// or a silent drop) A recognized-but-un-policed tool key (`web_search`,
+/// `read_skill`, `subagent`, …) has no `policed_direction` twin: the gate
+/// early-returns `None` for it, so a `deny` there parses + announces (B1) and is
+/// NOT enforced here. `None` — not a panic, not a `Deny`, not a widened `Allow`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_definition_ask_on_an_unpoliced_tool_stays_as_self() {
+    let (_lock, _restore, _home) = pin_guard_home("def-unpoliced");
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(read_call("t1", "inside-the-boundary.txt")),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("sandboxed", "sandboxed", "sandboxed")),
+    );
+    loop_.set_permission(Some(PermissionBlock {
+        tools: vec![
+            (ToolKey::WebSearch, Rules::whole_tool(Action::Deny)),
+            (ToolKey::ReadSkill, Rules::whole_tool(Action::Ask)),
+            // An UNRECOGNISED key (opencode's `task`) — retained, and equally
+            // unenforced (it has no advertised twin to police).
+            (
+                ToolKey::Unrecognized("task".to_string()),
+                Rules::whole_tool(Action::Deny),
+            ),
+        ],
+    }));
+    bounded_prompt(&mut loop_, "go").await;
+
+    for name in ["web_search", "read_skill", "task"] {
+        let tc = ToolCall {
+            id: "t1".to_string(),
+            name: name.to_string(),
+            arguments: json!({}),
+        };
+        assert_eq!(
+            loop_.policy_verdict(&tc),
+            None,
+            "`{name}` has no policed twin — the gate stays out of it (no panic, no verdict)"
+        );
+    }
+    assert!(
+        permission_requests(&sink_events.lock().unwrap()).is_empty(),
+        "and nothing prompts on the way"
+    );
+}
+
+/// (issue #101) A per-pattern ruleset (`bash: {"*": allow, "rm *": deny}`) has
+/// NO tool-wide verdict — the matcher that could read those rows does not exist
+/// (B1 announces it unsupported) — so it is `AsSelf`: the posture decides,
+/// unchanged. A pattern row is never silently read as a whole-tool verdict.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn per_pattern_rules_leave_the_verdict_untouched() {
+    let (_lock, _restore, _home) = pin_guard_home("def-patterns");
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(bash_call("t1", "true")),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("allow", "allow", "allow")),
+    );
+    loop_.set_permission(Some(PermissionBlock {
+        tools: vec![(
+            ToolKey::Bash,
+            Rules::per_tool(vec![
+                Rule {
+                    pattern: "*".to_string(),
+                    action: Action::Allow,
+                },
+                Rule {
+                    pattern: "rm *".to_string(),
+                    action: Action::Deny,
+                },
+            ]),
+        )],
+    }));
+    bounded_prompt(&mut loop_, "go").await;
+    assert_eq!(
+        loop_.policy_verdict(&bash_call("t1", "true")),
+        Some(Decision::Allow),
+        "a per-pattern block decides nothing (no matcher) — the posture stands"
+    );
+}
+
+/// (issue #101, THE evidence file) The REAL `~/.agents/agents/researcher.md`
+/// block — verbatim in shape, including its comments and its `"*": allow` bash
+/// catch-all — run through the REAL gate. This is the file issue #101's Evidence
+/// section names, and it declares NO `tools:` key (`grep -c '^tools:'` = 0), so
+/// the advertisement filter cannot reach it and the gate is the ONLY layer that
+/// could act on it. What the gate actually does with it is pinned here, in both
+/// directions, so nobody has to re-derive it:
+///
+/// * `task: deny` is a WHOLE-TOOL deny and reaches no verdict — `task` has no
+///   policed `policed_direction` twin (the named limitation);
+/// * `edit:` and `bash:` are PATTERN objects (`whole_tool: false`), so they carry
+///   NO tool-wide verdict and the posture stands. Enforcing those rows needs a
+///   command/path matcher nothing has validated — B1 parses them and announces
+///   `UnsupportedUnvalidatedMatcher(BashPatternRules)` for exactly this reason,
+///   and this task's scope line keeps that decision (the redirect trap:
+///   `grep x file 2>/dev/null` contains a `>`). Note the file's own bash catch-all
+///   is `"*": allow`, so even a perfect matcher would ALLOW a read-only command.
+///
+/// So this file's block is NOT enforced by the gate, and saying so IS the answer
+/// to "is #101 fixed for its own cited evidence?" — the ENFORCEABLE whole-tool
+/// class is (see the tests above and the real-worker e2e), the per-command bash
+/// class is announced-unsupported and needs its own matcher task. The pin below
+/// is what keeps that from ever being described as a silent drop by accident:
+/// every row of the real block is read, and the gate's `AsSelf` is a DECISION
+/// recorded here, not an oversight.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones() {
+    use crate::agent::definition_permission::{FrontmatterNote, UnsupportedReason};
+
+    let fm = "name: researcher\nmode: subagent\npermission:\n  \
+              # Markdown only. In opencode `edit` gates write / edit / patch, patterns match the\n  \
+              # worktree-relative path, and the LAST matching rule wins — so the catch-all goes first.\n  \
+              edit:\n    \"*\": deny\n    \"*.md\": allow\n    \"*.mdx\": allow\n  \
+              task: deny\n  \
+              # bash is a write hole (`echo x > src/app.ts`, `sed -i`, `tee`). Deny the mutating\n  \
+              # surface, then re-allow the fd-only redirects researchers lean on (`2>/dev/null`,\n  \
+              # `2>&1`, `> /dev/null`) — those rules are last because they win by order.\n  \
+              # Known gap: a file redirect that also carries an fd suffix (`cat x > f.ts 2>/dev/null`)\n  \
+              # re-matches an allow rule. The prompt contract below is the backstop for that.\n  \
+              bash:\n    \"*\": allow\n    \"rm *\": deny\n    \"2>/dev/null\": allow\n";
+    let lines: Vec<&str> = fm.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| l.starts_with("permission:"))
+        .unwrap();
+    let (block, notes) =
+        crate::agent::definition_permission::parse_permission_block(&lines, idx, "");
+    let block = block.expect("the file that motivated #101 must parse");
+    // The block reader's own announcement is the record that the bash rows are
+    // UNSUPPORTED — the gate's `AsSelf` below is that decision, not a drop.
+    assert!(
+        notes.contains(&FrontmatterNote::UnsupportedUnvalidatedMatcher(
+            UnsupportedReason::BashPatternRules
+        )),
+        "the real block announces its bash pattern rows: {notes:?}"
+    );
+    assert!(
+        block
+            .tools
+            .iter()
+            .any(|(k, _)| *k == ToolKey::Unrecognized("task".into())),
+        "`task` is retained, not dropped: {:?}",
+        block.tools.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+    // The bash ruleset is a pattern object with the file's own `allow` catch-all.
+    let bash = block
+        .tools
+        .iter()
+        .find(|(k, _)| *k == ToolKey::Bash)
+        .map(|(_, r)| r)
+        .expect("the file speaks about bash");
+    assert!(!bash.whole_tool, "the real bash block is a pattern object");
+    assert_eq!(
+        bash.patterns.first(),
+        Some(&Rule {
+            pattern: "*".to_string(),
+            action: Action::Allow
+        }),
+        "the file's own catch-all ALLOWS the shell"
+    );
+
+    // …and the GATE's answer for that block, on an all-`Allow` posture.
+    let (_lock, _restore, _home) = pin_guard_home("researcher-real");
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: Arc::new(StdMutex::new(Vec::new())),
+        }),
+        Some(&policy_settings("allow", "allow", "allow")),
+    );
+    loop_.set_permission(Some(block));
+    bounded_prompt(&mut loop_, "go").await;
+    // The POLICED tools, whose pattern rows decide nothing → the posture stands.
+    for (name, args) in [
+        ("bash", json!({ "command": "grep x file 2>/dev/null" })),
+        ("bash", json!({ "command": "rm -rf /tmp/scratch" })),
+        ("edit", json!({ "path": "src/app.ts" })),
+    ] {
+        let tc = ToolCall {
+            id: "t1".to_string(),
+            name: name.to_string(),
+            arguments: args,
+        };
+        assert_eq!(
+            loop_.policy_verdict(&tc),
+            Some(Decision::Allow),
+            "`{name}` under the real researcher block: a pattern object carries no \
+             tool-wide verdict, so the posture (`Allow`) stands — announced \
+             unsupported, never silently half-enforced"
+        );
+    }
+    // `task` is UN-POLICED: no verdict at all (not an `Allow`, not a `Deny`).
+    assert_eq!(
+        loop_.policy_verdict(&ToolCall {
+            id: "t2".to_string(),
+            name: "task".to_string(),
+            arguments: json!({ "task": "x" }),
+        }),
+        None,
+        "`task: deny` has no policed twin, so the gate answers `None` (the named \
+         limitation) rather than inventing a verdict"
+    );
+}

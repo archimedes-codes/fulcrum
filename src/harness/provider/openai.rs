@@ -196,6 +196,9 @@ pub(super) struct SseStream {
     tool_acc: BTreeMap<u32, ToolAcc>,
     /// A `finish_reason` chunk was seen (no synthetic `Done` at end).
     finished: bool,
+    /// A combined `Usage` was emitted (exactly once — the trailing
+    /// `usage` chunk, the first one to carry BOTH token counts).
+    usage_emitted: bool,
     /// The raw stream is exhausted (the stream ends after `pending`).
     exhausted: bool,
 }
@@ -208,6 +211,7 @@ impl SseStream {
             pending: VecDeque::new(),
             tool_acc: BTreeMap::new(),
             finished: false,
+            usage_emitted: false,
             exhausted: false,
         }
     }
@@ -256,13 +260,27 @@ impl SseStream {
             // The money rides the SAME usage object the counts were read
             // from (D4, AMENDED: the body, not a header). Purely ADDITIVE
             // — the token arithmetic above is untouched.
-            self.pending.push_back(ProviderEvent::Usage(
-                Usage {
-                    input_tokens: u32::try_from(u.0).unwrap_or(u32::MAX),
-                    output_tokens: u32::try_from(u.1).unwrap_or(u32::MAX),
-                },
-                v.get("usage").and_then(cost_usd_from_usage),
-            ));
+            //
+            // Exactly-once (the same `#108` defect class the anthropic
+            // `usage_emitted` guard fixes): the trailing `usage` chunk is
+            // emitted ONCE — a proxy re-sending it must not push a second
+            // frame the roll-up would sum as money that was not spent. This
+            // guard WRAPS the push, it does NOT early-return:
+            // `handle_chunk` continues past this block to the
+            // `choices[0].delta` handling and the `finish_reason`
+            // flush+`Done`, and a chunk that carries BOTH `usage` and a
+            // delta/finish_reason must still deliver them (pinned by
+            // `sse_usage_emitted_once_from_two_chunks`).
+            if !self.usage_emitted {
+                self.usage_emitted = true;
+                self.pending.push_back(ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: u32::try_from(u.0).unwrap_or(u32::MAX),
+                        output_tokens: u32::try_from(u.1).unwrap_or(u32::MAX),
+                    },
+                    v.get("usage").and_then(cost_usd_from_usage),
+                ));
+            }
         }
         let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
             return;
@@ -751,6 +769,44 @@ mod tests {
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ]
+        );
+    }
+
+    /// Exactly-once `Usage` on the openai wire (#108): a proxy that
+    /// re-sends the trailing `usage` chunk must not push a second frame
+    /// the cost roll-up would sum as money that was not spent.
+    ///
+    /// The SECOND `usage` chunk ALSO carries a `choices[0].delta.content`
+    /// and a `finish_reason` — so a guard written as an early `return`
+    /// from `handle_chunk` (which would exit PAST the `choices[0].delta`
+    /// handling and the `finish_reason` flush + `Done` that follow the
+    /// usage block) fails this pin on the MISSING `TextDelta` / `Done`,
+    /// not merely on the `Usage` count. A `Usage`-count-only pin passes
+    /// against that buggy guard; the full-vector assert is what makes
+    /// this a real pin.
+    #[tokio::test]
+    async fn sse_usage_emitted_once_from_two_chunks() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+        ]))
+        .await;
+        // ONE `Usage` frame, then the text, then the `Done` — nothing
+        // dropped, nothing doubled.
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
+                ProviderEvent::TextDelta("hi".to_string()),
+                ProviderEvent::Done(FinishReason::Stop),
+            ],
+            "two `usage` chunks emit ONE Usage and lose no delta/`Done` (got {events:?})"
         );
     }
 

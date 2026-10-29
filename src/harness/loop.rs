@@ -315,6 +315,16 @@ pub struct AgentLoop {
     /// Handed to every `ToolCtx` so the executor enforces the SAME tier the
     /// gate decided, and read by the gate itself.
     file_policy: FilePolicy,
+    /// (issue #101) The per-agent permission ruleset — `None` until set, the
+    /// same construction-time stance as `file_policy`. Wired via
+    /// [`Self::set_permission`] by the child Worker's `core.rs` (the line
+    /// that makes the gate LIVE); gate tests set it before the first prompt.
+    ///
+    /// A NARROWING layer only: the gate's strict-of-two merge
+    /// (`gate::stricter_of_two`) can only make a call MORE restricted than
+    /// `file_policy` would, never less — ADR 0030's "trust suppresses prompts
+    /// but never widens a deny" applied to definitions.
+    permission_block: Option<crate::agent::definition_permission::PermissionBlock>,
     /// The web tools' configuration IN FORCE for the current turn —
     /// refreshed from `settings.json` + env at the top of every
     /// `handle_prompt` alongside `file_policy` (one read per turn).
@@ -426,6 +436,10 @@ impl AgentLoop {
             // construction value only covers a tool call made BEFORE the
             // first prompt, of which there are none.
             file_policy: FilePolicy::default(),
+            // (issue #101) `None` = "the file does not speak about permissions"
+            // — no narrowing. Set before the first prompt by `core.rs` via
+            // [`Self::set_permission`] (the child Worker) or by a gate test.
+            permission_block: None,
             web: crate::agent::web::config::WebConfig::default(),
             render_requester: None,
         }
@@ -488,6 +502,24 @@ impl AgentLoop {
     /// `dispatch_native` driver derives the child's tool set from it).
     pub fn enabled_tools(&self) -> Option<&[String]> {
         self.enabled_tools.as_deref()
+    }
+
+    /// Set the per-agent permission ruleset (issue #101) — `None` = the file
+    /// does not speak about permissions (no narrowing). The gate consumes it
+    /// in the strict-of-two merge; a definition's rules can only NARROW the
+    /// user's `filePolicy`, never widen it.
+    pub fn set_permission(
+        &mut self,
+        permission: Option<crate::agent::definition_permission::PermissionBlock>,
+    ) {
+        self.permission_block = permission;
+    }
+
+    /// The per-agent permission ruleset (`None` = no narrowing).
+    pub fn permission_block(
+        &self,
+    ) -> Option<&crate::agent::definition_permission::PermissionBlock> {
+        self.permission_block.as_ref()
     }
 
     /// The thinking level (`None` = the model's default — the

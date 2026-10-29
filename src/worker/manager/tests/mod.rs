@@ -108,6 +108,8 @@ fn test_env(session_id: &str, enabled_tools: Option<Vec<String>>) -> StartEnv {
         "/tmp/config".to_string(),
         true,
         None,
+        // (issue #101) `from_parts`' new trailing arg (test fixture: no block).
+        None,
     )
 }
 

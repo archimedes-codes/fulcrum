@@ -94,6 +94,8 @@ async fn make_worker_manager(
             .unwrap_or_else(|| "/tmp".to_string()),
         true,
         None,
+        // (issue #101) `from_parts`' new trailing arg (parent fixture: no block).
+        None,
     );
     wm.attach("s1", &env)
         .await

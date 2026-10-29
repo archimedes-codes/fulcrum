@@ -1008,6 +1008,183 @@ async fn a_write_into_a_still_missing_protected_dir_is_refused() {
     drop((restore, lock));
 }
 
+/// (issue #104) ADR 0081's missing pin, concretely: with `writes: Allow`, a
+/// target that is the PARENT of a protected entry — `$HOME/.pi/agent/allowed.md`
+/// while `$HOME/.pi/agent/agents` is missing — must not be refused, and the
+/// file must land. An ancestor-peel mutation of the compare would
+/// prefix-match `…/.pi/agent` against this target and refuse it — the
+/// over-refusal #104 exists to pin. `!r.is_error` below is the assertion that
+/// EXPRESSES the property; what keeps THIS half non-vacuous is its premise
+/// (the entry really is on the snapshot with its full trailing spelling),
+/// which reddens under the snapshot-peel variant of the mutation. `writes:
+/// Allow` is essential — under `Sandboxed` the target leaves the `cwd` and
+/// dies at the boundary check, which would defeat the fixture (ADR 0081
+/// prescribes it for exactly this reason).
+///
+/// NO rules by design: `default_rules()` is empty and a no-rule protected write
+/// DISPATCHES (the gate owns the row-3 ask), so this half pins the literal
+/// case the issue describes. The falsifier half that reddens ON the
+/// over-refusal (the vector that needs a rule to reach the compare) is the
+/// sibling fixture `a_parent_deny_rule_does_not_move_the_guard_onto_the_parent_file`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_write_into_a_protected_dirs_parent_stays_allowed() {
+    use crate::agent::policy::{AccessPolicy, FilePolicy};
+
+    let home = temp_cwd("parent-home");
+    let lock = crate::test_support::env_lock();
+    let original = std::env::var_os("HOME");
+    let restore = RestoreHome(original);
+    // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
+    unsafe { std::env::set_var("HOME", home.path()) };
+
+    // `.pi/agent` EXISTS and `.pi/agent/agents` does NOT — the peel lands on
+    // `.pi/agent`, so the frozen entry is canonical-with-one-trailing on every
+    // platform (spelled through `canonicalize()` because macOS `temp_dir()`
+    // is under `/var` → `/private/var`).
+    std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
+    let home_canon = home.path().canonicalize().unwrap();
+    let agents = home_canon.join(".pi/agent/agents");
+
+    let protected = crate::agent::boundary::protected_dirs();
+    assert!(
+        protected.contains(&agents),
+        "the snapshot must carry the not-yet-existing dir — that is the premise: {protected:?}"
+    );
+
+    let cwd = temp_cwd("parent-cwd");
+    let c = ToolCtx {
+        protected,
+        // NO rules (`default_rules()` is EMPTY — the concatenation contract
+        // has nothing appended). A rule here is deliberately absent: the
+        // mutation-observable sibling test carries the `deny`, this half pins
+        // the issue's literal case.
+        rules: Vec::new(),
+        home: Some(home_canon.clone()),
+        file_policy: FilePolicy {
+            writes: AccessPolicy::Allow,
+            ..FilePolicy::default()
+        },
+        ..ctx(&cwd)
+    };
+    let target = home_canon.join(".pi/agent/allowed.md");
+    let r = execute_tool(
+        &c,
+        "write",
+        &json!({ "path": target, "content": "ALLOWED" }),
+    )
+    .await;
+
+    assert!(
+        !r.is_error,
+        "a write into a protected dir's own PARENT must stay allowed: {}",
+        text_of(&r)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap_or_default(),
+        "ALLOWED",
+        "the file must land next to the protected entry"
+    );
+
+    drop((restore, lock));
+}
+
+/// (issue #104 + ADR 0081) THE FALSIFIER's red half: the assertion that makes
+/// the ancestor-peel mutation observable. A USER `deny` rule spelling the
+/// PARENT (`~/.pi/agent`) forces `write_rule_refusal` row 1 to reach
+/// `protected_refusal` — and therefore to RUN the lenient compare that is the
+/// mutation under test. The deny itself refuses on BOTH trees, so the
+/// discriminator is the SENTENCE: correct code keeps the entry
+/// `…/.pi/agent/agents` whole, which does NOT prefix-match
+/// `…/.pi/agent/allowed.md`, so the target is OUTSIDE the guard-membership
+/// list and the refusal is the RULE-DENY sentence. Under the ancestor-peel the
+/// entry collapses to `…/.pi/agent`, which DOES prefix-match the parent file,
+/// and the refusal becomes the PROTECTED-GUARD sentence — the wording
+/// assertions below redden. Without the rule there is no row-1 path and the
+/// compare never runs (a no-rule protected write dispatches by design), which
+/// is why the issue's literal half lives in
+/// `a_write_into_a_protected_dirs_parent_stays_allowed`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_parent_deny_rule_does_not_move_the_guard_onto_the_parent_file() {
+    use crate::agent::policy::{AccessPolicy, FilePolicy};
+
+    let home = temp_cwd("parent-rule-home");
+    let lock = crate::test_support::env_lock();
+    let original = std::env::var_os("HOME");
+    let restore = RestoreHome(original);
+    // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
+    unsafe { std::env::set_var("HOME", home.path()) };
+
+    std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
+    let home_canon = home.path().canonicalize().unwrap();
+    let agents = home_canon.join(".pi/agent/agents");
+
+    let protected = crate::agent::boundary::protected_dirs();
+    assert!(
+        protected.contains(&agents),
+        "the snapshot must carry the not-yet-existing dir — that is the premise: {protected:?}"
+    );
+
+    let cwd = temp_cwd("parent-rule-cwd");
+    let deny = AccessRule {
+        path: "~/.pi/agent".to_string(),
+        direction: RuleDirection::Write,
+        decision: RuleDecision::Deny,
+    };
+    let c = ToolCtx {
+        protected,
+        rules: crate::agent::policy::default_rules()
+            .into_iter()
+            .chain(std::iter::once(deny))
+            .collect(),
+        home: Some(home_canon.clone()),
+        file_policy: FilePolicy {
+            writes: AccessPolicy::Allow,
+            ..FilePolicy::default()
+        },
+        ..ctx(&cwd)
+    };
+    let target = home_canon.join(".pi/agent/allowed.md");
+    // Premise (b): the target is OUTSIDE the guard-membership entry — the
+    // exact relationship the compare under test must respect (a parent write,
+    // not a write under the entry). THIS is the boundary the mutation breaks.
+    assert!(
+        !target.starts_with(&agents),
+        "premise: the parent file must not sit under the entry itself"
+    );
+    let r = execute_tool(
+        &c,
+        "write",
+        &json!({ "path": target, "content": "ALLOWED" }),
+    )
+    .await;
+
+    assert!(
+        r.is_error,
+        "the user deny on the parent dir is a real denial — refusing: {}",
+        text_of(&r)
+    );
+    let text = text_of(&r).to_string();
+    assert!(
+        text.contains("denied by the access rule"),
+        "the parent FILE is outside the guard-membership list, so the refusal \
+         must be the RULE-DENY sentence, not the protected-guard sentence: {text}"
+    );
+    assert!(
+        !text.contains("protected agent-definition directory"),
+        "the guard-membership compare must NOT fire for the parent file — an \
+         ancestor-peel compare matches `…/.pi/agent` here and answers with the \
+         protected sentence; THIS assertion reddens under that mutation: {text}"
+    );
+    assert!(
+        !target.exists(),
+        "the refusal must be honoured — nothing lands"
+    );
+
+    drop((restore, lock));
+}
+
 /// `bash` IGNORES the boundary (its `Sandboxed` tier is Landlock, Task 5):
 /// a sandboxed read cannot reach a file that `bash` can happily cat, so
 /// the boundary must not pretend to bound the shell.

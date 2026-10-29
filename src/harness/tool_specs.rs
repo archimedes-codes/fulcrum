@@ -287,9 +287,11 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                 "Gateway to MCP (Model Context Protocol) servers. Use this tool to discover and call tools from connected MCP servers.",
                 "",
                 "Workflow:",
-                "1. Search: mcp({ search: 'keyword' }) — find available tools",
-                "2. Describe: mcp({ describe: 'tool_name' }) — see full parameters",
-                "3. Call: mcp({ tool: 'tool_name', args: { ... } }) — execute the tool",
+                "1. Search: mcp({ search: 'keyword' }) — find available tools; each line names the tool in the form you call it",
+                "2. Describe: mcp({ describe: 'server_tool' }) — see full parameters",
+                "3. Call: mcp({ tool: 'server_tool', args: { ... } }) — execute the tool",
+                "",
+                "Names: both 'search' and the server listing (mcp({ server: 'name' })) print each tool as 'server_tool', and that is the name to pass to 'describe' and 'tool' (the alias 'mcp__server__tool' is accepted too); a bare tool name also works when only one server serves it, and a wrong prefix fails naming the likely tool.",
                 "",
                 "Other actions:",
                 "  Status:  mcp({}) or mcp({ action: 'status' }) — list all servers and their connection status",
@@ -303,10 +305,10 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "tool": { "type": "string", "description": "Tool name to call" },
+                    "tool": { "type": "string", "description": "Tool name to call (the prefixed form 'server_tool' that `search` prints is accepted, as is 'mcp__server__tool')" },
                     "args": { "description": "Tool arguments (a JSON string or an object)" },
                     "search": { "type": "string", "description": "Search tools by name/description keyword" },
-                    "describe": { "type": "string", "description": "Tool name to show full parameter schema for" },
+                    "describe": { "type": "string", "description": "Tool name to show full parameter schema for (accepts the prefixed 'server_tool' form)" },
                     "connect": { "type": "string", "description": "Server name to eagerly connect" },
                     "server": { "type": "string", "description": "Scopes the call to one server (search, describe, that server's tool list, or a tool call), and it must name a server this session holds — an entry the config marks disabled (or a legacy sse / malformed one) is not held, so a name outside that set fails rather than answering 'not found'" },
                     "action": { "type": "string", "description": "Action string ('status' or 'auth')" }

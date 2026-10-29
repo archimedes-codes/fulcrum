@@ -12,6 +12,18 @@
 //! frontmatter is silently skipped. Frontmatter is parsed by a
 //! hand-rolled tolerant reader (no new crate dependencies): an agent
 //! that cannot be parsed is skipped, never a crash.
+//!
+//! Six top-level keys are read (`name`, `description`, `model`,
+//! `thinking`, `tools`, and the NESTED `permission:` block — the format's
+//! first structured value, owned by
+//! [`crate::agent::definition_permission`]); `parse_agent_file` returns
+//! `(name, description, model, thinking, tools, permission, notes, body)`.
+//!
+//! Unknown top-level keys are announced as per-definition reports
+//! (`AgentDefinition::frontmatter_notes`) — never silent no-ops, never
+//! errors; #101 / #78. Discovery has no error or log channel to announce
+//! into (§ the module's total contract), so a note rides the returned row,
+//! the same way a shadow does (ADR 0065).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -49,6 +61,25 @@ pub struct AgentDefinition {
     /// Frontmatter `tools` (both the `read, bash` string and the `[read, bash]`
     /// array spellings normalize to this).
     pub tools: Option<Vec<String>>,
+    /// Frontmatter `permission` (opencode's per-tool allow/ask/deny block,
+    /// issue #101), typed as a NARROWING layer — an ORDERED aggregate of
+    /// `(ToolKey, Rules)`, never a one-tool enum (a multi-tool block is
+    /// fully representable; unrecognised tool keys are retained, not
+    /// dropped). `None` → this file does not speak about permissions (the
+    /// strict-of-two merge starts from `None` as "no narrowing"). `Some` →
+    /// the rules this file CARRIES; enforcement is the follow-up task's.
+    pub permission: Option<crate::agent::definition_permission::PermissionBlock>,
+    /// The frontmatter-READ notes (unknown top-level keys, unrecognised
+    /// tool keys, unsupported bash-pattern rows — issue #101's announce
+    /// half; #78's principle applied to files). A REPORT, never an error:
+    /// discovery stays total. The two `parse_value` copies are NOT
+    /// affected. Additive: an empty vec is the ordinary case.
+    /// **Wire/UI surfacing is the follow-up task's hand-off, mirroring the
+    /// `shadowed` report half ("a shadow is a REPORT, not an entry", ADR
+    /// 0065).** NOT the `Shadowed<T>` type: that carries
+    /// `{name,path,scope}` twice. NOT widened into `shadowed` (its
+    /// `[]`-wire pin stands).
+    pub frontmatter_notes: Vec<crate::agent::definition_permission::FrontmatterNote>,
     /// The file body (minus the frontmatter), trimmed. `""` when the body is
     /// empty (no system prompt).
     pub system_prompt: String,
@@ -135,7 +166,7 @@ pub fn discover_in_roots(roots: &[(PathBuf, AgentScope)]) -> Vec<AgentDefinition
             // `file_name` ends in `.md` (3 ASCII bytes), so the byte
             // offset is always on a char boundary.
             let stem = file_name[..file_name.len() - 3].to_string();
-            let Some((name, description, model, thinking, tools, system_prompt)) =
+            let Some((name, description, model, thinking, tools, permission, notes, system_prompt)) =
                 parse_agent_file(&content, &stem)
             else {
                 continue;
@@ -185,6 +216,8 @@ pub fn discover_in_roots(roots: &[(PathBuf, AgentScope)]) -> Vec<AgentDefinition
                     model,
                     thinking,
                     tools,
+                    permission,
+                    frontmatter_notes: notes,
                     system_prompt,
                     scope: *scope,
                     path: canon.to_string_lossy().into_owned(),
@@ -266,8 +299,15 @@ pub fn user_roots() -> Vec<(PathBuf, AgentScope)> {
 /// (missing closing `---`, …) → `None` (the agent is skipped, never a
 /// crash).
 ///
-/// Returns `(name, description, model, thinking, tools, body)`.
-#[allow(clippy::type_complexity)] // the 6-tuple IS the spec's signature
+/// Returns `(name, description, model, thinking, tools, permission, notes,
+/// body)` — SIX keys read (`permission` being the format's first NESTED
+/// value, owned by [`crate::agent::definition_permission`]), plus the
+/// announce notes for every top-level key this reader does not read.
+///
+/// The notes are a REPORT, never an error: the tuple is still `Some` and the
+/// definition is still discovered (issue #101 / #78 — the next dialect miss
+/// must not be another silent no-op, and discovery must stay total).
+#[allow(clippy::type_complexity)] // the wide tuple IS the spec's signature
 fn parse_agent_file(
     content: &str,
     fallback_name: &str,
@@ -277,8 +317,12 @@ fn parse_agent_file(
     Option<String>,
     Option<String>,
     Option<Vec<String>>,
+    Option<crate::agent::definition_permission::PermissionBlock>,
+    Vec<crate::agent::definition_permission::FrontmatterNote>,
     String,
 )> {
+    use crate::agent::definition_permission::{parse_permission_block, FrontmatterNote};
+
     // 1. Normalize `\r\n` and lone `\r` to `\n`.
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let lines: Vec<&str> = normalized.split('\n').collect();
@@ -287,7 +331,8 @@ fn parse_agent_file(
     //    is exactly `---`, then lines until a line that is exactly
     //    `---`. If line 1 is not `---`: no frontmatter → name =
     //    fallback (the stem), description = "", all Option fields =
-    //    None, body = the whole content (trimmed).
+    //    None, body = the whole content (trimmed). NO notes either — a file
+    //    with no frontmatter says nothing for the reader to misunderstand.
     if lines.first() != Some(&"---") {
         return Some((
             fallback_name.to_string(),
@@ -295,6 +340,8 @@ fn parse_agent_file(
             None,
             None,
             None,
+            None,
+            Vec::new(),
             normalized.trim().to_string(),
         ));
     }
@@ -306,17 +353,45 @@ fn parse_agent_file(
     let body = lines[fm_end + 1..].join("\n").trim().to_string();
 
     // 3. Top-level (non-indented) keys only, first occurrence of each
-    //    wins (indented lines belong to the previous key's block value;
-    //    any other top-level key is ignored).
+    //    wins (indented lines belong to the previous key's block value).
+    //
+    //    SIX keys are read. Every OTHER non-indented `key: value` line is
+    //    ANNOUNCED as `FrontmatterNote::UnknownKey` — opencode's markdown
+    //    agents carry `mode:`, `temperature:` and friends that this desktop
+    //    does not read, and #78's principle says a key the reader ignores is
+    //    a key the user believes took effect. An indented line is a block's
+    //    body and never a top-level key, so it is never announced here.
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut model: Option<String> = None;
     let mut thinking: Option<String> = None;
     let mut tools: Option<String> = None;
+    let mut permission: Option<crate::agent::definition_permission::PermissionBlock> = None;
+    let mut notes: Vec<FrontmatterNote> = Vec::new();
+    // One `UnknownKey("permission")` per FILE, even if the key repeats: the
+    // note reports "this file said something unreadable", and N unreadable
+    // spellings of one key in one file are one announcement (D3's
+    // first-occurrence-wins rule for notes).
+    let mut permission_announced = false;
     let mut i = 0;
     while i < fm.len() {
         let line = fm[i];
         if !line.starts_with(' ') && !line.starts_with('\t') {
+            // The line's key (None for a line that is not a `key: value` pair
+            // at all — a stray comment, a list item). A key that IS one of the
+            // six is never announced, EVEN WHEN it repeats: the repeat is a
+            // first-wins drop of a key the reader definitely knows, and
+            // announcing it as "unknown" would be a lie about the reader.
+            let key = top_level_key(line);
+            let known = matches!(
+                key,
+                Some("name")
+                    | Some("description")
+                    | Some("model")
+                    | Some("thinking")
+                    | Some("tools")
+                    | Some("permission")
+            );
             if name.is_none() {
                 if let Some(rest) = line.strip_prefix("name:") {
                     name = parse_value(fm, i, rest);
@@ -340,6 +415,37 @@ fn parse_agent_file(
             if tools.is_none() {
                 if let Some(rest) = line.strip_prefix("tools:") {
                     tools = parse_value(fm, i, rest);
+                }
+            }
+            // The NESTED arm. `parse_value` cannot carry this: it returns
+            // `None` for an empty inline value, and a `permission:` block's
+            // inline IS empty — its value lives entirely in the indented
+            // lines below, which the scalar path never visits. So the block
+            // gets its own reader (and its own parity statement — opencode's
+            // markdown-agent `permission:` block, NOT a pi format).
+            //
+            // The READER owns every note about the block, including
+            // `UnknownKey("permission")` for a `permission:` that yielded
+            // nothing readable at all — so this arm EXTENDS and never adds a
+            // note of its own, which would double-report the same event.
+            if permission.is_none() {
+                if let Some(rest) = line.strip_prefix("permission:") {
+                    let (block, block_notes) = parse_permission_block(fm, i, rest);
+                    // A REPEAT of an unreadable `permission:` adds nothing: the
+                    // note is per file (D3's one-note-per-file rule).
+                    let repeat_of_unreadable = block.is_none() && permission_announced;
+                    if block.is_none() {
+                        permission_announced = true;
+                    }
+                    if !repeat_of_unreadable {
+                        notes.extend(block_notes);
+                        permission = block;
+                    }
+                }
+            }
+            if !known {
+                if let Some(key) = key {
+                    notes.push(FrontmatterNote::UnknownKey(key.to_string()));
                 }
             }
         }
@@ -392,7 +498,42 @@ fn parse_agent_file(
     let tools = tools.as_deref().and_then(parse_tools);
 
     // 5. `body` = the content after the closing `---` (trimmed).
-    Some((name, description, model, thinking, tools, body))
+    Some((
+        name,
+        description,
+        model,
+        thinking,
+        tools,
+        permission,
+        notes,
+        body,
+    ))
+}
+
+/// The KEY of a top-level frontmatter line, or `None` when the line is not a
+/// `key: value` pair at all.
+///
+/// Deliberately stricter than `parse_value`'s separator rule and deliberately
+/// NOT a second reader: it only decides *which key a line names*, so the
+/// unknown-key announce can name it verbatim. A key must be a bare identifier
+/// (`[\w-]+`, the same character class the `frontmatter.ts` reader this copy
+/// mirrors uses in its `/^([\w-]+):\s*(.*)$/` regex), so a quoted token, a
+/// list item (`- deny`) or a comment line is not a key and gets no note here —
+/// a block's own reader announces its own unreadable rows.
+fn top_level_key(line: &str) -> Option<&str> {
+    let colon = line.find(':')?;
+    let key = &line[..colon];
+    if key.is_empty() {
+        return None;
+    }
+    if key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Some(key)
+    } else {
+        None
+    }
 }
 
 /// Normalize a parsed `tools` value to a list (or `None`): `trim()`; if
@@ -1132,5 +1273,394 @@ mod tests {
             canon(&loser).as_path(),
             "the loser's path must be canonical (compare via `canon`): {out:?}"
         );
+    }
+
+    // ---- The `permission:` frontmatter block (issue #101, part a) ----------
+    //
+    // Parse + type + ANNOUNCE only: these pin what discovery READS and what it
+    // REPORTS. Nothing here enforces anything — carrying the block to the gate
+    // and the launch resolver is the follow-up task's scope, so no assertion
+    // below reaches for a `LaunchConfig`, a DTO or a verdict.
+
+    use crate::agent::definition_permission::{
+        Action, FrontmatterNote, PermissionBlock, Rule, Rules, ToolKey, UnsupportedReason,
+    };
+
+    /// A file whose frontmatter carries ONLY a `permission:` block (the given
+    /// indented block lines) plus a one-line body.
+    fn permission_file(name: &str, block: &str) -> String {
+        format!("---\nname: {name}\npermission:\n{block}---\nBody.\n")
+    }
+
+    /// Discover one file over an owned scratch root.
+    fn discover_one(file_name: &str, content: &str) -> AgentDefinition {
+        let root = scratch();
+        write_file(&root.join(file_name), content);
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
+        assert_eq!(out.len(), 1, "the file must still be discovered: {out:?}");
+        out.into_iter().next().unwrap()
+    }
+
+    /// T7 — the blank-line SKIP rule. `parse_value`'s block branch BREAKS on an
+    /// empty line (a blank matches neither the indent branch nor the break
+    /// branch, so the loop just stops); copying that here would truncate a
+    /// legal, readable permission block MID-RULESET. A blank line inside the
+    /// block is therefore skipped, never a terminator.
+    #[test]
+    fn a_permission_block_with_a_blank_line_between_tool_groups_parses_in_full() {
+        let d = discover_one(
+            "blank.md",
+            &permission_file(
+                "blank",
+                "  edit: {\"*\": deny, \"*.md\": allow}\n\n   \n  bash: deny\n",
+            ),
+        );
+        let block = d
+            .permission
+            .clone()
+            .expect("the block parses — a blank line is not a terminator");
+        let keys: Vec<&ToolKey> = block.tools.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec![&ToolKey::Edit, &ToolKey::Bash],
+            "BOTH tool groups survive the blank line between them: {block:?}"
+        );
+        assert_eq!(block.tools[0].1.patterns.len(), 2, "and in full");
+        assert!(d.frontmatter_notes.is_empty(), "{:?}", d.frontmatter_notes);
+    }
+
+    /// T7b — the comment-line SKIP rule at the DISCOVERY layer, with the fixture
+    /// shaped like the real file #101's Evidence section names
+    /// (`~/.agents/agents/researcher.md`): comments between the tool groups, one
+    /// comment containing a colon, comments between pattern rows, an `edit:`
+    /// nested map, `task: deny` and a `bash:` pattern object.
+    ///
+    /// Without the comment rule the reader turns prose into rules: the colon
+    /// comment becomes `UnrecognizedToolKey("# Known gap")` IN the block, and
+    /// every colon-free comment becomes an `UnknownKey` carrying the whole
+    /// sentence — so the file that motivated the issue would still not parse,
+    /// and its announcements would be noise. The ONLY notes this file may
+    /// produce are the two its content earns.
+    #[test]
+    fn a_permission_block_with_comments_reports_only_real_tools_and_real_notes() {
+        let d = discover_one(
+            "researcher.md",
+            "---\nname: researcher\npermission:\n  \
+             # Markdown only. In opencode `edit` gates write / edit / patch, patterns match the\n  \
+             # worktree-relative path, and the LAST matching rule wins — so the catch-all goes first.\n  \
+             edit:\n    \"*\": deny\n    \"*.md\": allow\n  \
+             task: deny\n  \
+             # bash is a write hole (`echo x > src/app.ts`, `sed -i`, `tee`). Deny the mutating\n  \
+             # Known gap: a file redirect that also carries an fd suffix (`cat x > f.ts 2>/dev/null`)\n  \
+             # re-matches an allow rule. The prompt contract below is the backstop for that.\n  \
+             bash:\n    # The catch-all first, so the specifics win by order.\n    \
+             \"*\": allow\n    \"rm *\": deny\n---\nBody.\n",
+        );
+        assert_eq!(d.name, "researcher", "the file is still discovered");
+        assert_eq!(d.system_prompt, "Body.", "and the body is still the body");
+        let block = d
+            .permission
+            .clone()
+            .expect("the researcher-shaped block parses in full");
+        let keys: Vec<&ToolKey> = block.tools.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                &ToolKey::Edit,
+                &ToolKey::Unrecognized("task".to_string()),
+                &ToolKey::Bash,
+            ],
+            "ONLY the real tool keys — no `# …` entry masquerading as a tool: {keys:?}"
+        );
+        assert_eq!(
+            block.tools[0].1.patterns,
+            vec![
+                Rule {
+                    pattern: "*".to_string(),
+                    action: Action::Deny
+                },
+                Rule {
+                    pattern: "*.md".to_string(),
+                    action: Action::Allow
+                },
+            ],
+            "the nested `edit:` map survived the comments around it"
+        );
+        assert_eq!(
+            block.tools[2].1.patterns,
+            vec![
+                Rule {
+                    pattern: "*".to_string(),
+                    action: Action::Allow
+                },
+                Rule {
+                    pattern: "rm *".to_string(),
+                    action: Action::Deny
+                },
+            ],
+            "the comment BETWEEN pattern rows is skipped, not a terminator"
+        );
+        assert_eq!(
+            d.frontmatter_notes,
+            vec![
+                FrontmatterNote::UnrecognizedToolKey("task".to_string()),
+                FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::BashPatternRules),
+            ],
+            "no comment-derived note — the announce channel stays credible"
+        );
+    }
+
+    /// T8 — the whole 8-field parse: a real opencode-shaped block (an inline
+    /// pattern map + a whole-tool verdict + a NESTED pattern map) lands on the
+    /// typed, ordered ruleset, with nothing announced.
+    #[test]
+    fn a_permission_block_is_parsed_into_the_typed_ruleset() {
+        let d = discover_one(
+            "permission.md",
+            "---\nname: perm\ndescription: Speaks permissions.\npermission:\n  \
+             edit: {\"*\": deny, \"*.md\": allow}\n  bash: deny\n  \
+             read:\n    \"*\": ask\n    \"secrets/**\": deny\n---\nBody.\n",
+        );
+        assert_eq!(d.name, "perm");
+        assert_eq!(d.description, "Speaks permissions.");
+        assert_eq!(d.system_prompt, "Body.", "the body is still the body");
+        let block: &PermissionBlock = d.permission.as_ref().expect("a real value, not a no-op");
+        assert_eq!(
+            block.tools,
+            vec![
+                (
+                    ToolKey::Edit,
+                    Rules::per_tool(vec![
+                        Rule {
+                            pattern: "*".to_string(),
+                            action: Action::Deny
+                        },
+                        Rule {
+                            pattern: "*.md".to_string(),
+                            action: Action::Allow
+                        },
+                    ])
+                ),
+                (ToolKey::Bash, Rules::whole_tool(Action::Deny)),
+                (
+                    ToolKey::Read,
+                    Rules::per_tool(vec![
+                        Rule {
+                            pattern: "*".to_string(),
+                            action: Action::Ask
+                        },
+                        Rule {
+                            pattern: "secrets/**".to_string(),
+                            action: Action::Deny
+                        },
+                    ])
+                ),
+            ],
+            "three tools, FILE ORDER, both the inline-map and the nested spelling \
+             read — and the explicit `\"*\"` row stays per-pattern, not tool-wide"
+        );
+        assert!(
+            d.frontmatter_notes.is_empty(),
+            "a `permission:` key is NOT an unknown key: {:?}",
+            d.frontmatter_notes
+        );
+    }
+
+    /// T9 — the "confident no-op" regression, plus first-occurrence-wins for a
+    /// REPEATED `permission:` key (the note is per file, so a repeat adds none).
+    #[test]
+    fn a_permission_block_reads_as_a_real_value_not_a_noop() {
+        let d = discover_one(
+            "twice.md",
+            "---\nname: twice\npermission:\n  edit: deny\npermission:\n  read: deny\n---\nB.\n",
+        );
+        let block = d.permission.expect("the first block is a real value");
+        assert_eq!(
+            block.tools,
+            vec![(ToolKey::Edit, Rules::whole_tool(Action::Deny))],
+            "FIRST occurrence wins — the second block does not merge, append, \
+             or replace: {block:?}"
+        );
+        assert!(
+            d.frontmatter_notes.is_empty(),
+            "a KNOWN key repeating is not an unknown key, and a readable block \
+             announces nothing: {:?}",
+            d.frontmatter_notes
+        );
+    }
+
+    /// T10 — the scope line, in both directions: a bash OBJECT with ≥1 pattern
+    /// row MUST parse (so the follow-up task can still see it) and announces
+    /// itself unsupported; a whole-tool `bash: deny` needs no matcher and so is
+    /// SUPPORTED and carries no note. A naive `*>*` deny would block
+    /// `grep x file 2>/dev/null`, because the command text includes its
+    /// redirect — that is why the object is announced and not enforced.
+    #[test]
+    fn a_permission_announces_unsupported_bash_pattern_rules_but_parses() {
+        let d = discover_one(
+            "bashobj.md",
+            &permission_file("bashobj", "  bash: {\"*\": deny, \"grep *\": allow}\n"),
+        );
+        let block = d
+            .permission
+            .expect("a bash pattern block MUST parse — announce, never drop");
+        assert_eq!(
+            block.tools[0].0,
+            ToolKey::Bash,
+            "and it is still typed as `bash`"
+        );
+        assert!(
+            !block.tools[0].1.whole_tool,
+            "an object is per-pattern, never tool-wide"
+        );
+        assert_eq!(
+            block.tools[0].1.patterns,
+            vec![
+                Rule {
+                    pattern: "*".to_string(),
+                    action: Action::Deny
+                },
+                Rule {
+                    pattern: "grep *".to_string(),
+                    action: Action::Allow
+                },
+            ],
+            "the rows are TYPED and left for the follow-up task's matcher"
+        );
+        assert_eq!(
+            d.frontmatter_notes,
+            vec![FrontmatterNote::UnsupportedUnvalidatedMatcher(
+                UnsupportedReason::BashPatternRules
+            )],
+            "announced as unsupported — never enforced by a matcher nothing validated"
+        );
+
+        // The supported half: whole-tool `bash: deny`.
+        let supported = discover_one(
+            "bashdeny.md",
+            &permission_file("bashdeny", "  bash: deny\n"),
+        );
+        let block = supported.permission.expect("whole-tool bash deny parses");
+        assert!(
+            block.tools[0].1.is_deny(),
+            "and it IS the outright-deny shape: {block:?}"
+        );
+        assert!(
+            supported.frontmatter_notes.is_empty(),
+            "a whole-tool deny needs no pattern matcher, so it is SUPPORTED and \
+             announces nothing: {:?}",
+            supported.frontmatter_notes
+        );
+    }
+
+    /// T11 — #78's principle applied to FILES: a key the reader does not read
+    /// announces itself instead of being a silent no-op. Never an error — the
+    /// file is discovered and its other fields parse as usual.
+    #[test]
+    fn unknown_top_level_keys_are_announced_never_silently_dropped() {
+        let d = discover_one(
+            "opencode.md",
+            "---\nname: opencode\ndescription: An opencode-markdown agent.\nmode: subagent\ntemperature: 0.1\n---\nB.\n",
+        );
+        assert_eq!(d.name, "opencode", "the known keys still parse");
+        assert_eq!(d.description, "An opencode-markdown agent.");
+        assert_eq!(
+            d.frontmatter_notes,
+            vec![
+                FrontmatterNote::UnknownKey("mode".to_string()),
+                FrontmatterNote::UnknownKey("temperature".to_string()),
+            ],
+            "one note per unknown key, IN FILE ORDER"
+        );
+    }
+
+    /// T12 — tolerance: an unreadable `permission:` block never panics and
+    /// never funnels the file into the SKIP path the missing-closing-`---` case
+    /// uses. The definition is still discovered, `permission` is `None`, and the
+    /// file says what it could not read.
+    #[test]
+    fn malformed_permission_never_panics_the_discovery() {
+        // (a) an inline value where a nested map belongs.
+        let inline = discover_one(
+            "inline.md",
+            "---\nname: inline\npermission: deny\n---\nB.\n",
+        );
+        assert_eq!(inline.permission, None, "no readable block");
+        assert_eq!(
+            inline.frontmatter_notes,
+            vec![FrontmatterNote::UnknownKey("permission".to_string())],
+            "announced, not swallowed"
+        );
+
+        // (b) an indent-broken block: the rows are NOT indented, so they are
+        // not the block — and the file is still discovered.
+        let broken = discover_one(
+            "broken.md",
+            "---\nname: broken\npermission:\nedit: deny\n---\nB.\n",
+        );
+        assert_eq!(broken.permission, None);
+        assert_eq!(
+            broken.frontmatter_notes,
+            vec![
+                // The key spoke and yielded nothing readable…
+                FrontmatterNote::UnknownKey("permission".to_string()),
+                // …and the un-indented row is now a TOP-LEVEL key the reader
+                // does not read, so it announces itself too.
+                FrontmatterNote::UnknownKey("edit".to_string()),
+            ],
+            "{:?}",
+            broken.frontmatter_notes
+        );
+
+        // (c) an empty block (EOF right after the key).
+        let empty = discover_one("empty.md", "---\nname: empty\npermission:\n---\nB.\n");
+        assert_eq!(empty.permission, None);
+        assert_eq!(
+            empty.frontmatter_notes,
+            vec![FrontmatterNote::UnknownKey("permission".to_string())]
+        );
+
+        // (d) the contrast that makes (a)–(c) meaningful: a file whose
+        // FRONTMATTER is malformed is skipped (the pre-existing contract), so
+        // "malformed" and "unreadable block" are different outcomes.
+        let root = scratch();
+        write_file(
+            &root.join("nofence.md"),
+            "---\nname: nofence\npermission:\n  edit: deny\n",
+        );
+        assert!(
+            discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]).is_empty(),
+            "a missing closing `---` is still a skip — the block reader did not \
+             change the frontmatter contract"
+        );
+    }
+
+    /// T14 — notes are PER FILE: a noisy file never stains its neighbour's row,
+    /// and the ordering / dedupe pins of the suite still hold with the new
+    /// fields on the struct.
+    #[test]
+    fn a_notes_carrying_definition_is_discovered_without_affecting_adjoining_rows() {
+        let root = scratch();
+        write_file(
+            &root.join("noisy.md"),
+            "---\nname: noisy\nmode: subagent\n---\nB.\n",
+        );
+        write_file(&root.join("clean.md"), "---\nname: clean\n---\nB.\n");
+        let out = discover_in_roots(&[(root.to_path_buf(), AgentScope::User)]);
+        assert_eq!(out.len(), 2, "both rows survive: {out:?}");
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["clean", "noisy"], "still sorted by name");
+        let clean = out.iter().find(|d| d.name == "clean").unwrap();
+        let noisy = out.iter().find(|d| d.name == "noisy").unwrap();
+        assert!(
+            clean.frontmatter_notes.is_empty(),
+            "the clean row is clean: {:?}",
+            clean.frontmatter_notes
+        );
+        assert_eq!(
+            noisy.frontmatter_notes,
+            vec![FrontmatterNote::UnknownKey("mode".to_string())]
+        );
+        assert_eq!(clean.permission, None, "and no phantom block");
     }
 }

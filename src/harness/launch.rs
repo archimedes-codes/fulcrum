@@ -19,6 +19,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::agent::definition_permission::ToolKey;
 use crate::agent::harness::catalog::ModelCatalog;
 use crate::agent::harness::tool_specs;
 use crate::agent::harness::ModelRef;
@@ -58,6 +59,11 @@ pub(crate) struct ResolvedLaunch {
     pub thinking_source: OverrideSource,
     /// Which layer supplied `tools`; `Parent` when none did.
     pub tools_source: OverrideSource,
+    /// Which layer supplied `permission`; `Parent` when the definition does not
+    /// speak about permissions. There is NO settings.json permission layer
+    /// (ADR 0066's scope is the file), so this is `File` exactly when
+    /// `launch.permission.is_some()`.
+    pub permission_source: OverrideSource,
 }
 
 /// Which layer supplied a resolved field — the label space of the Agents modal
@@ -223,13 +229,17 @@ pub(crate) fn resolve_agent_launch(
         },
     };
     // ── tools ───────────────────────────────────────────────────────────
-    // An explicit `tools` param is NEVER filtered here (its semantics —
+    // An explicit `tools` param is NEVER FILTERED HERE (its semantics —
     // verbatim minus `subagent`/`list_agents`, `dispatch_native` — are
-    // unchanged, and it stays the ONLY layer that can hand a child zero tools).
+    // unchanged, and it stays the ONLY layer that can hand a child zero tools
+    // BY ITSELF; the deny drop below is the other thing that can empty a list).
     // The override and the frontmatter share BOTH rules (ADR 0067): unknown
     // names dropped, `subagent` / `list_agents` stripped so no layer grants a
     // child a delegation route, and a list that empties out treated as ABSENT —
-    // so no override can zero out a child by a typo or a stale name.
+    // so no override can zero out a child by a typo or a stale name. That
+    // emptied-means-ABSENT rule stays EXACTLY here (it guards accidental
+    // narrowing) and deliberately does NOT extend to the deny drop below, which
+    // empties by INTENT and therefore yields `Some(vec![])`.
     let specs = tool_specs();
     let narrow = |names: &[String]| {
         let known: Vec<String> = names
@@ -259,6 +269,82 @@ pub(crate) fn resolve_agent_launch(
             def.tools.as_ref().and_then(|t| narrow(t)),
         ),
     ]);
+    // (issue #101) A whole-tool `deny` in the file's `permission:` block drops
+    // the tool from the child's advertised set BEFORE the wire — the
+    // `subagent_flow` three-way rule re-advertises `launch.tools` VERBATIM, so
+    // the model is never offered a call the gate would deny. Only whole-tool
+    // denies act here (a `Rules::is_deny()` on the Ordered `Vec`); per-command
+    // pattern rows announce as unsupported and are NOT advertisement-changed.
+    //
+    // TWO HONEST LIMITS of this pre-wire filter, one of them closed by the rule
+    // below (the gate half, task05b, closes the other; neither is papered over):
+    //   * It acts only on a list the resolver PRODUCED. A whole-tool deny where
+    //     `tools:` is ABSENT (the `None` rung — "no allowlist, whatever the
+    //     parent offers") has no list to filter, so that leg is unhandled here.
+    //   * The filter also runs over a list that came from the explicit
+    //     `subagent` param. That is deliberate: a file may only ever make a
+    //     child MORE restricted, so dropping a denied name from the explicit
+    //     list narrows rather than grants — and when it empties that list the
+    //     result is ZERO tools, the honest reading of "you may only use bash"
+    //     plus "bash is denied" (= nothing). Zero tools is still NARROWER than
+    //     the parent's set, so narrowing-only holds.
+    //
+    // A list the deny empties yields `Some(vec![])` — ZERO tools — and NOT
+    // `None`. This is deliberately NOT `narrow`'s ADR 0067 emptied-means-ABSENT
+    // rule, and the distinction matters: ADR 0067 exists to stop a TYPO or a
+    // STALE NAME in an allowlist from accidentally zeroing a child, i.e. it
+    // guards against UNINTENDED narrowing. Here the emptiness is produced by a
+    // DELIBERATE `deny`, so that rationale does not apply — and falling back to
+    // ABSENT is strictly worse than what ADR 0067 guards against, because
+    // `None` is not "no tools": `subagent_flow.rs`'s three-way rule reads it as
+    // "the parent's list minus the guard". So the old `None` fallback made the
+    // MOST restrictive possible file (every advertised tool denied) the LEAST
+    // restrictive outcome — adding a deny GAVE THE CHILD MORE TOOLS than the
+    // same file without the deny, the exact inverse of issue #101's invariant
+    // ("a definition can make its own agent stricter … it can never grant past
+    // it") and of its acceptance item "drop the tool from the child's
+    // `enabled_tools` … so the model is never offered a call it can't make".
+    // The empty set is what the downstream actually means by "no tools":
+    //   * `subagent_flow.rs`'s `Some(tools)` arm filters `subagent` /
+    //     `list_agents` and passes the rest VERBATIM, and its comment says so —
+    //     "a non-empty set that empties out yields NO tools — NOT re-expanded";
+    //   * `worker/core.rs` applies `enabled_tools` VERBATIM — "a legitimately-
+    //     empty child tool set must NOT re-expand into all tools — the recursion
+    //     guard";
+    //   * the `[]` = ALL expansion lives in the `None` arm and reads
+    //     `wire.parent_enabled_tools` — a DIFFERENT input (the inherited-parent
+    //     list), never this launch field.
+    let tools = tools.map(|mut names| {
+        if let Some(block) = def.permission.as_ref() {
+            for (key, rules) in &block.tools {
+                if rules.is_deny() {
+                    if let Some(name) = tool_key_name(key) {
+                        names.retain(|n| n != name);
+                    }
+                }
+            }
+        }
+        // `Some` in, `Some` out — an emptied list stays `Some(vec![])` (see
+        // above). A `deny` may never convert a list into ABSENT.
+        names
+    });
+    // ── permission ────────────────────────────────────────────────────────
+    // A file-declared ruleset (issue #101). NO rung ladder: there is no
+    // settings.json `permission` key (the issue's scope is "what a file
+    // declares"), and the explicit `subagent` call has no permission param —
+    // so the layer is EXACTLY `File` when the file speaks and `Parent`
+    // otherwise, reusing the existing three `OverrideSource` variants. Never
+    // a `first_speaking` candidate: no `OverrideSource::Permission` variant
+    // exists, and `the_source_label_space_is_exactly_three_layers_and_never_space`
+    // pins the three-variant enum by a compile-error-exhaustive match.
+    let (permission, permission_source) = match def.permission.clone() {
+        // BOXED on the way onto the launch (see `LaunchConfig::permission`):
+        // the box keeps the wire enums that embed `LaunchConfig` under clippy's
+        // `large_enum_variant` threshold. Serde-transparent, so the JSON is the
+        // unboxed block the plan specifies.
+        Some(block) => (Some(Box::new(block)), OverrideSource::File),
+        None => (None, OverrideSource::Parent),
+    };
     // An EMPTY frontmatter body means "no system prompt" (the `or_else` must not
     // turn it into `Some("")` — `dispatch_native` would prepend an empty
     // message). The system-prompt layering is unchanged by ADR 0066 (an
@@ -274,10 +360,33 @@ pub(crate) fn resolve_agent_launch(
             thinking,
             frontmatter_thinking: def.thinking.clone(),
             tools,
+            permission,
         },
         model_source,
         thinking_source,
         tools_source,
+        permission_source,
+    }
+}
+
+/// The advertised `tool_specs()` NAME of a recognised `ToolKey`, `None` for
+/// an unrecognised one (they stay parsed + announced; their enforcement has no
+/// advertised twin). The name class is the `tool_specs()` set; a key NOT in it
+/// has no advertised name to drop.
+fn tool_key_name(key: &ToolKey) -> Option<&'static str> {
+    match key {
+        ToolKey::Bash => Some("bash"),
+        ToolKey::Read => Some("read"),
+        ToolKey::Write => Some("write"),
+        ToolKey::Edit => Some("edit"),
+        ToolKey::Find => Some("find"),
+        ToolKey::Grep => Some("grep"),
+        ToolKey::Ls => Some("ls"),
+        ToolKey::ReadSkill => Some("read_skill"),
+        ToolKey::Ask => Some("ask"),
+        ToolKey::WebSearch => Some("web_search"),
+        ToolKey::FetchContent => Some("fetch_content"),
+        ToolKey::Unrecognized(_) => None,
     }
 }
 
@@ -1636,6 +1745,8 @@ mod tests {
             model: model.map(str::to_string),
             thinking: thinking.map(str::to_string),
             tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+            permission: None,
+            frontmatter_notes: Vec::new(),
             system_prompt: "You are a scout.".to_string(),
             scope: crate::agents::AgentScope::Space,
             path: "/tmp/scout.md".to_string(),
@@ -1734,6 +1845,218 @@ mod tests {
         assert_eq!(r.model_source, OverrideSource::Parent);
         assert_eq!(r.thinking_source, OverrideSource::Parent);
         assert_eq!(r.tools_source, OverrideSource::Parent);
+    }
+
+    /// (issue #101, task05a) A whole-tool `deny` in the file's `permission:`
+    /// block is CARRIED verbatim into `launch.permission` (this half carries and
+    /// reports; the gate consumption is task05b's), and it DROPS the denied tool
+    /// from the resolver-narrowed `launch.tools` — the one live effect this half
+    /// ships, because `subagent_flow.rs` re-advertises `launch.tools` VERBATIM,
+    /// so a dropped name is never offered to the child. `permission_source`
+    /// reports `File` exactly because the file spoke.
+    #[test]
+    fn a_whole_tool_deny_drops_the_tool_from_the_resolved_launch() {
+        use crate::agent::definition_permission::{Action, PermissionBlock, Rules, ToolKey};
+        let catalog = ModelCatalog {
+            models: vec![fake_model("m1")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let block = PermissionBlock {
+            tools: vec![(ToolKey::Bash, Rules::whole_tool(Action::Deny))],
+        };
+        let mut def = def_with(None, None, Some(&["bash", "read"]));
+        def.permission = Some(block.clone());
+        let r = resolve_agent_launch(
+            &LaunchConfig::default(),
+            &def,
+            &OverrideLayer { global: None },
+            &catalog,
+        );
+        assert_eq!(
+            r.launch.tools,
+            Some(vec!["read".to_string()]),
+            "the whole-tool deny drops `bash` from the advertised set"
+        );
+        assert_eq!(
+            r.tools_source,
+            OverrideSource::File,
+            "the surviving list is still the FILE's rung"
+        );
+        assert_eq!(
+            r.launch.permission.as_deref(),
+            Some(&block),
+            "the block is carried VERBATIM (report, not verdict)"
+        );
+        assert_eq!(
+            r.permission_source,
+            OverrideSource::File,
+            "the file spoke about permissions"
+        );
+    }
+
+    /// (issue #101, task05a) A file that does NOT speak about permissions carries
+    /// `None` and reports `Parent` — and its tool list is untouched by the drop.
+    #[test]
+    fn a_definition_without_permission_carries_none_and_reports_parent() {
+        let catalog = ModelCatalog {
+            models: vec![fake_model("m1")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let def = def_with(None, None, Some(&["bash", "read"]));
+        let r = resolve_agent_launch(
+            &LaunchConfig::default(),
+            &def,
+            &OverrideLayer { global: None },
+            &catalog,
+        );
+        assert_eq!(r.launch.permission, None);
+        assert_eq!(r.permission_source, OverrideSource::Parent);
+        assert_eq!(
+            r.launch.tools,
+            Some(vec!["bash".to_string(), "read".to_string()]),
+            "no block, no drop"
+        );
+    }
+
+    /// (issue #101, task05a, the honest limit) Only a WHOLE-TOOL deny acts on the
+    /// advertised set: a per-pattern ruleset (which announces itself unsupported)
+    /// changes NOTHING here — no matcher exists to justify dropping a name.
+    #[test]
+    fn per_pattern_permission_rules_never_change_the_advertised_tools() {
+        use crate::agent::definition_permission::{Action, PermissionBlock, Rule, Rules, ToolKey};
+        let catalog = ModelCatalog {
+            models: vec![fake_model("m1")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let mut def = def_with(None, None, Some(&["bash", "read"]));
+        def.permission = Some(PermissionBlock {
+            tools: vec![(
+                ToolKey::Bash,
+                Rules::per_tool(vec![Rule {
+                    pattern: "rm *".to_string(),
+                    action: Action::Deny,
+                }]),
+            )],
+        });
+        let r = resolve_agent_launch(
+            &LaunchConfig::default(),
+            &def,
+            &OverrideLayer { global: None },
+            &catalog,
+        );
+        assert_eq!(
+            r.launch.tools,
+            Some(vec!["bash".to_string(), "read".to_string()]),
+            "a per-pattern deny is NOT an advertisement filter"
+        );
+    }
+
+    /// (issue #101, the narrowing invariant) A deny that removes the LAST
+    /// advertised name yields `Some(vec![])` = ZERO tools — NEVER `None`.
+    ///
+    /// This test used to pin the OPPOSITE (`None`), and that pin was the bug:
+    /// `subagent_flow.rs`'s three-way rule reads `None` as "the parent's list
+    /// minus the guard", so a definition whose `permission:` denied its OWN
+    /// entire `tools:` list handed the child the PARENT'S FULL SET — i.e. adding
+    /// a deny strictly WIDENED the child's tools, the exact inverse of issue
+    /// #101's invariant ("a definition can make its own agent stricter … it can
+    /// never grant past it") and of the acceptance item "drop the tool from the
+    /// child's `enabled_tools` … so the model is never offered a call it can't
+    /// make" — precisely in the case where the deny is most total.
+    ///
+    /// `Some(vec![])` is what the downstream actually means by "no tools" (see
+    /// the drop site's comment for the three-way rule's quotes), so the empty
+    /// set is the NARROWER and correct outcome on both rungs tested here: the
+    /// FILE's list, and the explicit `subagent({tools: […]})` param (where
+    /// "you may only use bash" + "bash is denied" = nothing, which is still
+    /// narrower than the parent's set and therefore respects narrowing-only).
+    #[test]
+    fn a_deny_that_empties_the_advertised_list_yields_zero_tools_not_the_parent_set() {
+        use crate::agent::definition_permission::{Action, PermissionBlock, Rules, ToolKey};
+        let catalog = ModelCatalog {
+            models: vec![fake_model("m1")],
+            default_model: None,
+            compaction: CompactionConfig::default(),
+        };
+        let mut def = def_with(None, None, Some(&["bash"]));
+        def.permission = Some(PermissionBlock {
+            tools: vec![(ToolKey::Bash, Rules::whole_tool(Action::Deny))],
+        });
+        let r = resolve_agent_launch(
+            &LaunchConfig::default(),
+            &def,
+            &OverrideLayer { global: None },
+            &catalog,
+        );
+        assert_eq!(
+            r.launch.tools,
+            Some(vec![]),
+            "a deny that empties the list is ZERO tools (`Some(vec![])`), NOT `None` — \
+             `None` means 'the parent's list minus the guard', so falling back to it \
+             would hand the child MORE tools than the same file without the deny"
+        );
+        assert_eq!(
+            r.launch.permission.as_deref(),
+            def.permission.as_ref(),
+            "the deny is still CARRIED for task05b's gate"
+        );
+        // The EXPLICIT-PARAM rung, handled honestly: `subagent({tools: ["bash"]})`
+        // + a file `bash: deny` = nothing left. Zero tools here is the correct
+        // consequence of the two statements, and it is NARROWER than the parent's
+        // set, so it respects narrowing-only (a file may restrict the explicit
+        // list, never widen it).
+        let explicit = LaunchConfig {
+            tools: Some(vec!["bash".to_string()]),
+            ..Default::default()
+        };
+        let r = resolve_agent_launch(&explicit, &def, &OverrideLayer { global: None }, &catalog);
+        assert_eq!(
+            r.launch.tools,
+            Some(vec![]),
+            "the explicit `tools: [\"bash\"]` param minus a `bash: deny` is ZERO tools, \
+             not a fall-through to the parent's set"
+        );
+    }
+
+    /// (issue #101, task05a) The `Box` on `LaunchConfig::permission` (a clippy
+    /// enum-size measure, documented at the field) is TRANSPARENT to serde: the
+    /// wire JSON is the B1-pinned block spelling, byte-for-byte what an unboxed
+    /// field would emit. This matters because the repo has NO wire-contract test
+    /// and task05b + the TS mirror read these spellings — a box that changed the
+    /// shape (e.g. a `#[serde(with)]` mishap) would silently hand them a
+    /// different document.
+    #[test]
+    fn the_boxed_permission_field_serializes_as_the_plain_block() {
+        use crate::agent::definition_permission::{Action, PermissionBlock, Rules, ToolKey};
+        let block = PermissionBlock {
+            tools: vec![(ToolKey::Edit, Rules::whole_tool(Action::Ask))],
+        };
+        let boxed = LaunchConfig {
+            permission: Some(Box::new(block.clone())),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&boxed).unwrap();
+        assert_eq!(
+            json["permission"],
+            serde_json::json!({
+                "tools": [["edit", { "patterns": [{ "pattern": "*", "action": "ask" }], "whole_tool": true }]]
+            }),
+            "the box is a Rust spelling, not a wire name: {json}"
+        );
+        // And it round-trips back through `Deserialize` (the wire is DECODED in
+        // production, so a box that only serialized one way would be a lie).
+        let text = serde_json::to_string(&boxed).unwrap();
+        let back: LaunchConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.permission.as_deref(), Some(&block));
+        // An ABSENT key decodes to `None` — the wire-additive promise (a frame
+        // written before this field exists still parses). `{}` is the whole
+        // promise: every `LaunchConfig` field is `Option`, so a frame missing
+        // `permission` entirely is a valid `None`.
+        let old: LaunchConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.permission, None, "an absent key is `None`");
     }
 
     /// (the second half of "only the OVERRIDE value may be written into

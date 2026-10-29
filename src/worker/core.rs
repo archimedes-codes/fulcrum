@@ -323,6 +323,13 @@ pub fn default_build_loop(
         // set — the in-process order: `set_enabled_tools` before
         // `build_main_prompt`).
         loop_.set_enabled_tools(env.enabled_tools.clone());
+        // (issue #101) The per-agent `permission:` ruleset the parent's launch
+        // carried (VERBATIM — no mapping, no re-resolution: `StartEnv.permission`
+        // IS the definition's declared block). THE line that makes the gate LIVE:
+        // without it the gate's strict-of-two consult sees `None` on every child
+        // and a file's `deny` / `ask` narrows nothing — the confident no-op #101
+        // exists to close. `None` here is the honest "the file is silent".
+        loop_.set_permission(env.permission.clone());
         if let Some(level) = &env.thinking {
             loop_.set_thinking_level(Some(level.clone()));
         }
@@ -763,6 +770,7 @@ mod tests {
             "/tmp".to_string(),
             true,
             system_prompt,
+            None,
         )
     }
 
@@ -822,6 +830,11 @@ mod tests {
             (StartMode::FreshChild, None) => {}
         }
         loop_.set_enabled_tools(env.enabled_tools.clone());
+        // (issue #101) The SAME line the production `build_loop` applies (the
+        // stub mirrors its init steps one-for-one, and this one is no exception):
+        // without it the stub-based tests would measure a loop that never saw the
+        // ruleset — the dormant-enforcement class this round exists to kill.
+        loop_.set_permission(env.permission.clone());
         if let Some(level) = &env.thinking {
             loop_.set_thinking_level(Some(level.clone()));
         }

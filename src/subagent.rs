@@ -58,6 +58,22 @@ pub struct LaunchConfig {
     pub frontmatter_thinking: Option<String>,
     /// Tool allowlist (named agents with `tools`); `None` → `--exclude-tools subagent`.
     pub tools: Option<Vec<String>>,
+    /// Frontmatter `permission` (issue #101's ruleset) as the definition
+    /// DECLARES it — a NARROWING layer only: the gate's strict-of-two merge
+    /// consumes it (task05b), so it can make a call MORE restricted than the
+    /// user's `filePolicy` would, never less. `None` → the file does not
+    /// speak about permissions (no narrowing). Crosses the wire inside
+    /// `SubagentDispatchWire.launch`; a config-less dispatch stays `None`.
+    ///
+    /// BOXED, and the box is load-bearing: an inline `Option<PermissionBlock>`
+    /// puts `LaunchConfig` at 144 bytes, which pushes the two wire enums that
+    /// carry it (`Outbound::SubagentDispatch` / `WorkerInboundEvent::
+    /// SubagentDispatch`, both in worker-owned files) over clippy's
+    /// `large_enum_variant` threshold — CI's `-D warnings` would fail on files
+    /// this task may not edit. `Box` is TRANSPARENT to serde, so the wire JSON
+    /// is byte-identical to the unboxed field the plan specifies; only Rust's
+    /// in-memory shape differs (task05b reads it through `Option::as_deref()`).
+    pub permission: Option<Box<crate::agent::definition_permission::PermissionBlock>>,
 }
 
 /// (issue #47) Whether a `subagent` call's `agentName` resolved against the
@@ -488,6 +504,9 @@ mod tests {
             enabled_tools,
             "/tmp/config".to_string(),
             true,
+            None,
+            // (issue #101) A parent/worker-side start (no definition involved) —
+            // `None` = no per-agent narrowing.
             None,
         )
     }

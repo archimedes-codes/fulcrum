@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use super::AgentLoop;
+use crate::agent::definition_permission::{Action, ToolKey};
 use crate::agent::fs_backend::{FsBackend, FsError};
 use crate::agent::harness::provider::ToolCall;
 use crate::agent::permission::{native_permission_gate, permission_title, PermissionOutcome};
@@ -44,6 +45,84 @@ pub(super) fn policed_direction(tool: &str) -> Option<PolicyDirection> {
         .iter()
         .find(|(name, _)| *name == tool)
         .map(|(_, dir)| *dir)
+}
+
+/// (issue #101) The per-agent verdict projected onto the gate's order — the
+/// definition's `Action` vocabulary (`Allow | Ask | Deny`, no `Confine`) plus the
+/// identity for "this file says nothing about this tool".
+///
+/// A separate type rather than a `Decision` on purpose: `Decision::Allow` MEANS
+/// "run it", which is not what a silent file means, and collapsing the two would
+/// let a caller mistake "no opinion" for a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DefinitionVerdict {
+    /// Strictest.
+    Deny,
+    Ask,
+    /// The identity of the merge (`Allow < everything`).
+    Allow,
+    /// The file does not speak about this tool (or cannot decide it) — the
+    /// merge's identity, NOT an `Allow`.
+    AsSelf,
+}
+
+/// (issue #101) STRICTEST-WINS over the total order **`Allow < Confine < Ask <
+/// Deny`** (grounding delta §5). `AsSelf` and `Allow` are both identities, so a
+/// definition can only ever NARROW the user's `filePolicy`, never widen it —
+/// ADR 0030's "trust suppresses prompts but never widens a deny" applied to
+/// definitions.
+///
+/// **`Confine` is NOT a midpoint of a `min` over the three per-agent actions.**
+/// It is a RUNNING sandbox (the Landlock `bash` the user asked for by choosing
+/// `shell: sandboxed`), so it ranks ABOVE `Allow` — a per-agent `Allow` cannot
+/// un-confine it — and BELOW `Ask`, so a per-agent `Ask` still tightens a
+/// confined run into a prompt. A merge written as a rank over `{Allow, Ask,
+/// Deny}` alone mis-orders `bash`: it would either let `allow` release the
+/// sandbox (a widening, the exact thing this layer forbids) or refuse to tighten
+/// a confined shell. The two arms below are that decision, spelled out.
+fn stricter_of_two(posture: Decision, definition: DefinitionVerdict) -> Decision {
+    match definition {
+        // The identities: no opinion, or an `Allow` that can beat nothing.
+        DefinitionVerdict::AsSelf | DefinitionVerdict::Allow => posture,
+        DefinitionVerdict::Ask => match posture {
+            // `Ask` outranks both the silent arms — including `Confine`, which
+            // RUNS (see the doc above).
+            Decision::Allow | Decision::Confine => Decision::Ask,
+            // `Ask` cannot loosen an `Ask`, and a `Deny` is already stricter.
+            Decision::Ask | Decision::Deny => posture,
+        },
+        // `Deny` is the top of the order: it beats every posture arm.
+        DefinitionVerdict::Deny => Decision::Deny,
+    }
+}
+
+/// (issue #101) The ONE place a call's tool name maps onto a per-agent
+/// [`ToolKey`]. The recognised keys are the advertised `tool_specs()` names —
+/// the same set `subagent_flow` / `core` filter — so a definition's `read:`
+/// speaks about the `read` tool and nothing else.
+///
+/// The per-agent map is PER TOOL KEY, so `read: deny` does not catch a `find`
+/// (`find` has its own key) even though both are judged in the Read direction at
+/// the gate; that keeps a file's statement as specific as the file wrote it.
+/// A `ToolKey::Unrecognized(name)` matches ITS OWN verbatim name only — it has
+/// no advertised twin to police, so the match is exact-or-nothing (and the
+/// verdict it carries then has no policed direction to reach, see
+/// [`AgentLoop::definition_verdict`]).
+fn tool_key_matches(key: &ToolKey, tool: &str) -> bool {
+    match key {
+        ToolKey::Bash => tool == "bash",
+        ToolKey::Read => tool == "read",
+        ToolKey::Write => tool == "write",
+        ToolKey::Edit => tool == "edit",
+        ToolKey::Find => tool == "find",
+        ToolKey::Grep => tool == "grep",
+        ToolKey::Ls => tool == "ls",
+        ToolKey::ReadSkill => tool == "read_skill",
+        ToolKey::Ask => tool == "ask",
+        ToolKey::WebSearch => tool == "web_search",
+        ToolKey::FetchContent => tool == "fetch_content",
+        ToolKey::Unrecognized(name) => name == tool,
+    }
 }
 
 /// (T03) The directory an `allow-directory` answer would allow: the RESOLVED
@@ -149,12 +228,59 @@ impl AgentLoop {
                 }
             }
         }
-        Some(decision_for(
-            policy,
-            beyond,
-            trusted,
-            dir == PolicyDirection::Shell,
+        Some(stricter_of_two(
+            decision_for(policy, beyond, trusted, dir == PolicyDirection::Shell),
+            // (issue #101) THE row-4 consultation. This is the ONLY place the
+            // per-agent layer enters the gate: the write branch above returned
+            // EARLY for rows 1–3 (a rule `Deny`, a rule `Allow`, the guard's
+            // `Ask`), so a definition's verdict can never see them and can
+            // therefore never bypass them. See [`stricter_of_two`] for the
+            // ordering and [`AgentLoop::definition_verdict`] for the projection.
+            self.definition_verdict(&tc.name),
         ))
+    }
+
+    /// (issue #101) The per-agent verdict for a tool name — `AsSelf` (no
+    /// narrowing) when the file does not speak about permissions at all, does
+    /// not mention this tool, or the ruleset is a per-pattern object this layer
+    /// cannot decide.
+    ///
+    /// NO PATH RESOLUTION HAPPENS HERE, and that is deliberate (grounding §9 /
+    /// ADR 0029's one-canonicalizer rule): the only verdict this layer produces
+    /// is a WHOLE-TOOL one (`Rules::catch_all_action()`), which folds onto the
+    /// direction's posture verdict — the "beyond the boundary?" question stays
+    /// the shared `FsBackend::validate` / `canonicalize_lenient` check the gate
+    /// and the executor already agree on, and the boundary ROOT SET (not
+    /// opencode's workspace-relative root) is what "relative to what" answers to.
+    /// Adding a second pattern resolver here would be the #92 / ADR 0081 escape
+    /// class, so there is none.
+    ///
+    /// A per-pattern ruleset (`whole_tool: false`, e.g. the motivating
+    /// `researcher.md`'s `bash:` object) is `AsSelf` by design: enforcing those
+    /// rows needs a command matcher nothing has validated (B1 parses them and
+    /// announces `UnsupportedUnvalidatedMatcher(BashPatternRules)`), so the
+    /// posture stands — announced-unsupported, never silently mis-enforced.
+    ///
+    /// FIRST matching tool key wins (B1's FIRST-WINS per key inside a block).
+    fn definition_verdict(&self, tool: &str) -> DefinitionVerdict {
+        let Some(block) = self.permission_block.as_ref() else {
+            return DefinitionVerdict::AsSelf;
+        };
+        let Some((_, rules)) = block
+            .tools
+            .iter()
+            .find(|(key, _)| tool_key_matches(key, tool))
+        else {
+            return DefinitionVerdict::AsSelf;
+        };
+        match rules.catch_all_action() {
+            Some(Action::Deny) => DefinitionVerdict::Deny,
+            Some(Action::Ask) => DefinitionVerdict::Ask,
+            Some(Action::Allow) => DefinitionVerdict::Allow,
+            // An explicit `{"*": action}` pattern ruleset has NO tool-wide
+            // verdict (`catch_all_action()` is `None` for it) — see above.
+            None => DefinitionVerdict::AsSelf,
+        }
     }
 
     /// Whether this loop's Space is trusted (ADR 0010). ONE place, because
@@ -332,6 +458,12 @@ impl AgentLoop {
     /// executor's own row-1 refusal for that case is
     /// `access::rule_deny_text`, and the executor is the layer the model
     /// reaches when the gate's wording is not the boundary's).
+    ///
+    /// (issue #101) WHICH layers can reach here grew; the WORDING did not, and
+    /// nothing here branches on the layer. A per-agent `Deny` arrives through the
+    /// SAME `Some(Decision::Deny)` arm in `turn.rs`, so a definition's refusal is
+    /// byte-identical to a user-rule or posture refusal and the model's recovery
+    /// cannot depend on which layer said no (ADR 0030). No new renderer exists.
     pub(super) fn deny_tool_result(&self, tc: &ToolCall) -> ToolResult {
         let dir = policed_direction(&tc.name);
         let text = match tc.arguments.get("path").and_then(|v| v.as_str()) {

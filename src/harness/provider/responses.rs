@@ -77,6 +77,9 @@ struct ResponsesStream {
     /// `response.incomplete` / `response.failed` / `error` — no synthetic
     /// `Done` at stream end).
     terminated: bool,
+    /// A combined `Usage` was emitted (exactly once — the first terminal
+    /// event to carry a `response.usage` with at least one token count).
+    usage_emitted: bool,
     /// The raw stream is exhausted (the stream ends after `pending`).
     exhausted: bool,
 }
@@ -90,6 +93,7 @@ impl ResponsesStream {
             event: None,
             tool_acc: BTreeMap::new(),
             terminated: false,
+            usage_emitted: false,
             exhausted: false,
         }
     }
@@ -272,13 +276,7 @@ impl ResponsesStream {
             Some("response.completed") => {
                 // The terminal event: the `usage` (when at least one side
                 // is present) PRECEDES the `Done`.
-                if let Some(usage) = self.response_usage(v) {
-                    // The cost rides the SAME terminal `response.usage`
-                    // object the counts came from — one more element on
-                    // this push, no new emission path.
-                    self.pending
-                        .push_back(ProviderEvent::Usage(usage, self.response_cost(v)));
-                }
+                self.emit_terminal_usage(v);
                 self.terminated = true;
                 if v.get("response")
                     .and_then(|r| r.get("status"))
@@ -290,13 +288,7 @@ impl ResponsesStream {
                 }
             }
             Some("response.incomplete") => {
-                if let Some(usage) = self.response_usage(v) {
-                    // The cost rides the SAME terminal `response.usage`
-                    // object the counts came from — one more element on
-                    // this push, no new emission path.
-                    self.pending
-                        .push_back(ProviderEvent::Usage(usage, self.response_cost(v)));
-                }
+                self.emit_terminal_usage(v);
                 self.terminated = true;
                 // `max_output_tokens` → `Length`; any other reason (or an
                 // absent one) → `Error`.
@@ -313,13 +305,7 @@ impl ResponsesStream {
                 self.pending.push_back(ProviderEvent::Done(finish));
             }
             Some("response.failed") => {
-                if let Some(usage) = self.response_usage(v) {
-                    // The cost rides the SAME terminal `response.usage`
-                    // object the counts came from — one more element on
-                    // this push, no new emission path.
-                    self.pending
-                        .push_back(ProviderEvent::Usage(usage, self.response_cost(v)));
-                }
+                self.emit_terminal_usage(v);
                 self.terminated = true;
                 self.pending
                     .push_back(ProviderEvent::Done(FinishReason::Error));
@@ -347,6 +333,39 @@ impl ResponsesStream {
         // PRECEDING `event:` line; the next `event:` line starts a new
         // event — the tags and the `data:` lines alternate on the wire).
         self.event = None;
+    }
+
+    /// Emit the terminal `Usage` ONCE — a doubled terminal event (a proxy
+    /// re-sending `response.completed`, or an `incomplete` followed by a
+    /// `completed`) must not push a second frame the roll-up would sum as
+    /// money that was not spent. The `usage_emitted` flag guards all THREE
+    /// terminal arms (`response.completed` / `response.incomplete` /
+    /// `response.failed`) — `terminated` does not: it is consulted only at
+    /// stream end, and it is set AFTER this push (the order is
+    /// coincidental, not protective). The counts gate is UNCHANGED:
+    /// `response_usage`'s `(None, None) => None` still drops a cost-only
+    /// `response.usage` (pinned by
+    /// `responses_sse_cost_with_no_token_counts_emits_no_usage_event`), so
+    /// this helper is NOT a second `Usage` producer.
+    ///
+    /// The early `return`s are safe here (unlike the openai parser, whose
+    /// guard WRAPS its inline push): this is a standalone fn whose entire
+    /// body is the emission, so returning skips nothing the caller must
+    /// still do — each terminal arm keeps its own `terminated = true` and
+    /// its `Done` logic after this call.
+    fn emit_terminal_usage(&mut self, v: &Value) {
+        if self.usage_emitted {
+            return;
+        }
+        let Some(usage) = self.response_usage(v) else {
+            return;
+        };
+        // The cost rides the SAME terminal `response.usage` object the
+        // counts came from — one more element on this push, no new
+        // emission path.
+        self.usage_emitted = true;
+        self.pending
+            .push_back(ProviderEvent::Usage(usage, self.response_cost(v)));
     }
 
     /// The `usage` of a terminal event's `response` object (the wire
@@ -714,6 +733,47 @@ mod tests {
         // Owned data so the stream is `'static` (independent of `chunks`).
         let data: Vec<Vec<u8>> = chunks.iter().map(|c| c.as_bytes().to_vec()).collect();
         responses_stream_bytes(&data)
+    }
+
+    /// Exactly-once `Usage` on the Responses wire (#108): `terminated`
+    /// does NOT protect the usage push — it is consulted only at stream
+    /// end to decide whether to synthesise a `Done`, and it is set AFTER
+    /// the push. A doubled `response.completed` (a proxy re-sending the
+    /// final event) therefore pushes TWO `Usage` frames today, and the
+    /// roll-up would read that as money that was not spent.
+    ///
+    /// The expected vector is `[Usage, Done(Stop), Done(Stop)]` — ONE
+    /// `Usage` (the thing #108 guards) but TWO `Done(Stop)` frames,
+    /// because the guard covers the `Usage` push ONLY. A doubled
+    /// terminal still yields a doubled `Done`: that is a pre-existing,
+    /// separate stop-reason concern, deliberately OUT of #108's scope,
+    /// and the vector documents that residue rather than hiding it.
+    #[tokio::test]
+    async fn sse_single_usage_chunk() {
+        let events = collect(responses_stream(&[
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
+                // The SECOND terminal's `Done` still arrives — the guard
+                // is about the cost frame, not the stop reason.
+                ProviderEvent::Done(FinishReason::Stop),
+                ProviderEvent::Done(FinishReason::Stop),
+            ],
+            "a doubled terminal emits ONE Usage (the doubled `Done` is the recorded residue) (got {events:?})"
+        );
     }
 
     #[tokio::test]

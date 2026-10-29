@@ -679,6 +679,14 @@ pub(crate) fn dispatch_subagent(
         parent_env.config_dir.clone(),
         false,
         system_prompt,
+        // (issue #101) The per-agent ruleset rides the child's start envelope
+        // VERBATIM — the child Worker's `core.rs` applies it to the loop's gate
+        // (`set_permission`), which is the hop that makes a definition's
+        // `permission:` block ENFORCE rather than decorate. `wire.launch.permission`
+        // is the definition's declared block, carried through task05a's
+        // `LaunchConfig` (`Option<Box<…>>` — `as_deref` on the way out of the box;
+        // `clone()` on the `Box` clones the block, which is what we want here).
+        wire.launch.permission.as_deref().cloned(),
     );
     // 6. The `subagent-session-started` UI lifecycle event (the
     // current driver's step 9 — the PARENT session's sink: the

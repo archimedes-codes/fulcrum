@@ -229,6 +229,170 @@ fn unknown_server_scope(manager: &McpManager, server: &str) -> Option<ToolResult
     )))
 }
 
+/// Whether `name` could be a prefixed spelling at all (it carries a `_`, which
+/// is also what an `mcp__<server>__<tool>` alias always carries).
+///
+/// This is the issue #68 boundary gate: a miss on a name that is NOT
+/// prefix-shaped keeps the old [`miss_result`] bytes (a SUCCESS when every
+/// in-scope server answered), and only a prefix-shaped name can take the
+/// issue #118 FAILED-miss path.
+fn is_prefix_shaped(name: &str) -> bool {
+    name.contains('_')
+}
+
+/// Decompose a prefixed spelling into `(server, raw_tool)` by matching the
+/// KNOWN server names — the longest known prefix wins, so a server named
+/// `github_enterprise` is never shadowed by a shorter `github` and a name is
+/// never split on its first `_`.
+///
+/// Accepts `<server>_<tool>` and, after stripping the `mcp__` marker,
+/// `mcp__<server>__<tool>` (whose halves join with `__`). `Some` only when the
+/// tool part is non-empty. It says nothing about whether that server SERVES the
+/// tool — the caller checks the pair against the collected tool set.
+fn resolve_prefixed<'a>(name: &'a str, known: &'a [String]) -> Option<(&'a str, &'a str)> {
+    // `mcp__<server>__<tool>` is the alias spelling: the marker goes first and
+    // the halves join with `__`, so after stripping the marker one extra `_`
+    // belongs to the separator rather than to the tool name.
+    let (rest, alias) = match name.strip_prefix("mcp__") {
+        Some(rest) => (rest, true),
+        None => (name, false),
+    };
+    let mut best: Option<(&'a str, &'a str)> = None;
+    for server in known {
+        // A known server name followed by the separator — and the LONGEST such
+        // server wins, so `github_enterprise` is never shadowed by `github`.
+        let Some(tail) = rest
+            .strip_prefix(server.as_str())
+            .and_then(|tail| tail.strip_prefix('_'))
+        else {
+            continue;
+        };
+        let tool = if alias {
+            tail.strip_prefix('_').unwrap_or(tail)
+        } else {
+            tail
+        };
+        if tool.is_empty() {
+            // `a_` names a server and NO tool — that is not a tool call.
+            continue;
+        }
+        if best.is_none_or(|(best, _)| server.len() > best.len()) {
+            best = Some((server.as_str(), tool));
+        }
+    }
+    best
+}
+
+/// The likely-correct prefixed spelling for a name whose prefix named no known
+/// server: the SERVED tool that is a `_`-suffix of `name` (the longest such
+/// tool wins) rejoined to the server that serves it — `atlassian_getJiraIssue`
+/// over a server `github` serving `getJiraIssue` → `Some("github_getJiraIssue")`.
+/// `None` when no served tool is a `_`-suffix, and for an empty prefix part
+/// (`_echo`) — there is nothing to say there.
+fn suggest_prefixed(name: &str, tools: &[(String, super::types::ToolInfo)]) -> Option<String> {
+    // The tool part of a prefixed spelling is a SUFFIX of the name, and the
+    // separator in front of it is a `_`. The longest served tool that fits wins
+    // (`get_jira_issue` beats `issue`); an equal-length tie breaks on the server
+    // name so the hint never depends on the manager's HashMap order.
+    let mut best: Option<(&str, &str)> = None;
+    for (server, tool) in tools {
+        let Some(at) = name.len().checked_sub(tool.name.len()) else {
+            continue;
+        };
+        // The tool sits at the END of the name with a `_` in front of it — and
+        // that `_` must not sit at position 0 (`_echo` names no server to blame).
+        if at == 0 || !name.ends_with(tool.name.as_str()) || name.as_bytes()[at - 1] != b'_' {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((best_server, best_tool)) => {
+                best_tool.len() < tool.name.len()
+                    || (best_tool.len() == tool.name.len() && server.as_str() < best_server)
+            }
+        };
+        if better {
+            best = Some((server.as_str(), tool.name.as_str()));
+        }
+    }
+    best.map(|(server, tool)| format!("{server}_{tool}"))
+}
+
+/// The issue #118 failed-miss shape, with issue #68 layered ON TOP rather than
+/// replaced: a prefix-shaped miss is ALWAYS a failure (even when every server
+/// answered — a wrong prefix is a wrong claim about which server owns the tool,
+/// not an honest "it isn't there"), and it still carries the `Skipped servers:`
+/// note when the scoped set was partial. The base message has no trailing
+/// period so [`skipped_note`] appends cleanly, and the note's bytes stay the
+/// ones the #68 test pins.
+fn prefixed_miss(message: String, skipped: &[(String, String)]) -> ToolResult {
+    fail(format!("{message}{}", skipped_note(skipped)))
+}
+
+/// The #118 miss wording for a prefix-shaped name that resolved to NOTHING —
+/// i.e. the prefix named no server the manager holds. With a served tool that
+/// is a `_`-suffix of the name it names the likely-correct spelling
+/// (`did you mean a_echo?`); without one it names the servers that DO exist,
+/// modeled on [`unknown_server_scope`]'s candidate list, because the failure is
+/// the same shape: the name the caller wrote is not in the set this session
+/// holds. No trailing period, so [`skipped_note`] appends cleanly.
+fn prefix_miss_message(
+    name: &str,
+    tools: &[(String, super::types::ToolInfo)],
+    known: &[String],
+) -> String {
+    // The PREFIX PART is what the caller wrote where a server name belongs: the
+    // text before the first `_` of the name (minus an `mcp__` marker). It is a
+    // display of the caller's own spelling, not a resolution — nothing matched.
+    let prefix = name
+        .strip_prefix("mcp__")
+        .unwrap_or(name)
+        .split('_')
+        .next()
+        .unwrap_or(name);
+    let servers = || {
+        if known.is_empty() {
+            "no MCP servers are configured".to_string()
+        } else {
+            format!("servers: {}", known.join(", "))
+        }
+    };
+    if prefix.is_empty() {
+        // `_echo` — the separator is there but NO server part was written, so
+        // there is no wrong server name to quote.
+        return format!(
+            "Tool not found: {name} — the prefixed form is 'server_tool' and this name has no \
+             server part ({})",
+            servers()
+        );
+    }
+    match suggest_prefixed(name, tools) {
+        Some(likely) => format!(
+            "Tool not found: {name} — no MCP server is named '{prefix}'; did you mean {likely}?"
+        ),
+        None => format!(
+            "Tool not found: {name} — no MCP server is named '{prefix}' ({})",
+            servers()
+        ),
+    }
+}
+
+/// The `describe` answer for one `(server, tool)` pair, shown under the name the
+/// CALLER wrote (`{name} ({server})` + description + the pretty `inputSchema`).
+/// Shared by the raw lookup and the prefixed lookup so both forms answer with the
+/// same bytes — only the name in the header differs, and it is the caller's own
+/// spelling either way (`echo (a)` for the raw name, `a_echo (a)` for the
+/// callable prefixed form they can paste straight back into `tool`).
+fn describe_block(name: &str, server: &str, tool: &super::types::ToolInfo) -> String {
+    let schema =
+        serde_json::to_string_pretty(&tool.input_schema).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "{name} ({server})\n{}\n\nSchema:\n{}",
+        tool.description.as_deref().unwrap_or(""),
+        schema
+    )
+}
+
 /// The `mcp` proxy tool (the param dispatch — the `@pi-archimedes/mcp`
 /// `buildProxyToolExecute` mirrored):
 /// - `status` (no `tool`/`search`/`describe`/`connect`/`server`, or
@@ -236,7 +400,7 @@ fn unknown_server_scope(manager: &McpManager, server: &str) -> Option<ToolResult
 /// - `connect` — eagerly connect a server (the outcome line).
 /// - `action: "auth"` + `server` — run the interactive OAuth flow.
 /// - `search` — matching tools, within the `server` scope when one is given
-///   (`[server] name — description`).
+///   (`[server] server_tool — description`, the callable form).
 /// - `describe` — a tool's full `inputSchema` (JSON), within the `server`
 ///   scope when one is given.
 /// - `server` (no `tool`) — that server's tools (name + description, one per
@@ -247,11 +411,27 @@ fn unknown_server_scope(manager: &McpManager, server: &str) -> Option<ToolResult
 ///   the `server` param is required (an error naming the candidates).
 /// - an unknown `action` — an error listing the valid ones.
 ///
+/// ISSUE #118 — THE PREFIXED NAME FORMS. `tool` and `describe` accept the
+/// callable spelling `search` prints, `<server>_<tool>`, and its
+/// `mcp__<server>__<tool>` alias. The prefix resolves against the server names
+/// the manager HOLDS by LONGEST prefix (never a split on the first `_`, so a
+/// server named `github_enterprise` is not shadowed by a `github`), it wins over
+/// a literal raw name that happens to look like it, and it names ONE server — so
+/// a prefixed call never hits the ambiguity rule. A resolved prefix dispatches
+/// the RAW tool name: the prefix is a spelling this proxy understands and never
+/// reaches the server. A `server` param forces the RAW reading (the name is
+/// passed through untouched), and a name carrying no `_` never enters the prefix
+/// tiers at all.
+///
 /// A `search` / `describe` / bare-`tool` miss while a server IN SCOPE was
 /// skipped (`NeedsAuth` / `Error` / a failed connect) is a FAILED result naming
 /// the skipped servers; a successful call is never downgraded by an unrelated
 /// dead server, and neither is a miss scoped by the `server` param to a server
 /// that answered (issue #68).
+///
+/// A miss on a PREFIX-shaped name is a FAILURE even when every server answered
+/// (issue #118), naming the likely-correct spelling — that rule is layered on
+/// top of the #68 rule above, which keeps its exact bytes for every raw name.
 ///
 /// A `server` param naming a server the manager does not HOLD FAILS (naming
 /// it + the servers it holds) on every scoped path — `search`, `describe`,
@@ -352,7 +532,12 @@ pub async fn mcp_tool(
             .iter()
             .filter(|(s, t)| {
                 in_scope(server.as_deref(), s)
-                    && (t.name.to_lowercase().contains(&q_lower)
+                    // The prefixed spelling matches too, so a model that copies
+                    // `a_echo` out of a listing can `search` it back (issue #118).
+                    // Purely ADDITIVE: the raw-name and description checks below
+                    // are untouched, so `echo` still finds `echo`.
+                    && (format!("{s}_{}", t.name).to_lowercase().contains(&q_lower)
+                        || t.name.to_lowercase().contains(&q_lower)
                         || t.description
                             .as_deref()
                             .unwrap_or("")
@@ -360,8 +545,12 @@ pub async fn mcp_tool(
                             .contains(&q_lower))
             })
             .map(|(s, t)| {
+                // The CALLABLE form: what this line prints is what `tool` /
+                // `describe` accept, so the model never has to invent a spelling
+                // (issue #118). The `[server]` tag and the description bytes are
+                // unchanged.
                 format!(
-                    "[{s}] {} — {}",
+                    "[{s}] {s}_{} — {}",
                     t.name,
                     t.description.as_deref().unwrap_or("(no description)")
                 )
@@ -383,6 +572,36 @@ pub async fn mcp_tool(
     // ── describe ──
     if let Some(name) = &describe {
         let all = collect_tools(manager, cancel).await;
+        let known = manager.server_names();
+        // ── the prefix tier (issue #118), UNscoped only ──
+        //
+        // The same precedence the call path uses: a prefix that names a KNOWN
+        // server commits to it (longest known prefix wins), and the schema shown
+        // is that server's raw tool's schema — the prefixed spelling is a name
+        // this proxy understands, so the header keeps showing it as the caller
+        // wrote it (`a_echo (a)`), which is the form they can paste straight back
+        // into `tool`. A prefix naming no known server falls through to the raw
+        // lookup below, and a raw miss for such a name becomes #118's failed
+        // miss. A `server` param forces the RAW reading, exactly as today.
+        if server.is_none() && is_prefix_shaped(name) {
+            if let Some((s, raw)) = resolve_prefixed(name, &known) {
+                let Some((_, t)) = all
+                    .tools
+                    .iter()
+                    .find(|(srv, ti)| srv == s && ti.name == raw)
+                else {
+                    let hint = suggest_prefixed(name, &all.tools)
+                        .map_or_else(String::new, |likely| format!("; did you mean {likely}?"));
+                    return prefixed_miss(
+                        format!(
+                            "Tool not found: {name} — server '{s}' does not serve '{raw}'{hint}"
+                        ),
+                        &scoped_skipped(&all.skipped, Some(s)),
+                    );
+                };
+                return ok(describe_block(name, s, t));
+            }
+        }
         // The `server` scope filters the LOOKUP, not just the failure wording:
         // a describe scoped to a server that does not serve the name is a MISS
         // scoped to that server, never another server's tool. (A describe of a
@@ -394,6 +613,18 @@ pub async fn mcp_tool(
             .iter()
             .find(|(s, ti)| ti.name == name.as_str() && in_scope(server.as_deref(), s.as_str()))
         else {
+            // A prefix-shaped name whose prefix names NO server this session
+            // holds is #118's failed miss: an error even with every server
+            // reachable, naming the likely-correct spelling — a wrong prefix is
+            // a wrong claim about where the tool lives, not an honest "isn't
+            // there". Only unscoped: with a `server` param the name is raw and
+            // the scoped #68 bytes below are the promised answer.
+            if server.is_none() && is_prefix_shaped(name) {
+                return prefixed_miss(
+                    prefix_miss_message(name, &all.tools, &known),
+                    &scoped_skipped(&all.skipped, server.as_deref()),
+                );
+            }
             // Nothing matched in scope AND the scoped set was partial → a
             // FAILED result naming the skipped servers (issue #68); a skip
             // OUTSIDE the named `server` does not bear on this call.
@@ -402,13 +633,7 @@ pub async fn mcp_tool(
                 &scoped_skipped(&all.skipped, server.as_deref()),
             );
         };
-        let schema =
-            serde_json::to_string_pretty(&t.input_schema).unwrap_or_else(|_| "{}".to_string());
-        return ok(format!(
-            "{name} ({s})\n{}\n\nSchema:\n{}",
-            t.description.as_deref().unwrap_or(""),
-            schema
-        ));
+        return ok(describe_block(name, s, t));
     }
 
     // ── list server (server param only, no tool) ──
@@ -419,8 +644,15 @@ pub async fn mcp_tool(
                     let lines: Vec<String> = tools
                         .iter()
                         .map(|t| {
+                            // The CALLABLE form, same as `search` (issue #118):
+                            // what this line prints is what `tool` / `describe`
+                            // accept, so a name copied out of here works
+                            // verbatim. This path is scoped to ONE known server,
+                            // so the `<server>_` prefix is unambiguous. The
+                            // description bytes and the fallbacks are unchanged.
                             format!(
-                                "{}: {}",
+                                "{}_{}: {}",
+                                name,
                                 t.name,
                                 t.description.as_deref().unwrap_or("(no description)")
                             )
@@ -446,32 +678,93 @@ pub async fn mcp_tool(
             Some(s) => (s.clone(), t.clone()),
             None => {
                 let all = collect_tools(manager, cancel).await;
-                let matches: Vec<String> = all
-                    .tools
-                    .iter()
-                    .filter(|(_, ti)| ti.name == t.as_str())
-                    .map(|(s, _)| s.clone())
-                    .collect();
-                if matches.is_empty() {
-                    // Nothing matched AND something was skipped → a FAILED
-                    // result naming the skipped servers (issue #68); with every
-                    // server reachable the wording is unchanged and stays a
-                    // success. This branch only runs UNscoped (a named `server`
-                    // resolves above without collecting), so the filter is a
-                    // no-op here — applied to keep the rule stated in one
-                    // shape: partiality is judged over the scoped set.
-                    return miss_result(
-                        format!("Tool not found: {t}"),
-                        &scoped_skipped(&all.skipped, server.as_deref()),
-                    );
-                }
-                if matches.len() == 1 {
-                    (matches[0].clone(), t.clone())
-                } else {
-                    return fail(format!(
-                        "Tool '{t}' is ambiguous (servers: {}); use the `server` param",
-                        matches.join(", ")
-                    ));
+                let known = manager.server_names();
+                // ── the prefix tier (issue #118) ──
+                //
+                // A name that CARRIES a separator may be the callable
+                // `<server>_<tool>` spelling `search` prints (or its
+                // `mcp__<server>__<tool>` alias). Resolving it against the
+                // KNOWN server names — longest prefix first, never a split on
+                // the first `_` — names ONE server by construction, so this
+                // path never reaches the ambiguity arm below: the tie rule
+                // counts the servers owning a RAW name, and a prefix has
+                // already picked its server.
+                //
+                // A resolved prefix WINS, and that includes the case where its
+                // server does not serve the tool: the call FAILS rather than
+                // quietly dispatching some OTHER server's tool that happens to
+                // be literally named `github_echo` (the decided precedence; the
+                // shadow it leaves is recorded in `docs/features/mcp-known-gaps.md`).
+                //
+                // What the tier yields is the pair `(server, RAW tool)`, and the
+                // RAW tool is what the dispatch below forwards — the prefix is a
+                // SPELLING this proxy understands, never a name a server is
+                // asked to run. A prefix that names NO known server does not
+                // commit: the name falls through to the raw tier, so a tool
+                // genuinely named `get_item` resolves exactly as it always did.
+                let prefixed = is_prefix_shaped(t).then(|| resolve_prefixed(t, &known));
+                match prefixed.flatten() {
+                    Some((s, raw)) => {
+                        if !all.tools.iter().any(|(srv, ti)| srv == s && ti.name == raw) {
+                            // The prefix named a server that does not serve this
+                            // tool: a FAILED miss — never the raw all-healthy
+                            // success — with the skip note scoped to the server
+                            // the prefix itself named.
+                            let hint = suggest_prefixed(t, &all.tools)
+                                .map_or_else(String::new, |likely| {
+                                    format!("; did you mean {likely}?")
+                                });
+                            return prefixed_miss(
+                                format!(
+                                    "Tool not found: {t} — server '{s}' does not serve '{raw}'{hint}"
+                                ),
+                                &scoped_skipped(&all.skipped, Some(s)),
+                            );
+                        }
+                        (s.to_string(), raw.to_string())
+                    }
+                    None => {
+                        let matches: Vec<String> = all
+                            .tools
+                            .iter()
+                            .filter(|(_, ti)| ti.name == t.as_str())
+                            .map(|(s, _)| s.clone())
+                            .collect();
+                        if matches.is_empty() {
+                            // A prefix-shaped name whose prefix names no server
+                            // this session holds: #118's FAILED miss, layered on
+                            // top of #68 rather than replacing it — a wrong
+                            // prefix is a wrong claim about where the tool
+                            // lives, so it is an error EVEN WHEN every server
+                            // answered, and it still names the skips (the call
+                            // was unscoped, so every skip is in scope).
+                            if is_prefix_shaped(t) {
+                                return prefixed_miss(
+                                    prefix_miss_message(t, &all.tools, &known),
+                                    &scoped_skipped(&all.skipped, server.as_deref()),
+                                );
+                            }
+                            // Nothing matched AND something was skipped → a FAILED
+                            // result naming the skipped servers (issue #68); with every
+                            // server reachable the wording is unchanged and stays a
+                            // success. This branch only runs UNscoped (a named `server`
+                            // resolves above without collecting), so the filter is a
+                            // no-op here — applied to keep the rule stated in one
+                            // shape: partiality is judged over the scoped set.
+                            return miss_result(
+                                format!("Tool not found: {t}"),
+                                &scoped_skipped(&all.skipped, server.as_deref()),
+                            );
+                        }
+                        if matches.len() == 1 {
+                            (matches[0].clone(), t.clone())
+                        } else {
+                            return fail(format!(
+                                "Tool '{t}' is ambiguous (servers: {}); use the `server` param",
+                                matches.join(", ")
+                            ));
+                        }
+                    }
                 }
             }
         };
@@ -595,7 +888,10 @@ mod tests {
         )
         .await;
         assert!(!r.is_error);
-        assert_eq!(text(&r), "[a] echo — echo its text argument");
+        // The listing prints the CALLABLE form (issue #118): the name on this
+        // line is the name `tool` / `describe` accept, so the model never has to
+        // guess how to spell a server's tool.
+        assert_eq!(text(&r), "[a] a_echo — echo its text argument");
         manager.close_all();
     }
 
@@ -640,11 +936,29 @@ mod tests {
         )
         .await;
         assert!(!r.is_error);
-        // The fake server's three tools (one per line).
+        // The fake server's three tools (one per line), each under the CALLABLE
+        // form (issue #118): this listing is scoped to ONE known server, so the
+        // `<server>_` prefix is unambiguous, and the name printed here is the
+        // name `tool` / `describe` accept — copying a raw name out of this
+        // output is exactly the confusion #118 is about.
         let t = text(&r);
-        assert!(t.contains("echo: echo its text argument"), "{t}");
-        assert!(t.contains("hang: never answers"), "{t}");
-        assert!(t.contains("err: always errors"), "{t}");
+        assert!(t.contains("a_echo: echo its text argument"), "{t}");
+        assert!(t.contains("a_hang: never answers"), "{t}");
+        assert!(t.contains("a_err: always errors"), "{t}");
+        // The pin for WHY the bytes changed: what this listing prints is what
+        // the call path accepts, so a copied name works verbatim.
+        let callable = "a_echo";
+        let d = mcp_tool(
+            &mut manager,
+            &serde_json::json!({ "describe": callable }),
+            &cancel(),
+        )
+        .await;
+        assert!(
+            !d.is_error,
+            "`describe` accepts the printed name: {}",
+            text(&d)
+        );
         manager.close_all();
     }
 
@@ -1281,5 +1595,156 @@ mod tests {
             "and the message says a switched-off entry is not held: {t}"
         );
         manager.close_all();
+    }
+
+    // ── issue #118: server-prefixed tool names (`<server>_<tool>`) ────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prefixed_tool_name_calls_the_servers_tool() {
+        // TWO servers both serving `echo`: the prefixed spelling names ONE of
+        // them, so the ambiguity rule must not fire — a resolved prefix already
+        // decided the server, and the raw-name tie arm is not this call's path.
+        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake", "b": "fake" }));
+        let r = mcp_tool(
+            &mut manager,
+            &serde_json::json!({ "tool": "a_echo", "args": { "text": "x" } }),
+            &cancel(),
+        )
+        .await;
+        assert!(!r.is_error, "`a_echo` is server a's `echo`: {:?}", text(&r));
+        let t = text(&r);
+        assert_eq!(t, "x", "the RAW tool name is what gets dispatched");
+        assert!(!t.contains("ambiguous"), "a prefix names one server: {t}");
+        // The `mcp__<server>__<tool>` alias is the same call.
+        let r = mcp_tool(
+            &mut manager,
+            &serde_json::json!({ "tool": "mcp__a__echo", "args": { "text": "y" } }),
+            &cancel(),
+        )
+        .await;
+        assert!(!r.is_error, "the alias form resolves: {:?}", text(&r));
+        assert_eq!(text(&r), "y");
+        manager.close_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prefixed_describe_shows_the_schema() {
+        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let r = mcp_tool(
+            &mut manager,
+            &serde_json::json!({ "describe": "a_echo" }),
+            &cancel(),
+        )
+        .await;
+        assert!(!r.is_error, "`a_echo` describes server a's `echo`");
+        let t = text(&r);
+        // The header shows the name AS GIVEN (the callable spelling) over the
+        // same schema bytes the raw `describe` answers with.
+        assert!(t.contains("a_echo (a)"), "the tool + server: {t}");
+        assert!(t.contains("\"type\": \"object\""), "the schema: {t}");
+        assert!(t.contains("\"text\""), "the schema's property: {t}");
+        manager.close_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_name_containing_an_underscore_resolves_by_longest_prefix() {
+        // `github` is a known server too, and it is a PREFIX of
+        // `github_enterprise`: splitting on the FIRST `_` would read server
+        // `github` + tool `enterprise_echo`, a pair nobody serves, so this call
+        // would fail. Success pins the LONGEST known-server prefix win.
+        let (mut manager, _dir) = manager_with(&serde_json::json!({
+            "github": narrow_server(),
+            "github_enterprise": "fake",
+        }));
+        let r = mcp_tool(
+            &mut manager,
+            &serde_json::json!({ "tool": "github_enterprise_echo", "args": { "text": "x" } }),
+            &cancel(),
+        )
+        .await;
+        assert!(
+            !r.is_error,
+            "the server is `github_enterprise`, not `github`: {:?}",
+            text(&r)
+        );
+        assert_eq!(text(&r), "x");
+        manager.close_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wrong_prefix_is_a_failed_miss_naming_the_likely_tool() {
+        // Every server ANSWERED, and this is STILL a failure: a name carrying a
+        // prefix that no server answers to is a wrong claim about where the tool
+        // lives, so it must not read as the plain `Tool not found` success the
+        // raw-name rule gives (issue #118 layered onto #68, not replacing it).
+        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let r = mcp_tool(
+            &mut manager,
+            &serde_json::json!({ "tool": "atlassian_echo" }),
+            &cancel(),
+        )
+        .await;
+        assert!(r.is_error, "a wrong prefix is an error, not a not-found");
+        let t = text(&r);
+        assert!(t.contains("atlassian_echo"), "the name is echoed: {t}");
+        assert!(t.contains("a_echo"), "the likely spelling is named: {t}");
+        // Same for `describe`.
+        let r = mcp_tool(
+            &mut manager,
+            &serde_json::json!({ "describe": "atlassian_echo" }),
+            &cancel(),
+        )
+        .await;
+        assert!(r.is_error, "a wrong prefix fails a describe too");
+        assert!(text(&r).contains("a_echo"), "{:?}", text(&r));
+        manager.close_all();
+    }
+
+    #[test]
+    fn the_prefix_resolver_matches_the_longest_known_server() {
+        let known: Vec<String> = ["github", "github_enterprise", "a"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // The longest known server wins — never a split on the first `_`.
+        assert_eq!(
+            resolve_prefixed("github_enterprise_get_issue", &known),
+            Some(("github_enterprise", "get_issue"))
+        );
+        // A shorter known prefix still resolves when nothing longer matches.
+        assert_eq!(
+            resolve_prefixed("github_get_issue", &known),
+            Some(("github", "get_issue"))
+        );
+        // The `mcp__` alias joins with `__` and strips back to the same pair.
+        assert_eq!(
+            resolve_prefixed("mcp__github_enterprise__get_issue", &known),
+            Some(("github_enterprise", "get_issue"))
+        );
+        // An EMPTY tool part is not a tool: `a_` names a server and nothing else.
+        assert_eq!(resolve_prefixed("a_", &known), None);
+        assert_eq!(resolve_prefixed("mcp__a__", &known), None);
+        // No `_` at all → not prefix-shaped, so nothing to resolve.
+        assert_eq!(resolve_prefixed("echo", &known), None);
+        // A prefix that is not a known server resolves to nothing (the caller
+        // decides the failed miss).
+        assert_eq!(resolve_prefixed("atlassian_echo", &known), None);
+        // A tool name that itself carries `_` keeps its underscores.
+        assert_eq!(
+            resolve_prefixed("a_get_the_item", &known),
+            Some(("a", "get_the_item"))
+        );
+        // The empty-prefix spelling has no server to name.
+        assert_eq!(resolve_prefixed("_echo", &known), None);
+    }
+
+    #[test]
+    fn only_a_name_carrying_a_separator_is_prefix_shaped() {
+        assert!(is_prefix_shaped("a_echo"));
+        assert!(is_prefix_shaped("mcp__a__echo"));
+        // The #68 gate: a plain name never enters the prefix tiers, so its miss
+        // keeps the old success bytes.
+        assert!(!is_prefix_shaped("nope"));
+        assert!(!is_prefix_shaped("echo"));
     }
 }

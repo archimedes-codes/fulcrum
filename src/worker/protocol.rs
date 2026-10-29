@@ -244,6 +244,20 @@ pub struct StartEnv {
     pub thinking: Option<String>,
     pub trusted: bool,
     pub enabled_tools: Option<Vec<String>>,
+    /// (issue #101) The per-agent `permission:` ruleset as the PARENT's
+    /// resolved launch carried it — VERBATIM from
+    /// [`crate::agent::subagent::LaunchConfig::permission`], i.e. the
+    /// definition's declared NARROWING layer. `None` → the file does not speak
+    /// about permissions and the child's gate starts from "no narrowing".
+    ///
+    /// The field the gate's enforcement rides on: `worker/core.rs` hands this
+    /// to `AgentLoop::set_permission` next to `set_enabled_tools`, and without
+    /// that line the child's gate consult would see `None` on every dispatch —
+    /// unit-tested enforcement that never runs (the confident no-op #101 is
+    /// about). Crosses the wire inside the `start` envelope (`camelCase`,
+    /// ADDITIVE: an old supervisor's `start` without the key decodes to `None`,
+    /// because serde treats a missing `Option` field as absent-by-default).
+    pub permission: Option<crate::agent::definition_permission::PermissionBlock>,
     pub config_dir: String,
     pub subagent_enabled: bool,
     pub system_prompt: Option<String>,
@@ -270,6 +284,7 @@ impl StartEnv {
         config_dir: String,
         subagent_enabled: bool,
         system_prompt: Option<String>,
+        permission: Option<crate::agent::definition_permission::PermissionBlock>,
     ) -> Self {
         Self {
             session_id,
@@ -281,6 +296,7 @@ impl StartEnv {
             thinking,
             trusted,
             enabled_tools,
+            permission,
             config_dir,
             subagent_enabled,
             system_prompt,
@@ -483,10 +499,11 @@ mod tests {
             "/tmp/config".to_string(),
             true,
             None,
+            None,
         )
     }
 
-    /// The `start` envelope as the `Inbound::Start` variant (all 13
+    /// The `start` envelope as the `Inbound::Start` variant (all 14
     /// fields, the harness `enabled_tools` convention verbatim).
     fn start_inbound() -> Inbound {
         Inbound::Start(Box::new(StartEnv {
@@ -517,8 +534,48 @@ mod tests {
             config_dir: "/tmp/config".to_string(),
             subagent_enabled: false,
             system_prompt: Some("child prompt".to_string()),
+            // (issue #101) A NON-`None` block ON PURPOSE: this literal is the
+            // payload `every_inbound_variant_round_trips` encodes and DECODES
+            // through `decode_inbound`, so the `Deserialize` side of the whole
+            // `PermissionBlock` aggregate is pinned on every run — including
+            // the spellings B1 froze (`Action` lowercase, `ToolKey` camelCase,
+            // `Unrecognized` externally tagged, `whole_tool` snake_case with NO
+            // `rename_all` on `Rules`). A convenience `rename_all` added to any
+            // nested type reddens THAT test instead of silently decoding a real
+            // file's block into a different ruleset.
+            permission: Some(test_permission_block()),
             incarnation: "a3f9c1".to_string(),
         }))
+    }
+
+    /// The `permission` fixture the round-trip pin carries: one whole-tool
+    /// verdict, one per-pattern ruleset, and one unrecognised tool key — the
+    /// three shapes `Rules` / `ToolKey` can hold, so the decode exercises every
+    /// nested type in the aggregate.
+    fn test_permission_block() -> crate::agent::definition_permission::PermissionBlock {
+        use crate::agent::definition_permission::{Action, Rule, Rules, ToolKey};
+        crate::agent::definition_permission::PermissionBlock {
+            tools: vec![
+                (ToolKey::Bash, Rules::whole_tool(Action::Deny)),
+                (
+                    ToolKey::Edit,
+                    Rules::per_tool(vec![
+                        Rule {
+                            pattern: "*".to_string(),
+                            action: Action::Deny,
+                        },
+                        Rule {
+                            pattern: "*.md".to_string(),
+                            action: Action::Allow,
+                        },
+                    ]),
+                ),
+                (
+                    ToolKey::Unrecognized("task".to_string()),
+                    Rules::whole_tool(Action::Ask),
+                ),
+            ],
+        }
     }
 
     /// Every `Inbound` variant round-trips through `encode_line` +

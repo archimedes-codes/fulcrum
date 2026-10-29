@@ -904,6 +904,8 @@ mod tests {
             "/tmp/config".to_string(),
             true,
             None,
+            // (issue #101) `from_parts`' new trailing arg (test fixture: no block).
+            None,
         )
     }
 
