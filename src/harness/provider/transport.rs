@@ -103,15 +103,24 @@ pub(crate) async fn map_response(
     Err(map_status(status, body.as_deref()).expect("a non-success status maps to an error"))
 }
 
+pub(crate) const TITLE_SESSION_SUFFIX: &str = "-title";
+
 /// The LiteLLM session / request tracking headers (added when the request
 /// carries a session id): `x-litellm-session-id` + `x-request-id`, both set
-/// to the session id.
+/// to the session id (or a unique request id if titling).
 pub(crate) fn litellm_headers(session_id: Option<&str>) -> Vec<(String, String)> {
     match session_id {
-        Some(sid) => vec![
-            ("x-litellm-session-id".to_string(), sid.to_string()),
-            ("x-request-id".to_string(), sid.to_string()),
-        ],
+        Some(sid) => {
+            let request_id = if sid.ends_with(TITLE_SESSION_SUFFIX) {
+                format!("{sid}-{}", uuid::Uuid::new_v4())
+            } else {
+                sid.to_string()
+            };
+            vec![
+                ("x-litellm-session-id".to_string(), sid.to_string()),
+                ("x-request-id".to_string(), request_id),
+            ]
+        }
         None => Vec::new(),
     }
 }
@@ -500,5 +509,49 @@ mod tests {
             header,
             format!("user-agent: archimedes/{}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn litellm_headers_sets_unique_uuid_request_id_for_title_suffix() {
+        let headers = litellm_headers(Some("sess-1-title"));
+        let session_id = headers
+            .iter()
+            .find(|(k, _)| k == "x-litellm-session-id")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(session_id, Some("sess-1-title"));
+
+        let request_id = headers
+            .iter()
+            .find(|(k, _)| k == "x-request-id")
+            .map(|(_, v)| v.as_str())
+            .expect("x-request-id should be present");
+
+        assert!(request_id.starts_with("sess-1-title-"));
+        let uuid_part = request_id.strip_prefix("sess-1-title-").unwrap();
+        assert!(uuid::Uuid::parse_str(uuid_part).is_ok());
+
+        // Unique on each call
+        let headers2 = litellm_headers(Some("sess-1-title"));
+        let request_id2 = headers2
+            .iter()
+            .find(|(k, _)| k == "x-request-id")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_ne!(request_id, request_id2);
+    }
+
+    #[test]
+    fn litellm_headers_sets_identical_request_id_for_normal_session() {
+        let headers = litellm_headers(Some("sess-1"));
+        let session_id = headers
+            .iter()
+            .find(|(k, _)| k == "x-litellm-session-id")
+            .map(|(_, v)| v.as_str());
+        let request_id = headers
+            .iter()
+            .find(|(k, _)| k == "x-request-id")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(session_id, Some("sess-1"));
+        assert_eq!(request_id, Some("sess-1"));
     }
 }
