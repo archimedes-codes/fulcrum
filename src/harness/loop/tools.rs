@@ -5,7 +5,7 @@ use super::AgentLoop;
 use crate::agent::harness::provider::ToolCall;
 use crate::agent::interactive::{sudo_run_flow, todo_apply};
 use crate::agent::mcp::mcp_tool;
-use crate::agent::tools::{execute_tool, ContentBlock, ToolCtx, ToolResult};
+use crate::agent::tools::{execute_tool, ContentBlock, ToolResult};
 
 pub(super) fn cancelled_tool_result() -> ToolResult {
     ToolResult {
@@ -87,32 +87,17 @@ impl AgentLoop {
         match tc.name.as_str() {
             "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
             | "read_skill" | "web_search" | "fetch_content" | "get_search_content" => {
+                // The ONE `ToolCtx` construction is `PermissionContext::to_tool_ctx`
+                // (finding 6): the frozen boundary + guard list, the per-turn
+                // rule list + policy, the web config and the render requester
+                // all come from the SAME bundle the gate judged with, so the
+                // executor cannot re-decide differently from its gate. `cwd` is
+                // the loop's own `space_cwd` (not permission state) and `cancel`
+                // is the TURN token.
                 execute_tool(
-                    &ToolCtx {
-                        cwd: self.space_cwd.clone(),
-                        cancel: turn.clone(),
-                        // `None` = the real discovery roots (the same
-                        // `discover_skills` the prompt builder used).
-                        skill_roots: None,
-                        // (ADR 0030) The frozen boundary + deny-list.
-                        boundary: self.read_boundary.clone(),
-                        protected: self.protected.clone(),
-                        // (T03) The rule list IN FORCE for this turn — the
-                        // SAME concatenated list the gate judged with (one
-                        // concat per turn, so gate and executor agree).
-                        rules: self.rules.clone(),
-                        // (T03) The home `rule_for` expands a `~` rule
-                        // against (frozen at construction — no per-call
-                        // `$HOME` read).
-                        home: self.rules_home.clone(),
-                        // (ADR 0030 Task 3) The policy the gate decided with
-                        // — the SAME per-turn value, so the executor cannot
-                        // re-decide differently from the gate (it enforces
-                        // the `Sandboxed` floor and confines `bash`).
-                        file_policy: self.file_policy.clone(),
-                        web: self.web.clone(),
-                        render_requester: self.render_requester.clone(),
-                    },
+                    &self
+                        .permissions
+                        .to_tool_ctx(self.space_cwd.clone(), turn.clone()),
                     &tc.name,
                     &tc.arguments,
                 )

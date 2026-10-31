@@ -24,6 +24,28 @@
 
 use serde_json::Value;
 
+/// The compaction trigger vocabulary (ADR 0045). `#[serde(rename_all =
+/// "snake_case")]` is the WIRE CONTRACT: `Manual` → `"manual"`, `Threshold` →
+/// `"threshold"`, `Overflow` → `"overflow"` — byte-identical to the TS union
+/// `CompactionReason = "manual" | "threshold" | "overflow"` (types.ts:143) and
+/// to `normalize.rs`'s passthrough. The `_Avoid_` vocabulary (CONTEXT.md's
+/// compaction reason entry) bans `context_limit`, `trigger`, `cause` and "auto
+/// vs manual" — this enum is the only vocabulary.
+///
+/// `pub` (not `pub(crate)`) because it is a field type of the `pub`
+/// `RpcEvent` variants below: a crate-private type there trips
+/// `private_interfaces`, and `RpcEvent` cannot narrow (it is re-exported
+/// `pub use events::{EventSink, RpcEvent}`). This matches the tree's
+/// precedent for the other enums that ride `RpcEvent` payloads
+/// (`PermissionOutcome`, `AgentNameResolution`, `SubagentOutcome`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
 /// Sink for outbound events (session updates, session-closed, …).
 ///
 /// The Tauri wiring implements this with `AppHandle::emit`; tests implement
@@ -144,11 +166,11 @@ pub enum RpcEvent {
     },
     #[serde(rename_all = "camelCase")]
     compaction_start {
-        reason: String,
+        reason: CompactionReason,
     },
     #[serde(rename_all = "camelCase")]
     compaction_end {
-        reason: String,
+        reason: CompactionReason,
         result: Option<Value>,
         aborted: bool,
         will_retry: bool,

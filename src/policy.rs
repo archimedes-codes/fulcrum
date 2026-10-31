@@ -107,6 +107,32 @@ pub enum Decision {
     Confine,
 }
 
+/// (finding 6) Whether the policed call is the SHELL or a PATH tool — the
+/// distinction [`decision_for`] needs, as a type instead of a `bool`.
+///
+/// `Decision::Confine` means "run it, inside the OS sandbox", and only a
+/// shell has anything to confine: for a path tool the boundary IS the
+/// refusal, so the same tier means `Deny`. As a `bool` that was a parameter
+/// discipline — a caller passing `is_shell: true` for a `read` could produce
+/// a `Confine` the executor would happily run UNSANDBOXED under a tier that
+/// meant refusal. As this enum the `Confine` arm is spelled for `Shell`
+/// alone, so a path tool's `Decision` cannot be `Confine` at all; the
+/// unreachable variant becomes unrepresentable rather than documented.
+///
+/// `Path` is a UNIT on purpose: `decision_for`'s match arm is its only
+/// consumer and never reads a payload, and the direction of the call (read
+/// vs write) continues to ride the gate's `PolicyDirection` — a
+/// `RuleDirection` payload here could hold `ReadWrite`, a value no tool's
+/// direction key can ever produce, which would invite precisely the
+/// impossible value this type exists to exclude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicedTool {
+    /// `bash` — the ONLY `Confine`-capable tool.
+    Shell,
+    /// A path-taking tool (`read` / `find` / `grep` / `ls` / `write` / `edit`).
+    Path,
+}
+
 /// The ONE policy decision point (ADR 0030): a pure function of the
 /// direction's policy, whether the access reaches BEYOND the boundary,
 /// whether the Space is trusted, and whether the tool is the shell. It
@@ -130,8 +156,16 @@ pub enum Decision {
 /// — the boundary already IS the refusal), while for `bash` it must mean
 /// *run confined*: refusing every command would make `Shell=Sandboxed`
 /// disable `bash` entirely, and confining is what the user chose. A
-/// path-param tool therefore NEVER yields [`Decision::Confine`].
-pub fn decision_for(policy: AccessPolicy, beyond: bool, trusted: bool, is_shell: bool) -> Decision {
+/// path-param tool therefore NEVER yields [`Decision::Confine`] — and
+/// since the shell/path distinction is the [`PolicedTool`] parameter
+/// rather than a `bool`, it never CAN (see that type's doc; the pin is
+/// `path_tool_decisions_can_never_be_confine_at_the_type_level`).
+pub fn decision_for(
+    policy: AccessPolicy,
+    beyond: bool,
+    trusted: bool,
+    tool: PolicedTool,
+) -> Decision {
     // Inside the boundary every policy allows — the policy decides ONLY
     // the beyond-boundary case.
     if !beyond {
@@ -152,8 +186,12 @@ pub fn decision_for(policy: AccessPolicy, beyond: bool, trusted: bool, is_shell:
         // `bash` is CONFINED, not refused (Task 5's Landlock sandbox); a
         // path tool has nothing to confine, so it is refused. `trusted`
         // is deliberately unread in this arm — Deny is never widened.
-        AccessPolicy::Sandboxed if is_shell => Decision::Confine,
-        AccessPolicy::Sandboxed => Decision::Deny,
+        // This match is the ONLY place `Decision::Confine` is produced, and
+        // it is reachable only through `PolicedTool::Shell`.
+        AccessPolicy::Sandboxed => match tool {
+            PolicedTool::Shell => Decision::Confine,
+            PolicedTool::Path => Decision::Deny,
+        },
     }
 }
 
@@ -312,9 +350,12 @@ mod tests {
     use super::*;
     use AccessPolicy::*;
 
-    /// `is_shell = false` (a path-param tool) — the default the truth
+    /// A path-param tool (the finding-6 type: `decision_for`'s shell/path
+    /// distinction is a [`PolicedTool`], not a `bool`) — the default the truth
     /// table is written against.
-    const PATH_TOOL: bool = false;
+    const PATH_TOOL: PolicedTool = PolicedTool::Path;
+    /// The shell (`bash`) — the one `Confine`-capable member of the type.
+    const SHELL: PolicedTool = PolicedTool::Shell;
 
     /// The full 3 × 2 × 2 = 12-case truth table, asserted CASE BY CASE
     /// (one `assert_eq!` per row, each labelled) so a failure names the
@@ -355,17 +396,17 @@ mod tests {
             Decision::Allow,
             "Ask beyond the boundary on a TRUSTED Space is suppressed"
         );
-        // The `bash` rows of the same table (`is_shell = true`): the
+        // The `bash` rows of the same table (`PolicedTool::Shell`): the
         // Ask/Allow rows are IDENTICAL to the path tools — only the
         // Sandboxed row diverges, and it is asserted by name below.
         for trusted in [false, true] {
             assert_eq!(
-                decision_for(Ask, true, trusted, true),
+                decision_for(Ask, true, trusted, SHELL),
                 decision_for(Ask, true, trusted, PATH_TOOL),
                 "Ask treats the shell like a path tool, trusted={trusted}"
             );
             assert_eq!(
-                decision_for(Allow, true, trusted, true),
+                decision_for(Allow, true, trusted, SHELL),
                 Decision::Allow,
                 "Allow treats the shell like a path tool, trusted={trusted}"
             );
@@ -374,7 +415,7 @@ mod tests {
         // `bash` (a command is always beyond), but the row must still hold —
         // `Sandboxed` gates nothing inside the boundary.
         assert_eq!(
-            decision_for(Sandboxed, false, false, true),
+            decision_for(Sandboxed, false, false, SHELL),
             Decision::Allow,
             "`beyond = false` allows even the shell under Sandboxed"
         );
@@ -403,19 +444,19 @@ mod tests {
             "the trusted Sandboxed answer is still a Deny, never a prompt"
         );
         assert_eq!(
-            decision_for(Sandboxed, true, false, true),
-            decision_for(Sandboxed, true, true, true),
+            decision_for(Sandboxed, true, false, SHELL),
+            decision_for(Sandboxed, true, true, SHELL),
             "Trust must not change the shell's Sandboxed answer either"
         );
         // And a Deny is never `Ask` — a Sandboxed Space emits no prompt at
         // all in any configuration (the acceptance: a denied access never
         // reaches the UI).
         for trusted in [false, true] {
-            for is_shell in [false, true] {
+            for tool in [PATH_TOOL, SHELL] {
                 assert_ne!(
-                    decision_for(Sandboxed, true, trusted, is_shell),
+                    decision_for(Sandboxed, true, trusted, tool),
                     Decision::Ask,
-                    "Sandboxed must never prompt, trusted={trusted} is_shell={is_shell}"
+                    "Sandboxed must never prompt, trusted={trusted} tool={tool:?}"
                 );
             }
         }
@@ -427,13 +468,13 @@ mod tests {
     fn sandboxed_shell_confines_instead_of_denying() {
         for trusted in [false, true] {
             assert_eq!(
-                decision_for(Sandboxed, true, trusted, true),
+                decision_for(Sandboxed, true, trusted, SHELL),
                 Decision::Confine,
                 "bash under Shell=Sandboxed is confined, trusted={trusted}"
             );
         }
         // CONTRAST (so this cannot pass vacuously): the SAME inputs with
-        // `is_shell = false` are a Deny.
+        // `PolicedTool::Path` are a Deny.
         assert_eq!(
             decision_for(Sandboxed, true, false, PATH_TOOL),
             Decision::Deny,
@@ -445,7 +486,7 @@ mod tests {
         for policy in [Ask, Allow] {
             for trusted in [false, true] {
                 assert_ne!(
-                    decision_for(policy, true, trusted, true),
+                    decision_for(policy, true, trusted, SHELL),
                     Decision::Confine,
                     "{policy:?} must not confine, trusted={trusted}"
                 );
@@ -475,9 +516,65 @@ mod tests {
         let confined: Vec<_> = [Sandboxed, Ask, Allow]
             .iter()
             .flat_map(|p| [false, true].map(|b| (*p, b)))
-            .filter(|(p, b)| decision_for(*p, *b, false, true) == Decision::Confine)
+            .filter(|(p, b)| decision_for(*p, *b, false, SHELL) == Decision::Confine)
             .collect();
         assert_eq!(confined, vec![(Sandboxed, true)]);
+    }
+
+    /// (finding 6) The TYPE-SEAL pin: a path tool's `Decision` is not merely
+    /// never `Confine` in this table, it is structurally incapable of being
+    /// `Confine` — `decision_for`'s fourth parameter is a [`PolicedTool`] and
+    /// the ONLY arm that produces `Decision::Confine` is the `Shell` arm. The
+    /// guard used to be a `is_shell: bool` parameter, which meant "a caller
+    /// that passed the wrong boolean gets a silent `Confine` for a `read`" was
+    /// expressible; with the enum it is a type error at the call site.
+    ///
+    /// The sweep is the FULL 3 × 2 × 2 grid (every policy × beyond × trust),
+    /// so no future arm can leak a `Confine` into the `Path` column at any
+    /// input. The `Shell` half of the test keeps the POSITIVE alive: without
+    /// it the sweep would pass vacuously the moment someone deleted the
+    /// `Shell => Confine` arm, which is exactly the wrong fix.
+    #[test]
+    fn path_tool_decisions_can_never_be_confine_at_the_type_level() {
+        for policy in [Sandboxed, Ask, Allow] {
+            for beyond in [false, true] {
+                for trusted in [false, true] {
+                    assert_ne!(
+                        decision_for(policy, beyond, trusted, PolicedTool::Path),
+                        Decision::Confine,
+                        "{policy:?} beyond={beyond} trusted={trusted} must not confine a path tool"
+                    );
+                }
+            }
+        }
+        // The positive (so the sweep above cannot pass by deletion): the
+        // shell DOES confine at (Sandboxed, beyond=true), for both trust
+        // values — the row `POLICIED_TOOLS`' single `bash` entry rides, and
+        // the end-to-end pins at `policy_gate.rs`'s `Confine`/`Ask` assertions
+        // depend on it staying.
+        for trusted in [false, true] {
+            assert_eq!(
+                decision_for(Sandboxed, true, trusted, PolicedTool::Shell),
+                Decision::Confine,
+                "the shell still confines under Sandboxed, trusted={trusted}"
+            );
+        }
+        // And the shell's `Confine` stays exactly one cell of its own grid:
+        // every other (policy, beyond) combination answers something else.
+        for policy in [Ask, Allow] {
+            for beyond in [false, true] {
+                assert_ne!(
+                    decision_for(policy, beyond, false, PolicedTool::Shell),
+                    Decision::Confine,
+                    "{policy:?} beyond={beyond} must not confine the shell"
+                );
+            }
+        }
+        assert_ne!(
+            decision_for(Sandboxed, false, false, PolicedTool::Shell),
+            Decision::Confine,
+            "inside the boundary nothing confines — `Confine` is a beyond-boundary answer"
+        );
     }
 
     #[test]

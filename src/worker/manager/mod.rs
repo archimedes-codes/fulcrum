@@ -336,11 +336,6 @@ impl WorkerManager {
         self.hooks.attach_cwd_registrar(registrar);
     }
 
-    /// Attach the child-cwd registrar (alias for [`Self::set_cwd_registrar`]).
-    pub fn attach_cwd_registrar(&self, registrar: CwdRegistrar) {
-        self.set_cwd_registrar(registrar);
-    }
-
     /// Cancel an in-flight subagent dispatch (a parent turn abort —
     /// the `SubagentCancel` flow: `send_abort` + the drive task's
     /// `cancel` flag → the `Cancelled` outcome + the reap).

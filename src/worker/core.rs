@@ -1587,8 +1587,9 @@ mod tests {
     /// loop's CONTROL channel and returns NO frame (`handle`'s return is the
     /// store / sink frames; `RpcEvent`s leave via the PUMP), so the
     /// observation point is the pump: a `compaction_start` whose `reason` is
-    /// `manual`. The stub transcript is the single system prompt, so the
-    /// outcome is `Skipped` — both frames still fire. (Cancellation is NOT
+    /// [`crate::agent::events::CompactionReason::Manual`]. The stub transcript
+    /// is the single system prompt, so the outcome is `Skipped` — both frames
+    /// still fire. (Cancellation is NOT
     /// asserted here: the canned provider completes synchronously, so no
     /// cancel window exists — that pin lives in `loop.rs`.)
     #[tokio::test]
@@ -1622,7 +1623,7 @@ mod tests {
                 f,
                 Outbound::Event {
                     event: RpcEvent::compaction_start { reason }
-                } if reason == "manual"
+                } if reason == &crate::agent::events::CompactionReason::Manual
             )),
             "the compact frame reached the loop's control queue (a `compaction_start` \
              with the manual reason), got {frames:?}"

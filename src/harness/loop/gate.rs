@@ -7,7 +7,7 @@ use crate::agent::definition_permission::{Action, ToolKey};
 use crate::agent::fs_backend::{FsBackend, FsError};
 use crate::agent::harness::provider::ToolCall;
 use crate::agent::permission::{native_permission_gate, permission_title, PermissionOutcome};
-use crate::agent::policy::{decision_for, AccessPolicy, Decision};
+use crate::agent::policy::{decision_for, AccessPolicy, Decision, PolicedTool};
 use crate::agent::tools::exec::protected_refusal_text;
 use crate::agent::tools::{ContentBlock, ToolResult};
 
@@ -183,7 +183,7 @@ impl AgentLoop {
                 // always beyond the boundary (see `decision_for`). Rules never
                 // apply to `bash` either (the spec's guard-rail), so there is
                 // nothing to resolve.
-                (self.file_policy.shell, true, None)
+                (self.permissions.file_policy.shell, true, None)
             }
             PolicyDirection::Read | PolicyDirection::Write => {
                 let Some(raw) = tc.arguments.get("path").and_then(|v| v.as_str()) else {
@@ -229,7 +229,20 @@ impl AgentLoop {
             }
         }
         Some(stricter_of_two(
-            decision_for(policy, beyond, trusted, dir == PolicyDirection::Shell),
+            // (finding 6) The shell/path distinction is the `PolicedTool` type
+            // now, not a `bool`: built here, from the tool-name table's
+            // direction, and the ONLY way a `Confine` can leave
+            // `decision_for` is through the `Shell` arm — a path tool's
+            // `Decision` cannot be `Confine` at the type level.
+            decision_for(
+                policy,
+                beyond,
+                trusted,
+                match dir {
+                    PolicyDirection::Shell => PolicedTool::Shell,
+                    PolicyDirection::Read | PolicyDirection::Write => PolicedTool::Path,
+                },
+            ),
             // (issue #101) THE row-4 consultation. This is the ONLY place the
             // per-agent layer enters the gate: the write branch above returned
             // EARLY for rows 1–3 (a rule `Deny`, a rule `Allow`, the guard's
@@ -266,7 +279,7 @@ impl AgentLoop {
     ///
     /// FIRST matching tool key wins (B1's FIRST-WINS per key inside a block).
     fn definition_verdict(&self, tool: &str) -> DefinitionVerdict {
-        let Some(block) = self.permission_block.as_ref() else {
+        let Some(block) = self.permissions.permission_block.as_ref() else {
             return DefinitionVerdict::AsSelf;
         };
         let Some((_, rules)) = block
@@ -330,10 +343,10 @@ impl AgentLoop {
         trusted: bool,
     ) -> Option<(Decision, Option<PathBuf>)> {
         if let Some(rule) = crate::agent::policy::rule_for(
-            &self.rules,
+            &self.permissions.rules,
             crate::agent::policy::RuleDirection::Write,
             resolved,
-            self.rules_home.as_deref(),
+            self.permissions.rules_home.as_deref(),
         ) {
             return Some((
                 match rule.decision {
@@ -398,16 +411,20 @@ impl AgentLoop {
     /// for a direction it must not.
     fn is_guard_path(&self, dir: PolicyDirection, resolved: &Path) -> bool {
         dir == PolicyDirection::Write
-            && self.protected.iter().any(|root| resolved.starts_with(root))
+            && self
+                .permissions
+                .protected
+                .iter()
+                .any(|root| resolved.starts_with(root))
     }
 
     /// The policy that governs a direction (ADR 0030: the settings are
     /// per-direction, which is why `read` and `edit` can disagree).
     pub(super) fn direction_policy(&self, dir: PolicyDirection) -> AccessPolicy {
         match dir {
-            PolicyDirection::Read => self.file_policy.reads,
-            PolicyDirection::Write => self.file_policy.writes,
-            PolicyDirection::Shell => self.file_policy.shell,
+            PolicyDirection::Read => self.permissions.file_policy.reads,
+            PolicyDirection::Write => self.permissions.file_policy.writes,
+            PolicyDirection::Shell => self.permissions.file_policy.shell,
         }
     }
 
@@ -420,7 +437,9 @@ impl AgentLoop {
     /// unrestricted (that widening is the gate's DECISION, not its input).
     pub(super) fn direction_boundary(&self, dir: PolicyDirection) -> Vec<PathBuf> {
         match dir {
-            PolicyDirection::Read | PolicyDirection::Shell => self.read_boundary.clone(),
+            PolicyDirection::Read | PolicyDirection::Shell => {
+                self.permissions.read_boundary.clone()
+            }
             PolicyDirection::Write => vec![self.space_cwd.clone()],
         }
     }
@@ -478,7 +497,7 @@ impl AgentLoop {
                 // four dirs must name THAT reason, or the model is sent hunting
                 // for a boundary that is not the problem.
                 let protected = (dir == Some(PolicyDirection::Write))
-                    .then(|| protected_refusal_text(&self.protected, &tc.name, path))
+                    .then(|| protected_refusal_text(&self.permissions.protected, &tc.name, path))
                     .flatten();
                 match protected {
                     Some(msg) => msg,
@@ -528,10 +547,10 @@ impl AgentLoop {
             PolicyDirection::Shell => return None,
         };
         crate::agent::policy::rule_for(
-            &self.rules,
+            &self.permissions.rules,
             rdir,
             &crate::agent::fs_backend::canonicalize_lenient(path),
-            self.rules_home.as_deref(),
+            self.permissions.rules_home.as_deref(),
         )
         .filter(|rule| rule.decision == crate::agent::policy::RuleDecision::Deny)
     }

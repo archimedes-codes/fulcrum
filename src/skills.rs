@@ -66,7 +66,7 @@ impl SkillInfo {
 /// ADR 0065. UI-only: never interpolated into a prompt tag.
 ///
 /// `PartialEq` is derived so a DTO CARRYING this can be compared as a whole
-/// (`commands::agents::AgentConfigDto` needs it for its tests) — derived HERE
+/// (`commands::agents::AgentDefinitionReportDto` needs it for its tests) — derived HERE
 /// rather than mirroring this struct into a second Rust shape, which is the
 /// Rust↔Rust twin ADR 0065 exists to forbid. Both users of `Shadowed<T>`
 /// benefit from the one derivation.
@@ -229,44 +229,23 @@ pub fn discover_in_roots(roots: &[(PathBuf, SkillScope)]) -> Vec<SkillInfo> {
 ///
 /// Do NOT canonicalize the input before walking (the caller passes a
 /// canonical path; if `space_path` doesn't exist, return an empty vec).
+///
+/// DELEGATOR: the walk-up itself lives in [`crate::roots::space_roots_in`],
+/// the ONE owner it shares with `agents::space_roots` (Finding 10). This
+/// function contributes only the two join targets and the scope tag; the
+/// order, the `.git` stop and the raw-spelling contract are the helper's, and
+/// `tests/skills.rs::space_roots_walks_up_to_the_git_marker` pins them through
+/// here (that integration test reaches this `pub fn` — and `discover_in_roots`
+/// and `SkillScope` — unchanged, which is why nothing in `roots.rs` is `pub`).
 pub fn space_roots(space_path: &Path) -> Vec<(PathBuf, SkillScope)> {
-    if !space_path.exists() {
-        return Vec::new();
-    }
-    // Find the repo root: the first ancestor (including `space_path`
-    // itself) that contains a `.git` entry; if none exists, only
-    // `space_path` is a level.
-    let mut repo_root: Option<PathBuf> = None;
-    let mut cur = space_path.to_path_buf();
-    loop {
-        if cur.join(".git").exists() {
-            repo_root = Some(cur.clone());
-            break;
-        }
-        match cur.parent() {
-            Some(p) if p != cur => {
-                cur = p.to_path_buf();
-            }
-            _ => break,
-        }
-    }
-    // Levels, innermost (the space itself) first, up to and including
-    // the repo root.
-    let mut levels = vec![space_path.to_path_buf()];
-    if let Some(root) = repo_root {
-        let mut cur = space_path.to_path_buf();
-        while cur != root {
-            let next = cur.parent().unwrap().to_path_buf();
-            levels.push(next.clone());
-            cur = next;
-        }
-    }
-    let mut out = Vec::new();
-    for level in &levels {
-        out.push((level.join(".agents/skills"), SkillScope::Space));
-        out.push((level.join(".pi/skills"), SkillScope::Space));
-    }
-    out
+    crate::roots::space_roots_in(
+        space_path,
+        Path::new(".agents/skills"),
+        Path::new(".pi/skills"),
+    )
+    .into_iter()
+    .map(|path| (path, SkillScope::Space))
+    .collect()
 }
 
 /// `home_dir().join(".agents/skills")` (first) and

@@ -1654,7 +1654,7 @@ async fn a_tilde_spelled_guarded_write_yields_an_ancestor_rule_for_matches() {
             &rules,
             crate::agent::policy::RuleDirection::Write,
             &canonical_target,
-            loop_.rules_home.as_deref(),
+            loop_.permissions.rules_home.as_deref(),
         ),
         Some(&tilde_rule),
         "a `~` rule expands against the loop's frozen `rules_home`"
@@ -1793,25 +1793,25 @@ async fn the_per_turn_rule_list_is_defaults_first_then_the_user_rules() {
     // `Vec::new()` (the documented initial value — there is no tool call before
     // a prompt, so it cannot decide anything).
     assert!(
-        loop_.rules.clone().is_empty(),
+        loop_.permissions.rules.clone().is_empty(),
         "the pre-first-turn rule list is EMPTY by design"
     );
     assert!(
-        loop_.default_rules.clone().is_empty(),
+        loop_.permissions.default_rules.clone().is_empty(),
         "the default half is EMPTY (the round-3 correction)"
     );
     assert!(
-        loop_.rules_home.is_some(),
+        loop_.permissions.rules_home.is_some(),
         "the `~`-expansion home is captured once at construction"
     );
 
     bounded_prompt(&mut loop_, "go").await;
-    let after = loop_.rules.clone();
+    let after = loop_.permissions.rules.clone();
     // The defaults are empty today, so the concat's CONTENT is the user rules —
     // but the assertion that earns its place is the ORDER: every default sits
     // before every user rule, which is what the contract means and what stays
     // true when the default half is no longer empty.
-    let defaults = loop_.default_rules.clone();
+    let defaults = loop_.permissions.default_rules.clone();
     assert_eq!(
         after.len(),
         defaults.len() + 1,

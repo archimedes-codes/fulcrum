@@ -20,8 +20,8 @@ use serde_json::Value;
 
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
-    cost_usd_from_usage, ChatRole, FinishReason, MessageContent, ModelRequest, Provider,
-    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage, WireToolCall,
+    cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
+    Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage, WireToolCall,
 };
 
 // ── (issue #122) the shared sanitisation-placeholder vocabulary ───────────
@@ -312,7 +312,8 @@ impl SseStream {
     }
 
     /// Handle one parsed chunk (a `choices[0].delta` + optional
-    /// top-level `usage`).
+    /// top-level `usage`; an `error` chunk is classified first — see the
+    /// error arm below).
     fn handle_chunk(&mut self, v: &Value) {
         // (issue #122) The ONLY chunk that may extend the held run is one that
         // carries `delta.content`. Any OTHER chunk (`usage`, a `reasoning`
@@ -374,6 +375,32 @@ impl SseStream {
                     v.get("usage").and_then(cost_usd_from_usage),
                 ));
             }
+        }
+        // (Finding 1) An in-stream `error` chunk (the HTTP status was 200 —
+        // the error is IN the stream: `data: {"error":{…}}`). Checked HERE,
+        // BEFORE the `choices` deref below, because an error chunk carries no
+        // `choices` at all: the deref used to `return` and the chunk was
+        // discarded in silence, the stream end synthesized
+        // `Done(FinishReason::Error)`, and `turn.rs` fabricated a `Retryable`
+        // from it — 4 doomed ladder retries against a bad key, and ADR 0045's
+        // mid-stream overflow recovery unreachable on this wire. Classified by
+        // `parse_error_chunk` (types.rs) — the ONE classifier of the three
+        // wires, so an auth body is the `Auth` tier here exactly as it is on
+        // Anthropic, and the settings UI's auth keying works on every provider.
+        //
+        // AFTER the usage block ON PURPOSE: a chunk carrying BOTH `usage` and
+        // `error` still delivers its `Usage` (the usage gate WRAPS its push, it
+        // does not early-return, so the `usage_emitted` latch is not skipped).
+        //
+        // FLUSH SEAM (issue #122): the error ends the text run, so anything the
+        // placeholder-prefix hold is keeping is released BEFORE the push —
+        // mirroring the transport-error arm and the `finish_reason` flush seam:
+        // nothing the hold keeps may overtake the error event.
+        if let Some(e) = parse_error_chunk(v) {
+            self.flush_stream_text();
+            self.exhausted = true;
+            self.pending.push_back(ProviderEvent::Error(e));
+            return;
         }
         let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
             return;
@@ -1112,6 +1139,68 @@ mod tests {
                 ProviderEvent::Done(FinishReason::Stop),
             ]
         );
+    }
+
+    /// (Finding 1) An in-stream `error` chunk on the chat-completions wire
+    /// is a REAL tier, not a fabricated one. Until the parser had an error
+    /// arm this chunk was discarded at the `choices` deref (an `error`
+    /// chunk carries no `choices`), the stream end synthesized
+    /// `Done(FinishReason::Error)`, and `turn.rs` turned that into
+    /// `Retryable("the model stream ended without a finish_reason")` — 4
+    /// doomed ladder retries against a key that cannot become valid. The
+    /// Anthropic wire reports the same body as `Auth` in ONE call, and the
+    /// settings UI keys off the auth tier.
+    #[tokio::test]
+    async fn sse_mid_stream_auth_error_is_reported() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[],\"error\":{\"type\":\"authentication_error\",\"message\":\"Bad key\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Error(ProviderError::Auth(
+                "authentication_error: Bad key".to_string()
+            ))],
+            "an in-stream `error` chunk is a real `Auth` tier, terminal \
+             (no synthesized `Done`, no retryable fabrication)"
+        );
+        // The message survives the classification (the UI shows it).
+        match &events[0] {
+            ProviderEvent::Error(ProviderError::Auth(msg)) => {
+                assert!(msg.contains("Bad key"), "got {msg:?}");
+            }
+            other => panic!("expected an Auth error, got {other:?}"),
+        }
+    }
+
+    /// (ADR 0045) The overflow half of the same arm: an over-window prompt
+    /// reported INSIDE the stream must reach the loop as
+    /// [`ProviderError::ContextOverflow`], which `retry.rs`'s
+    /// `context_overflow_is_never_retried` forbids the ladder from touching
+    /// (the loop compacts in the turn instead). The `is_context_overflow_text`
+    /// check runs BEFORE the `kind` match, so a `Fatal`-looking
+    /// `invalid_request_error` kind keeps the overflow tier.
+    #[tokio::test]
+    async fn sse_mid_stream_context_overflow_is_reported() {
+        let events = collect(sse_stream(&[
+            "data: {\"choices\":[],\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 213462 tokens > 200000 maximum\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Error(ProviderError::ContextOverflow(
+                "invalid_request_error: prompt is too long: 213462 tokens > 200000 maximum"
+                    .to_string()
+            ))],
+            "an in-stream overflow is the overflow tier (ADR 0045) — the \
+             loop compacts it in the turn, the ladder never re-issues it"
+        );
+        match &events[0] {
+            ProviderEvent::Error(ProviderError::ContextOverflow(msg)) => {
+                assert!(msg.contains("prompt is too long"), "got {msg:?}");
+            }
+            other => panic!("expected a ContextOverflow error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

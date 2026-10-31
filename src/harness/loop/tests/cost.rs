@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::CompactionRan;
 use super::support::*;
-use crate::agent::events::{EventSink, RpcEvent};
+use crate::agent::events::{CompactionReason, EventSink, RpcEvent};
 use crate::agent::harness::catalog::CompactionConfig;
 use crate::agent::harness::compact::Compactor;
 use crate::agent::harness::provider::{
@@ -634,7 +634,12 @@ async fn a_priced_compaction_emits_one_cost_update_frame_carrying_that_calls_cos
     // frame assertion below a test that never reached the summariser).
     assert_eq!(
         loop_
-            .run_compaction("threshold", false, None, &CancellationToken::new())
+            .run_compaction(
+                CompactionReason::Threshold,
+                false,
+                None,
+                &CancellationToken::new()
+            )
             .await,
         CompactionRan::Compacted,
         "the fixture really compacted, so the summary call really happened"
@@ -731,7 +736,12 @@ async fn a_compaction_whose_summary_reported_no_cost_emits_no_frame_at_all() {
     ]);
     assert_eq!(
         loop_
-            .run_compaction("threshold", false, None, &CancellationToken::new())
+            .run_compaction(
+                CompactionReason::Threshold,
+                false,
+                None,
+                &CancellationToken::new()
+            )
             .await,
         CompactionRan::Compacted,
         "precondition: the compaction really ran and the summary call really happened"

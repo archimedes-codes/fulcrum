@@ -612,22 +612,15 @@ pub(crate) fn bash_exit_report(
 /// goes `None` the moment the exit status is collected, and a `None` here
 /// skips the group kill and leaves an orphaned grandchild holding the pipes
 /// (and writing the marker file it was about to write).
+///
+/// **The owner moved.** The syscall itself lives in
+/// [`crate::agent::childproc::kill_process_group`] — one owner for the
+/// process-group kill, so every exec path latches the same way (ADR 0080's
+/// amendment, Finding 3). This wrapper keeps the `bash`-side NAME (its call
+/// sites and the `exec.rs` test-only re-export stay valid) and adds nothing but
+/// the delegation.
 pub(crate) async fn kill_bash_process_group(pid: Option<u32>, child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        // A negative pid SIGKILLs the WHOLE process group (the child is
-        // the group leader via `process_group(0)`).
-        if let Some(pid) = pid {
-            let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        }
-        // Fallback: kill the direct child as well.
-        let _ = child.kill().await;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid; // No process groups to kill here.
-        let _ = child.kill().await;
-    }
+    crate::agent::childproc::kill_process_group(pid, child).await;
 }
 
 #[cfg(test)]

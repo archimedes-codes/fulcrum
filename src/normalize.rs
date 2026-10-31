@@ -261,10 +261,11 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                     })]
                 }
                 // Accumulate the partial-args JSON fragments. For an
-                // ANNOUNCED id a complete object is sent as `rawInput`,
-                // an incomplete one as `partialArgs` (the adapter-era
-                // behavior, kept for the streaming tool-call frames). For
-                // an UNANNOUNCED id the delta is BUFFER ONLY — no frame:
+                // ANNOUNCED id a complete object is sent as `rawInput`; the
+                // incomplete-fragment emit was retired (Finding 8) — a
+                // fragment that never completes produces no frame; only the
+                // completed `rawInput` is emitted. For an UNANNOUNCED id the
+                // delta is BUFFER ONLY — no frame:
                 // a `tool_call_update` for an id the frontend never saw
                 // would create a message with `title = toolCallId` (e.g.
                 // `chatcmpl-tool-…`); the announcement comes from
@@ -288,11 +289,7 @@ pub(crate) fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                             "toolCallId": id,
                             "rawInput": v,
                         })],
-                        Err(_) => vec![json!({
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": id,
-                            "partialArgs": acc,
-                        })],
+                        Err(_) => Vec::new(),
                     }
                 }
                 // The full `arguments` object (the wire `toolCall` field —
@@ -979,10 +976,10 @@ mod normalize_tests {
     }
 
     /// The tool-call frame sequence: `toolcall_start` → `tool_call` (empty
-    /// `rawInput`), `toolcall_delta` → `tool_call_update` (partial args as
-    /// `partialArgs` while incomplete, `rawInput` once the accumulated
-    /// string parses as JSON), `toolcall_end` → `tool_call_update` with the
-    /// full `arguments` object + the buffer cleared.
+    /// `rawInput`), `toolcall_delta` → `tool_call_update` (`rawInput` once
+    /// the accumulated string parses as JSON; an incomplete fragment emits
+    /// nothing — retired per Finding 8), `toolcall_end` → `tool_call_update`
+    /// with the full `arguments` object + the buffer cleared.
     #[test]
     fn toolcall_frames_accumulate_args() {
         let mut st = TurnState::default();
@@ -1004,8 +1001,9 @@ mod normalize_tests {
         assert_eq!(start[0]["title"], "bash");
         assert_eq!(start[0]["rawInput"], json!({}));
 
-        // An incomplete JSON fragment → `partialArgs` (the adapter's
-        // behavior — the frontend shows the raw string while parsing).
+        // An incomplete JSON fragment emits NO frame (the incomplete-fragment
+        // emit arm was retired — Finding 8; the buffer still accumulates so
+        // the completed delta below emits `rawInput`).
         let partial = normalize(
             &ev(json!({
                 "type": "message_update",
@@ -1014,8 +1012,10 @@ mod normalize_tests {
             })),
             &mut st,
         );
-        assert_eq!(partial[0]["partialArgs"], "{\"cmd\":");
-        assert!(partial[0].get("rawInput").is_none());
+        assert!(
+            partial.is_empty(),
+            "the incomplete fragment emits no frame (Finding 8)"
+        );
 
         // The fragment completes → `rawInput` (the accumulated string
         // parses as JSON).

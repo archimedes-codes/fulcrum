@@ -187,7 +187,6 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::UdpSocket;
 
     /// Send a raw HTTP request to a bound `CallbackServer` (a helper for
     /// the tests — a separate connection that issues the `/callback` GET).
@@ -249,17 +248,6 @@ mod tests {
             .next()
             .and_then(|p| p.parse().ok())
             .expect("the redirect URI has a port")
-    }
-
-    /// A bound server's port (a helper — bind a UDP socket to find a free
-    /// port is not needed; the `CallbackServer` picks its own port).
-    #[allow(dead_code)]
-    fn _free_port() -> u16 {
-        UdpSocket::bind("127.0.0.1:0")
-            .expect("binds")
-            .local_addr()
-            .expect("addr")
-            .port()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

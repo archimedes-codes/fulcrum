@@ -8,6 +8,7 @@ use super::emit::TurnAccumulator;
 use super::AgentLoop;
 use super::CompactionRan;
 use super::CompactionTrigger;
+use crate::agent::events::CompactionReason;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::provider::openai::content_is_the_sanitise_placeholder;
 use crate::agent::harness::provider::{
@@ -46,13 +47,15 @@ pub(super) struct TurnLoopState {
 impl AgentLoop {
     /// Prepare the transcript and bookkeeping for a new turn.
     pub(super) fn begin_turn(&mut self, text: &str, images: &[ImageRef]) {
-        // A queued compaction belongs to the turn that queued it, and this turn
-        // has queued none: drop whatever a PREVIOUS turn left behind (see the
-        // field — a Stop racing an overflow recovery exits BEFORE the trigger is
-        // consumed). Without this the fresh prompt turn inherits the dead turn's
-        // `overflow` trigger, compacts for a reason it never hit, and — `run_compaction`
-        // having shrunk nothing — settles as an error without a model call.
-        self.force_compact = None;
+        // (finding 6) A queued compaction belongs to the turn that queued it,
+        // and this turn has queued none: `enter_turn()` is the ONE clear of the
+        // latch (see [`TurnControl`]) — calling it HERE is what makes the
+        // one-turn lifetime a method rather than a rule this function has to
+        // remember. Without it the fresh prompt turn inherits the dead turn's
+        // `overflow` trigger, compacts for a reason it never hit, and —
+        // `run_compaction` having shrunk nothing — settles as an error without
+        // a model call.
+        self.turn_control.enter_turn();
         let content = if images.is_empty() {
             MessageContent::Text(text.to_string())
         } else {
@@ -96,11 +99,11 @@ impl AgentLoop {
         turn: &CancellationToken,
         turn_tool_results: &mut Vec<Value>,
     ) -> TurnFlow {
-        let trigger = self.force_compact.take();
+        let trigger = self.turn_control.take();
         let due = trigger.is_some() || self.compactor.should_compact();
         if due {
             let t = trigger.unwrap_or(CompactionTrigger {
-                reason: "threshold",
+                reason: CompactionReason::Threshold,
                 will_retry: false,
             });
             let ran = self
@@ -119,7 +122,7 @@ impl AgentLoop {
             // re-issued. Settling here was the bug: it left the user watching
             // the indicator clear and typing "continue", the symptom ADR 0045
             // exists to end.
-            if t.reason == "overflow" && ran == CompactionRan::Skipped {
+            if t.reason == CompactionReason::Overflow && ran == CompactionRan::Skipped {
                 self.settle_error(std::mem::take(turn_tool_results));
                 return TurnFlow::Return;
             }
@@ -252,6 +255,26 @@ impl AgentLoop {
                 _ = turn.cancelled() => return None,
             }
         }
+        // The FABRICATION GUARD: this conversion fires ONLY when the stream
+        // reported NO error event at all (`mid_stream_error.is_none()`) but
+        // ended on a synthesized / bare `Done(Error)` — a stream that simply
+        // stopped. It must never overwrite a real tier: `ProviderEvent::Error`
+        // sets `mid_stream_error` in the match above, so a wire that reports
+        // its in-stream error as a real event lands here with `Some` and this
+        // retryable string is never chosen over it.
+        //
+        // (Finding 1) That distinction is what makes ADR 0045's
+        // `context_overflow_is_never_retried` invariant reachable: an overflow
+        // reported MID-STREAM has to arrive as
+        // `ProviderError::ContextOverflow` — the ladder's only input is
+        // `Retryable`, so a fabricated `Retryable` here would turn a
+        // compact-in-the-turn recovery into 4 doomed re-issues of the identical
+        // oversized bytes. The OpenAI-completions wire used to be unable to
+        // deliver one (its parser had no `error` arm, so every in-stream error
+        // fell through to this fabrication); with the parser arm in place all
+        // three wires report mid-stream auth / overflow as a real
+        // `ProviderEvent::Error` and this branch only ever sees a stream that
+        // genuinely carried no error.
         if mid_stream_error.is_none() && acc.finish == Some(FinishReason::Error) {
             mid_stream_error = Some(ProviderError::Retryable(
                 "the model stream ended without a finish_reason".to_string(),
@@ -296,10 +319,7 @@ impl AgentLoop {
                     self.emit(RpcEvent::message_retracted);
                 }
                 self.compactor.turn_abandoned(&self.messages);
-                self.force_compact = Some(CompactionTrigger {
-                    reason: "overflow",
-                    will_retry: true,
-                });
+                self.turn_control.arm(CompactionReason::Overflow, true);
                 return TurnFlow::Continue;
             }
         }
@@ -530,6 +550,21 @@ impl AgentLoop {
                         }
                     }
                     Some(Decision::Deny) => self.deny_tool_result(tc),
+                    // (finding 6) What reaches here: `Some(Decision::Allow)`,
+                    // `None` (an ungated tool), and `Some(Decision::Confine)`
+                    // — and `Confine` can ONLY be `bash`, because
+                    // `decision_for`'s fourth parameter is the `PolicedTool`
+                    // type and its `Confine` arm is spelled for `Shell` alone:
+                    // a path tool's `Decision` is structurally incapable of
+                    // being `Confine` (pinned by
+                    // `path_tool_decisions_can_never_be_confine_at_the_type_level`).
+                    // So dispatching IS the confined run: the `bash` executor
+                    // reads `ctx.file_policy.shell` and sandboxes itself
+                    // (Task 5's Landlock). Before the type, this arm silently
+                    // ingested a `Confine` a mis-threaded `is_shell` boolean
+                    // could produce for a path tool — an unsandboxed `read`
+                    // under a tier that meant refusal; that combination is now
+                    // unrepresentable at the SOURCE rather than explained here.
                     _ => self.dispatch_tool(tc, turn).await,
                 }
             };

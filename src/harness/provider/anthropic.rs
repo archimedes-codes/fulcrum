@@ -16,11 +16,10 @@ use serde_json::json;
 use serde_json::Value;
 
 use super::openai::{parse_arguments, LineAssembler};
-use super::overflow::is_context_overflow_text;
 use super::transport::{build_client, litellm_headers, map_response, ANTHROPIC_API_VERSION};
 use super::types::{
-    cost_usd_from_usage, ChatRole, FinishReason, MessageContent, ModelRequest, Provider,
-    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
+    cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
+    Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
 };
 use crate::agent::tools::ContentBlock;
 
@@ -73,50 +72,6 @@ pub fn normalize_anthropic_base_url(base_url: &str) -> String {
         without_trailing.to_string()
     } else {
         format!("{without_trailing}/v1")
-    }
-}
-
-/// Map an Anthropic `error` event's `type` to a [`ProviderError`] (the
-/// wire `type` is the classification: `overloaded_error` / `api_error`
-/// are transient, `authentication_error` / `permission_error` are auth,
-/// the rest are permanent; an UNKNOWN type is conservative — retryable,
-/// a new error type is probably transient, and the `RetryPolicy`'s
-/// budget bounds the damage). The ONE exception is the context-overflow
-/// message (ADR 0045), which is checked FIRST because Anthropic reports an
-/// over-window prompt as an ordinary `invalid_request_error`.
-fn map_anthropic_error(v: &Value) -> ProviderError {
-    let message = v
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("(no message)");
-    let kind = v
-        .get("error")
-        .and_then(|e| e.get("type"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    // (ADR 0045) An over-window prompt arrives here as an
-    // `invalid_request_error` — a `kind` that maps to `Fatal` on its own — so
-    // the MESSAGE has to decide the tier, before the `kind` match. This is the
-    // only place a mid-stream `ProviderEvent::Error` is built, so without it
-    // nothing could ever produce a mid-stream overflow and the loop's
-    // mid-stream recovery arm would be dead code. The exclusions run first
-    // inside the check, so a throttle stays the tier its `kind` says.
-    if is_context_overflow_text(message) {
-        return ProviderError::ContextOverflow(format!("{kind}: {message}"));
-    }
-    match kind {
-        "overloaded_error" | "api_error" => ProviderError::Retryable(format!("{kind}: {message}")),
-        "authentication_error" | "permission_error" => {
-            ProviderError::Auth(format!("{kind}: {message}"))
-        }
-        "invalid_request_error" | "not_found_error" => {
-            ProviderError::Fatal(format!("{kind}: {message}"))
-        }
-        _ => {
-            let label = if kind.is_empty() { "unknown" } else { kind };
-            ProviderError::Retryable(format!("{label}: {message}"))
-        }
     }
 }
 
@@ -403,9 +358,19 @@ impl AnthropicStream {
                 // the error is IN the stream). The `AgentLoop` records
                 // it (a `Done` may still follow on a healthy stream end;
                 // the error takes precedence in the loop's accounting).
+                // Classified by `parse_error_chunk` (types.rs) — the ONE
+                // classifier of the three wires. The `.expect` is the
+                // load-bearing guarantee that a `None` can never silently
+                // drop an Anthropic error: this arm only runs for an
+                // `error` EVENT, and an `error` event always carries an
+                // `error` object, so the classifier is always `Some` here
+                // (a `None` would be a wire violation and must panic loudly
+                // rather than fall through to the non-error path).
                 self.exhausted = true;
                 self.pending
-                    .push_back(ProviderEvent::Error(map_anthropic_error(v)));
+                    .push_back(ProviderEvent::Error(parse_error_chunk(v).expect(
+                        "an anthropic `error` event always carries an `error` object",
+                    )));
             }
             _ => {
                 // `message_stop` / `content_block_stop` / unknown: no
@@ -863,116 +828,6 @@ mod tests {
         assert_eq!(
             map_anthropic_stop_reason("something_new"),
             FinishReason::Stop
-        );
-    }
-
-    #[test]
-    fn map_anthropic_error_mapping() {
-        fn err(kind: Option<&str>) -> ProviderError {
-            let mut error = serde_json::Map::new();
-            error.insert("message".to_string(), json!("boom"));
-            if let Some(k) = kind {
-                error.insert("type".to_string(), json!(k));
-            }
-            map_anthropic_error(&json!({ "type": "error", "error": error }))
-        }
-        // `overloaded_error` / `api_error` are transient.
-        for kind in ["overloaded_error", "api_error"] {
-            match err(Some(kind)) {
-                ProviderError::Retryable(_) => {}
-                e => panic!("{kind} is retryable, got {e:?}"),
-            }
-        }
-        // `authentication_error` / `permission_error` are auth.
-        for kind in ["authentication_error", "permission_error"] {
-            match err(Some(kind)) {
-                ProviderError::Auth(_) => {}
-                e => panic!("{kind} is auth, got {e:?}"),
-            }
-        }
-        // `invalid_request_error` / `not_found_error` are permanent.
-        for kind in ["invalid_request_error", "not_found_error"] {
-            match err(Some(kind)) {
-                ProviderError::Fatal(_) => {}
-                e => panic!("{kind} is fatal, got {e:?}"),
-            }
-        }
-        // An UNKNOWN type is conservative — retryable.
-        match err(Some("mystery_error")) {
-            ProviderError::Retryable(_) => {}
-            e => panic!("an unknown type is retryable, got {e:?}"),
-        }
-        // An absent / empty `type` is retryable, labeled `unknown`.
-        for kind in [None, Some("")] {
-            match err(kind) {
-                ProviderError::Retryable(msg) => {
-                    assert!(
-                        msg.contains("unknown"),
-                        "an absent/empty type is labeled `unknown` (got {msg:?})"
-                    );
-                }
-                other => panic!("an absent/empty type is retryable, got {other:?}"),
-            }
-        }
-    }
-
-    /// (ADR 0045) `map_anthropic_error` is the ONLY producer of mid-stream
-    /// `ProviderError`s, so it is the only place a mid-stream SSE `error`
-    /// event can become a `ContextOverflow` — without it the loop's
-    /// mid-stream recovery arm would be unreachable. Anthropic reports an
-    /// over-window prompt as `invalid_request_error` (which maps to `Fatal`
-    /// on its own), so the MESSAGE decides: the overflow check runs BEFORE
-    /// the `kind` match, and a throttle / rate-limit message is excluded
-    /// first (a Bedrock-style throttle behind a gateway stays the tier its
-    /// `kind` says).
-    #[test]
-    fn map_anthropic_error_detects_a_context_overflow() {
-        fn err(kind: &str, message: &str) -> ProviderError {
-            map_anthropic_error(&json!({
-                "type": "error",
-                "error": { "type": kind, "message": message },
-            }))
-        }
-        // The real Anthropic wording, behind the `kind` that used to be
-        // `Fatal`: the tier is the overflow, message included.
-        assert_eq!(
-            err(
-                "invalid_request_error",
-                "prompt is too long: 213462 tokens > 200000 maximum"
-            ),
-            ProviderError::ContextOverflow(
-                "invalid_request_error: prompt is too long: 213462 tokens > 200000 maximum"
-                    .to_string()
-            )
-        );
-        // The `kind` does not have to be `invalid_request_error` — the
-        // message is what the tier reads (a gateway may wrap it).
-        for kind in ["api_error", "mystery_error", ""] {
-            assert!(
-                matches!(
-                    err(kind, "Your input exceeds the context window of this model"),
-                    ProviderError::ContextOverflow(_)
-                ),
-                "{kind} with an overflow message is the overflow tier"
-            );
-        }
-        // An `invalid_request_error` that is NOT about length stays `Fatal`
-        // (a bad tool spec, a malformed body — nothing a compaction fixes).
-        assert_eq!(
-            err("invalid_request_error", "boom"),
-            ProviderError::Fatal("invalid_request_error: boom".to_string())
-        );
-        // The exclusions run first, so a throttle behind an
-        // `invalid_request_error` is not read as an overflow.
-        assert_eq!(
-            err(
-                "invalid_request_error",
-                "ThrottlingException: Too many tokens, please wait before trying again."
-            ),
-            ProviderError::Fatal(
-                "invalid_request_error: ThrottlingException: Too many tokens, please wait before trying again."
-                    .to_string()
-            )
         );
     }
 

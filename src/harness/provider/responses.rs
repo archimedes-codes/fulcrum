@@ -18,8 +18,8 @@ use serde_json::Value;
 use super::openai::{parse_arguments, LineAssembler};
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
-    cost_usd_from_usage, ChatRole, FinishReason, MessageContent, ModelRequest, Provider,
-    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
+    cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
+    Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
 };
 use crate::agent::tools::ContentBlock;
 
@@ -312,17 +312,38 @@ impl ResponsesStream {
             }
             Some("error") => {
                 // An in-stream `error` event (the HTTP status was 200 —
-                // the error is IN the stream). Terminal: the turn cannot
-                // continue (deliberately simpler than the Anthropic
-                // `error` mapping — the Responses `error` object has no
+                // the error is IN the stream). Terminal for an
+                // UNCLASSIFIABLE body: the Responses `error` object has no
                 // stable `type` taxonomy, and a mid-stream error after a
-                // partial response must NOT be blindly retried: the
-                // `AgentLoop` has already consumed the partial deltas,
-                // so the `RetryPolicy` sees a non-retryable end).
+                // partial response must NOT be blindly retried — the
+                // `AgentLoop` has already consumed the partial deltas, so
+                // the `RetryPolicy` sees a non-retryable end. A `None`
+                // (no `error` object the classifier can read at all), a
+                // `Retryable` or a `Fatal` therefore stay the bare terminal
+                // `Done(Error)`: pushing an `Error` for those would let the
+                // ladder re-issue a turn whose deltas are already spent, or
+                // settle a tier this wire cannot stand behind.
+                //
+                // EXCEPT the two tiers `parse_error_chunk` (types.rs)
+                // recognises with confidence — ADR 0045's context overflow
+                // and auth — which upgrade to a REAL
+                // `ProviderEvent::Error` so the loop's mid-stream recovery
+                // works on the Responses wire too: an overflow is compacted
+                // IN the turn and never ladder-retried
+                // (`context_overflow_is_never_retried`), and an auth failure
+                // is returned verbatim in one call and keys the settings UI
+                // (ADRs 0081 / 0082 / 0045). Exactly one event is pushed
+                // either way — never both an `Error` and a `Done`.
                 self.exhausted = true;
                 self.terminated = true;
-                self.pending
-                    .push_back(ProviderEvent::Done(FinishReason::Error));
+                match parse_error_chunk(v) {
+                    Some(e @ (ProviderError::ContextOverflow(_) | ProviderError::Auth(_))) => {
+                        self.pending.push_back(ProviderEvent::Error(e));
+                    }
+                    _ => self
+                        .pending
+                        .push_back(ProviderEvent::Done(FinishReason::Error)),
+                }
             }
             _ => {
                 // `response.created` / `response.output_item.added`
@@ -1150,11 +1171,18 @@ mod tests {
 
     #[tokio::test]
     async fn responses_sse_error_event() {
-        // An in-stream `error` event → `Done(Error)` (terminal — the turn
-        // cannot continue; deliberately simpler than the Anthropic
-        // `error` mapping: the Responses `error` object has no stable
-        // `type` taxonomy, and a mid-stream error after a partial
-        // response must not be blindly retried).
+        // An in-stream `error` event whose body the classifier cannot read
+        // stays the TERMINAL `Done(Error)` — deliberately. The Responses
+        // `error` object has no stable `type` taxonomy, and this
+        // `server_error` body carries NEITHER a classifier wire key nor an
+        // overflow phrase, so `parse_error_chunk` answers on its `None` side
+        // and the upgrade keeps it terminal: only ADR 0045-classified
+        // overflow / auth bodies upgrade to a real tier (see
+        // `responses_sse_context_overflow_error_event` /
+        // `responses_sse_auth_error_event`). Pushing an `Error` for an
+        // unclassifiable body would hand the `RetryPolicy` a tier this wire
+        // cannot stand behind, on a turn whose partial deltas the
+        // `AgentLoop` has ALREADY consumed.
         let events = collect(responses_stream(&[
             "event: error\n\
              data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}\n\n",
@@ -1165,7 +1193,69 @@ mod tests {
             1,
             "an `error` event is terminal (the stream ends)"
         );
-        assert_eq!(events[0], ProviderEvent::Done(FinishReason::Error));
+        assert_eq!(
+            events[0],
+            ProviderEvent::Done(FinishReason::Error),
+            "an unclassifiable `error` body stays the bare terminal — the \
+             divergence from the Anthropic wire is deliberate"
+        );
+    }
+
+    /// (ADR 0045) The upgrade: an over-window prompt reported INSIDE the
+    /// Responses stream is a real `ContextOverflow` tier, so the loop's
+    /// mid-stream recovery (compact in the turn, never ladder-retry —
+    /// `context_overflow_is_never_retried`) is reachable on this wire.
+    #[tokio::test]
+    async fn responses_sse_context_overflow_error_event() {
+        let events = collect(responses_stream(&[
+            "event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your input exceeds the context window of this model\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Error(ProviderError::ContextOverflow(
+                "invalid_request_error: Your input exceeds the context window of this model"
+                    .to_string()
+            ))],
+            "an in-stream overflow upgrades to the real tier (exactly one \
+             event — no `Done` alongside it)"
+        );
+        match &events[0] {
+            ProviderEvent::Error(ProviderError::ContextOverflow(msg)) => {
+                assert!(msg.contains("Your input exceeds"), "got {msg:?}");
+            }
+            other => panic!("expected a ContextOverflow error, got {other:?}"),
+        }
+    }
+
+    /// (ADRs 0081 / 0082) The other upgraded tier: a bad key reported inside
+    /// the Responses stream is the `Auth` tier — returned verbatim in ONE
+    /// call (no doomed ladder retries) and the tier the settings UI keys on.
+    /// The terminal path for unclassifiable bodies is pinned by
+    /// `responses_sse_error_event`, and the stream-end synthesis by
+    /// `responses_sse_stream_end_without_terminal` — both stay green.
+    #[tokio::test]
+    async fn responses_sse_auth_error_event() {
+        let events = collect(responses_stream(&[
+            "event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"Bad key\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Error(ProviderError::Auth(
+                "authentication_error: Bad key".to_string()
+            ))],
+            "an in-stream auth failure upgrades to the real tier (exactly \
+             one event — no `Done` alongside it)"
+        );
+        match &events[0] {
+            ProviderEvent::Error(ProviderError::Auth(msg)) => {
+                assert!(msg.contains("Bad key"), "got {msg:?}");
+            }
+            other => panic!("expected an Auth error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

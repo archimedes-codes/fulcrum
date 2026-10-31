@@ -106,15 +106,35 @@ pub const SUDO_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const TOOL_EXEC_FAST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const TOOL_EXEC_BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The `SudoRunner`'s outcome: `timed_out: true` + `exit_code` (the timeout
-/// sentinel, 124) = a timeout; `error: Some(…)` = a spawn failure (NOT an
-/// auth failure — the cached credential is kept).
+/// The `SudoRunner`'s outcome. The three verdict fields are the SHARED exit
+/// classifier's (`crate::agent::tools::exec::bash::bash_exit_report`, ADR
+/// 0080 + its amendment), so the elevated path reports the same shape a `bash`
+/// run does:
+///
+/// * `exit_code` is the exit code that was actually OBSERVED — `None` when no
+///   code was (a signal death, a child that was never reaped, a process-level
+///   failure, a non-run). NEVER a fabricated number: `-1` was
+///   indistinguishable from a real code, and `124` is a real `timeout(1)` exit
+///   code, so a sentinel could never be told apart from the event it faked.
+/// * `is_error` / `note` are the classifier's verdict and note — the wire
+///   `isError` / error text the render turns into what the model reads. A
+///   pipe-held exit 0 (`timed_out: true`, pipes still held at the deadline) is
+///   therefore `is_error: false` with a `DO NOT RE-RUN` note, exactly as in
+///   `exec_bash`.
+/// * `timed_out` stays the RUN's own fact (did the deadline fire) and feeds
+///   the classifier inside `run_sudo_real`; the render no longer keys off it —
+///   a pipe-held completion has `timed_out: true` and is not an error.
+/// * `error: Some(…)` is a PROCESS-level failure (spawn error, transport
+///   failure, stdin-write timeout). It is never an auth failure, so the cached
+///   credential is kept.
 #[derive(Debug, Clone)]
 pub struct SudoRun {
-    pub exit_code: i32,
+    pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    pub is_error: bool,
+    pub note: Option<String>,
     pub error: Option<String>,
 }
 
@@ -377,7 +397,7 @@ pub(crate) async fn sudo_run_flow(
                 text: "The command is empty — provide the exact command to run with elevated privileges.".to_string(),
             }],
             details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "empty command" }),
+                json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "empty command" }),
             ),
             is_error: true,
         };
@@ -443,7 +463,7 @@ pub(crate) async fn sudo_run_flow(
                     .to_string(),
             }],
             details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "command not confirmed" }),
+                json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "command not confirmed" }),
             ),
             is_error: true,
         };
@@ -516,7 +536,7 @@ pub(crate) async fn sudo_run_flow(
                     .to_string(),
             }],
             details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": -1, "stdout": "", "stderr": "", "error": "password entry cancelled" }),
+                json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "password entry cancelled" }),
             ),
             is_error: true,
         };
@@ -556,12 +576,22 @@ pub(crate) async fn sudo_run_flow(
     let stdout = scrub_secret(&run.stdout, &password);
     let stderr = scrub_secret(&run.stderr, &password);
 
+    // The render's arm ORDER is load-bearing (ADR 0080's amendment). (1) the
+    // PROCESS-level latch first, (2) the auth signature, (3) the classifier's
+    // error verdict, (4) the success arm. A process-level failure carries
+    // `exit_code: None` with `is_error` FALSE — `run.error` is the ONLY signal
+    // it renders from — so it must be checked before any verdict-derived arm,
+    // or the success branch would report a spawn failure as a completed run:
+    // the exact class of misreport this seam exists to kill.
     if let Some(error) = &run.error {
-        // Process-level failure (spawn `error`, spawner throw, fatal stdin
-        // write) — the suite's `tool.ts:483-490`: a clean tool failure with
-        // `exitCode: -1` + `error`, NEVER an auth failure — the cached
+        // Process-level failure (spawn error, transport failure, stdin-write
+        // timeout) — the suite's `tool.ts:483-490`: a clean tool failure with
+        // the `error` + `isError`, NEVER an auth failure — the cached
         // credential is KEPT (a transport glitch is transient relative to
-        // the credential itself).
+        // the credential itself). `exitCode` is whatever was observed (a
+        // process-level failure observed none, so the wire says `null` —
+        // the bash `ToolResult::fail(…, None)` shape, never a fabricated
+        // `-1`).
         ToolResult {
             content: vec![ContentBlock::Text {
                 text: format!("failed to run privileged command: {error}"),
@@ -574,55 +604,76 @@ pub(crate) async fn sudo_run_flow(
     } else if auth_failed {
         // The suite's auth-failure handling (`tool.ts:225-228`): CLEAR the
         // cached password (a mistyped password must not stick for the TTL —
-        // the next `sudo_exec` re-prompts) and report the failure.
+        // the next `sudo_exec` re-prompts) and report the failure. The
+        // two-condition auth signature only ever follows a REAL `sudo` exit,
+        // so a code exists to name — no fallback number is invented for it.
         sudo_password.lock().await.remove(sid);
+        let code = run
+            .exit_code
+            .expect("an auth failure has an observed sudo exit code");
         ToolResult {
             content: vec![ContentBlock::Text {
-                text: format!("sudo authentication failed (incorrect password) — exit code {}. The in-memory credential cache was cleared; the user will be re-prompted on the next attempt.", run.exit_code),
+                text: format!("sudo authentication failed (incorrect password) — exit code {code}. The in-memory credential cache was cleared; the user will be re-prompted on the next attempt."),
             }],
             details: Some(
                 json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": "authentication failed" }),
             ),
             is_error: true,
         }
-    } else if run.timed_out {
-        // The suite's timeout result (`tool.ts:493-504`): the (partial)
-        // stdout + the timeout error + `isError`.
+    } else if run.is_error {
+        // The classifier's error verdict (R2/R3/R4/R5 — ADR 0080's truth
+        // table, reached through the SHARED `bash_exit_report`). The NOTE is
+        // the report: it is preferred over any generic text whenever it
+        // exists, because it is the one that knows whether this was a
+        // deadline, a signal death, an unknown status, or a command's OWN
+        // exit code that merely coincided with a held pipe (R2 — the row
+        // whose whole purpose is not to read like a hang). The generic
+        // "command failed with exit code N" survives only for a noted-less
+        // non-zero exit, which is the classifier's normal-exit row.
+        let error = match (&run.note, run.exit_code) {
+            (Some(note), _) => note.clone(),
+            (None, Some(n)) => format!("command failed with exit code {n}"),
+            // An `is_error` with no code AND no note is unreachable by
+            // construction (the classifier notes every code-less error); the
+            // conservative fallback keeps the arm total honest rather than
+            // panicking on an unreachable row.
+            (None, None) => "the command's exit status is unknown".to_string(),
+        };
         ToolResult {
             content: vec![ContentBlock::Text {
                 text: stdout.clone(),
             }],
             details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": format!("timed out after {timeout_ms}ms — command was killed") }),
+                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": error }),
             ),
             is_error: true,
         }
-    } else if run.exit_code == 0 {
-        // Success: the SCRUBBED stdout VERBATIM (`content[0].text` is what
-        // the LLM sees — NOT a summary; `details` is not LLM-visible). NO
-        // `isError`, NO `error`.
+    } else {
+        // Success (R1 and the plain exit-0 row): the SCRUBBED stdout VERBATIM
+        // (`content[0].text` is what the LLM sees — NOT a summary; `details`
+        // is not LLM-visible), plus the classifier's note when it has one.
+        // R1 arrives HERE: `timed_out: true`, `is_error: false`, and a note
+        // that says the command COMPLETED and forbids re-running it. The
+        // render deliberately does not consult `run.timed_out` — a pipe-held
+        // completion has it set and is not an error (keying off the flag was
+        // the original bug).
+        let mut text = stdout.clone();
+        if let Some(note) = &run.note {
+            // Byte-shaped like `exec_bash`'s note append: the note is a LINE
+            // of what the model reads, never a suffix glued onto the last
+            // line of output.
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(note);
+            text.push('\n');
+        }
         ToolResult {
-            content: vec![ContentBlock::Text {
-                text: stdout.clone(),
-            }],
+            content: vec![ContentBlock::Text { text }],
             details: Some(
                 json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr }),
             ),
             is_error: false,
-        }
-    } else {
-        // A non-zero exit (no auth markers, no timeout): `isError` + the
-        // suite's failure text. (The suite's two-strike ambiguous-failure
-        // rule with the `sudo -n -v` `authProbe` is SCOPED OUT — fast path
-        // only, documented above.)
-        ToolResult {
-            content: vec![ContentBlock::Text {
-                text: stdout.clone(),
-            }],
-            details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": run.exit_code, "stdout": stdout, "stderr": stderr, "error": format!("command failed with exit code {}", run.exit_code) }),
-            ),
-            is_error: true,
         }
     }
 }
@@ -769,10 +820,12 @@ mod tests {
                 .unwrap()
                 .push((argv.clone(), password.clone(), timeout));
             let r = self.result.lock().unwrap().clone().unwrap_or(SudoRun {
-                exit_code: 0,
+                exit_code: Some(0),
                 stdout: String::new(),
                 stderr: String::new(),
                 timed_out: false,
+                is_error: false,
+                note: None,
                 error: None,
             });
             Box::pin(async move { r })
@@ -1070,7 +1123,14 @@ mod tests {
             "The command is empty — provide the exact command to run with elevated privileges."
         );
         assert_eq!(result["details"]["error"], "empty command");
-        assert_eq!(result["details"]["exitCode"], -1);
+        // A NON-RUN reports no exit code (ADR 0080's amendment): the bash
+        // missing-command analogue is `ToolResult::fail(…, None)`, so the
+        // wire says `null` — the fabricated `-1` is deleted.
+        assert!(
+            result["details"]["exitCode"].is_null(),
+            "a rejection that never ran a command reports NO exit code: {:?}",
+            result["details"]
+        );
         assert_eq!(result["isError"], true);
         assert_eq!(runner.call_count(), 0, "no runner call");
         assert!(
@@ -1115,6 +1175,14 @@ mod tests {
             "Command not confirmed — not executed, and no password was requested."
         );
         assert_eq!(result["details"]["error"], "command not confirmed");
+        // A cancel that never ran a command reports NO exit code (ADR 0080's
+        // amendment, Decision 2 — this literal was the reviewer's untabled
+        // `exitCode: -1`, now `null` like the bash missing-command shape).
+        assert!(
+            result["details"]["exitCode"].is_null(),
+            "a non-run reports no exit code, never a fabricated -1: {:?}",
+            result["details"]
+        );
         assert_eq!(result["isError"], true);
         assert_eq!(runner.call_count(), 0, "no runner call");
         assert!(
@@ -1141,10 +1209,12 @@ mod tests {
     #[tokio::test]
     async fn sudo_exec_with_a_confirmed_password_runs_and_scrubs_the_secret() {
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: 0,
+            exit_code: Some(0),
             stdout: "out line\nhunter2\nthird".to_string(),
             stderr: "prompt\nhunter2".to_string(),
             timed_out: false,
+            is_error: false,
+            note: None,
             error: None,
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1249,6 +1319,13 @@ mod tests {
             "Password entry cancelled — not executed, and nothing was cached."
         );
         assert_eq!(result["details"]["error"], "password entry cancelled");
+        // The second previously-untabled non-run literal (`exitCode: -1` →
+        // `null`): nothing ran, so no code may be claimed.
+        assert!(
+            result["details"]["exitCode"].is_null(),
+            "a non-run reports no exit code, never a fabricated -1: {:?}",
+            result["details"]
+        );
         assert_eq!(result["isError"], true);
         assert_eq!(runner.call_count(), 0, "no runner call");
         assert!(
@@ -1289,13 +1366,15 @@ mod tests {
     #[tokio::test]
     async fn sudo_exec_auth_failure_clears_the_cached_password() {
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: 1,
+            exit_code: Some(1),
             stdout: String::new(),
             // The suite's EXACT two-condition auth-failure signature
             // (`tool.ts:225-228`): the sudo-prompt precondition + the
             // "incorrect password" marker.
             stderr: "[sudo] password for daniel\n3 incorrect password attempts".to_string(),
             timed_out: false,
+            is_error: true,
+            note: None,
             error: None,
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1352,10 +1431,12 @@ mod tests {
     #[tokio::test]
     async fn a_second_sudo_exec_within_the_ttl_skips_the_password_prompt() {
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: 0,
+            exit_code: Some(0),
             stdout: "ok".to_string(),
             stderr: String::new(),
             timed_out: false,
+            is_error: false,
+            note: None,
             error: None,
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1436,13 +1517,36 @@ mod tests {
         assert!(pending_sudo.lock().await.is_empty());
     }
 
+    /// The classifier verdict is what the render reports — for BOTH of the
+    /// rows a deadline run can land on. Renamed from
+    /// `sudo_exec_timeout_returns_the_partial_output_with_the_error`: the old
+    /// name promised "the error", and after ADR 0080's amendment a
+    /// deadline-reaching run is NOT necessarily an error at all.
+    ///
+    /// Case 1 (R5 — a genuine hang): the classifier's `DEADLINE` note IS the
+    /// report, the code is `null` (never the fabricated `124`), `isError` is
+    /// true, the partial stdout survives, and the credential cache is kept.
+    /// The retired `{timeout_ms}ms` kill template is gone from the render (it
+    /// claimed a fate the run had not shown), so the classifier's note text is
+    /// what the model reads.
+    ///
+    /// Case 2 (R1 — a pipe-held completion): `is_error: false` with
+    /// `timed_out: true`, `exitCode: 0`, and the `DO NOT RE-RUN` note in the
+    /// text the model reads — the arm-ordering proof that the render no longer
+    /// keys off `timed_out`.
     #[tokio::test]
-    async fn sudo_exec_timeout_returns_the_partial_output_with_the_error() {
+    async fn sudo_exec_timeout_reports_the_classifier_note_and_partial_output() {
+        const DEADLINE: &str = "The command timed out and was killed at its deadline.";
+        // ── Case 1: R5, a genuine hang (signal death, no code). ──
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: 124,
+            exit_code: None,
             stdout: "partial".to_string(),
             stderr: String::new(),
             timed_out: true,
+            is_error: true,
+            note: Some(format!(
+                "{DEADLINE} The command died on signal 9 rather than exiting with a code."
+            )),
             error: None,
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1478,26 +1582,102 @@ mod tests {
         );
         let response = task.await.unwrap();
         let result = &response["result"];
-        // The suite's timeout result (`tool.ts:493-504`): the (partial)
-        // stdout + the timeout error + `isError`.
+        // The (partial) stdout survives, and the classifier's note IS the
+        // error text — the retired template is not reconstructed from
+        // `timeout_ms` anywhere.
         assert_eq!(result["content"][0]["text"], "partial");
         assert_eq!(
             result["details"]["error"],
-            "timed out after 120000ms — command was killed"
+            "The command timed out and was killed at its deadline. The command died on signal 9 rather than exiting with a code."
         );
         assert_eq!(result["isError"], true);
+        assert!(
+            result["details"]["exitCode"].is_null(),
+            "a signal death names NO code — never the old `124` sentinel: {:?}",
+            result["details"]
+        );
         // A timeout is NOT an auth failure: the cache is kept.
         assert!(password.lock().await.contains_key("sid1"));
+
+        // ── Case 2: R1, a pipe-held COMPLETION reaching the deadline. ──
+        let runner = Arc::new(FakeRunner::with_result(SudoRun {
+            exit_code: Some(0),
+            stdout: "installed\n".to_string(),
+            stderr: String::new(),
+            timed_out: true,
+            is_error: false,
+            note: Some(
+                "The command COMPLETED and was observed exiting with code 0. \
+                 DO NOT RE-RUN this command — it already succeeded and its side \
+                 effects have landed."
+                    .to_string(),
+            ),
+            error: None,
+        }));
+        let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
+        let task = run_sudo(
+            "id1",
+            json!({ "command": "apt update", "reason": "r" }),
+            runner.clone(),
+            pending_sudo.clone(),
+            password.clone(),
+            close_tx,
+            sink.clone(),
+        )
+        .await;
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:confirm").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "confirm",
+                json!({ "confirmed": true })
+            )
+            .await
+        );
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:password").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "password",
+                json!({ "password": "pw" })
+            )
+            .await
+        );
+        let response = task.await.unwrap();
+        let result = &response["result"];
+        assert!(
+            result.get("isError").is_none(),
+            "R1: a pipe-held exit 0 is a completion, not a timeout (the wire \
+             OMITS `isError` when it is false): {result}"
+        );
+        assert_eq!(result["details"]["exitCode"], 0);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("the model text is a string");
+        assert!(
+            text.contains("DO NOT RE-RUN"),
+            "the note must ride along the success text: {text:?}"
+        );
+        assert!(
+            result["details"]["error"].is_null(),
+            "the error details field must carry no \"timed out\" claim for a \
+             completion (there is no error at all): {:?}",
+            result["details"]
+        );
     }
 
     #[tokio::test]
     async fn sudo_exec_nonzero_exit_is_an_error_and_a_spawn_failure_keeps_the_cache() {
         // Non-zero exit (no auth markers) → `isError` + the failure text.
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: 3,
+            exit_code: Some(3),
             stdout: "some output".to_string(),
             stderr: "some error".to_string(),
             timed_out: false,
+            is_error: true,
+            note: None,
             error: None,
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1543,10 +1723,12 @@ mod tests {
         // A spawn failure (`error: Some(…)`) → a clean failure, NOT an auth
         // failure: the cached credential is KEPT.
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: -1,
+            exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
+            is_error: false,
+            note: None,
             error: Some("failed to spawn sudo: ENOENT".to_string()),
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1586,11 +1768,160 @@ mod tests {
             result["content"][0]["text"],
             "failed to run privileged command: failed to spawn sudo: ENOENT"
         );
-        assert_eq!(result["details"]["exitCode"], -1);
+        assert!(
+            result["details"]["exitCode"].is_null(),
+            "a process-level failure observed no exit code — never a fabricated `-1` \
+             (the bash `ToolResult::fail(…, None)` shape): {:?}",
+            result["details"]
+        );
         assert_eq!(result["isError"], true);
         assert!(
             password.lock().await.contains_key("sid1"),
             "a spawn failure is not an auth failure — the cache is kept"
+        );
+    }
+
+    /// The render's arm ORDER is load-bearing, and this is the pin (ADR 0080's
+    /// amendment). A PROCESS-level failure carries `exit_code: None` with
+    /// `is_error` FALSE — the classifier never ran, so the verdict fields are
+    /// untouched and `run.error` is the ONLY signal it has. If the
+    /// `is_error`-derived arms were evaluated first, this run would fall to the
+    /// success arm and a failed spawn would be reported as a completed
+    /// privileged command — the exact class of misreport this task exists to
+    /// kill, so the `run.error` arm comes FIRST.
+    #[tokio::test]
+    async fn a_process_level_sudo_failure_renders_before_any_classifier_arm() {
+        let runner = Arc::new(FakeRunner::with_result(SudoRun {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            // Deliberately FALSE: a process-level failure never reaches the
+            // classifier, so this is the only shape the first arm can fire on.
+            is_error: false,
+            note: None,
+            error: Some("failed to spawn sudo: Permission denied (os error 13)".to_string()),
+        }));
+        let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
+        let task = run_sudo(
+            "id1",
+            json!({ "command": "apt update", "reason": "r" }),
+            runner.clone(),
+            pending_sudo.clone(),
+            password.clone(),
+            close_tx,
+            sink.clone(),
+        )
+        .await;
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:confirm").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "confirm",
+                json!({ "confirmed": true })
+            )
+            .await
+        );
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:password").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "password",
+                json!({ "password": "pw" })
+            )
+            .await
+        );
+        let response = task.await.unwrap();
+        let result = &response["result"];
+        assert_eq!(
+            result["isError"], true,
+            "the process-level arm fires even though `is_error` is false — a \
+             success-shaped verdict must never swallow it: {result}"
+        );
+        assert_eq!(
+            result["details"]["error"], "failed to spawn sudo: Permission denied (os error 13)",
+            "the process-level error text is what the model reads"
+        );
+        assert!(
+            result["details"]["exitCode"].is_null(),
+            "no code was observed: {:?}",
+            result["details"]
+        );
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("failed to run privileged command:")),
+            "the model text names the process-level failure: {:?}",
+            result["content"]
+        );
+        // A process-level failure is NOT an auth failure: the cache is kept.
+        assert!(password.lock().await.contains_key("sid1"));
+    }
+
+    /// The classifier's NOTE wins over the generic failure text whenever it
+    /// exists — the R2 row is why. R2 is a pipe-held run whose command exited
+    /// NON-ZERO on its own: the classifier says so in words ("that is the
+    /// command's own exit code, not a deadline") precisely so the model does not
+    /// retry a command that genuinely failed. If the render preferred the
+    /// generic `"command failed with exit code N"`, the note — the whole point
+    /// of R2 — would never reach the model. `bash.rs`'s render is the reference:
+    /// the note always rides along the verdict.
+    #[tokio::test]
+    async fn a_classifier_note_is_preferred_over_the_generic_failure_text() {
+        const R2_NOTE: &str = "The command FAILED with exit code 3 — that is the command's own exit code, not a deadline. The run only reached its deadline because a background process still held the output pipe open after the command had exited.";
+        let runner = Arc::new(FakeRunner::with_result(SudoRun {
+            exit_code: Some(3),
+            stdout: "some output".to_string(),
+            stderr: String::new(),
+            timed_out: true,
+            is_error: true,
+            note: Some(R2_NOTE.to_string()),
+            error: None,
+        }));
+        let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
+        let task = run_sudo(
+            "id1",
+            json!({ "command": "apt update", "reason": "r" }),
+            runner.clone(),
+            pending_sudo.clone(),
+            password.clone(),
+            close_tx,
+            sink.clone(),
+        )
+        .await;
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:confirm").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "confirm",
+                json!({ "confirmed": true })
+            )
+            .await
+        );
+        assert!(wait_for_sudo_key(&pending_sudo, "sid1/id1:password").await);
+        assert!(
+            respond_sudo(
+                &pending_sudo,
+                "id1",
+                "password",
+                json!({ "password": "pw" })
+            )
+            .await
+        );
+        let response = task.await.unwrap();
+        let result = &response["result"];
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["details"]["exitCode"], 3, "the REAL code survives");
+        assert_eq!(
+            result["details"]["error"], R2_NOTE,
+            "the classifier's note IS the report — the generic text must not win"
+        );
+        assert!(
+            password.lock().await.contains_key("sid1"),
+            "an R2 failure is not an auth failure — the cache is kept"
         );
     }
 
@@ -1633,10 +1964,12 @@ mod tests {
     #[tokio::test]
     async fn an_expired_cached_password_re_prompts_instead_of_reusing() {
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: 0,
+            exit_code: Some(0),
             stdout: "ok".to_string(),
             stderr: String::new(),
             timed_out: false,
+            is_error: false,
+            note: None,
             error: None,
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1779,10 +2112,12 @@ mod tests {
         // A runner that succeeds (the flow completes — the user answers both
         // sub-prompts, the command runs, and the flow returns a success result).
         let runner = Arc::new(FakeRunner::with_result(SudoRun {
-            exit_code: 0,
+            exit_code: Some(0),
             stdout: "ok\n".to_string(),
             stderr: String::new(),
             timed_out: false,
+            is_error: false,
+            note: None,
             error: None,
         }));
         let (pending_sudo, password, close_tx, sink) = sudo_fixtures(runner.clone()).await;
@@ -1838,6 +2173,344 @@ mod tests {
         assert!(
             pending_sudo.lock().await.is_empty(),
             "the pending_sudo map is empty after the completion (no leaked dead-oneshot)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // (Finding 5) The `details` wire vocabulary — PRODUCER side.
+    //
+    // `details` is a VALUE vocabulary inside one frame (not an event *name*),
+    // which `src/lib/ipc/events.ts` (:21-31) explicitly endorses pinning by
+    // tests on each side. This is the Rust half; the TS half is task07b's
+    // `src/lib/toolDetailsRegistry.test.ts`. BOTH halves agree on ONE list —
+    // the frozen 34-key producer literal below, copied VERBATIM from
+    // task07b's plan section "The frozen producer list" (re-derived from the
+    // tree ONCE at HEAD 29b16df, vet round 2; re-verified against this tree at
+    // HEAD 1483d94 by the harness-loop grounding, indexed-assignment emission
+    // included). DO NOT re-derive it: a new emitter is a live wire change to
+    // report, never a silent edit of this constant.
+    // ---------------------------------------------------------------------
+
+    // THE details wire vocabulary — producer side. 34 keys. FROZEN in
+    // task07b's plan §"The frozen producer list" (re-derived from the tree
+    // ONCE at HEAD 29b16df, vet round 2); re-verified against this tree at
+    // HEAD 1483d94 by the harness-loop grounding (indexed-assignment
+    // emission included: web/tools.rs:314,317 add `renderer`/`rendererNote`
+    // post-build). Copy VERBATIM — drift between this Rust copy and the TS
+    // registry's PRODUCER_KEYS is the guard's own first test subject.
+    const PRODUCER_KEYS: [&str; 34] = [
+        "bytes",
+        "cancelled",
+        "command",
+        "customInput",
+        "description",
+        "diff",
+        "dir",
+        "entries",
+        "error",
+        "exitCode",
+        "extractor",
+        "lines",
+        "matches",
+        "occurrences",
+        "operation",
+        "path",
+        "provider",
+        "reason",
+        "renderer",
+        "rendererNote",
+        "responseId",
+        "resultCount",
+        "results",
+        "scope",
+        "skill",
+        "skills",
+        "status",
+        "stderr",
+        "stdout",
+        "title",
+        "todos",
+        "truncated",
+        "url",
+        "wordCount",
+    ];
+
+    /// One producer `details` shape: `(shape name, the details object,
+    /// whether the producing `ToolResult` is a failure)`.
+    ///
+    /// One fixture per shape GROUP from the frozen register — the shapes the
+    /// 39 production emission sites emit (`details: Some(json!({...}))` and
+    /// the `ok_text(.., Some(json!(..)))` second arg, across `web/tools.rs`,
+    /// `interactive/mod.rs`, `harness/ask.rs`, `tools/exec/bash.rs`,
+    /// `tools/exec/fs_tools.rs`, `tools/exec/search.rs`, `tools/exec/skills.rs`).
+    /// Each fixture is the WIRE shape, not an invented one: the sudo arms carry
+    /// `exitCode: null` on the never-ran paths (ADR 0080's amendment — never a
+    /// fabricated `-1`), and `renderer`/`rendererNote` are the OPTIONAL keys
+    /// `web/tools.rs` adds by indexed assignment only when a renderer was used.
+    fn producer_details_fixtures() -> Vec<(&'static str, Value, bool)> {
+        vec![
+            // The single-key failure shape (`web/tools.rs`'s seven error arms).
+            ("error", json!({ "error": "boom" }), true),
+            // The todo shapes (`interactive/mod.rs`'s todo_apply arms).
+            (
+                "todo read",
+                json!({ "operation": "read", "todos": [] }),
+                false,
+            ),
+            (
+                "todo write failure",
+                json!({
+                    "operation": "write",
+                    "todos": [{ "content": "a", "status": "pending" }],
+                    "error": "todoList required",
+                }),
+                true,
+            ),
+            // The skills shapes (`tools/exec/skills.rs`).
+            ("skill list", json!({ "skills": 2 }), false),
+            (
+                "skill dir",
+                json!({ "skill": "tester", "scope": "user", "dir": "/tmp/s" }),
+                false,
+            ),
+            (
+                "skill file",
+                json!({ "skill": "tester", "path": "SKILL.md" }),
+                false,
+            ),
+            // The file shapes (`tools/exec/fs_tools.rs`).
+            (
+                "read text",
+                json!({ "path": "/tmp/a.rs", "lines": 12 }),
+                false,
+            ),
+            (
+                "read image",
+                json!({ "path": "/tmp/a.png", "bytes": 2048 }),
+                false,
+            ),
+            (
+                "edit",
+                json!({
+                    "path": "/tmp/a.rs",
+                    "occurrences": 1,
+                    "diff": "--- a\n+++ b\n",
+                }),
+                false,
+            ),
+            ("ls", json!({ "entries": 3 }), false),
+            // The search shapes (`tools/exec/search.rs`).
+            (
+                "find / grep",
+                json!({ "matches": 40, "truncated": true }),
+                false,
+            ),
+            // The bash shape (`tools/exec/bash.rs`).
+            (
+                "bash",
+                json!({ "exitCode": 0, "truncated": false, "cancelled": false }),
+                false,
+            ),
+            // The sudo shapes (`interactive/mod.rs`'s eight sudo_exec arms):
+            // the ran arm (no `error`) and the failed arm.
+            (
+                "sudo ran",
+                json!({
+                    "command": "apt update",
+                    "reason": "install deps",
+                    "exitCode": 0,
+                    "stdout": "ok",
+                    "stderr": "",
+                }),
+                false,
+            ),
+            (
+                "sudo rejected (never ran: exitCode is null, not -1)",
+                json!({
+                    "command": "  ",
+                    "reason": "r",
+                    "exitCode": Value::Null,
+                    "stdout": "",
+                    "stderr": "",
+                    "error": "empty command",
+                }),
+                true,
+            ),
+            // The web shapes (`web/tools.rs`).
+            (
+                "web_search",
+                json!({
+                    "responseId": "r1",
+                    "provider": "duckduckgo",
+                    "resultCount": 1,
+                    "results": [{ "title": "t", "url": "u" }],
+                }),
+                false,
+            ),
+            (
+                "fetch_content (renderer keys present — the indexed-assignment pair)",
+                json!({
+                    "responseId": "r2",
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "wordCount": 100,
+                    "status": 200,
+                    "extractor": "readable",
+                    "truncated": false,
+                    "renderer": "webview",
+                    "rendererNote": "note",
+                }),
+                false,
+            ),
+            (
+                "get_search_content matches",
+                json!({ "responseId": "r3", "matches": [] }),
+                false,
+            ),
+            (
+                "get_search_content cached",
+                json!({ "responseId": "r4" }),
+                false,
+            ),
+            // The ask shape (`harness/ask.rs`) — the two keys the old 32-key
+            // list missed, AND the `results` spanning key.
+            (
+                "ask",
+                json!({
+                    "results": [{ "question": "q", "selectedOptions": [] }],
+                    "customInput": Value::Null,
+                    "description": Value::Null,
+                }),
+                false,
+            ),
+        ]
+    }
+
+    /// (Finding 5 (b)) Every producer `details` shape round-trips through
+    /// [`tool_result_response_value`] UNCHANGED — byte-identical `Value`
+    /// equality — and the envelope's two documented `isError` behaviours hold
+    /// (a success omits it, a failure carries it). This is the gap the
+    /// pre-existing todo/sudo/ask round-trip pins never covered: the WEB and
+    /// exec shapes had no interactive-module round-trip at all.
+    #[test]
+    fn details_producer_shapes_round_trip_through_tool_result_response_value() {
+        let fixtures = producer_details_fixtures();
+        assert!(
+            !fixtures.is_empty(),
+            "the fixture collection is non-empty (the vacuity guard — a collapsed \
+             list must fail, not pass silently)"
+        );
+
+        for (name, details, is_error) in &fixtures {
+            let result = ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!("the `{name}` shape"),
+                }],
+                details: Some(details.clone()),
+                is_error: *is_error,
+            };
+            let envelope = tool_result_response_value(&result);
+
+            // The `details` value survives VERBATIM (no key renamed, dropped,
+            // added, or re-cased on the way through the envelope).
+            assert_eq!(
+                &envelope["details"], details,
+                "the `{name}` details shape round-trips byte-identically through \
+                 tool_result_response_value"
+            );
+
+            // The envelope's documented `isError` behaviour.
+            if *is_error {
+                assert_eq!(
+                    envelope["isError"],
+                    Value::Bool(true),
+                    "a failure carries `isError` (`{name}`)"
+                );
+            } else {
+                assert!(
+                    envelope.get("isError").is_none(),
+                    "a success OMITS `isError` entirely (`{name}`) — not a false, \
+                     not a null"
+                );
+            }
+
+            // The `content` key is always there (the envelope's own shape pin).
+            assert!(
+                envelope["content"].is_array(),
+                "the envelope carries the `content` array (`{name}`)"
+            );
+        }
+    }
+
+    /// (Finding 5 (c)) The fixture union's key set EQUALS the frozen 34-key
+    /// producer list — set-equality BOTH ways, so a producer key with no
+    /// reader-side fixture and a fixture key that is not on the frozen list
+    /// both fail the same test. Plus the repo-census vacuity guards.
+    #[test]
+    fn details_producer_key_union_equals_the_frozen_list() {
+        use std::collections::BTreeSet;
+
+        // Vacuity guard 1: the frozen list itself is non-empty and is the
+        // declared width (a collapsed/edited-down array reddens here, not
+        // silently).
+        assert!(
+            !PRODUCER_KEYS.is_empty(),
+            "PRODUCER_KEYS is non-empty (the census vacuity guard)"
+        );
+        assert_eq!(
+            PRODUCER_KEYS.len(),
+            34,
+            "the frozen producer list is the declared 34 keys — a member added or \
+             removed here is a WIRE change to report, not a list edit"
+        );
+        let frozen: BTreeSet<&str> = PRODUCER_KEYS.into_iter().collect();
+        assert_eq!(
+            frozen.len(),
+            PRODUCER_KEYS.len(),
+            "the frozen list carries no duplicate key"
+        );
+
+        let fixtures = producer_details_fixtures();
+        assert!(!fixtures.is_empty(), "the fixture groups are non-empty");
+
+        // The union of every fixture's keys.
+        let mut union: BTreeSet<&str> = BTreeSet::new();
+        for (name, details, _) in &fixtures {
+            let obj = details
+                .as_object()
+                .unwrap_or_else(|| panic!("the `{name}` fixture is a details OBJECT"));
+            assert!(
+                !obj.is_empty(),
+                "the `{name}` fixture carries at least one key"
+            );
+            for key in obj.keys() {
+                union.insert(key.as_str());
+            }
+        }
+
+        // Set-equality BOTH ways (the finding's (c): a key on one side and not
+        // the other is drift between the two halves' copies of the agreement).
+        let missing_from_fixtures: Vec<&&str> =
+            frozen.iter().filter(|k| !union.contains(*k)).collect();
+        let not_on_the_frozen_list: Vec<&&str> =
+            union.iter().filter(|k| !frozen.contains(*k)).collect();
+        assert!(
+            missing_from_fixtures.is_empty(),
+            "every frozen PRODUCER_KEYS key appears in >= 1 fixture group — these \
+             do not: {missing_from_fixtures:?} (the cross-coverage guard against \
+             silent list <-> fixture drift)"
+        );
+        assert!(
+            not_on_the_frozen_list.is_empty(),
+            "no fixture emits a key that is NOT on the frozen producer list — \
+             these are unregistered: {not_on_the_frozen_list:?} (a new emitter is a \
+             live wire change to REPORT, never a silent edit of PRODUCER_KEYS)"
+        );
+        assert_eq!(
+            union.len(),
+            34,
+            "the fixture union is exactly the 34-key producer vocabulary, got {}",
+            union.len()
         );
     }
 }

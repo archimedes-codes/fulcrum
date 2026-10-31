@@ -55,6 +55,19 @@
 //! invariant E keeps both call forms in this module. The Unix `sh -c`
 //! convention, the env and the child's stdio stay where they were.
 //!
+//! And since ADR 0080's amendment: **the process-group kill** —
+//! [`kill_process_group`]. Four sites used to signal a child's group with four
+//! independent implementations under two pid policies, and the two that read
+//! `Child::id()` LIVE at kill time skipped the group kill on the reap-ordered
+//! crash path (the live read is `None` once the child is reaped) — i.e. exactly
+//! where the group kill matters. One owner makes the latched-pid rule the API:
+//! the caller passes the pid it captured at spawn, and census invariant F keeps
+//! the syscall in this file (with one named carve-out — a synchronous `Drop`
+//! cannot call an `async fn`). Like the constructor policy, this is a kill
+//! seam: the REAP stays with the caller, because the callers genuinely differ
+//! (the elevated path must not leave a zombie; the bash and Worker paths must
+//! not reap a child another task owns).
+//!
 //! Nothing here is provable by running it — `cargo test` is itself a
 //! console-subsystem process, so a child inherits the test harness's console
 //! whether or not the flag is set, and neither std nor tokio can read a
@@ -167,9 +180,273 @@ pub fn append_cmd_c(_cmd: &mut tokio::process::Command, _command: &str) {
     }
 }
 
+/// SIGKILL a child's WHOLE process group by the LATCHED pid, then fall back to
+/// killing the direct child.
+///
+/// `pid` is the pid captured BEFORE the child could be reaped: `Child::id()`
+/// goes `None` the moment the exit status is collected, and a `None` here skips
+/// the group kill and leaves an orphaned grandchild. Every caller therefore
+/// latches at spawn — the historical defect this owner replaces was two sites
+/// that read `Child::id()` LIVE at kill time, which is exactly the reap-ordered
+/// crash path where the group kill matters (ADR 0080's amendment, Finding 3).
+///
+/// `#[cfg(unix)]`: a negative pid is the whole process group (the children this
+/// is used for are group leaders — `process_group(0)` for a Tool child,
+/// `setpgid(0, 0)` in `pre_exec` for the Worker and the elevated child).
+/// `#[cfg(not(unix))]`: the direct child only — there are no process groups to
+/// signal off unix, so nothing is lost, and the claim in the unix note above is
+/// simply not made there.
+///
+/// **Kill-only, by design** (the shape `kill_bash_process_group` already had):
+/// reaping stays the caller's decision, because the callers differ — the bash
+/// and Worker paths must not reap (a `wait` there would race another owner of
+/// the status), while the elevated path wants no zombie and reaps through
+/// `kill_process_group_and_reap`. The `SudoGroupGuard::drop` is the one site
+/// that keeps its own inline syscall: a `Drop` is synchronous and cannot reach
+/// an `async fn`; its pid is already latched and the census carves it out by
+/// name.
+pub(crate) async fn kill_process_group(pid: Option<u32>, child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        // A negative pid SIGKILLs the WHOLE process group (the child is the
+        // group leader). ESRCH — the group already gone — is the normal case
+        // for a child that exited on its own, hence the discarded result.
+        if let Some(pid) = pid {
+            let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+        // Fallback: kill the direct child as well (a no-op on a reaped child).
+        let _ = child.kill().await;
+    }
+    #[cfg(not(unix))]
+    {
+        // Gated on the ARM, not the call, so the `pid` binding does not exist
+        // unread on Windows (`unused_variable` under `-D warnings`).
+        let _ = pid; // No process groups to kill here.
+        let _ = child.kill().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (ADR 0080 amendment, Finding 3 / A5) The behavioural pin for
+    /// "a LATCHED pid group-kills even after the direct child has been
+    /// reaped". This is the observable `WorkerHandle::kill()` delegates to, so
+    /// this test IS the method's RED (Decision 3 of the task06 plan): the
+    /// pre-consolidation code read `Child::id()` LIVE at kill time, and that
+    /// returns `None` the moment the exit status is collected — which is
+    /// exactly the state a crash (or a reap-ordered teardown) leaves — so the
+    /// negative-pid group kill was SKIPPED and an orphaned grandchild survived
+    /// the one path that exists to kill it.
+    ///
+    /// Shape: `/bin/sh -c` spawned as its own process group (the sudo/worker
+    /// `setpgid` pattern), backgrounding a `sleep 60` grandchild whose pid it
+    /// writes to a file, then exiting 0 IMMEDIATELY. The direct child is
+    /// therefore reaped BEFORE the helper is called, so the ONLY way the
+    /// grandchild can die is a `kill(-pgid)` built from the pid latched at
+    /// spawn.
+    ///
+    /// The helper is kill-only (matching `kill_bash_process_group`): the wait
+    /// stays the caller's, so the test does NOT `child.wait()` again after the
+    /// helper — the single reap already happened above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_group_kills_by_the_latched_pid_after_the_direct_child_is_reaped() {
+        use std::process::Stdio;
+
+        assert!(
+            std::path::Path::new("/bin/sh").exists(),
+            "/bin/sh must exist"
+        );
+        let scratch =
+            crate::test_support::ScratchDir::in_env_temp("archimedes-childproc-kill-test-", "pid");
+        let grandchild_pid_file = scratch.join("grandchild.pid");
+        let mut cmd = command("sh");
+        cmd.arg("-c").arg(format!(
+            "( sleep 60 > /dev/null 2>&1 & echo $! > {} ); sleep 0.2",
+            grandchild_pid_file.display()
+        ));
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        cmd.stdin(Stdio::null());
+        cmd.kill_on_drop(true);
+        // The child owns its process group (the sudo/worker pattern) so a
+        // negative pid reaches the grandchild.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("`sh` starts");
+        // The pid is LATCHED at spawn — the whole point of the helper's
+        // parameter, and the value a live `Child::id()` can no longer produce.
+        let pid = child.id();
+        assert!(pid.is_some(), "a freshly spawned child has a pid");
+
+        // REAP the direct child BEFORE the helper runs (the child exits 0 on
+        // its own after the backgrounded `sleep` is running).
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+            .await
+            .expect("the direct child exits promptly")
+            .expect("the wait succeeds");
+        assert!(
+            status.success(),
+            "the fixture child exits 0, got {status:?}"
+        );
+        assert!(
+            child.id().is_none(),
+            "the LIVE read is `None` once the child is reaped — the exact state \
+             the pre-fix kill sites read, and why they skipped the group kill"
+        );
+
+        let grandchild_pid: u32 = std::fs::read_to_string(&grandchild_pid_file)
+            .expect("the script wrote the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+
+        // The helper, called with the LATCHED pid on the already-reaped child.
+        kill_process_group(pid, &mut child).await;
+
+        // The GRANDCHILD is dead: the negative-pid kill fired off the latched
+        // value. (Poll — the kernel reaps the orphaned, killed grandchild
+        // promptly, but not instantaneously.)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut gone = false;
+        while std::time::Instant::now() < deadline && !gone {
+            if unsafe { libc::kill(grandchild_pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                gone = true;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        assert!(
+            gone,
+            "the grandchild (pid {grandchild_pid}) is dead — a latched pid must \
+             group-kill even after the direct child was reaped"
+        );
+    }
+
+    /// Invariant F — the process-group kill lives ONLY in this module's helper
+    /// (plus the one carved-out `Drop`).
+    ///
+    /// **Why this invariant exists.** Four independent
+    /// `libc::kill(-(pid as i32), libc::SIGKILL)` implementations existed at
+    /// four sites under two pid policies (ADR 0080's amendment, Finding 3):
+    /// two latched the pid at spawn (`kill_bash_process_group`'s parameter,
+    /// `SudoGroupGuard`) and two re-read `Child::id()` live at kill time
+    /// (`WorkerHandle::kill`, `kill_process_group_and_reap`) — and a live read
+    /// returns `None` on a reaped child, so the two live sites silently skipped
+    /// the group kill on exactly the crash/reap path the group kill exists for.
+    /// The consolidation gives the kill ONE owner; this census is what keeps a
+    /// fifth site from appearing with either policy.
+    ///
+    /// **The one carve-out, by name:** `interactive/sudo_exec.rs`'s
+    /// `SudoGroupGuard::drop`. A `Drop` impl is SYNCHRONOUS and cannot reach an
+    /// `async fn`, so the guard keeps its inline syscall; its pid is already
+    /// latched at spawn and its disarm-on-reap semantics are pinned by
+    /// `run_sudo_real_a_dropped_future_kills_the_whole_process_group` and
+    /// `run_sudo_real_a_normal_completion_does_not_kill_the_process_group`.
+    /// That is 1 site in `childproc.rs` + 1 in `sudo_exec.rs`, ZERO everywhere
+    /// else — in particular zero in `exec/bash.rs` (now a thin wrapper),
+    /// `worker/client.rs` (now delegates) and `interactive/mod.rs`.
+    ///
+    /// **Armed, and how it could fail.** The guard below asserts the scan FINDS
+    /// the two permitted sites before it asserts anything is absent: a scan
+    /// whose needle drifted from the code would report a perfect clean bill of
+    /// health for an empty corpus, which ADR 0080's standard calls UNVERIFIED,
+    /// not green. It is a LINT on text, so a string literal carrying the needle
+    /// also trips it — the error goes the safe way (a false alarm costs a
+    /// rename).
+    #[test]
+    fn production_process_group_kill_lives_only_in_childproc() {
+        const SUDO_EXEC: &str = "agent/interactive/sudo_exec.rs";
+        // The needle is the negative-pid SIGKILL itself — the syscall shape,
+        // not a name that a wrapper could rename.
+        const NEEDLE: &str = "libc::kill(-(pid as i32)";
+        // The files the consolidation touched, plus the two owners. Anything
+        // NOT in this list is out of scope for the sweep (a site elsewhere
+        // would be a new conversation, not a silent pass).
+        let files = [
+            SELF,
+            SUDO_EXEC,
+            "agent/tools/exec/bash.rs",
+            "agent/worker/client.rs",
+            "agent/interactive/mod.rs",
+        ];
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(
+            src_root.is_dir(),
+            "the census resolved the wrong root: {} is not a directory",
+            src_root.display()
+        );
+
+        let sites: Vec<(String, Vec<usize>)> = files
+            .iter()
+            .map(|rel| {
+                let region = production_region(&src_root.join(rel));
+                let lines: Vec<usize> = region
+                    .iter()
+                    .filter(|l| l.text.contains(NEEDLE))
+                    .map(|l| l.line)
+                    .collect();
+                ((*rel).to_string(), lines)
+            })
+            .collect();
+
+        // ── Vacuity / arming guard FIRST: the sweep must SEE both permitted
+        // sites, or the "zero everywhere else" claim below has read nothing.
+        let in_self = sites
+            .iter()
+            .find(|(rel, _)| rel == SELF)
+            .map(|(_, lines)| lines.len())
+            .unwrap_or(0);
+        let in_sudo = sites
+            .iter()
+            .find(|(rel, _)| rel == SUDO_EXEC)
+            .map(|(_, lines)| lines.len())
+            .unwrap_or(0);
+        assert_eq!(
+            (in_self, in_sudo),
+            (1, 1),
+            "Invariant F is BLIND: the sweep found {in_self} copy(ies) of \
+             `{NEEDLE}` in `{SELF}` (expected 1 — the helper) and {in_sudo} in \
+             `{SUDO_EXEC}` (expected 1 — the `SudoGroupGuard::drop` carve-out). At 0 \
+             the needle drifted from the code (or a root resolved wrongly: {}), and \
+             the zero-check below would pass having seen nothing.",
+            src_root.display(),
+        );
+
+        // ── The invariant: nothing else kills a process group.
+        let violations: Vec<String> = sites
+            .iter()
+            .filter(|(rel, _)| rel != SELF && rel != SUDO_EXEC)
+            .flat_map(|(rel, lines)| {
+                lines
+                    .iter()
+                    .map(move |line| format!("{rel}:{line}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "Invariant F (one owner of the process-group kill): production code signals a \
+             process group outside `childproc::kill_process_group` at {violations:?} — every \
+             extra site re-chooses the pid policy, and the historical mistake was reading \
+             `Child::id()` LIVE there (it is `None` once the child is reaped, so the group \
+             kill is silently skipped on the crash path and a grandchild survives). Call \
+             `childproc::kill_process_group(latched_pid, child)`; the only permitted \
+             inline site is `SudoGroupGuard::drop`, which cannot be async (ADR 0080's \
+             amendment).",
+        );
+    }
 
     /// Claim: the constant is the value Microsoft documents for
     /// `CREATE_NO_WINDOW`, written out here as an independent literal rather

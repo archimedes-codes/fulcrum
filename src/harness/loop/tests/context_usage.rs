@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::CompactionRan;
 use super::support::*;
+use crate::agent::events::CompactionReason;
 use crate::agent::events::EventSink;
 use crate::agent::harness::catalog::{CompactionConfig, Model};
 use crate::agent::harness::compact::{self, Compactor};
@@ -1000,7 +1001,12 @@ async fn a_compaction_emits_a_context_usage_update_from_the_reestimate() {
     // The compaction REALLY shrank the transcript (the wrapper's return).
     assert_eq!(
         loop_
-            .run_compaction("threshold", false, None, &CancellationToken::new())
+            .run_compaction(
+                CompactionReason::Threshold,
+                false,
+                None,
+                &CancellationToken::new()
+            )
             .await,
         CompactionRan::Compacted,
         "a compaction that rewrote the transcript shrank it"

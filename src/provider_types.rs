@@ -402,9 +402,65 @@ pub(crate) fn cost_usd_from_usage(usage: &Value) -> Option<f64> {
     }
 }
 
+/// Classify an in-stream SSE `error` chunk into a [`ProviderError`] — the
+/// ONE classifier of the three wires (the `cost_usd_from_usage` precedent:
+/// a shared reader of a `Value` each parser already holds, so no per-wire
+/// copy can drift).
+///
+/// The wire `type` is the classification: `overloaded_error` / `api_error`
+/// are transient, `authentication_error` / `permission_error` are auth, the
+/// rest are permanent; an UNKNOWN type is conservative — retryable, a new
+/// error type is probably transient, and the `RetryPolicy`'s budget bounds
+/// the damage. The ONE exception is the context-overflow message (ADR 0045),
+/// which is checked FIRST because Anthropic reports an over-window prompt as
+/// an ordinary `invalid_request_error`.
+///
+/// (ADR 0045) An over-window prompt arrives here as an
+/// `invalid_request_error` — a `kind` that maps to `Fatal` on its own — so
+/// the MESSAGE has to decide the tier, before the `kind` match. This is the
+/// only place a mid-stream `ProviderEvent::Error` is built, so without it
+/// nothing could ever produce a mid-stream overflow and the loop's
+/// mid-stream recovery arm would be dead code. The exclusions run first
+/// inside the check, so a throttle stays the tier its `kind` says.
+///
+/// `None` means NOT an error chunk — the chunk carries no `error` key at
+/// all, and the caller proceeds with its normal parsing. An `error` object
+/// that is present but empty is NOT `None`: the `"(no message)"` and
+/// `""`-kind fallbacks run and yield `Retryable("unknown: (no message)")`,
+/// exactly the behaviour the Anthropic wire has always had (the format
+/// string `"{kind}: {message}"` is byte-identical to that wire's, so its
+/// behaviour is preserved by construction).
+pub(crate) fn parse_error_chunk(v: &Value) -> Option<ProviderError> {
+    let error = v.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("(no message)");
+    let kind = error.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    // (ADR 0045) THE ORDER IS LOAD-BEARING: the overflow check runs BEFORE
+    // the `kind` match (see the doc above), and the exclusions run first
+    // inside the check, so a throttle stays the tier its `kind` says.
+    if crate::agent::harness::provider::overflow::is_context_overflow_text(message) {
+        return Some(ProviderError::ContextOverflow(format!("{kind}: {message}")));
+    }
+    Some(match kind {
+        "overloaded_error" | "api_error" => ProviderError::Retryable(format!("{kind}: {message}")),
+        "authentication_error" | "permission_error" => {
+            ProviderError::Auth(format!("{kind}: {message}"))
+        }
+        "invalid_request_error" | "not_found_error" => {
+            ProviderError::Fatal(format!("{kind}: {message}"))
+        }
+        _ => {
+            let label = if kind.is_empty() { "unknown" } else { kind };
+            ProviderError::Retryable(format!("{label}: {message}"))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::cost_usd_from_usage;
+    use super::{cost_usd_from_usage, parse_error_chunk, ProviderError};
     use serde_json::json;
 
     #[test]
@@ -488,5 +544,152 @@ mod tests {
         // an unpriced call look free.
         assert_eq!(cost_usd_from_usage(&json!({"cost": 0})), Some(0.0));
         assert_eq!(cost_usd_from_usage(&json!({"cost": 0.0})), Some(0.0));
+    }
+
+    // ── `parse_error_chunk` (the ONE classifier of the three wires) ──────
+    //
+    // (Moved from `anthropic.rs`'s `map_anthropic_error_*` tests — the
+    // lifted classifier is byte-identical, so the inputs and expectations
+    // are textually unchanged, only the call shape gained an `.unwrap()`.)
+
+    #[test]
+    fn parse_error_chunk_maps_wire_kind_tiers() {
+        fn err(kind: Option<&str>) -> ProviderError {
+            let mut error = serde_json::Map::new();
+            error.insert("message".to_string(), json!("boom"));
+            if let Some(k) = kind {
+                error.insert("type".to_string(), json!(k));
+            }
+            parse_error_chunk(&json!({ "type": "error", "error": error })).expect("an error chunk")
+        }
+        // `overloaded_error` / `api_error` are transient.
+        for kind in ["overloaded_error", "api_error"] {
+            match err(Some(kind)) {
+                ProviderError::Retryable(_) => {}
+                e => panic!("{kind} is retryable, got {e:?}"),
+            }
+        }
+        // `authentication_error` / `permission_error` are auth.
+        for kind in ["authentication_error", "permission_error"] {
+            match err(Some(kind)) {
+                ProviderError::Auth(_) => {}
+                e => panic!("{kind} is auth, got {e:?}"),
+            }
+        }
+        // `invalid_request_error` / `not_found_error` are permanent.
+        for kind in ["invalid_request_error", "not_found_error"] {
+            match err(Some(kind)) {
+                ProviderError::Fatal(_) => {}
+                e => panic!("{kind} is fatal, got {e:?}"),
+            }
+        }
+        // An UNKNOWN type is conservative — retryable.
+        match err(Some("mystery_error")) {
+            ProviderError::Retryable(_) => {}
+            e => panic!("an unknown type is retryable, got {e:?}"),
+        }
+        // An absent / empty `type` is retryable, labeled `unknown`.
+        for kind in [None, Some("")] {
+            match err(kind) {
+                ProviderError::Retryable(msg) => {
+                    assert!(
+                        msg.contains("unknown"),
+                        "an absent/empty type is labeled `unknown` (got {msg:?})"
+                    );
+                }
+                other => panic!("an absent/empty type is retryable, got {other:?}"),
+            }
+        }
+    }
+
+    /// (ADR 0045) `parse_error_chunk` is the ONLY producer of mid-stream
+    /// `ProviderError`s, so it is the only place a mid-stream SSE `error`
+    /// event can become a `ContextOverflow` — without it the loop's
+    /// mid-stream recovery arm would be unreachable. Anthropic reports an
+    /// over-window prompt as `invalid_request_error` (which maps to `Fatal`
+    /// on its own), so the MESSAGE decides: the overflow check runs BEFORE
+    /// the `kind` match, and a throttle / rate-limit message is excluded
+    /// first (a Bedrock-style throttle behind a gateway stays the tier its
+    /// `kind` says).
+    #[test]
+    fn parse_error_chunk_detects_a_context_overflow_before_the_kind_match() {
+        fn err(kind: &str, message: &str) -> ProviderError {
+            parse_error_chunk(&json!({
+                "type": "error",
+                "error": { "type": kind, "message": message },
+            }))
+            .expect("an error chunk")
+        }
+        // The real Anthropic wording, behind the `kind` that used to be
+        // `Fatal`: the tier is the overflow, message included.
+        assert_eq!(
+            err(
+                "invalid_request_error",
+                "prompt is too long: 213462 tokens > 200000 maximum"
+            ),
+            ProviderError::ContextOverflow(
+                "invalid_request_error: prompt is too long: 213462 tokens > 200000 maximum"
+                    .to_string()
+            )
+        );
+        // The `kind` does not have to be `invalid_request_error` — the
+        // message is what the tier reads (a gateway may wrap it).
+        for kind in ["api_error", "mystery_error", ""] {
+            assert!(
+                matches!(
+                    err(kind, "Your input exceeds the context window of this model"),
+                    ProviderError::ContextOverflow(_)
+                ),
+                "{kind} with an overflow message is the overflow tier"
+            );
+        }
+        // An `invalid_request_error` that is NOT about length stays `Fatal`
+        // (a bad tool spec, a malformed body — nothing a compaction fixes).
+        assert_eq!(
+            err("invalid_request_error", "boom"),
+            ProviderError::Fatal("invalid_request_error: boom".to_string())
+        );
+        // The exclusions run first, so a throttle behind an
+        // `invalid_request_error` is not read as an overflow.
+        assert_eq!(
+            err(
+                "invalid_request_error",
+                "ThrottlingException: Too many tokens, please wait before trying again."
+            ),
+            ProviderError::Fatal(
+                "invalid_request_error: ThrottlingException: Too many tokens, please wait before trying again."
+                    .to_string()
+            )
+        );
+    }
+
+    /// The `None`-discipline (the `cost_usd_from_usage` precedent): `None`
+    /// means the chunk carries NO `error` key at all, so the caller proceeds
+    /// with its normal parsing. An `error` key that is PRESENT is always
+    /// `Some` — even an empty object, which falls through the
+    /// `"(no message)"` / `""`-kind fallbacks to the `unknown`-labelled
+    /// `Retryable` the Anthropic wire has always produced.
+    #[test]
+    fn parse_error_chunk_returns_none_for_non_error_bodies() {
+        for chunk in [
+            json!({"choices": []}),
+            json!({"choices": [{"delta": {"content": "x"}}]}),
+            json!({"usage": {"prompt_tokens": 1, "completion_tokens": 1}}),
+            json!({}),
+        ] {
+            assert_eq!(
+                parse_error_chunk(&chunk),
+                None,
+                "a chunk with no `error` key is not an error chunk: {chunk}"
+            );
+        }
+        // PRESENT-but-empty is NOT `None` (the fallbacks run — today's
+        // Anthropic behaviour, byte-identical).
+        assert_eq!(
+            parse_error_chunk(&json!({"error": {}})),
+            Some(ProviderError::Retryable(
+                "unknown: (no message)".to_string()
+            ))
+        );
     }
 }

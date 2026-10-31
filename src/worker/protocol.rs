@@ -955,7 +955,7 @@ mod tests {
                 assistant_message_event: serde_json::json!({ "type": "textDelta" }),
             },
             crate::agent::events::RpcEvent::compaction_end {
-                reason: "context_limit".to_string(),
+                reason: crate::agent::events::CompactionReason::Threshold,
                 result: None,
                 aborted: false,
                 will_retry: false,
@@ -977,6 +977,103 @@ mod tests {
                 other => panic!("expected `Event`, got {other:?}"),
             }
         }
+    }
+
+    /// The compaction reason's WIRE SPELLINGS are frozen (Finding 4).
+    ///
+    /// The Rust enum and the TS union are ONE contract:
+    /// `export type CompactionReason = "manual" | "threshold" | "overflow";`
+    /// (`src/lib/types.ts` — `types.ts:143`, landed 9d8687c). The enum's
+    /// `#[serde(rename_all = "snake_case")]` is what makes that true; any other
+    /// rename strategy changes the wire and breaks every TS reader (the
+    /// `compacting` store field, `normalize.rs`'s `compaction_update`
+    /// passthrough, `toolOutput.ts`'s exhaustive switch with its `never`
+    /// default arm).
+    ///
+    /// This test is the DRIFT PIN: a fourth member, a renamed spelling, or a
+    /// changed rename strategy reddens it. It references the members BY NAME
+    /// (never a `&str` literal) so it cannot pass vacuously against a
+    /// string-typed field.
+    #[test]
+    fn compaction_reason_serde_spellings_are_frozen() {
+        use crate::agent::events::CompactionReason;
+
+        // (a) The three members serialize to EXACTLY the three TS spellings.
+        assert_eq!(
+            serde_json::to_string(&CompactionReason::Manual).unwrap(),
+            "\"manual\"",
+            "the manual trigger's wire spelling is frozen (types.ts:143)"
+        );
+        assert_eq!(
+            serde_json::to_string(&CompactionReason::Threshold).unwrap(),
+            "\"threshold\"",
+            "the threshold trigger's wire spelling is frozen (types.ts:143)"
+        );
+        assert_eq!(
+            serde_json::to_string(&CompactionReason::Overflow).unwrap(),
+            "\"overflow\"",
+            "the overflow trigger's wire spelling is frozen (types.ts:143)"
+        );
+        // And back — the reader side accepts exactly those strings.
+        for (wire, member) in [
+            ("\"manual\"", CompactionReason::Manual),
+            ("\"threshold\"", CompactionReason::Threshold),
+            ("\"overflow\"", CompactionReason::Overflow),
+        ] {
+            let back: CompactionReason =
+                serde_json::from_str(wire).expect("the frozen spelling deserializes");
+            assert_eq!(back, member, "`{wire}` maps back to its own enum member");
+        }
+
+        // (b) A full `RpcEvent` carrying each member round-trips VERBATIM
+        // through the real outbound codec (mirrors
+        // `rpc_event_inside_event_nesting_round_trips`'s shape).
+        let events = vec![
+            crate::agent::events::RpcEvent::compaction_start {
+                reason: CompactionReason::Overflow,
+            },
+            crate::agent::events::RpcEvent::compaction_end {
+                reason: CompactionReason::Threshold,
+                result: None,
+                aborted: false,
+                will_retry: false,
+                error_message: None,
+            },
+            crate::agent::events::RpcEvent::compaction_start {
+                reason: CompactionReason::Manual,
+            },
+            crate::agent::events::RpcEvent::compaction_end {
+                reason: CompactionReason::Manual,
+                result: Some(serde_json::json!({ "tokens": 12 })),
+                aborted: true,
+                will_retry: false,
+                error_message: Some("failed: boom".to_string()),
+            },
+        ];
+        for event in events {
+            let line = encode_outbound(&Outbound::Event {
+                event: event.clone(),
+            });
+            let decoded = decode_outbound(&line).expect("the frame decodes");
+            match decoded {
+                Outbound::Event { event: back } => {
+                    assert_eq!(event, back, "the compaction RpcEvent round-trips verbatim")
+                }
+                other => panic!("expected `Event`, got {other:?}"),
+            }
+        }
+
+        // The `type` discriminator itself is NOT camelCased by the per-variant
+        // `rename_all` (the enum-level note in `events.rs`): the frame the TS
+        // side routes on is unchanged by the enum.
+        let line = encode_outbound(&Outbound::Event {
+            event: crate::agent::events::RpcEvent::compaction_start {
+                reason: CompactionReason::Manual,
+            },
+        });
+        let raw: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(raw["event"]["type"], "compaction_start");
+        assert_eq!(raw["event"]["reason"], "manual");
     }
 
     /// `decode_inbound` routes a `compact` line to the `Compact` variant.

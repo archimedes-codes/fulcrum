@@ -95,7 +95,7 @@ pub struct AgentDefinition {
     /// struct is unaffected.
     ///
     /// **A REPORT, rendered on the winning row — never a row of its own.** It
-    /// crosses the wire: `commands::agents::AgentConfigDto` carries this very
+    /// crosses the wire: `commands::agents::AgentDefinitionReportDto` carries this very
     /// `Shadowed<AgentScope>` (ADR 0068), so the sidebar **Agents** modal can
     /// name the loser a collision excluded. `AgentDefinitionDto` still does NOT
     /// carry it — and `discover_agents(None)` reads user-level roots only, so
@@ -244,44 +244,21 @@ pub fn discover_in_roots(roots: &[(PathBuf, AgentScope)]) -> Vec<AgentDefinition
 ///
 /// Do NOT canonicalize the input before walking (the caller passes a
 /// canonical path; if `space_path` doesn't exist, return an empty vec).
+///
+/// DELEGATOR: the walk-up itself lives in [`crate::roots::space_roots_in`],
+/// the ONE owner it shares with `skills::space_roots` (Finding 10). This
+/// function contributes only the two join targets and the scope tag; the
+/// order, the `.git` stop and the raw-spelling contract are the helper's, and
+/// `space_roots_walks_up_to_the_repo_root` pins them through here.
 pub fn space_roots(space_path: &Path) -> Vec<(PathBuf, AgentScope)> {
-    if !space_path.exists() {
-        return Vec::new();
-    }
-    // Find the repo root: the first ancestor (including `space_path`
-    // itself) that contains a `.git` entry; if none exists, only
-    // `space_path` is a level.
-    let mut repo_root: Option<PathBuf> = None;
-    let mut cur = space_path.to_path_buf();
-    loop {
-        if cur.join(".git").exists() {
-            repo_root = Some(cur.clone());
-            break;
-        }
-        match cur.parent() {
-            Some(p) if p != cur => {
-                cur = p.to_path_buf();
-            }
-            _ => break,
-        }
-    }
-    // Levels, innermost (the space itself) first, up to and including
-    // the repo root.
-    let mut levels = vec![space_path.to_path_buf()];
-    if let Some(root) = repo_root {
-        let mut cur = space_path.to_path_buf();
-        while cur != root {
-            let next = cur.parent().unwrap().to_path_buf();
-            levels.push(next.clone());
-            cur = next;
-        }
-    }
-    let mut out = Vec::new();
-    for level in &levels {
-        out.push((level.join(".agents/agents"), AgentScope::Space));
-        out.push((level.join(".pi/agents"), AgentScope::Space));
-    }
-    out
+    crate::roots::space_roots_in(
+        space_path,
+        Path::new(".agents/agents"),
+        Path::new(".pi/agents"),
+    )
+    .into_iter()
+    .map(|path| (path, AgentScope::Space))
+    .collect()
 }
 
 /// `home_dir().join(".agents/agents")` (first) and

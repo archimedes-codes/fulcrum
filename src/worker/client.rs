@@ -714,24 +714,31 @@ impl WorkerHandle {
         self.pid
     }
 
-    /// Kill the Worker: on Unix the WHOLE process group SIGKILL (the
-    /// child is the group leader via `setpgid` — the `RealSudoRunner`
-    /// pattern) + a fallback kill of the direct child; on Windows the
-    /// direct `child.kill()`. Best-effort (an already-reaped child is a
-    /// no-op).
+    /// Kill the Worker: on Unix the WHOLE process group SIGKILL (the child is
+    /// the group leader via `setpgid(0, 0)` — the `RealSudoRunner` pattern),
+    /// then a fallback kill of the direct child; off Unix the direct
+    /// `child.kill()`. Best-effort (every failure is discarded — the caller is
+    /// a teardown that has nothing to do with the outcome).
+    ///
+    /// The group kill uses the **latched** [`Self::pid`] — captured at spawn
+    /// and never re-read — and NOT `Child::id()`: that goes `None` the moment
+    /// the exit status is collected, which is exactly the state a crash leaves
+    /// (the read task's `wait()` has reaped the child by the time a crashed
+    /// Worker is reaped). A live read there silently SKIPPED the group kill on
+    /// the one path the group kill exists for, leaving the Worker's own
+    /// children alive; the latched value fires there, so the WHOLE-group claim
+    /// this comment makes is the behaviour the code delivers. The direct-child
+    /// fallback is still a no-op on an already-reaped child — that is the
+    /// belt-and-braces half, not the group half.
+    ///
+    /// The syscall itself lives in
+    /// [`crate::agent::childproc::kill_process_group`] (one owner for the
+    /// process-group kill — ADR 0080's amendment).
     pub async fn kill(&self) -> Result<(), WorkerError> {
         let mut guard = self.child.lock().await;
         #[cfg(unix)]
         {
-            // A negative pid SIGKILLs the WHOLE process group (the
-            // child is the group leader via `setpgid(0, 0)`); `None`
-            // when the child was already reaped (then the kill below
-            // is a no-op too).
-            if let Some(pid) = guard.id() {
-                let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            }
-            // Fallback: kill the direct child as well.
-            let _ = guard.kill().await;
+            crate::agent::childproc::kill_process_group(self.pid, &mut guard).await;
         }
         #[cfg(not(unix))]
         {
@@ -1315,6 +1322,48 @@ mod tests {
             pid,
             "the value after the reap is the one captured at spawn"
         );
+    }
+
+    /// (ADR 0080 amendment, Finding 3 / A5) The method-level contract pin for
+    /// `kill()` on an ALREADY-REAPED handle: the pid survives the reap, the
+    /// kill is best-effort `Ok`, and it completes (no hang).
+    ///
+    /// This is the METHOD statement of the fix; the BEHAVIOURAL red — the
+    /// negative-pid group kill actually firing on a reaped direct child — lives
+    /// in `childproc::kill_process_group_kills_by_the_latched_pid_after_the_direct_child_is_reaped`,
+    /// because `kill()` delegates the group kill to that helper and the
+    /// `fake_worker` fixture spawns no grandchild (adding one is a file
+    /// boundary outside this task's owned set). Do NOT "fix" this test by
+    /// dropping the post-reap `kill()` — that call is the whole point: before
+    /// the fix `kill()` read `guard.id()` (live) and skipped the group kill
+    /// here, while `self.pid` — the value its own doc says is the only one a
+    /// crashed Worker's attribution has to work from — sat unused one method
+    /// away.
+    #[tokio::test]
+    async fn a_kill_on_an_already_reaped_handle_is_best_effort_and_uses_the_latched_pid() {
+        let handle = spawn_fixture().expect("the fixture binary exists (cargo test built it)");
+        let pid = handle.pid();
+        assert!(pid.is_some(), "a live child has a pid (captured at spawn)");
+        // The graceful close + the reap (the same route the pid-latch pin
+        // uses: `kill()` + `exited()` would hang, since a signal death
+        // publishes `None` and `exited()` waits for `Some`). `exited()`
+        // returning IS the proof the read task's `child.wait()` collected the
+        // status — the state `Child::id()` reports as `None`.
+        handle.send_close().expect("close encodes");
+        let _ = handle.exited().await;
+        assert_eq!(
+            handle.pid(),
+            pid,
+            "the latched pid survives the reap — the value `kill()` must signal the \
+             group with, since a live `Child::id()` is `None` by now"
+        );
+        // The kill on the reaped child: best-effort and bounded (no hang).
+        let killed = tokio::time::timeout(Duration::from_secs(10), handle.kill())
+            .await
+            .expect(
+                "kill() on an already-reaped handle completes — it never waits on a dead child",
+            );
+        assert!(killed.is_ok(), "the kill is best-effort, got {killed:?}");
     }
 
     /// A `permission-response` round-trip completes the canned

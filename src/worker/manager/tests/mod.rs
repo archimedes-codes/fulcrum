@@ -2579,3 +2579,395 @@ async fn worker_manager_with_hooks_invokes_custom_hooks() {
         "custom hook on_event must receive worker Exited event"
     );
 }
+
+// ── The pump's `Lagged(n)` arm (Finding 7 / F7a) ──────────────────
+
+/// A `session-update` `agent_message_chunk` `SinkFrame` (the pump's
+/// `SinkFrame` arm is the ONLY thing that feeds a drive, so the frame
+/// shape is the one `the_subagent_capture_captures_the_final_text_from_the_sink_frames`
+/// pins — the `sessionId` is the drive's own child id).
+fn worker_sink_frame(message_id: &str, text: &str) -> WorkerInboundEvent {
+    WorkerInboundEvent::SinkFrame {
+        event: "session-update".to_string(),
+        payload: serde_json::json!({
+            "sessionId": "child-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": message_id,
+                "content": { "type": "text", "text": text }
+            }
+        }),
+    }
+}
+
+/// The text one `SinkFrame` carries (`None` for any other frame, or for a
+/// frame with no text) — the predicate behind the delivered / skipped
+/// frame assertions (it reads the frame VERBATIM out of the `EventLog`, so
+/// it cannot be satisfied by anything but the frame itself).
+fn frame_text(evt: &WorkerInboundEvent) -> Option<&str> {
+    match evt {
+        WorkerInboundEvent::SinkFrame { payload, .. } => {
+            payload.get("update")?.get("content")?.get("text")?.as_str()
+        }
+        _ => None,
+    }
+}
+
+/// Does this frame carry exactly `text`?
+fn text_is(evt: &WorkerInboundEvent, text: &str) -> bool {
+    frame_text(evt) == Some(text)
+}
+
+/// The drive's CURRENT captured text — the SAME `SubagentCapture`
+/// `failed_with_salvage` hands the parent as the child's salvage, read
+/// through the real `drives` entry (`seed_drive`'s).
+fn captured_text(manager: &WorkerManager, child_id: &str) -> String {
+    let capture = manager
+        .state
+        .drives
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(child_id)
+        .expect("the drive is seeded")
+        .capture
+        .clone();
+    capture.captured_text()
+}
+
+/// (F7a — Finding 7's pump clause; a **coverage/regression PIN, NOT a
+/// red**: the `Lagged` arm at HEAD already log-and-`continue`s, so every
+/// assertion below describes behavior that is ALREADY correct and the test
+/// is green from the moment it lands. The plan's §2 evidence is that no
+/// honest red exists here — the finding's complaint is ZERO coverage, and
+/// this test replaces "exercised zero times" with "exercised, green".)
+///
+/// The pump's `Lagged(n)` arm, exercised DIRECTLY: `run_pump_loop` is
+/// invoked with a hand-built `broadcast::channel(64)` (the test-sized copy
+/// of production's `channel(256)`) whose ONLY receiver the pump owns, over
+/// a `seed_drive`'d drive, so the `SinkFrame` feed path (`feed_capture` /
+/// `note_liveness_frame`) is the production one.
+///
+/// The arithmetic that makes the arm genuinely enter (deterministic, not a
+/// favourable interleaving — the default `#[tokio::test]` runtime is
+/// CURRENT-THREAD, so the pump advances ONLY at this test's `.await`s, and
+/// the burst loop below contains NO `.await`):
+/// - 2 salvage frames are sent and CONSUMED (the bounded wait proves the
+///   pump's cursor is at position 2);
+/// - 65 burst frames are then sent into the capacity-64 ring: positions
+///   2..=66, so the ring ends up holding the LAST 64 — positions 3..=66 —
+///   and position 2 (`burst-2`) is the ONE overwritten frame;
+/// - tokio's `recv_ref` then computes `next = tail.pos - len = 67 - 64 = 3`
+///   and `missed = 3 - 2 = 1` ⇒ exactly ONE `Err(Lagged(1))`, once.
+///
+/// What that pins, in the finding's own words: the dropped frame never
+/// re-armed the liveness clock (the count is 66, not 67), the salvage the
+/// pump had ALREADY fed survives the storm ("no worse than a partial
+/// salvage"), the ring tail after the gap IS delivered (the loop continued
+/// past the `Lagged`), and exactly one frame — the overwritten one — was
+/// skipped.
+#[tokio::test]
+async fn lagged_frames_log_continue_and_preserve_partial_salvage() {
+    let (manager, _crashes, events, _sinks) = make_manager(None);
+    // The `SinkFrame` feed target (a real `SubagentDrive`; its
+    // `parent_session_id` is where the pump delivers the frames).
+    seed_drive(&manager, "child-1");
+    let state = manager.state.clone();
+
+    let (tx, rx) = tokio::sync::broadcast::channel::<WorkerInboundEvent>(64);
+    // The pump owns the ONLY receiver — with a second subscriber the ring
+    // arithmetic (and therefore the lag) would be a different test.
+    assert_eq!(
+        tx.receiver_count(),
+        1,
+        "the pump holds the channel's only receiver (no second subscriber to contaminate the ring)"
+    );
+    let j = tokio::spawn(super::pump::run_pump_loop(
+        state,
+        Duration::from_secs(60),
+        "child-1".to_string(),
+        /* is_subagent = */ true,
+        rx,
+        Some(11),
+    ));
+
+    // (1) The salvage phase — 2 frames under a REAL message id, and the
+    //     bounded wait that pins the pump's cursor at position 2.
+    for text in ["salvage-", "tail"] {
+        tx.send(worker_sink_frame("m1", text))
+            .expect("the pump receiver is alive");
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while liveness_view(&manager, "child-1").0 < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        liveness_view(&manager, "child-1").0,
+        2,
+        "the salvage frames were FED (the pump consumed exactly 2 — its cursor is at position 2)"
+    );
+    assert_eq!(
+        captured_text(&manager, "child-1"),
+        "salvage-tail",
+        "the salvage composed from the two chunks before the storm"
+    );
+
+    // (2) The LAGGED burst — 65 sends with NO await between them, so the
+    //     current-thread pump cannot consume a single one mid-burst: the
+    //     cursor STAYS at 2 and the ring wraps past it exactly once.
+    let mut total_ok = 0u32;
+    for i in 2..67u32 {
+        if let Ok(rem) = tx.send(worker_sink_frame("system", &format!("burst-{i}"))) {
+            assert!(
+                rem >= 1,
+                "frame {i}: the pump receiver is still subscribed (a dropped receiver would make `send` \
+                 return `Err` and the ring would never wrap — the lag would be fabricated)"
+            );
+            total_ok += 1;
+        }
+    }
+    assert_eq!(
+        total_ok, 65,
+        "ALL 65 burst frames were accepted into the ring (only the pump's cursor lags behind them)"
+    );
+
+    // (3) The pump CONTINUED past the gap: the LAST retained frame is
+    //     delivered AND fed (a bounded wait — a frame that never arrives is
+    //     a test failure, not a hang). The wait is on the FEED rather than
+    //     on the `on_event` log alone because the pump delivers a frame to
+    //     the hooks BEFORE it feeds its own drive, so the log entry for
+    //     `burst-66` exists a moment before its liveness bump does.
+    let settle = tokio::time::Instant::now() + Duration::from_secs(20);
+    while (liveness_view(&manager, "child-1").0 < 66
+        || !collect_now(&events, "live-parent")
+            .iter()
+            .any(|(_, e)| text_is(e, "burst-66")))
+        && tokio::time::Instant::now() < settle
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !j.is_finished(),
+        "the `Lagged` arm must `continue`, not `break` — the loop is still running after the gap"
+    );
+
+    // (4) The pinned observables.
+    assert_eq!(
+        captured_text(&manager, "child-1"),
+        "salvage-tail",
+        "the salvage already fed is INTACT — the burst's `system` bookkeeping frames never enter the capture"
+    );
+    assert_eq!(
+        liveness_view(&manager, "child-1"),
+        (66, Vec::new()),
+        "exactly 2 + 64 delivered `SinkFrame`s fed the liveness clock: the ONE lagged frame never \
+         re-armed it (a re-fed lag reads 67, a stopped loop fewer than 66)"
+    );
+    // The subagent's frames are delivered under the DRIVE's parent id.
+    let got = collect_now(&events, "live-parent");
+    assert!(
+        got.iter().any(|(_, e)| text_is(e, "burst-3")),
+        "the OLDEST RETAINED frame after the gap (`burst-3`) was delivered — the arm did not stop the loop"
+    );
+    assert!(
+        got.iter().any(|(_, e)| text_is(e, "burst-66")),
+        "the LAST retained frame was delivered (the salvage is no worse than a partial salvage)"
+    );
+    assert!(
+        !got.iter().any(|(_, e)| text_is(e, "burst-2")),
+        "`burst-2` (the ONE frame the ring overwrote) was SKIPPED, not delivered — the sharpest proof \
+         that the lag really happened and that exactly one frame was lost"
+    );
+    assert_eq!(
+        got.iter().filter(|(_, e)| frame_text(e).is_some()).count(),
+        66,
+        "2 salvage + 64 delivered burst frames reached `on_event` — the pump skipped the lagged frame \
+         and NOTHING else"
+    );
+
+    // (5) Teardown — `Closed` is the `Lagged` arm's COMPLEMENT (it ends the
+    //     loop where `Lagged` continues).
+    drop(tx);
+    j.await
+        .expect("dropping the last sender closes the channel and the pump loop breaks");
+}
+
+/// (F7a — Finding 7's "`Exited` arriving between `detach` and the registry
+/// write"; a **coverage/regression PIN, NOT a red**: both arms describe
+/// behavior `unexpected_exit` already produces at HEAD, so the test is
+/// green from the moment it lands — see the plan's §2 evidence. Its value
+/// is that the window's two failure modes (`on_crash` firing TWICE, or
+/// zero times) become loud, named failures.)
+///
+/// The two arms drive the SAME pump (`run_pump_loop`, invoked directly on a
+/// fresh channel) with the SAME frame, and differ ONLY in the registry
+/// state the `Exited` lands in:
+///
+/// - **detached** — a REAL `fake_worker` handle is seeded into `workers`
+///   (`reaping: false`) and the REAL `manager.detach` runs: `detach_worker`
+///   REMOVES the `workers` entry FIRST and only then spawns the background
+///   reap (close + 2 s grace + `kill`), so "the `Exited` lands AFTER the
+///   removal" holds structurally rather than by luck. Absent from `workers`
+///   AND `drives` ⇒ `unexpected_exit` is `false` ⇒ EXPECTED ⇒ NO `on_crash`.
+/// - **registered** — the control that makes the null expectation above
+///   believable: the identical pump + frame with the entry still present and
+///   not reaping ⇒ UNEXPECTED ⇒ `on_crash` fires EXACTLY ONCE with the
+///   frame's code and the pump's captured pid.
+///
+/// What is deliberately NOT asserted: the router's
+/// `on_session_exited_expected` / `session-closed` effect. A directly
+/// invoked `run_pump_loop` cannot reach it (the `workers` entry is gone
+/// before `reap_worker` runs and the router is not in the loop), so claiming
+/// it here would be a vacuous pass. The router's expected-exit side stays
+/// covered by its own unit tests in `session/router.rs`.
+#[tokio::test]
+async fn an_exited_after_detach_is_handled_as_expected_and_a_registered_one_fires_on_crash_once() {
+    // ── The negative arm: the DETACHED window ──────────────────────
+    let (manager, crashes, events, _sinks) = make_manager(None);
+    // A REAL handle (`WorkerHandle` has no public constructor, so the real
+    // spawn is the honest way to build the entry — the fixture binary is
+    // built by `cargo build --all-targets`, which the gate runs first).
+    let handle = FakeWorkerFactory
+        .spawn()
+        .expect("the `fake_worker` fixture spawns (build --all-targets first)");
+    manager
+        .state
+        .workers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            "c1".to_string(),
+            super::WorkerEntry {
+                handle: handle.clone(),
+                env: test_env("c1", None),
+                reaping: false,
+            },
+        );
+    assert!(
+        manager.test_is_attached("c1"),
+        "the seeded entry is registered (the state a live session's pump sees)"
+    );
+
+    // The REAL detach: the `workers` entry is removed FIRST, the reap runs
+    // in the background.
+    let detached = manager.detach("c1").expect("the detach returns the handle");
+    assert!(
+        !manager.test_is_attached("c1"),
+        "`detach_worker` removed the entry BEFORE the reap — the window the finding names"
+    );
+    assert_eq!(
+        manager.test_drive_count(),
+        0,
+        "the session is absent from `drives` too (the other half of `unexpected_exit`'s lookup)"
+    );
+
+    // The `Exited` now lands IN THE WINDOW (after the removal).
+    let (tx, rx) = tokio::sync::broadcast::channel::<WorkerInboundEvent>(8);
+    let j = tokio::spawn(super::pump::run_pump_loop(
+        manager.state.clone(),
+        Duration::from_secs(60),
+        "c1".to_string(),
+        /* is_subagent = */ false,
+        rx,
+        Some(4242),
+    ));
+    tx.send(WorkerInboundEvent::Exited(Some(0)))
+        .expect("the pump receiver is alive");
+    drop(tx);
+    j.await
+        .expect("the `Exited` is terminal — the pump loop ended on it");
+
+    // The frame still reached the router's input (a detached session's exit
+    // is not a dropped frame).
+    let got = collect_now(&events, "c1");
+    assert!(
+        got.iter()
+            .any(|(_, e)| { matches!(e, WorkerInboundEvent::Exited(Some(0))) }),
+        "the `Exited` frame reached `on_event` under `c1` — a frame dropped on the detached path \
+         would leave the router blind to the exit: {got:?}"
+    );
+    // …and it is an EXPECTED exit: NO `on_crash`.
+    let c = crashes.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert!(
+        c.iter().all(|(id, _, _)| id != "c1"),
+        "detached ⇒ `unexpected_exit()` is `false` ⇒ NO `on_crash` — a double-fire or a \
+         crash-misroute in the window fails here: {c:?}"
+    );
+
+    // Bounded settle: let the background reap close + kill the fixture so no
+    // orphan process survives the test. Its own `Exited` publishes on the
+    // SPAWNED handle's broadcast, where no production pump is subscribed —
+    // so it cannot reach the collectors, and the crash log must stay clean.
+    let reaped = tokio::time::timeout(Duration::from_secs(10), detached.exited()).await;
+    assert_eq!(
+        reaped.ok().flatten(),
+        Some(0),
+        "the detached Worker self-exits 0 on the reap's `close`"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let c = crashes.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert!(
+        c.iter().all(|(id, _, _)| id != "c1"),
+        "the background reap does not turn the window into a crash either: {c:?}"
+    );
+
+    // ── The positive arm: the control (registered, not reaping) ────
+    let (manager2, crashes2, _events2, _sinks2) = make_manager(None);
+    let handle2 = FakeWorkerFactory
+        .spawn()
+        .expect("the `fake_worker` fixture spawns (build --all-targets first)");
+    manager2
+        .state
+        .workers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            "c2".to_string(),
+            super::WorkerEntry {
+                handle: handle2,
+                env: test_env("c2", None),
+                reaping: false,
+            },
+        );
+    let (tx2, rx2) = tokio::sync::broadcast::channel::<WorkerInboundEvent>(8);
+    let j2 = tokio::spawn(super::pump::run_pump_loop(
+        manager2.state.clone(),
+        Duration::from_secs(60),
+        "c2".to_string(),
+        /* is_subagent = */ false,
+        rx2,
+        Some(7777),
+    ));
+    tx2.send(WorkerInboundEvent::Exited(Some(137)))
+        .expect("the pump receiver is alive");
+    drop(tx2);
+    j2.await
+        .expect("the `Exited` is terminal — the pump loop ended on it");
+
+    let c2 = crashes2.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let hits: Vec<_> = c2.iter().filter(|(id, _, _)| id == "c2").collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "present-and-NOT-reaping is UNEXPECTED ⇒ `on_crash` EXACTLY once (the mirror of the \
+         detached arm — a fix that suppresses crashes in this window fails here): {c2:?}"
+    );
+    assert_eq!(
+        hits[0],
+        &("c2".to_string(), Some(137), Some(7777)),
+        "the frame's exit code and the pid the pump was handed at spawn are the attribution payload \
+         the router needs to name the right Worker log (7777 is the value THIS test passed to \
+         `run_pump_loop` — the pump reads it off its own argument, exactly as `start_pump` reads it \
+         off the handle before spawning the loop)"
+    );
+
+    // Cleanup: the `detach` reaps the live spawn, and it must NOT re-fire
+    // `on_crash` (the entry is removed, so the reap's exit is EXPECTED).
+    manager2.detach("c2");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c2 = crashes2.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert_eq!(
+        c2.iter().filter(|(id, _, _)| id == "c2").count(),
+        1,
+        "the cleanup detach does not re-fire `on_crash`: {c2:?}"
+    );
+}

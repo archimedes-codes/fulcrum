@@ -21,7 +21,7 @@
 //! error `"permission denied"`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::events::CompactionReason;
 use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::catalog::{Model, ModelCatalog};
@@ -86,9 +87,10 @@ pub enum ControlCmd {
 }
 
 /// A compaction the loop must run before its next model call, and what to
-/// report it as (`reason` is a UI contract — ADR 0045; `will_retry` is true
-/// only for overflow recovery, where the turn continues on the other side of
-/// the indicator with the SAME model call).
+/// report it as (`reason` is a UI contract — ADR 0045, and [`CompactionReason`]
+/// is its vocabulary; `will_retry` is true only for overflow recovery, where
+/// the turn continues on the other side of the indicator with the SAME model
+/// call).
 ///
 /// This replaced the `force_compact: bool` flag, which could carry the
 /// instruction "compact" but not the reason the mid-turn caller needed to
@@ -96,7 +98,7 @@ pub enum ControlCmd {
 /// wire (and the flag never had a production caller until the overflow).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CompactionTrigger {
-    pub reason: &'static str,
+    pub reason: CompactionReason,
     pub will_retry: bool,
 }
 
@@ -120,6 +122,54 @@ pub(crate) enum CompactionRan {
     Failed,
 }
 
+/// The "compact before the next model call" state of ONE turn (finding 6).
+/// Its lifetime is ONE TURN, and [`TurnControl::enter_turn`] is the ONLY way
+/// to clear it — called from `begin_turn`, so a trigger a PREVIOUS turn
+/// queued can never survive into the next prompt.
+///
+/// Both producers set it and `continue` straight to the loop top, where the
+/// cancellation check runs FIRST, so a Stop that lands as the overflow is
+/// handled settles the turn (`settle_cancelled`) without ever taking the
+/// trigger — leaving it armed would make the NEXT prompt run the canceled
+/// turn's overflow recovery (and, when that compaction shrinks nothing, end
+/// the new turn as an error before its own model call). That used to be a
+/// `pub` field with a clear the turn had to remember to perform; it is now a
+/// private latch behind a method, so the invariant is enforced by the type
+/// instead of by a comment — the pin is
+/// `a_stale_overflow_trigger_does_not_hijack_the_next_turn`.
+///
+/// `CompactionRan` deliberately does NOT live here: it is a FUNCTION RESULT
+/// (returned by [`AgentLoop::run_compaction`], consumed by the overflow
+/// caller), not one-turn state that needs clearing — bending it into a field
+/// would change the live by-value flow for no invariant gained. This bundle
+/// owns the TRIGGER; the verdict stays the return value.
+#[derive(Default)]
+pub(crate) struct TurnControl {
+    force_compact: Option<CompactionTrigger>,
+}
+
+impl TurnControl {
+    /// The ONE clear: called at the top of every turn, dropping whatever a
+    /// previous turn left behind (see the struct doc — a Stop racing an
+    /// overflow recovery exits BEFORE the trigger is consumed).
+    fn enter_turn(&mut self) {
+        self.force_compact = None;
+    }
+
+    /// Queue a compaction for the next model call of THIS turn. The typed
+    /// entry point for every producer (both overflow sites — and the tests
+    /// that pre-arm a trigger), so a malformed trigger cannot be built.
+    fn arm(&mut self, reason: CompactionReason, will_retry: bool) {
+        self.force_compact = Some(CompactionTrigger { reason, will_retry });
+    }
+
+    /// Take the queued trigger, if any (the compaction check at the top of
+    /// the model-call loop; taking it is what makes it one-shot).
+    fn take(&mut self) -> Option<CompactionTrigger> {
+        self.force_compact.take()
+    }
+}
+
 /// The suite's `sudo_exec` state (the frame-free core's dependencies —
 /// `runner` / `pending_sudo` / `sudo_password`, mirroring the
 /// `SessionDriver` fields).
@@ -136,6 +186,248 @@ impl Default for SudoDeps {
             runner: Arc::new(RealSudoRunner),
             pending_sudo: Arc::new(TokioMutex::new(HashMap::new())),
             sudo_password: Arc::new(TokioMutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// (finding 6) The permission cluster: the state the file-access policy
+/// (ADR 0030) judges a tool call with, and the state every `ToolCtx` carries
+/// so the executor enforces the SAME decision the gate made. The eight
+/// fields moved out of [`AgentLoop`] verbatim (four frozen at construction,
+/// three refreshed once per turn, one per-agent narrowing) plus `web` and
+/// `render_requester` — the two that share the per-turn refresh cadence AND
+/// ride the same single `ToolCtx` construction, so splitting them off would
+/// re-open the construction this bundle exists to own.
+///
+/// Lifetime is the SESSION (the loop task owns it): `new` computes the
+/// frozen half from the ONE `$HOME` read, `refresh` re-reads the per-turn
+/// half at the top of every `handle_prompt`, and `to_tool_ctx` is the ONE
+/// place a `ToolCtx` is built. `space_cwd` deliberately STAYS an `AgentLoop`
+/// field — it is the `ToolCtx`'s `cwd` but also the write-boundary root, the
+/// trust lookup key, and the subagent parent's cwd, none of which is
+/// permission state — so it arrives as `to_tool_ctx`'s argument, as does the
+/// turn's cancel token (a per-CALL value, never loop state).
+///
+/// Fields are `pub(super)`: the gate (`loop::gate`), the dispatcher
+/// (`loop::tools`), the turn (`loop::turn`) and the loop's own tests read
+/// them the way they read the flat fields before — `self.permissions.<field>`
+/// — with no accessor explosion.
+pub(crate) struct PermissionContext {
+    // ── frozen at construction (ADR 0030) — the ONE `$HOME` read ──
+    /// (ADR 0030) The session's READ boundary — `cwd` + the discovery roots
+    /// (user + space level), computed ONCE at construction (the boundary is
+    /// frozen for the session's life: a skill dir created mid-session must
+    /// not silently widen it). Handed to every `ToolCtx`.
+    pub(super) read_boundary: Vec<PathBuf>,
+    /// (ADR 0030) The write GUARD-MEMBERSHIP list (`boundary::protected_dirs()`
+    /// — the four user-level agent-definition dirs), frozen with the boundary.
+    /// Since the permissions spec's round-3 correction this is NOT a rule set:
+    /// a write under one of these with no rule matching is the guard's ROW-3
+    /// ASK, not a deny. It is also the list the Landlock subtraction consumes,
+    /// which is why it is a plain four-path list and never rule-derived.
+    pub(super) protected: Vec<PathBuf>,
+    /// (T03) The DEFAULT rule set (`policy::default_rules()` — EMPTY since the
+    /// round-3 correction: the four agent dirs are the guard-membership set on
+    /// [`PermissionContext::protected`], not default deny rules, so the spec's
+    /// single behavioural change — "today's hardcoded deny becomes an ask" — is
+    /// reachable), computed ONCE at construction exactly like `protected` (the
+    /// same `$HOME` read: `skills::home_dir()`), frozen for the session's life.
+    /// The USER half lives in `file_policy.rules` (per-turn by Deviation 4);
+    /// the two halves are concatenated per turn into [`PermissionContext::rules`].
+    /// The defaults-first concat shape stays even with the default half empty:
+    /// it is the contract, and it protects whatever the defaults become next.
+    pub(super) default_rules: Vec<crate::agent::policy::AccessRule>,
+    /// (T03) The home `rule_for` expands a leading `~` against — the SAME
+    /// value `default_rules()`/`protected_dirs()` go through, captured in
+    /// `new` so no per-call `$HOME` read happens. `None` = no home: a `~`
+    /// rule matches NOTHING (silently — `rule_for`'s `expand_rule_path`
+    /// expands nothing against `None`; the CONSEQUENCE is pinned by
+    /// `a_tilde_rule_with_home_none_matches_nothing_and_with_a_real_home_matches_and_decides`).
+    pub(super) rules_home: Option<std::path::PathBuf>,
+    // ── refreshed once per turn (ADR 0030 Deviation 4) ──
+    /// (ADR 0030 Task 3) The file-access policy IN FORCE for the current
+    /// turn — refreshed from `settings.json` at the top of every
+    /// `handle_prompt` (Deviation 4: one read per turn, so every tool call
+    /// in a turn agrees and a mid-turn hand-edit is observed at the NEXT
+    /// prompt; the same in-process read `launch.rs` does per dispatch).
+    /// `config_dir: None` → all-`Allow` (no settings layer to read).
+    /// Handed to every `ToolCtx` so the executor enforces the SAME tier the
+    /// gate decided, and read by the gate itself.
+    pub(super) file_policy: FilePolicy,
+    /// (T03) The rule list IN FORCE for the current turn:
+    /// `default_rules() ++ file_policy.rules` — defaults FIRST, the
+    /// CONCATENATION CONTRACT of [`crate::agent::policy::default_rules`] (an
+    /// exact-tie user `allow` must beat a rule listed before it; concatenated
+    /// the other way round the allow-directory action silently no-ops),
+    /// reassembled at the top of every `handle_prompt` next to the
+    /// `file_policy` re-read (ONE concat per turn, so every tool call in a
+    /// turn agrees). Handed to every `ToolCtx` so the gate and the
+    /// executors' rule check judge the SAME list.
+    ///
+    /// The default half is EMPTY today ([`PermissionContext::default_rules`]),
+    /// so in practice this is the user rules — but the concat keeps the
+    /// contract's SHAPE so a rule the user set (or a default reintroduced)
+    /// lands in the documented order rather than by accident of there being
+    /// one list.
+    ///
+    /// INITIAL VALUE (before the first `handle_prompt`): `Vec::new()` — the
+    /// same construction-time stance as `file_policy` (`FilePolicy::default()`
+    /// until the first prompt; there are no tool calls before a prompt, so
+    /// the empty value is inert). The concat first runs at the top of the
+    /// FIRST `handle_prompt`, so the first turn's calls always see
+    /// `default_rules() ++ user rules` — never `vec![]` once a prompt was
+    /// handled, which is why the concat site needs no "was a turn handled
+    /// yet?" branch.
+    pub(super) rules: Vec<crate::agent::policy::AccessRule>,
+    /// The web tools' configuration IN FORCE for the current turn —
+    /// refreshed from `settings.json` + env at the top of every
+    /// `handle_prompt` alongside `file_policy` (one read per turn).
+    pub(super) web: crate::agent::web::config::WebConfig,
+    // ── setter-driven (never re-read by `refresh`) ──
+    /// (finding 13b) The enabled tools (`None` = ALL tools; `Some(v)` =
+    /// exactly `v` — `Some(vec![])` = NO tools). A disabled tool is a
+    /// tool-result error, NOT executed.
+    pub(super) enabled_tools: Option<Vec<String>>,
+    /// (issue #101) The per-agent permission ruleset — `None` until set, the
+    /// same construction-time stance as `file_policy`. Wired via
+    /// [`AgentLoop::set_permission`] by the child Worker's `core.rs` (the line
+    /// that makes the gate LIVE); gate tests set it before the first prompt.
+    ///
+    /// A NARROWING layer only: the gate's strict-of-two merge
+    /// (`gate::stricter_of_two`) can only make a call MORE restricted than
+    /// `file_policy` would, never less — ADR 0030's "trust suppresses prompts
+    /// but never widens a deny" applied to definitions.
+    pub(super) permission_block: Option<crate::agent::definition_permission::PermissionBlock>,
+    /// Render requester for escalated web fetches (Task 7). Travels with the
+    /// cluster into the ONE `ToolCtx` construction.
+    pub(super) render_requester: Option<Arc<dyn crate::agent::web::RenderRequester>>,
+}
+
+impl PermissionContext {
+    /// Compute the frozen half from the ONE `$HOME` read the construction is
+    /// allowed (the Worker process already reads `$HOME` for MCP and skill
+    /// discovery — reading it per tool call is what this binding replaced),
+    /// and init the per-turn half to the same inert values the flat fields
+    /// carried before the first prompt.
+    fn new(config_dir: Option<&Path>, space_cwd: &Path) -> Self {
+        // The construction NEVER reads `settings.json` (the per-turn half
+        // starts inert, exactly as the flat fields did) — `config_dir` is the
+        // settings root only `refresh` consumes, carried here so the bundle's
+        // two entry points share one shape.
+        let _ = config_dir;
+        // (ADR 0030) The boundary is computed ONCE here, not per tool call
+        // (it is frozen for the session, and `read_roots` walks the tree +
+        // canonicalizes). Reading `$HOME` is legitimate HERE — the Worker
+        // process already does it for MCP and for skill discovery.
+        let read_boundary = crate::agent::boundary::read_roots(space_cwd);
+        let protected = crate::agent::boundary::protected_dirs();
+        // (T03) The rule layer's frozen half. `default_rules()` goes through
+        // the SAME `skills::home_dir()` chain `protected_dirs()` just walked,
+        // so ONE binding serves both the rule set and the `~`-expansion home
+        // `rule_for` needs — no second `$HOME` read after construction.
+        let rules_home = crate::skills::home_dir();
+        let default_rules = crate::agent::policy::default_rules();
+        Self {
+            read_boundary,
+            protected,
+            default_rules,
+            rules_home,
+            // Refreshed per turn by `handle_prompt` (Deviation 4); the
+            // construction value only covers a tool call made BEFORE the
+            // first prompt, of which there are none.
+            file_policy: FilePolicy::default(),
+            // (T03) The per-turn rule list. `Vec::new()` mirrors the
+            // `file_policy` default above: the concat first runs at the top
+            // of `handle_prompt`, and there is no tool call before a prompt.
+            rules: Vec::new(),
+            web: crate::agent::web::config::WebConfig::default(),
+            enabled_tools: None,
+            // (issue #101) `None` = "the file does not speak about permissions"
+            // — no narrowing. Set before the first prompt by `core.rs` via
+            // [`AgentLoop::set_permission`] (the child Worker) or by a gate test.
+            permission_block: None,
+            render_requester: None,
+        }
+    }
+
+    /// Re-read the per-turn half from `settings.json` (ADR 0030 Deviation 4:
+    /// ONE read per turn, called at the top of every `handle_prompt`, so every
+    /// tool call in a turn agrees and a mid-turn hand-edit is observed at the
+    /// NEXT prompt). `permission_block` / `enabled_tools` / `render_requester`
+    /// are setter-driven and deliberately untouched here.
+    fn refresh(&mut self, config_dir: Option<&Path>) {
+        // (ADR 0030 Deviation 4) The policy and web config are
+        // re-read from `settings.json` ONCE per turn — the same in-process read
+        // `launch.rs` does per dispatch, so a user who flips a select in
+        // Settings affects an ALREADY-RUNNING session at its next prompt
+        // (no restart, no relaunch). ONE read per turn (not per tool call):
+        // every tool call in a turn must agree, or a half-asked batch would
+        // be a policy the user never chose. `config_dir: None` → the
+        // all-`Allow` default (no settings layer) + env-only web config.
+        let settings = config_dir.map(crate::config::load_settings);
+        self.file_policy = settings
+            .as_ref()
+            .map(|s| s.file_policy.clone())
+            .unwrap_or_default();
+        // (T03) The rules IN FORCE for this turn: the frozen defaults FIRST,
+        // the user rules SECOND — the CONCATENATION CONTRACT of
+        // `policy::default_rules()` (an exact-tie appended `allow` must beat a
+        // rule listed before it; inverted, the allow-directory action silently
+        // no-ops). The default half is EMPTY today (the four agent dirs are the
+        // guard-membership set, not rules), so this is the user rules — but the
+        // shape stays, because it is the contract and it is what protects the
+        // order of whatever the defaults become. ONE concat per turn, next to
+        // the `file_policy` re-read, so the gate and the executors judge the
+        // SAME list for the whole turn and a mid-turn hand-edit lands at the
+        // NEXT prompt (Deviation 4).
+        // UNCONDITIONAL — `self.rules` starts as `Vec::new()` and is
+        // overwritten here on every prompt, so it is never the empty init
+        // again once a prompt has been handled.
+        self.rules = {
+            let mut rules = self.default_rules.clone();
+            rules.extend(self.file_policy.rules.iter().cloned());
+            rules
+        };
+        self.web = crate::agent::web::config::WebConfig::from_web_settings(
+            settings.as_ref().map(|s| &s.web),
+        );
+    }
+
+    /// The ONE `ToolCtx` construction (moved verbatim from `tools.rs`): the
+    /// frozen boundary + guard list, the per-turn rule list and policy, the
+    /// web config, and the render requester — the exact set the gate judged
+    /// with, so an executor can never re-decide differently from its gate.
+    ///
+    /// `cwd` is the loop's `space_cwd` (an `AgentLoop` field, not permission
+    /// state — see the struct doc) and `cancel` is the TURN token (a per-call
+    /// value; a Stop must kill the tool child). `skill_roots: None` = the real
+    /// discovery roots (the same `discover_skills` the prompt builder used) —
+    /// the test seam that pins them never goes through here.
+    fn to_tool_ctx(&self, cwd: PathBuf, cancel: CancellationToken) -> crate::agent::tools::ToolCtx {
+        crate::agent::tools::ToolCtx {
+            cwd,
+            cancel,
+            // `None` = the real discovery roots (the same
+            // `discover_skills` the prompt builder used).
+            skill_roots: None,
+            // (ADR 0030) The frozen boundary + deny-list.
+            boundary: self.read_boundary.clone(),
+            protected: self.protected.clone(),
+            // (T03) The rule list IN FORCE for this turn — the
+            // SAME concatenated list the gate judged with (one
+            // concat per turn, so gate and executor agree).
+            rules: self.rules.clone(),
+            // (T03) The home `rule_for` expands a `~` rule
+            // against (frozen at construction — no per-call
+            // `$HOME` read).
+            home: self.rules_home.clone(),
+            // (ADR 0030 Task 3) The policy the gate decided with
+            // — the SAME per-turn value, so the executor cannot
+            // re-decide differently from the gate (it enforces
+            // the `Sandboxed` floor and confines `bash`).
+            file_policy: self.file_policy.clone(),
+            web: self.web.clone(),
+            render_requester: self.render_requester.clone(),
         }
     }
 }
@@ -210,10 +502,14 @@ pub struct AgentLoop {
     pub subagent: Option<Arc<dyn SubagentDispatcher>>,
     pub sudo: SudoDeps,
     retry: RetryPolicy,
-    /// The enabled tools (`None` = ALL tools; `Some(v)` = exactly `v`
-    /// — `Some(vec![])` = NO tools). A disabled tool is a tool-result
-    /// error, NOT executed; finding 13b.
-    enabled_tools: Option<Vec<String>>,
+    /// (finding 6) The permission cluster — the 8-field cluster + `web` +
+    /// `render_requester` — owned by ONE bundle (see [`PermissionContext`]):
+    /// the frozen half computed once at construction, the per-turn half
+    /// refreshed at the top of every `handle_prompt`, and the ONE `ToolCtx`
+    /// construction. `space_cwd` STAYS a field of this loop (it is the
+    /// write-boundary root, the trust key and the subagent parent's cwd, not
+    /// permission state) and arrives as `to_tool_ctx`'s `cwd` argument.
+    permissions: PermissionContext,
     // ── per-session internal state (owned by the loop task) ──
     thinking_level: Option<String>,
     /// The normalizer's turn state (the `messageId` counter + the
@@ -229,20 +525,10 @@ pub struct AgentLoop {
     /// The provider transcript (the `native_messages` content).
     messages: Vec<ChatMessage>,
     compactor: Compactor,
-    /// The "compact before the next model call" flag — read INSIDE a turn
-    /// (so only a path that runs in a turn can set it: the overflow recovery),
-    /// and carrying the `reason` / `will_retry` that recovery has to report.
-    /// A hand-triggered `/compact` does NOT use it — a command is an IDLE
-    /// action (`ControlCmd::Compact`).
-    ///
-    /// Its lifetime is ONE TURN, and `handle_turn` ENFORCES that by clearing it
-    /// on entry: both producers set it and `continue` straight to the loop top,
-    /// where the cancellation check runs FIRST, so a Stop that lands as the
-    /// overflow is handled settles the turn (`settle_cancelled`) without ever
-    /// taking the trigger — leaving it armed would make the NEXT prompt run the
-    /// canceled turn's overflow recovery (and, when that compaction shrinks
-    /// nothing, end the new turn as an error before its own model call).
-    force_compact: Option<CompactionTrigger>,
+    /// (finding 6) The turn-scoped "compact before the next model call" latch
+    /// — see [`TurnControl`] (the type owns the one-turn lifetime; `arm` sets
+    /// it, `enter_turn` — called from `begin_turn` — is the ONLY clear).
+    turn_control: TurnControl,
     /// The session's current context size in tokens (the `context_usage_
     /// update` frame source — the frontend's context-percentage display).
     ///
@@ -252,88 +538,14 @@ pub struct AgentLoop {
     /// since (the `Compactor`'s anchor + trailing tail). One number for the
     /// bar and the trigger — never the sum of every call's prompt.
     last_context_tokens: u64,
-    /// (ADR 0030) The session's READ boundary — `cwd` + the discovery roots
-    /// (user + space level), computed ONCE at construction (the boundary is
-    /// frozen for the session's life: a skill dir created mid-session must
-    /// not silently widen it). Handed to every `ToolCtx`.
-    read_boundary: Vec<PathBuf>,
-    /// (ADR 0030) The write GUARD-MEMBERSHIP list (`boundary::protected_dirs()`
-    /// — the four user-level agent-definition dirs), frozen with the boundary.
-    /// Since the permissions spec's round-3 correction this is NOT a rule set:
-    /// a write under one of these with no rule matching is the guard's ROW-3
-    /// ASK, not a deny. It is also the list the Landlock subtraction consumes,
-    /// which is why it is a plain four-path list and never rule-derived.
-    protected: Vec<PathBuf>,
-    /// (T03) The DEFAULT rule set (`policy::default_rules()` — EMPTY since the
-    /// round-3 correction: the four agent dirs are the guard-membership set on
-    /// [`Self::protected`], not default deny rules, so the spec's single
-    /// behavioural change — "today's hardcoded deny becomes an ask" — is
-    /// reachable), computed ONCE at construction exactly like `protected` (the
-    /// same `$HOME` read: `skills::home_dir()`), frozen for the session's life.
-    /// The USER half lives in `file_policy.rules` (per-turn by Deviation 4);
-    /// the two halves are concatenated per turn into [`Self::rules`]. The
-    /// defaults-first concat shape stays even with the default half empty: it
-    /// is the contract, and it protects whatever the defaults become next.
-    default_rules: Vec<crate::agent::policy::AccessRule>,
-    /// (T03) The home `rule_for` expands a leading `~` against — the SAME
-    /// value `default_rules()`/`protected_dirs()` go through, captured in
-    /// `new` so no per-call `$HOME` read happens. `None` = no home: a `~`
-    /// rule matches NOTHING (silently — `rule_for`'s `expand_rule_path`
-    /// expands nothing against `None`; the CONSEQUENCE is pinned by
-    /// `a_tilde_rule_with_home_none_matches_nothing_and_with_a_real_home_matches_and_decides`).
-    rules_home: Option<std::path::PathBuf>,
-    /// (T03) The rule list IN FORCE for the current turn:
-    /// `default_rules() ++ file_policy.rules` — defaults FIRST, the
-    /// CONCATENATION CONTRACT of [`crate::agent::policy::default_rules`] (an
-    /// exact-tie user `allow` must beat a rule listed before it; concatenated
-    /// the other way round the allow-directory action silently no-ops),
-    /// reassembled at the top of every `handle_prompt` next to the
-    /// `file_policy` re-read (ONE concat per turn, so every tool call in a
-    /// turn agrees). Handed to every `ToolCtx` so the gate and the
-    /// executors' rule check judge the SAME list.
-    ///
-    /// The default half is EMPTY today ([`Self::default_rules`]), so in
-    /// practice this is the user rules — but the concat keeps the contract's
-    /// SHAPE so a rule the user set (or a default reintroduced) lands in the
-    /// documented order rather than by accident of there being one list.
-    ///
-    /// INITIAL VALUE (before the first `handle_prompt`): `Vec::new()` — the
-    /// same construction-time stance as `file_policy` (`FilePolicy::default()`
-    /// until the first prompt; there are no tool calls before a prompt, so
-    /// the empty value is inert). The concat first runs at the top of the
-    /// FIRST `handle_prompt`, so the first turn's calls always see
-    /// `default_rules() ++ user rules` — never `vec![]` once a prompt was
-    /// handled, which is why the concat site needs no "was a turn handled
-    /// yet?" branch.
-    rules: Vec<crate::agent::policy::AccessRule>,
-    /// (ADR 0030 Task 3) The file-access policy IN FORCE for the current
-    /// turn — refreshed from `settings.json` at the top of every
-    /// `handle_prompt` (Deviation 4: one read per turn, so every tool call
-    /// in a turn agrees and a mid-turn hand-edit is observed at the NEXT
-    /// prompt; the same in-process read `launch.rs` does per dispatch).
-    /// `config_dir: None` → all-`Allow` (no settings layer to read).
-    /// Handed to every `ToolCtx` so the executor enforces the SAME tier the
-    /// gate decided, and read by the gate itself.
-    file_policy: FilePolicy,
-    /// (issue #101) The per-agent permission ruleset — `None` until set, the
-    /// same construction-time stance as `file_policy`. Wired via
-    /// [`Self::set_permission`] by the child Worker's `core.rs` (the line
-    /// that makes the gate LIVE); gate tests set it before the first prompt.
-    ///
-    /// A NARROWING layer only: the gate's strict-of-two merge
-    /// (`gate::stricter_of_two`) can only make a call MORE restricted than
-    /// `file_policy` would, never less — ADR 0030's "trust suppresses prompts
-    /// but never widens a deny" applied to definitions.
-    permission_block: Option<crate::agent::definition_permission::PermissionBlock>,
-    /// The web tools' configuration IN FORCE for the current turn —
-    /// refreshed from `settings.json` + env at the top of every
-    /// `handle_prompt` alongside `file_policy` (one read per turn).
-    web: crate::agent::web::config::WebConfig,
-    /// Render requester for escalated web fetches (Task 7).
-    pub render_requester: Option<Arc<dyn crate::agent::web::RenderRequester>>,
 }
 
 impl AgentLoop {
+    // 22 args — kept; > default threshold 7 (no clippy.toml). A LoopParams
+    // collapse is out of F6's scope (the commit is the type pair, not the lint
+    // allow). The permission cluster is computed INSIDE this constructor from
+    // `space_cwd` + `config_dir`, never passed in, so extracting it into
+    // [`PermissionContext`] removed field-lines, not parameters.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: String,
@@ -374,18 +586,11 @@ impl AgentLoop {
             space_cwd.clone(),
             config_dir.as_deref(),
         );
-        // (ADR 0030) The boundary is computed ONCE here, not per tool call
-        // (it is frozen for the session, and `read_roots` walks the tree +
-        // canonicalizes). Reading `$HOME` is legitimate HERE — the Worker
-        // process already does it for MCP and for skill discovery.
-        let read_boundary = crate::agent::boundary::read_roots(&space_cwd);
-        let protected = crate::agent::boundary::protected_dirs();
-        // (T03) The rule layer's frozen half. `default_rules()` goes through
-        // the SAME `skills::home_dir()` chain `protected_dirs()` just walked,
-        // so ONE binding serves both the rule set and the `~`-expansion home
-        // `rule_for` needs — no second `$HOME` read after construction.
-        let rules_home = crate::skills::home_dir();
-        let default_rules = crate::agent::policy::default_rules();
+        // (ADR 0030 / finding 6) The permission cluster — the frozen half
+        // (boundary + guard list + default rules + `~`-expansion home, all from
+        // the ONE `$HOME` read) and the inert per-turn values — is built by the
+        // bundle itself; see [`PermissionContext`].
+        let permissions = PermissionContext::new(config_dir.as_deref(), &space_cwd);
         Self {
             session_id,
             space_cwd,
@@ -412,7 +617,7 @@ impl AgentLoop {
             subagent,
             sudo,
             retry,
-            enabled_tools: None,
+            permissions,
             thinking_level: None,
             turn_state: std::sync::Mutex::new(TurnState::stamped(incarnation)),
             text_acc: std::sync::Mutex::new(HashMap::new()),
@@ -420,28 +625,8 @@ impl AgentLoop {
             thought_state: std::sync::Mutex::new(ThoughtState::default()),
             messages: Vec::new(),
             compactor,
-            force_compact: None,
+            turn_control: TurnControl::default(),
             last_context_tokens: 0,
-            read_boundary,
-            protected,
-            // (T03) The frozen default rule set + the `~`-expansion home, both
-            // computed above from the ONE `$HOME` read this construction does.
-            default_rules,
-            rules_home,
-            // (T03) The per-turn rule list. `Vec::new()` mirrors the
-            // `file_policy` default below: the concat first runs at the top
-            // of `handle_prompt`, and there is no tool call before a prompt.
-            rules: Vec::new(),
-            // Refreshed per turn by `handle_prompt` (Deviation 4); the
-            // construction value only covers a tool call made BEFORE the
-            // first prompt, of which there are none.
-            file_policy: FilePolicy::default(),
-            // (issue #101) `None` = "the file does not speak about permissions"
-            // — no narrowing. Set before the first prompt by `core.rs` via
-            // [`Self::set_permission`] (the child Worker) or by a gate test.
-            permission_block: None,
-            web: crate::agent::web::config::WebConfig::default(),
-            render_requester: None,
         }
     }
 
@@ -449,7 +634,7 @@ impl AgentLoop {
         &mut self,
         requester: Option<Arc<dyn crate::agent::web::RenderRequester>>,
     ) {
-        self.render_requester = requester;
+        self.permissions.render_requester = requester;
     }
 
     /// Queue a prompt (best-effort — a full / closed queue is dropped).
@@ -495,13 +680,13 @@ impl AgentLoop {
     /// `Some(vec![])` = NO tools; a disabled tool is a tool-result
     /// error, NOT executed; finding 13b).
     pub fn set_enabled_tools(&mut self, tools: Option<Vec<String>>) {
-        self.enabled_tools = tools;
+        self.permissions.enabled_tools = tools;
     }
 
     /// The enabled tools (`None` = ALL — finding 13b; the
     /// `dispatch_native` driver derives the child's tool set from it).
     pub fn enabled_tools(&self) -> Option<&[String]> {
-        self.enabled_tools.as_deref()
+        self.permissions.enabled_tools.as_deref()
     }
 
     /// Set the per-agent permission ruleset (issue #101) — `None` = the file
@@ -512,14 +697,7 @@ impl AgentLoop {
         &mut self,
         permission: Option<crate::agent::definition_permission::PermissionBlock>,
     ) {
-        self.permission_block = permission;
-    }
-
-    /// The per-agent permission ruleset (`None` = no narrowing).
-    pub fn permission_block(
-        &self,
-    ) -> Option<&crate::agent::definition_permission::PermissionBlock> {
-        self.permission_block.as_ref()
+        self.permissions.permission_block = permission;
     }
 
     /// The thinking level (`None` = the model's default — the
@@ -672,7 +850,7 @@ impl AgentLoop {
                                 fresh.clone();
                             fresh
                         };
-                        self.run_compaction("manual", false, instructions, &turn)
+                        self.run_compaction(CompactionReason::Manual, false, instructions, &turn)
                             .await;
                     }
                     None => break,
@@ -694,41 +872,14 @@ impl AgentLoop {
     /// blocks — when images are present; a text-only prompt keeps the
     /// `Text` shape).
     pub async fn handle_prompt(&mut self, prompt: &PromptTurn) {
-        // (ADR 0030 Deviation 4) The policy and web config are
-        // re-read from `settings.json` ONCE per turn — the same in-process read
-        // `launch.rs` does per dispatch, so a user who flips a select in
-        // Settings affects an ALREADY-RUNNING session at its next prompt
-        // (no restart, no relaunch). ONE read per turn (not per tool call):
-        // every tool call in a turn must agree, or a half-asked batch would
-        // be a policy the user never chose. `config_dir: None` → the
-        // all-`Allow` default (no settings layer) + env-only web config.
-        let settings = self.config_dir.as_deref().map(crate::config::load_settings);
-        self.file_policy = settings
-            .as_ref()
-            .map(|s| s.file_policy.clone())
-            .unwrap_or_default();
-        // (T03) The rules IN FORCE for this turn: the frozen defaults FIRST,
-        // the user rules SECOND — the CONCATENATION CONTRACT of
-        // `policy::default_rules()` (an exact-tie appended `allow` must beat a
-        // rule listed before it; inverted, the allow-directory action silently
-        // no-ops). The default half is EMPTY today (the four agent dirs are the
-        // guard-membership set, not rules), so this is the user rules — but the
-        // shape stays, because it is the contract and it is what protects the
-        // order of whatever the defaults become. ONE concat per turn, next to
-        // the `file_policy` re-read, so the gate and the executors judge the
-        // SAME list for the whole turn and a mid-turn hand-edit lands at the
-        // NEXT prompt (Deviation 4).
-        // UNCONDITIONAL — `self.rules` starts as `Vec::new()` and is
-        // overwritten here on every prompt, so it is never the empty init
-        // again once a prompt has been handled.
-        self.rules = {
-            let mut rules = self.default_rules.clone();
-            rules.extend(self.file_policy.rules.iter().cloned());
-            rules
-        };
-        self.web = crate::agent::web::config::WebConfig::from_web_settings(
-            settings.as_ref().map(|s| &s.web),
-        );
+        // (ADR 0030 Deviation 4) The policy, the rule concat and the web
+        // config are re-read ONCE per turn — `PermissionContext::refresh`
+        // (the same in-process read `launch.rs` does per dispatch, so a user
+        // who flips a select in Settings affects an ALREADY-RUNNING session at
+        // its next prompt; ONE read per turn, so every tool call in a turn
+        // agrees). The setter-driven members (`permission_block` /
+        // `enabled_tools` / `render_requester`) are not touched by it.
+        self.permissions.refresh(self.config_dir.as_deref());
         // A Stop is pending (the turn token is cancelled — `NativeHandle::cancel`
         // cancelled it): a queued prompt must not start a FRESH turn after the
         // user pressed Stop. Drain the queue + skip this prompt (the token is
@@ -813,10 +964,7 @@ impl AgentLoop {
                 Err(ProviderError::ContextOverflow(_)) if !state.overflow_recovered => {
                     state.overflow_recovered = true;
                     self.compactor.turn_abandoned(&self.messages);
-                    self.force_compact = Some(CompactionTrigger {
-                        reason: "overflow",
-                        will_retry: true,
-                    });
+                    self.turn_control.arm(CompactionReason::Overflow, true);
                     continue;
                 }
                 Err(e) => {
@@ -936,13 +1084,15 @@ impl AgentLoop {
     /// goes through `emit_cost_update`, so a priced summary call reaches the
     /// cost channel like any other priced call, and a `None` emits nothing).
     ///
-    /// `reason` is the TRIGGER (`manual` for `/compact`, `threshold` for the
-    /// context-pressure check, `overflow` for a provider context-overflow
-    /// recovery) — it rides both events and the renderer's `compaction_update`
-    /// state frame. `will_retry` is the event's "the turn continues on the
-    /// other side of this compaction" flag. `instructions` are the user's
-    /// extra summary instructions (`/compact <args>`); the automatic paths
-    /// (threshold / overflow) pass `None`.
+    /// `reason` is the TRIGGER ([`CompactionReason`] — `Manual` for `/compact`,
+    /// `Threshold` for the context-pressure check, `Overflow` for a provider
+    /// context-overflow recovery; the wire spellings `"manual"` / `"threshold"`
+    /// / `"overflow"` are the enum's serde contract) — it rides both events and
+    /// the renderer's `compaction_update` state frame. `will_retry` is the
+    /// event's "the turn continues on the other side of this compaction" flag.
+    /// `instructions` are the user's extra summary instructions
+    /// (`/compact <args>`); the automatic paths (threshold / overflow) pass
+    /// `None`.
     ///
     /// Returns [`CompactionRan`] — the three-way outcome, because a caller
     /// recovering from an overflow must NOT read "shrunk nothing" as one fact:
@@ -950,13 +1100,13 @@ impl AgentLoop {
     /// is doomed), `Failed` means the SUMMARY call errored (which says nothing
     /// about the turn's own request, so the turn is re-issued).
     ///
-    /// For `reason: "overflow"` the SAME `compaction_end` also carries an
-    /// ACTIONABLE `error_message` when the transcript did not shrink (ADR 0045):
-    /// the one event the user sees must say what to do (a larger window, or that
-    /// the summary call failed and the transcript is unchanged). It is composed
-    /// HERE rather than by the caller because this is the only place that emits
-    /// `compaction_end` — a second one would double the transcript line and the
-    /// state frame.
+    /// For [`CompactionReason::Overflow`] the SAME `compaction_end` also carries
+    /// an ACTIONABLE `error_message` when the transcript did not shrink (ADR
+    /// 0045): the one event the user sees must say what to do (a larger window,
+    /// or that the summary call failed and the transcript is unchanged). It is
+    /// composed HERE rather than by the caller because this is the only place
+    /// that emits `compaction_end` — a second one would double the transcript
+    /// line and the state frame.
     ///
     /// `will_retry` is reconciled with the outcome HERE for the same reason: it
     /// is a promise about what the loop does next, and the only party that
@@ -964,14 +1114,12 @@ impl AgentLoop {
     /// `Skipped` settles the turn, so it must not promise a retry.
     async fn run_compaction(
         &mut self,
-        reason: &str,
+        reason: CompactionReason,
         will_retry: bool,
         instructions: Option<String>,
         turn: &CancellationToken,
     ) -> CompactionRan {
-        self.emit(RpcEvent::compaction_start {
-            reason: reason.to_string(),
-        });
+        self.emit(RpcEvent::compaction_start { reason });
         let mut aborted = false;
         let mut error_message: Option<String> = None;
         // The compaction's own output (pi's `CompactionResult` shape), shown on
@@ -979,7 +1127,7 @@ impl AgentLoop {
         let mut result: Option<Value> = None;
         // The overflow recovery's outcome needs a DIFFERENT message from the
         // transient ones (below): only the user can act on a window too small.
-        let overflow = reason == "overflow";
+        let overflow = reason == CompactionReason::Overflow;
         // What actually happened (the return value — see above).
         let mut ran = CompactionRan::Skipped;
         // The keep-recent budget comes from the COMPACTOR (its config copy +
@@ -1066,7 +1214,7 @@ impl AgentLoop {
         // straight through to a dead turn.
         let will_retry = will_retry && !(overflow && ran == CompactionRan::Skipped);
         self.emit(RpcEvent::compaction_end {
-            reason: reason.to_string(),
+            reason,
             result,
             aborted,
             will_retry,
@@ -1085,7 +1233,10 @@ impl AgentLoop {
         ModelRequest {
             model: self.model.id.clone(),
             messages: self.messages.clone(),
-            tools: Self::advertised_tool_specs(&self.enabled_tools, self.subagent.is_none()),
+            tools: Self::advertised_tool_specs(
+                &self.permissions.enabled_tools,
+                self.subagent.is_none(),
+            ),
             options: ModelOptions {
                 temperature: None,
                 max_tokens: None,
@@ -1101,7 +1252,7 @@ impl AgentLoop {
     /// as `tools[]`, so the prompt's `<tools>` section can never disagree
     /// with the API param (ADR 0017).
     pub fn advertised_specs(&self) -> Vec<ToolSpec> {
-        Self::advertised_tool_specs(&self.enabled_tools, self.subagent.is_none())
+        Self::advertised_tool_specs(&self.permissions.enabled_tools, self.subagent.is_none())
     }
 
     /// The tool specs advertised to the model (finding B): `tool_specs()`

@@ -8,11 +8,11 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::agent::events::EventSink;
 use crate::agent::hostenv::EnvPatch;
@@ -105,10 +105,16 @@ fn build_command_with(cmd0: &str, rest: &[String], patch: &EnvPatch) -> tokio::p
 async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -> SudoRun {
     let Some((cmd0, rest)) = argv.split_first() else {
         return SudoRun {
-            exit_code: -1,
+            // A non-run observed NO exit code — never a fabricated `-1`
+            // (the bash missing-command analogue reports no code either).
+            // `is_error: false`: the render's process-level arm reports from
+            // `error` alone, so the verdict fields stay the classifier's.
+            exit_code: None,
             stdout: String::new(),
             stderr: "no command in argv".to_string(),
             timed_out: false,
+            is_error: false,
+            note: None,
             error: Some("no command in argv".to_string()),
         };
     };
@@ -147,12 +153,16 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
         Ok(c) => c,
         Err(e) => {
             return SudoRun {
-                exit_code: -1,
+                // Process-level failure: no exit code was observable (the
+                // child never existed) — `null` on the wire, never `-1`.
+                exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
                 timed_out: false,
+                is_error: false,
+                note: None,
                 error: Some(format!("failed to spawn {cmd0}: {e}")),
-            }
+            };
         }
     };
     // Kill the WHOLE process group if the run is dropped mid-flight (finding
@@ -165,6 +175,13 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
     // it fires ONLY on an abrupt drop (the future dropped mid-flight, before
     // the child was reaped).
     let mut group_guard = SudoGroupGuard { pid: child.id() };
+    // The child's pid, captured NOW and carried for the whole run: the
+    // process-group kills below need it, and `Child::id()` returns `None` once
+    // the child has been reaped — which is exactly the state a timeout, a
+    // stalled write or a crash leaves. Reading it LIVE at kill time would
+    // silently SKIP the group kill there and orphan a grandchild (ADR 0080's
+    // amendment, Finding 3; the same rule the `SudoGroupGuard` above follows).
+    let child_pid = child.id();
     // The password travels via stdin ONLY (`sudo -S` reads it from there —
     // it never appears in argv or env). A fatal EPIPE (the child finished
     // without reading it — e.g. a NOPASSWD sudo) is NOT an auth failure:
@@ -184,16 +201,22 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
         let write = match tokio::time::timeout(Duration::from_secs(5), write).await {
             Ok(r) => r,
             Err(_) => {
-                kill_process_group_and_reap(&mut child).await;
+                kill_process_group_and_reap(child_pid, &mut child).await;
                 // The group was just killed + reaped — disarm the guard (a
                 // second `kill(-pgid)` on a reaped pgid is a redundant
                 // double-kill / a pid-reuse hazard).
                 group_guard.disarm();
                 return SudoRun {
-                    exit_code: -1,
+                    // Process-level failure (the write never landed): no exit
+                    // code was observed — `null`, never the old `-1`. NOT the
+                    // run's `timed_out` (a write timeout is not the run
+                    // hitting its deadline) and NOT an auth failure.
+                    exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
                     timed_out: false,
+                    is_error: false,
+                    note: None,
                     error: Some("timed out writing password to sudo stdin".to_string()),
                 };
             }
@@ -201,93 +224,246 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
         let _ = write;
         let _ = stdin.shutdown().await;
     }
-    let mut stdout = child.stdout.take().expect("stdout handle");
-    let mut stderr = child.stderr.take().expect("stderr handle");
-    // Shared (chunked) buffers: the PARTIAL data survives a timeout (the
-    // read tasks are dropped, the buffers keep what was read so far).
-    let stdout_buf = Arc::new(StdMutex::new(Vec::new()));
-    let stderr_buf = Arc::new(StdMutex::new(Vec::new()));
-    let read = async {
-        let (o, e) = tokio::join!(
-            read_stream_into(&mut stdout, &stdout_buf),
-            read_stream_into(&mut stderr, &stderr_buf),
-        );
-        (o, e, child.wait().await)
-    };
-    let result = tokio::time::timeout(timeout, read).await;
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&stdout_buf.lock().unwrap_or_else(|p| p.into_inner())).into_owned(),
-        String::from_utf8_lossy(&stderr_buf.lock().unwrap_or_else(|p| p.into_inner())).into_owned(),
-    );
-    match result {
-        Ok((o, e, w)) => {
-            // A read failure (a broken pipe that is NOT an EPIPE) or a
-            // `wait` failure: a clean transport failure (NOT an auth
-            // failure — the cache is kept). Kill + reap (no zombie).
-            let error = o
-                .as_ref()
-                .err()
-                .or_else(|| e.as_ref().err())
-                .or_else(|| w.as_ref().err())
-                .map(|e| e.to_string());
-            if let Some(error) = error {
-                // Kill + reap ONLY when the `wait` did NOT succeed: when
-                // `w` is `Ok` the process is already dead AND reaped — a
-                // `kill` on a reaped pid is a bare `kill(pid, SIGKILL)`
-                // with no reaped-state guard, and a reaped pid is free for
-                // reuse (it could SIGKILL an unrelated process). A read
-                // failure with a successful `wait` is just a transport
-                // glitch (the child's own exit settles the run).
-                if w.is_err() {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+    // The read handles carry the `_pipe` suffix (rather than the bare
+    // `stdout` / `stderr`) so the TEXT each return path reports can use the
+    // field names below without shadowing the handles the drain still reads.
+    let mut stdout_pipe = child.stdout.take().expect("stdout handle");
+    let mut stderr_pipe = child.stderr.take().expect("stderr handle");
+    // The partial output survives the deadline because the buffers outlive the
+    // loop (the old code kept them behind an `Arc<Mutex<…>>` because its reads
+    // ran as joined futures inside a `timeout`; a `select!` loop reads them
+    // itself, so plain locals hold the same fact with no locking).
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    // The facts the report is built from — the same set `exec_bash` keeps
+    // (ADR 0080 + its amendment).
+    let mut timed_out = false;
+    // The child's exit status, as SOON as it is observed. THIS is the F2 fix:
+    // the old code ran `child.wait()` INSIDE the same `tokio::join!` as the
+    // reads, under one `tokio::timeout`, so a grandchild holding a pipe kept
+    // the reads pending, the deadline cancelled the whole join — the `wait()`
+    // with it — and a status the child had already delivered was discarded
+    // with it. The `wait` now retires INDEPENDENTLY of the reads.
+    let mut status: Option<std::process::ExitStatus> = None;
+    // A failed `wait` means the status can never be learned, so the arm is
+    // retired (re-polling a permanently failing wait would spin the loop).
+    let mut await_status = true;
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    // A read failure that is NOT the swallowed EPIPE class: the transport is
+    // broken, which is a PROCESS-level failure (never an auth failure — the
+    // cached credential is kept), exactly what the old
+    // `o.as_ref().err() / e.as_ref().err()` detection meant.
+    let mut transport_error: Option<String> = None;
+    // One chunk buffer per stream (both select arms borrow them at once).
+    let mut out_chunk = [0u8; 8192];
+    let mut err_chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        // NOTE: the LAST arm of `tokio::select!` may not carry an `if` guard
+        // (macro limitation) — the unguarded arms come last. There is NO
+        // cancel arm: the sudo run has no cancel token (a dropped flow is the
+        // `SudoGroupGuard`'s case, not a loop arm).
+        tokio::select! {
+            r = stdout_pipe.read(&mut out_chunk), if stdout_open => {
+                match r {
+                    Ok(0) => stdout_open = false,
+                    Ok(n) => stdout_buf.extend_from_slice(&out_chunk[..n]),
+                    Err(e) => {
+                        if !is_swallowed_pipe_error(&e) {
+                            transport_error = Some(e.to_string());
+                            break;
+                        }
+                        stdout_open = false;
+                    }
                 }
-                // The child is reaped (a `wait` failure, or the read failure
-                // with a successful `wait` — the child's own exit settled the
-                // run) — disarm the guard (a `kill(-pgid)` on a reaped pid is
-                // a pid-reuse hazard; the group is left alone on a transport
-                // failure, matching the "no group kill on a normal exit" rule).
-                group_guard.disarm();
-                return SudoRun {
-                    exit_code: -1,
-                    stdout,
-                    stderr,
-                    timed_out: false,
-                    error: Some(error),
-                };
-            }
-            let status = w.expect("wait succeeded (checked above)");
-            // A NORMAL completion (no read / wait error): the child exited and
-            // was reaped inside `read` — disarm the guard so the group is left
-            // alone (a backgrounded grandchild the user wanted to keep running
-            // survives; a bare group kill here is a pid-reuse hazard too).
-            group_guard.disarm();
-            SudoRun {
-                exit_code: status.code().unwrap_or(-1),
-                stdout,
-                stderr,
-                timed_out: false,
-                error: None,
-            }
+            },
+            r = stderr_pipe.read(&mut err_chunk), if stderr_open => {
+                match r {
+                    Ok(0) => stderr_open = false,
+                    Ok(n) => stderr_buf.extend_from_slice(&err_chunk[..n]),
+                    Err(e) => {
+                        if !is_swallowed_pipe_error(&e) {
+                            transport_error = Some(e.to_string());
+                            break;
+                        }
+                        stderr_open = false;
+                    }
+                }
+            },
+            s = child.wait(), if await_status => {
+                // The exit status is captured HERE, in the same `select!` as
+                // the reads, so what a run reports cannot depend on whether a
+                // pipe is still held, nor on the drain below. `wait` is
+                // cancel-safe, so re-polling it per iteration is safe; the arm
+                // is retired once the status lands (or once it fails).
+                match s {
+                    Ok(s) => status = Some(s),
+                    Err(e) => {
+                        if transport_error.is_none() {
+                            transport_error = Some(e.to_string());
+                        }
+                    }
+                }
+                await_status = false;
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                timed_out = true;
+                break;
+            },
         }
-        Err(_) => {
-            // Timeout: kill the WHOLE process group + reap (the shared
-            // helper — consistent with the write-timeout kill above).
-            kill_process_group_and_reap(&mut child).await;
-            // The group was just killed + reaped — disarm the guard (a second
-            // `kill(-pgid)` on a reaped pgid is a redundant double-kill / a
-            // pid-reuse hazard).
-            group_guard.disarm();
-            SudoRun {
-                // The suite's timeout sentinel (124).
-                exit_code: 124,
-                stdout,
-                stderr,
-                timed_out: true,
-                error: None,
+        // A transport failure ends the run (the loop cannot make progress on a
+        // broken pipe).
+        if transport_error.is_some() {
+            break;
+        }
+        // Pipe EOF is NOT the end of the run (exactly `exec_bash`'s rule): a
+        // child that closed its pipes may not have exited yet, and `select!`
+        // completes ONE arm per iteration. Break only once the exit status is
+        // SETTLED — seen, or the wait arm retired.
+        if !stdout_open && !stderr_open && (status.is_some() || !await_status) {
+            break;
+        }
+    }
+
+    // LATCH the pipe fact BEFORE the kill, not at the report (ADR 0080's
+    // sampling-point contract, now governing the elevated path too).
+    // `stdout_open`/`stderr_open` still mean "held at the deadline" ONLY here:
+    // the group kill below kills the holder, and the drain below then reads the
+    // EOF that kill produced and clears both flags — so by the time the report
+    // is built the pair reads `false` for the exact run this fact exists to
+    // identify. Reading the live pair at the report is the silent-no-op trap
+    // this line exists to close (#94, and the same trap for `sudo -S`).
+    let pipes_held = stdout_open || stderr_open;
+
+    // Convert the buffers to text NOW: the PARTIAL data must survive every path
+    // below (the kill and the drain only ever ADD to the buffers).
+    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+
+    // ── the transport-failure path (the pre-port rule, PRESERVED) ──────────
+    if let Some(error) = transport_error {
+        // Kill + reap ONLY when the `wait` did NOT succeed: when the status was
+        // observed the process is already dead AND reaped — a `kill` on a reaped
+        // pid is a bare `kill(pid, SIGKILL)` with no reaped-state guard, and a
+        // reaped pid is free for reuse (it could SIGKILL an unrelated process).
+        // A read failure with an observed exit is just a transport glitch (the
+        // child's own exit settles the run), and the GROUP is left alone —
+        // matching the "no group kill on a normal exit" rule.
+        if status.is_none() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        // The child is reaped (a `wait` failure, or the read failure with an
+        // observed exit) — disarm the guard (a `kill(-pgid)` on a reaped pid is
+        // a pid-reuse hazard).
+        group_guard.disarm();
+        return SudoRun {
+            // A process-level failure observed NO exit code — `null` on the
+            // wire (the bash `ToolResult::fail(…, None)` shape), never the old
+            // fabricated `-1`. `is_error` stays false: the render's
+            // process-level arm is what reports this, and it renders from
+            // `error` alone.
+            exit_code: None,
+            stdout,
+            stderr,
+            timed_out: false,
+            is_error: false,
+            note: None,
+            error: Some(error),
+        };
+    }
+
+    // Kill the WHOLE process group whenever anything may still be alive: the
+    // loop broke on the deadline with the child's exit unobserved, or with a
+    // pipe still held (a backgrounded grandchild may hold it). The kill is
+    // skipped ONLY when the exit was observed AND both pipes are closed —
+    // nothing is alive then, and signalling the (possibly recycled) process
+    // group would be wrong (`run_sudo_real_a_normal_completion_does_not_kill_the_process_group`).
+    if stdout_open || stderr_open || status.is_none() {
+        kill_process_group_and_reap(child_pid, &mut child).await;
+    }
+    // Drain what the group's death frees, bounded by `DRAIN_GRACE` — NOT an
+    // unbounded wait for EOF (a grandchild that escaped the group could hold
+    // the pipes forever). Only meaningful while a pipe is open.
+    if stdout_open || stderr_open {
+        let grace = tokio::time::Instant::now() + crate::agent::tools::exec::bash::DRAIN_GRACE;
+        loop {
+            tokio::select! {
+                r = stdout_pipe.read(&mut out_chunk), if stdout_open => {
+                    match r {
+                        Ok(0) => stdout_open = false,
+                        Ok(n) => stdout_buf.extend_from_slice(&out_chunk[..n]),
+                        Err(_) => stdout_open = false,
+                    }
+                },
+                r = stderr_pipe.read(&mut err_chunk), if stderr_open => {
+                    match r {
+                        Ok(0) => stderr_open = false,
+                        Ok(n) => stderr_buf.extend_from_slice(&err_chunk[..n]),
+                        Err(_) => stderr_open = false,
+                    }
+                },
+                _ = tokio::time::sleep_until(grace) => break,
+            }
+            if !stdout_open && !stderr_open {
+                break;
             }
         }
     }
+    // Give the reap ONE bounded chance to land when the status is still
+    // unknown (the child is usually already dead from the group kill, so this
+    // returns at once). THIS is what makes a genuine hang land on the
+    // classifier's R5 row — the group kill's SIGKILL death is OBSERVED here,
+    // so the report can name the signal instead of arriving at R3 with no
+    // status at all. Without it, a hang is reported "exit status unknown".
+    if status.is_none() {
+        if let Ok(Ok(s)) =
+            tokio::time::timeout(crate::agent::tools::exec::bash::DRAIN_GRACE, child.wait()).await
+        {
+            status = Some(s);
+        }
+    }
+    // The PARTIAL data is what the model sees on every path below, so the
+    // text is taken from the buffers AFTER the drain added to them.
+    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+    // SHARED classifier, CALLED not copied (ADR 0080's amendment): the elevated
+    // path answers the completion question with the same function, and the same
+    // sampling-point contract, as `exec_bash`. `cancelled` is `false` because
+    // the sudo run has no cancel arm; the fourth fact is the LATCHED
+    // `pipes_held`, never the live pair the kill and drain just cleared.
+    let (exit_code, is_error, note) =
+        crate::agent::tools::exec::bash::bash_exit_report(false, timed_out, status, pipes_held);
+    // The run is settled (the child was reaped by the loop, by the kill + reap,
+    // or by the bounded reap above) — disarm the guard: a backgrounded
+    // grandchild the user wanted to keep running survives a normal completion,
+    // and a second `kill(-pgid)` on a group already reaped is a redundant
+    // double-kill / a pid-reuse hazard.
+    group_guard.disarm();
+    SudoRun {
+        exit_code,
+        stdout,
+        stderr,
+        timed_out,
+        is_error,
+        note,
+        error: None,
+    }
+}
+
+/// Is this read error one the capture path RECORDS but does not fail the run
+/// on? `true` for the broken-pipe class (`EPIPE` / `ERROR_BROKEN_PIPE`), which
+/// is the same policy the password write already follows: a child that finished
+/// without consuming the pipe is not a failure — the child's own exit settles
+/// the run. Every OTHER read error is a genuine transport failure and is
+/// latched as one (`run_sudo_real`'s `transport_error`).
+fn is_swallowed_pipe_error(e: &std::io::Error) -> bool {
+    // `ErrorKind::BrokenPipe` is what `EPIPE` (unix) and
+    // `ERROR_BROKEN_PIPE` (Windows) both surface as in std, so one arm covers
+    // both platforms without a `cfg`.
+    e.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 /// Kill + reap a `run_sudo_real` child: SIGKILL the WHOLE process group
@@ -297,12 +473,18 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
 /// by the write-timeout and run-timeout paths so a stalled-write kill is
 /// consistent with a run-timeout kill (a grandchild of the group leader
 /// must not survive either).
-async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
-    let _ = child.kill().await;
+///
+/// `pid` is the LATCHED pid `run_sudo_real` captured at spawn, never a live
+/// `Child::id()` — the live read is `None` by the time a timed-out child has
+/// been reaped, and a `None` there skips the group kill and leaves the
+/// elevated grandchildren of a root command alive. The kill is delegated to
+/// `crate::agent::childproc::kill_process_group` (its single owner); this
+/// wrapper adds only the reap.
+async fn kill_process_group_and_reap(pid: Option<u32>, child: &mut tokio::process::Child) {
+    // The group kill itself lives in `childproc` (one owner — ADR 0080's
+    // amendment); the REAP is this caller's decision (the elevated path wants
+    // no zombie, the bash and Worker paths must not reap).
+    crate::agent::childproc::kill_process_group(pid, child).await;
     let _ = child.wait().await;
 }
 
@@ -349,26 +531,6 @@ impl Drop for SudoGroupGuard {
             let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
     }
-}
-
-/// Read a stream to EOF into `buf` (chunked — bounded; the buffer is
-/// shared so the partial data survives a timeout, see
-/// [`run_sudo_real`]).
-async fn read_stream_into<R: AsyncRead + Unpin>(
-    r: &mut R,
-    buf: &Arc<StdMutex<Vec<u8>>>,
-) -> std::io::Result<()> {
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = r.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        buf.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .extend_from_slice(&chunk[..n]);
-    }
-    Ok(())
 }
 
 /// A drop guard that cleans up a `sudo_run_flow`'s `pending_sudo` entry
@@ -466,7 +628,13 @@ mod tests {
     #[tokio::test]
     async fn run_sudo_real_an_empty_argv_is_a_failure() {
         let run = run_sudo_real(Vec::new(), "pw".to_string(), Duration::from_secs(5)).await;
-        assert_eq!(run.exit_code, -1);
+        // A non-run observed no exit code: `None` (the wire says `null`), never
+        // the fabricated `-1` the pre-port code shipped.
+        assert!(
+            run.exit_code.is_none(),
+            "no code was observed, got {:?}",
+            run.exit_code
+        );
         assert!(!run.timed_out);
         assert_eq!(run.error.as_deref(), Some("no command in argv"));
     }
@@ -486,7 +654,13 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(run.exit_code, -1);
+        // The child never existed, so NO code is observable — `None`, never a
+        // fabricated `-1`.
+        assert!(
+            run.exit_code.is_none(),
+            "no code was observed, got {:?}",
+            run.exit_code
+        );
         assert!(!run.timed_out);
         assert!(
             run.error
@@ -529,7 +703,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(run.exit_code, 0, "the child's exit settles the run");
+        assert_eq!(run.exit_code, Some(0), "the child's exit settles the run");
         assert!(!run.timed_out);
         assert!(
             run.error.is_none(),
@@ -570,11 +744,33 @@ mod tests {
             Duration::from_millis(800),
         )
         .await;
-        // The suite's timeout sentinel (124) + the flag; NO error (a timeout
-        // is not a process-level failure).
-        assert_eq!(run.exit_code, 124, "the suite's timeout sentinel");
-        assert!(run.timed_out);
-        assert!(run.error.is_none());
+        // A GENUINE hang reports the classifier's R5 row: the group kill's
+        // SIGKILL death is OBSERVED by the bounded post-loop reap, so the run
+        // names the signal and claims NO code. The old `124` sentinel is
+        // deleted — `124` is a real `timeout(1)` exit code, so a sentinel could
+        // never be told apart from the event it faked.
+        assert!(
+            run.exit_code.is_none(),
+            "a signal death names no code — never a fabricated sentinel, got {:?}",
+            run.exit_code
+        );
+        assert!(run.timed_out, "the deadline genuinely fired");
+        assert!(
+            run.error.is_none(),
+            "a timeout is not a process-level failure"
+        );
+        let note = run
+            .note
+            .clone()
+            .expect("R5 carries the deadline + signal note");
+        assert!(
+            note.contains("timed out"),
+            "a genuine hang is still CALLED a hang (the deadline sentence stays): {note:?}"
+        );
+        assert!(
+            note.contains("signal"),
+            "R5 names the signal death the bounded reap observed: {note:?}"
+        );
         // The PARTIAL stdout survives the timeout: the read tasks are
         // dropped mid-stream, but the shared buffers keep what was read so
         // far (the `from_utf8_lossy` conversion below the read phase picks
@@ -606,6 +802,86 @@ mod tests {
         assert!(
             gone,
             "the grandchild (pid {grandchild_pid}) is dead — the group kill reached it"
+        );
+    }
+
+    /// (ADR 0080 amendment, Finding 2 / A3) A pipe-held COMPLETION under the
+    /// elevated runner is a success, not a kill. The bash R1 fixture shape,
+    /// run through `run_sudo_real`: the child echoes its markers and exits 0
+    /// while a backgrounded subshell still holds the stdout / stderr write
+    /// ends, so the deadline fires with both pipes held. The pre-port runner
+    /// read the status INSIDE the same `tokio::join!` as the reads, so the
+    /// timeout cancelled the `wait()` with it and reported the fabricated
+    /// `124` sentinel + `timed_out` + (at the render) a claim that the command
+    /// had been killed — a model watching a successful privileged command
+    /// "fail" re-runs it.
+    /// After the port: the status retires INDEPENDENTLY of the reads, the
+    /// pipe fact is LATCHED above the kill gate, and the shared classifier
+    /// (`bash_exit_report`) answers R1 — exit 0, `is_error: false`, the
+    /// `DO NOT RE-RUN` note, and never the word "timed out".
+    ///
+    /// No grandchild-pid assertion here (hence no `ScratchDir` pid file): the
+    /// status asserted is the DIRECT child's, and the group's fate is pinned
+    /// by `run_sudo_real_timeout_kills_the_whole_process_group`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_sudo_real_a_pipe_held_completion_is_reported_as_success_not_a_timeout() {
+        assert!(
+            std::path::Path::new("/bin/sh").exists(),
+            "/bin/sh must exist"
+        );
+        // The bash R1 shape verbatim: two markers, then a backgrounded
+        // subshell that keeps BOTH pipe write ends open for 25 s (the
+        // deadline is 800 ms, so the pipes are HELD when it fires) and only
+        // then closes them.
+        let run = run_sudo_real(
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo COMPLETED-1; ( sleep 25; exec >&- 2>&- ) & echo COMPLETED-2".to_string(),
+            ],
+            "pw".to_string(),
+            Duration::from_millis(800),
+        )
+        .await;
+        // The classifier read the REAL exit code — never a fabricated number.
+        assert_eq!(
+            run.exit_code,
+            Some(0),
+            "a pipe-held exit 0 is an OBSERVED completion, got {:?} (stdout {:?})",
+            run.exit_code,
+            run.stdout
+        );
+        assert!(
+            !run.is_error,
+            "R1: a command watched exiting 0 is NOT an error, note {:?}",
+            run.note
+        );
+        assert!(
+            run.timed_out,
+            "the deadline genuinely fired (the pipes were held) — the flag stays the run's fact"
+        );
+        assert!(
+            run.error.is_none(),
+            "a completion is not a process-level failure, got {:?}",
+            run.error
+        );
+        let note = run
+            .note
+            .clone()
+            .expect("R1 carries the pipe-held-success note");
+        assert!(
+            note.contains("DO NOT RE-RUN"),
+            "the model must be told not to re-run a command that already succeeded: {note:?}"
+        );
+        assert!(
+            !note.contains("timed out"),
+            "the note must not call a completion a timeout: {note:?}"
+        );
+        assert!(
+            run.stdout.contains("COMPLETED-1") && run.stdout.contains("COMPLETED-2"),
+            "the output captured before the deadline is returned: {:?}",
+            run.stdout
         );
     }
 
@@ -720,7 +996,7 @@ mod tests {
         )
         .await;
         // A NORMAL completion (exit 0, no timeout, no error).
-        assert_eq!(run.exit_code, 0, "a normal completion exits 0");
+        assert_eq!(run.exit_code, Some(0), "a normal completion exits 0");
         assert!(!run.timed_out);
         assert!(run.error.is_none());
         // The GRANDCHILD (the backgrounded `sleep`) is ALIVE: the normal
@@ -763,7 +1039,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(run.exit_code, 0, "a benign command exits 0");
+        assert_eq!(run.exit_code, Some(0), "a benign command exits 0");
         assert!(!run.timed_out);
         assert!(
             run.error.is_none(),
@@ -799,7 +1075,13 @@ mod tests {
         )
         .await;
         let elapsed = started.elapsed();
-        assert_eq!(run.exit_code, -1);
+        // A process-level failure (the write never landed): no code observed,
+        // so `None` — the old fabricated `-1` is gone.
+        assert!(
+            run.exit_code.is_none(),
+            "no code was observed, got {:?}",
+            run.exit_code
+        );
         assert!(!run.timed_out, "a write timeout is not the run timeout");
         assert_eq!(
             run.error.as_deref(),
