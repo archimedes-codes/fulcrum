@@ -666,6 +666,100 @@ async fn bash_timeout_t_reports_a_no_console_input_diagnostic() {
     );
 }
 
+/// (issue #79 residual (a), the OTHER half of the pair) The sibling above pins that the failure
+/// recommends a replacement, and three tests pin that the replacement STRING is present —
+/// [`cmd_input_redirection_is_diagnosed_as_the_no_console_input_tool_policy`], the same assertion
+/// inside [`bash_timeout_t_reports_a_no_console_input_diagnostic`], and the first-line pin inside
+/// [`a_run_whose_text_carries_the_cmd_redirect_error_gets_the_diagnostic_as_its_first_line`]. None
+/// of them ever showed the replacement WORKS. THIS is the behaviour leg: on the SAME child that
+/// cannot run `timeout`, `ping -n 3 127.0.0.1 > NUL` must WAIT, EXIT 0, and need NO console input.
+/// Without it the tool would be pointing the model at a second dead end on the one platform it
+/// advises it for.
+///
+/// WHY THE LOWER BOUND IS THE LOAD-BEARING ASSERTION: `timeout`'s documented failure mode on this
+/// child is to exit AT ONCE — the sibling test's own doc records it, and `cmd` says so in its own
+/// sentence ("…exiting the process immediately"). A test that only asserted the command RAN, or
+/// only bounded the run from ABOVE, would pass on that broken behaviour and prove nothing. Only a
+/// FLOOR distinguishes a real wait from an instant exit, so 1200 ms is what this test is actually
+/// about; the other three assertions characterise the wait, they do not establish it.
+///
+/// FLOOR MARGIN, deliberately loose: `-n 3` sleeps ~2 s (one interval between each reply) and the
+/// floor sits at 1200 ms. Ping's delay is a TIMER, not CPU work, so a loaded runner can overshoot
+/// but cannot undershoot — there is no contention mechanism that makes a timer fire early. There
+/// is therefore NO upper bound here, and one must never be added: an upper bound is how a
+/// wall-clock test becomes a flake (the shape this repo already suffers in
+/// `src/**/Reasoning.test.tsx`'s ratio assertion — not imported into Rust).
+///
+/// `-n 3`, NOT the recommended `-n 20`: three pings prove the mechanism in ~2 s; twenty would cost
+/// ~19 s of CI time to prove the SAME thing. This test therefore proves the SHAPE — `ping` needs
+/// no console input, `> NUL` is honoured by `cmd`, exit code 0 — and NOT the literal count in the
+/// recommended string. It deliberately makes NO assertion on that string: presence is already
+/// owned by the three tests named above, and repeating it here would be a vacuous second pin.
+///
+/// ASSERTION 3 IS NOT THE SUCCESS PROOF. Empty text is evidence that the `> NUL` redirection was
+/// HONOURED (the reply lines never reached the pipe, so output stays small); it is NOT evidence
+/// that the run succeeded, because a mis-reported FAILING run's text would be empty too. Success
+/// rests on assertions 1, 2 and 4 between them: exit 0 and `!is_error` (it worked), ≥1200 ms (it
+/// waited), `cancelled: false` (the wait ended by itself, the deadline never fired).
+///
+/// ⚠ `#[cfg(windows)]` — `ping`'s `-n` flag and `> NUL` are `cmd`/Windows shapes, so this test can
+/// exist on no other platform. It RUNS only on CI's `windows-latest` leg; locally the ceiling is
+/// `cargo check --target x86_64-pc-windows-gnu --all-targets`, a compile gate and not a run. Do NOT
+/// relax the gate to make it execute here: a test that silently does not run on the platform it
+/// guards is the blind spot issue #79 was filed about (see the warning block below).
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_ping_workaround_actually_waits_without_console_input() {
+    let cwd = temp_cwd("bash-ping-waits");
+    let start = std::time::Instant::now();
+    let r = execute_tool(
+        &ctx(&cwd),
+        "bash",
+        &json!({ "command": "ping -n 3 127.0.0.1 > NUL" }),
+    )
+    .await;
+    // 1. It SUCCEEDS, where `timeout` cannot.
+    assert!(
+        !r.is_error,
+        "`ping` is the workaround this tool RECOMMENDS, so it must succeed where `timeout /t` \
+         fails: TEXT={:?} DETAILS={:?}",
+        text_of(&r),
+        r.details
+    );
+    assert_eq!(
+        r.details.as_ref().unwrap()["exitCode"],
+        0,
+        "`ping` exits 0 on this console-less child (the recommendation would be a second dead \
+         end if it did not): DETAILS={:?}",
+        r.details
+    );
+    // 2. THE LOAD-BEARING ASSERTION: it WAITED. `timeout`'s failure is to exit at once, so only a
+    //    floor separates the workaround that sleeps from the one that fails instantly.
+    assert!(
+        start.elapsed() >= Duration::from_millis(1200),
+        "`ping` must actually SLEEP (three replies ~2 s apart) — an ELAPSED FLOOR is the only \
+         thing that distinguishes a real wait from `timeout`'s exit-immediately failure mode: \
+         ELAPSED={:?} TEXT={:?}",
+        start.elapsed(),
+        text_of(&r)
+    );
+    // 3. Evidence that `> NUL` was HONOURED (output stays small) — NOT evidence of success.
+    assert!(
+        text_of(&r).trim().is_empty(),
+        "`> NUL` is honoured by `cmd` (our `/d /s /c` raw tail passes the redirection through \
+         untouched), so the reply lines never reach the pipe and the model-facing text is empty: \
+         TEXT={:?}",
+        text_of(&r)
+    );
+    // 4. It finished on its own — the deadline never fired.
+    assert_eq!(
+        r.details.as_ref().unwrap()["cancelled"],
+        false,
+        "the wait ended by itself; the bash deadline never fired: DETAILS={:?}",
+        r.details
+    );
+}
+
 // ── the quoting contract, on the shell that actually re-parses it ─────
 //
 // `#[cfg(windows)]` rather than `#[cfg(not(unix))]`: these spawn `cmd.exe`,
@@ -753,6 +847,210 @@ async fn bash_an_inline_quoted_path_still_takes_the_branch() {
     );
 }
 
+/// (issue #79 residual R1, the contract the false success VIOLATED) A backgrounded launch that
+/// reports a clean success must have ACTUALLY STARTED something. Mechanism-free on purpose: it
+/// claims nothing about who holds a file lock, only about the observable pairing of a reported
+/// success with evidence of a start.
+///
+/// WHY THIS EXISTS AND THE TEST ABOVE DOES NOT COVER IT: [`bash_an_inline_quoted_path_still_takes_the_branch`]
+/// pins the same "the exit code is the thing that lies" shape on the QUOTING path. Nothing pinned
+/// the BACKGROUNDED LAUNCH itself — `start /B prog.bat`, the command the issue names verbatim and
+/// the symptom the issue says must NOT be closed by the quoting fix. This test is also the repro
+/// harness §Gaps records as not existing ("whoever reproduces it on a real Windows box owns the
+/// question"): it is the first thing in this repo that drives `start /B` at all.
+///
+/// THE FIXTURE IS THE REPORTED COMMAND, NOT AN INVENTED ONE. `std::fs::write` drops a
+/// `marker.bat` that appends `RAN` to `marker.txt`, and the tool runs `start /B marker.bat` — the
+/// issue's `start /B prog.bat` shape with a name local to the scratch dir. `@echo off` keeps the
+/// echo of each command line out of the captured text. The line endings are EXPLICIT `\r\n`: a
+/// batch file with bare `\n` is not reliably parsed by `cmd`, so a LF-only fixture would be testing
+/// the parser instead of the launcher.
+///
+/// DO NOT ADD A `""` TITLE SLOT. The fixture is verbatim `start /B marker.bat` with NO quotes, so
+/// `start`'s "first quoted token is the window title" rule is not in play here at all. That trap is
+/// real — it is why the Windows `BASH_DESCRIPTION` (`agent/harness/tool_specs.rs`) tells the model
+/// never to pass `""` there — but prepending `""` "helpfully" would change WHAT THIS TEST MEASURES
+/// (it would exercise the title-slot path instead of the reported one). Keep the command byte-exact.
+///
+/// `/B` STAYS. `cmd /c start` with NO `/B` allocates its own console regardless of `CREATE_NO_WINDOW`
+/// (§6's standing caveat: a handle-ownership question, not another face of the window bug this doc
+/// is about), so dropping `/B` would both change what is measured and pop a window on the runner.
+///
+/// THE ASSERTION IS A MATERIAL IMPLICATION, AND THAT IS THE WHOLE POINT: `code != Some(0) ||
+/// marker_exists` fails on exactly ONE state — **exit 0 with nothing started** — which is precisely
+/// what the issue reported (`Access is denied.` printed after the agent's echo marker, `exitCode: 0`
+/// reported, no log file, no process, the agent telling the user a build was "running in the
+/// background"). Every other cell of the truth table passes: a non-zero code, or a start with no
+/// reported status, are both honest outcomes.
+///
+/// `code == None` ALSO SATISFIES THE LEFT SIDE, AND THAT IS INTENTIONAL. `as_i64()` yields `None`
+/// for a `Value::Null` `exitCode` — an UNOBSERVED status, e.g. a run killed at its deadline — and
+/// `None != Some(0)` is true, so the implication passes without consulting the marker. An unobserved
+/// status is not a *clean success*, so the contract simply does not apply to it. This is exactly why
+/// the sibling [`bash_timeout_t_reports_a_no_console_input_diagnostic`] uses the stricter
+/// `code.is_i64() && code.as_i64().unwrap() != 0` form: a later author who STRENGTHENS this to a
+/// pinned exit code must keep that `is_i64()` guard, so "real non-zero" stays distinguishable from
+/// "null".
+///
+/// THAT SLACK IS ONLY SAFE BECAUSE TWO ASSERTIONS RUN BEFORE IT, and they are the reason it cannot
+/// turn a hang into a green test. This test passes no `timeout_ms`, so the default deadline applies;
+/// a grandchild inheriting the piped stdout/stderr could hold the run to that deadline, which makes
+/// `exitCode` `null` and satisfies the implication WITHOUT the marker being consulted — a VACUOUS
+/// pass, a hang reported as coverage. `cancelled == false` closes the CANCEL route (it is written only
+/// by the cancel arm of the select loop), and a `!text.contains("timed out")` guard closes the
+/// DEADLINE route, which `cancelled` does NOT: the deadline sets a separate `timed_out` flag that
+/// reaches the model-facing NOTE but never `details` — measured on this branch, a deadline run reports
+/// `{"cancelled": false, "exitCode": null}`. With both in place the `None` the implication forgives is
+/// genuinely "an unobserved status that is neither a cancel nor a timeout", which is the only case this
+/// paragraph excuses. Do NOT replace either guard with an explicit small `timeout_ms`: that installs
+/// the deadline as the expected outcome and manufactures the vacuous path instead of closing it.
+///
+/// DO NOT OVER-CLAIM WHAT THIS DETECTS. The implication's job is narrow — the R1 contract, exit 0 ⇒
+/// something started. It is NOT the detector for a hypothetical "`exec_bash` always reports 0" bug;
+/// that is pinned by the many existing asserts in this file that require a SPECIFIC code (e.g.
+/// [`bash_passes_inline_double_quotes_through_to_cmd_verbatim`] asserts `exitCode == 0`,
+/// [`bash_timeout_t_reports_a_no_console_input_diagnostic`] asserts a non-zero one). What makes THIS
+/// test non-vacuous is only that the hard case — exit 0 with no marker — is the reported symptom,
+/// and the implication fails on it. Say the narrow thing.
+///
+/// THE MARKER'S CONTENTS ARE ASSERTED WHEN IT EXISTS, so a phantom zero-byte `marker.txt` created by
+/// anything at all cannot satisfy the implication in the batch's place.
+///
+/// THE FAILURE MESSAGE CARRIES A `read_dir` LISTING OF THE SCRATCH DIR on purpose: if `marker.txt`
+/// showed up OUTSIDE it, that listing is what tells us `start` changed the working directory — a
+/// different finding, but an equally useful one.
+///
+/// THIS TEST MAKES TWO ASSERTIONS, NOT THREE — the third one that used to sit here is DELETED, and
+/// the reason is worth keeping so nobody re-adds it. It read
+/// `if text.contains(X) { assert!(!text.trim().is_empty() && text.contains(X)) }`, and a guard of
+/// that shape CANNOT FAIL: `text.contains(X)` is the condition that PRODUCED `X`, and a text holding
+/// a non-empty sentence is non-empty, so both halves of the body were true by construction on every
+/// path — including the `None` path, which skipped the body outright. It looked like coverage and
+/// asserted nothing. The claim it gestured at — that our layer does not swallow one of the issue's
+/// error sentences — is real and worth pinning, but the only honest way to pin it is to construct a
+/// run whose text is KNOWN to carry the sentence, so the assertion is checked against something the
+/// output scan did not supply. That needs no Windows at all, so the claim now lives in the
+/// cross-platform [`the_bash_tool_passes_issue_79_error_sentences_through_verbatim`], which runs on
+/// Linux and macOS as well as on CI's Windows leg. NEITHER test asks `exec_bash` to PROMOTE an
+/// exit-0-with-error-text run into an error — that promotion would be a `bash_exit_report` change
+/// (its `(Some(n), None)` arm — "a normal non-zero exit needs no note — the code IS the report") and is
+/// explicitly OUT OF SCOPE on both sides of the move. That is NOT the same as "neither looks at
+/// `is_error`": this test never touches `is_error`, and the moved-to test asserts `!r.is_error`, but it
+/// asserts it because `echo` genuinely exits 0 — that clean code riding alongside an error sentence is
+/// what makes the run #79's shape, not a claim about what the tool ought to conclude.
+///
+/// ⚠ `#[cfg(windows)]`, and BOTH OUTCOMES ON CI ARE FINDINGS — a later reader must not "fix" a red
+/// run of this test. Locally the ceiling is `cargo check --target x86_64-pc-windows-gnu
+/// --all-targets`, a compile gate and NOT a run: there is no host for it, not Linux and not wine.
+/// The proof leg is CI's `windows-latest` run, and §Gaps records which of these it gave:
+/// - **RED** → the lock REPRODUCED. Record the verbatim output and the exit code in §Gaps. Do NOT
+///   weaken the assertion, do NOT add a retry, do NOT invent a mechanism. The issue then has, for
+///   the first time, an observed repro with real text — the artefact a fix needs.
+/// - **GREEN** → the lock does NOT reproduce in CI's DEBUG build. That narrows R1 to the packaged
+///   RELEASE bundle — the GUI-subsystem binary (`main.rs:2`,
+///   `cfg_attr(not(debug_assertions), windows_subsystem = "windows")`) that CI never builds — the
+///   same debug-vs-release blind spot §Gaps already records for the window bug.
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_start_b_does_not_report_success_without_starting_something() {
+    let cwd = temp_cwd("bash-start-b");
+    // EXPLICIT \r\n — `cmd` does not reliably parse a batch file with bare \n.
+    std::fs::write(
+        cwd.join("marker.bat"),
+        "@echo off\r\necho RAN >> marker.txt\r\n",
+    )
+    .unwrap();
+    // Verbatim `start /B marker.bat` — NO `""` title slot, `/B` kept. See the doc comment.
+    let r = execute_tool(
+        &ctx(&cwd),
+        "bash",
+        &json!({ "command": "start /B marker.bat" }),
+    )
+    .await;
+    let text = text_of(&r);
+
+    // `start /B` is ASYNCHRONOUS: it hands off and returns. A single immediate `exists()` would be
+    // a race, not a test, so poll the scratch dir for up to ~5 s.
+    let marker = cwd.join("marker.txt");
+    let mut marker_exists = marker.exists();
+    for _ in 0..50 {
+        if marker_exists {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        marker_exists = marker.exists();
+    }
+
+    // 0. THE RUN FINISHED ON ITS OWN — this is what makes the `None` slack in the implication below
+    //    SAFE instead of VACUOUS. This test passes no `timeout_ms`, so the DEFAULT deadline applies,
+    //    and a grandchild that INHERITED the piped stdout/stderr handles and held them open could take
+    //    the run to that deadline; on that path `exitCode` becomes `null`, `code == None` satisfies the
+    //    left side WITHOUT consulting the marker, and a HANG would be reported as a GREEN test. Two
+    //    facts close the two routes into that cell:
+    //
+    //    (a) `cancelled == false` — the cancel arm of `exec_bash`'s select loop is the ONLY writer of
+    //        `cancelled` (`exec/bash.rs`, the `ctx.cancel.cancelled()` arm), so this rules out a run
+    //        that was cancelled out from under the test.
+    //    (b) the captured text carries NO deadline note — and this half is LOAD-BEARING, because
+    //        `cancelled` does NOT cover the deadline. MEASURED on this branch: `sleep 5` with
+    //        `timeout_ms: 300` reports `{"cancelled": false, "exitCode": null}` — the deadline arm sets
+    //        the SEPARATE `timed_out` flag, which `bash_exit_report` turns into the note
+    //        "The command timed out and was killed at its deadline." but which NEVER reaches `details`
+    //        (`exec_bash` emits only `exitCode` / `truncated` / `cancelled`). So a deadline run would
+    //        sail past (a), and `contains("timed out")` on the model-facing text is the only thing that
+    //        sees it. `timed_out`'s every exit-`None` branch carries that sentence, so (a)+(b) together
+    //        mean the `None` the implication still forgives is genuinely "an unobserved status that is
+    //        neither a cancel nor a timeout" — the case the doc comment describes.
+    //
+    //    DELIBERATELY NOT AN EXPLICIT `timeout_ms`: setting a small one would MANUFACTURE the vacuous
+    //    path these two assertions exist to close — a deadline would become the expected outcome rather
+    //    than something the test proves did not happen.
+    assert_eq!(
+        r.details.as_ref().unwrap()["cancelled"], false,
+        "the run must not have been cancelled: a cancelled run reports a `null` exitCode, and \
+         `code == None` satisfies the implication below WITHOUT consulting the marker, so a cancelled \
+         run would pass this test vacuously: TEXT={text:?} DETAILS={:?}",
+        r.details
+    );
+    assert!(
+        !text.contains("timed out"),
+        "the run must not have reached its deadline: `timed_out` is NOT in `details` (only \
+         `cancelled` is, and the deadline arm leaves it FALSE — measured on this branch), so the \
+         deadline note in the captured text is the only way to tell \"the status was never observed\" \
+         from \"the run hung and we killed it\". A hang here would make the implication below pass \
+         vacuously on `code == None`: TEXT={text:?} DETAILS={:?}",
+        r.details
+    );
+
+    // 1. THE CONTRACT, as a material implication: a reported exit 0 ⇒ something started.
+    let code = r.details.as_ref().unwrap()["exitCode"].as_i64();
+    assert!(
+        code != Some(0) || marker_exists,
+        "a backgrounded launch that reports exit code 0 must have started something (issue #79's \
+         false success: exitCode 0 with no process and no log file). The dir listing below is how \
+         we tell \"nothing started\" from \"it started somewhere else\": TEXT={text:?} \
+         DETAILS={:?} CWD={:?}",
+        r.details,
+        std::fs::read_dir(&cwd)
+            .map(|rd| rd
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+
+    // 2. If it started, the BATCH ran — not merely "a file appeared".
+    if marker_exists {
+        let contents = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            contents.contains("RAN"),
+            "the marker's CONTENTS are the proof `marker.bat` actually ran — a zero-byte \
+             `marker.txt` from any other source would satisfy the implication above while proving \
+             nothing: CONTENTS={contents:?}"
+        );
+    }
+}
+
 /// (issue #79 residual (a), the WIRING) The pure translator is pinned by
 /// [`cmd_input_redirection_is_diagnosed_as_the_no_console_input_tool_policy`] and the presence of
 /// cmd's sentence in a REAL run is pinned on the Windows CI leg by
@@ -792,6 +1090,172 @@ async fn a_run_whose_text_carries_the_cmd_redirect_error_gets_the_diagnostic_as_
         text.contains("\nERROR: Input redirection is not supported"),
         "the captured text is kept (never replaced) and still starts its own line after the \
          diagnostic: {text:?}"
+    );
+}
+
+/// (issue #79 residual R1, the claim the false success actually violates) When a command's output
+/// CARRIES one of #79's error sentences, `exec_bash` must pass it through to the model INTACT. The
+/// false success was never only a wrong number: `exitCode: 0` told the agent the build had started,
+/// and `Access is denied.` was the only thing in the result that said otherwise — so if our layer
+/// swallowed that sentence, the model would have NOTHING to disbelieve the code with. The model must
+/// be able to SEE the error. THIS is the pin for that.
+///
+/// IT REPLACED A VACUOUS BLOCK. The `#[cfg(windows)]`
+/// [`bash_start_b_does_not_report_success_without_starting_something`] used to carry a third
+/// assertion shaped `if text.contains(X) { assert!(!text.trim().is_empty() && text.contains(X)) }`.
+/// A guard of that form CANNOT FAIL: `text.contains(X)` is the condition that PRODUCED `X`, and a
+/// text containing a non-empty sentence is non-empty — so the body was true by construction on every
+/// path, including the `None` path that skips it entirely. It read like coverage and asserted
+/// nothing. The only honest way to pin "our layer does not swallow the error sentence" is to
+/// construct a run whose text is KNOWN to carry it, which needs no Windows at all — so the claim
+/// moved HERE, where the input is built independently of the output scan and the assertion can
+/// therefore be false.
+///
+/// UNLIKE THE `start /B` TEST, THIS RUNS ON EVERY PLATFORM — Linux and macOS included, not only on
+/// CI's `windows-latest` leg. It is UNGATED, mirroring its precedent
+/// [`a_run_whose_text_carries_the_cmd_redirect_error_gets_the_diagnostic_as_its_first_line`], which
+/// is ALSO ungated (its doc says so on purpose: the wiring in `exec_bash` it pins is not `cfg`-gated,
+/// so it must not rest on a CI-only test). That precedent's technique is what this copies: have the
+/// CHILD EMIT the exact sentence from a plain print command, so the test runs on a host that has no
+/// `cmd.exe` and needs no `cmd` behaviour beyond "a shell prints what it is told to print".
+///
+/// ONE DELIBERATE DIFFERENCE FROM THE PRECEDENT, AND IT IS THE PORTABILITY HALF: the precedent
+/// emits with `printf`, which is a `sh` builtin and NOT a `cmd` builtin, so its Windows leg rides on
+/// whatever `printf.exe` happens to be on that runner's PATH. This test emits with `echo`, which is a
+/// builtin on BOTH shells (`sh -c` on Unix, `cmd /d /s /c` on Windows), and both sentences are
+/// metacharacter-free on both — no `&`, `|`, `<`, `>`, `(`, `)`, `^`, `%`, `$` or backtick — and
+/// carry NO QUOTES AT ALL, so nothing here depends on how `childproc::append_cmd_c` treats an
+/// embedded `"`. Both shells therefore PRINT BOTH SENTENCES VERBATIM and the test needs no gate.
+/// (The precedent stays as it is; fixing its emission is not this claim.)
+///
+/// THE TWO PLATFORMS DO NOT PRINT THE SAME BYTES, AND THE ASSERTION KNOWS IT. `cmd`'s `echo`
+/// terminates its argument at a metacharacter but does NOT discard the whitespace preceding it, so
+/// `echo X && echo Y` prints `X ` — with ONE TRAILING SPACE — where `sh` discards it. Line 1
+/// therefore carries a trailing space on Windows and nothing else differs: our layer is byte-exact
+/// (`childproc::cmd_c_tail` is `format!("/d /s /c \"{command}\"")`, handed to `raw_arg`), so that
+/// space is `cmd`'s own argument parsing and not something we added. Trailing whitespace produced by
+/// the SHELL is not what this test pins — the two `contains` checks below pin the sentence bytes — so
+/// the exact-body check `trim_end`s each line for precisely that. `trim_end` forgives the shell's
+/// whitespace and NOTHING ELSE: the `lines().len() == 2` check still rules out a prepend and an
+/// append, so slack on the right edge cannot hide content on either side of the body.
+///
+/// DO NOT "PORTABILITY-FIX" THE `&&` INTO A BARE `&`. That is the usual `cmd` idiom for dodging
+/// exactly this trailing-space quirk, and it is WRONG here: in `sh`, `&` is the BACKGROUND operator,
+/// so `echo A& echo B` backgrounds the first `echo` and the two writes to the shared pipe RACE — the
+/// order of the two lines becomes non-deterministic, which would make the ordered assertion below
+/// flaky on Unix to buy one space on Windows. `&&` stays.
+///
+/// WHY EVERY ASSERTION BELOW IS NECESSARY, and what each one rules out:
+/// - exit 0 + `!is_error` reproduces #79's EXACT shape — an error sentence riding on a clean
+///   success. Without this pairing the text pin would be testing the wrong run: a NON-zero run's text
+///   arriving intact says nothing about the case where the code is the only thing that lied.
+/// - the two sentences arrive as the WHOLE body, in order: line 1 is the first sentence (after
+///   `trim_end`, see above) and there are exactly two lines. Line 1 is what rules out the one thing
+///   that inserts in front of captured text — `cmd_input_redirection_diagnostic`'s prepend, which keys
+///   on `ERROR: Input redirection is not supported`, a sentence this run does not carry, and which
+///   would have displaced line 1 AND made the line count three while leaving both `contains` checks
+///   green. "Exactly two lines" is what rules out anything APPENDED — an exit-report note in
+///   particular — and together the two pins say the captured bytes survived the 100 KB cap and the
+///   lossy UTF-8 conversion as the exact body, not merely present somewhere in it.
+///
+/// NOT A PROMOTION ASSERTION, and deliberately so. The test DOES assert `!r.is_error` (assertion 1
+/// below), but that is a fact about the fixture — `echo` exits 0, so a correct tool reports success —
+/// and it is exactly what makes the run #79's shape. What the test does NOT do is ask `exec_bash` to
+/// PROMOTE an exit-0-with-error-text run into an error: that would be a `bash_exit_report` change (its
+/// `(Some(n), None)` arm — "a normal non-zero exit needs no note — the code IS the report") and is out
+/// of scope. This test makes NO claim about what the tool should CONCLUDE from the sentence, only that
+/// the sentence ARRIVES.
+#[tokio::test]
+async fn the_bash_tool_passes_issue_79_error_sentences_through_verbatim() {
+    let cwd = temp_cwd("bash-issue-79-verbatim");
+    // Both sentences #79 quotes, verbatim INCLUDING the trailing period on the second one, from the
+    // shell's own `echo` — a builtin on `sh` AND on `cmd`, so this needs no `cmd.exe`, no
+    // `printf.exe`, no third-party tool and no `cfg` gate. The `.` is inert in both shells' `echo`
+    // arguments (it is not a metacharacter in either), so carrying it costs nothing and makes the
+    // claim below true: the constant is now byte-equal to the sentence as the issue writes it, and the
+    // period survives both `echo`s to be asserted by the `contains` check and by line 2. No quotes
+    // anywhere in the command: the sentences carry none, and an embedded `"` would move the claim from
+    // "does our layer swallow the text" to "how does `append_cmd_c` escape a quote", which
+    // [`bash_passes_inline_double_quotes_through_to_cmd_verbatim`] already owns.
+    const LOCKED: &str =
+        "The process cannot access the file because it is being used by another process";
+    const DENIED: &str = "Access is denied.";
+    let r = execute_tool(
+        &ctx(&cwd),
+        "bash",
+        &json!({ "command": format!("echo {LOCKED} && echo {DENIED}") }),
+    )
+    .await;
+    let text = text_of(&r);
+
+    // 1. THE #79 SHAPE: an error sentence riding on a CLEAN success. This is the half that makes the
+    //    text pin test the RIGHT run — on a non-zero run, "the text survived" would say nothing about
+    //    the case where the code was the only thing that lied.
+    assert!(
+        !r.is_error,
+        "the run must be a clean success for this to be #79's shape — the whole point is that the \
+         TEXT is the only evidence of a problem: TEXT={text:?} DETAILS={:?}",
+        r.details
+    );
+    assert_eq!(
+        r.details.as_ref().unwrap()["exitCode"], 0,
+        "`echo` exits 0 on both shells, so the exit code is the lying half of the pair: DETAILS={:?}",
+        r.details
+    );
+
+    // 2. THE CLAIM ITSELF, once per sentence, asserted against constants written here and NOT read
+    //    out of the output (that independence is what makes this falsifiable, and what the deleted
+    //    block could not have).
+    assert!(
+        text.contains(LOCKED),
+        "issue #79's file-lock sentence must reach the model VERBATIM — swallowed by truncation, by \
+         a replacement, or by any rewrite of the captured text, it is the one thing that contradicts \
+         the exit 0 above: LOOKING_FOR={LOCKED:?} TEXT={text:?} DETAILS={:?}",
+        r.details
+    );
+    assert!(
+        text.contains(DENIED),
+        "issue #79's `Access is denied.` sentence must reach the model VERBATIM for the same reason: \
+         LOOKING_FOR={DENIED:?} TEXT={text:?} DETAILS={:?}",
+        r.details
+    );
+
+    // 3. THE BODY IS EXACTLY THOSE TWO SENTENCES, IN THAT ORDER, AND NOTHING ELSE BUT THE SHELL'S OWN
+    //    TRAILING WHITESPACE. Line 1 rules out the one thing in `exec_bash` that inserts BEFORE
+    //    captured text (the diagnostic prepend, which keys on a sentence this run does not carry — and
+    //    which would have displaced line 1 AND turned the count into three while leaving both
+    //    `contains` checks above green); the line COUNT rules out anything APPENDED, an exit-report note
+    //    included, so assertion 1's "clean success" claim is checked on the text axis too and not only
+    //    on `is_error`.
+    //
+    //    THE `trim_end` IS FOR THE SHELL AND FOR NOTHING ELSE. `cmd`'s `echo` keeps the space that
+    //    precedes `&&` in its argument (`sh` discards it), so line 1 arrives as LOCKED + " " on
+    //    Windows. Trimming the RIGHT edge cannot cost either property this assertion exists for: a
+    //    PREPEND is still caught (line 1 would be the diagnostic, and the count would be three) and an
+    //    APPEND is still caught (the count would be three). Both were observed RED by planting them.
+    //    See the doc comment for why `&&` is not softened to `&` to dodge the space instead.
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "exactly two lines — a prepend (the diagnostic) or an append (an exit-report note) changes the \
+         count: TEXT={text:?} DETAILS={:?}",
+        r.details
+    );
+    assert_eq!(
+        lines[0].trim_end(),
+        LOCKED,
+        "line 1 IS issue #79's file-lock sentence, with nothing inserted in front of it (this is the \
+         assertion the deleted vacuous block could not be, because the expected value here was written \
+         before the run and not read out of it): TEXT={text:?} DETAILS={:?}",
+        r.details
+    );
+    assert_eq!(
+        lines[1].trim_end(),
+        DENIED,
+        "line 2 IS issue #79's `Access is denied.` sentence, in order and with nothing appended after \
+         it: TEXT={text:?} DETAILS={:?}",
+        r.details
     );
 }
 
