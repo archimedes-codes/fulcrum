@@ -21,6 +21,7 @@ use super::types::{
     cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
     Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
 };
+use crate::agent::harness::WireApi;
 use crate::agent::tools::ContentBlock;
 
 /// Map an Anthropic `stop_reason` to a [`FinishReason`].
@@ -73,6 +74,104 @@ pub fn normalize_anthropic_base_url(base_url: &str) -> String {
     } else {
         format!("{without_trailing}/v1")
     }
+}
+
+/// Normalize a wire base URL per the model's API (T3b / #131, ADR 0026
+/// amendment; interface §9 — do NOT overload `normalize_anthropic_base_url`:
+/// that helper can only ever PRODUCE a `/v1`-suffixed path, it never strips,
+/// so it cannot express the Messages rule).
+///
+/// - [`WireApi::AnthropicMessages`] → the ROOT: a trailing `/v1` is stripped
+///   (the Anthropic client appends its OWN `/v1/messages`, so a base of
+///   `{root}/v1` would produce `{root}/v1/v1/messages`);
+/// - [`WireApi::OpenAiCompletions`] / [`WireApi::OpenAiResponses`] →
+///   `{root}/v1` (appended idempotently — the shape
+///   `normalize_anthropic_base_url` produces);
+/// - [`WireApi::LiteLLM`] → `{root}/v1` (a discovery MODE, not a wire — its
+///   completion wire IS `openai-completions`, ADR 0026).
+///
+/// Operates on the URL PATH (a query string is never corrupted — the
+/// `url::Url` surgery the sibling helper uses); an unparseable base falls back
+/// to a plain suffix strip/append on the trimmed string.
+///
+/// IDEMPOTENCY CONTRACT (part of this helper's public spec): applying the
+/// helper twice yields the same URL as applying it once, for EVERY wire —
+/// `n(n(u)) == n(u)`. That is what lets the helper and its `build_provider`
+/// call site land in either order (the second pass is always a no-op), and the
+/// tests pin it directly (the `idempotent` cases) as well as at the call site.
+pub fn normalize_wire_base_url(base_url: &str, api: WireApi) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // The Messages rule strips, every other wire appends.
+    let strip = api == WireApi::AnthropicMessages;
+    if let Ok(mut url) = url::Url::parse(trimmed) {
+        // An OWNED `String` (NOT a `&str` borrowing from `url` — `set_path`
+        // below mutates `url`, so the borrow must not outlive it).
+        let pathname = url.path().trim_end_matches('/').to_string();
+        let has_v1 = pathname.to_lowercase().ends_with("/v1");
+        if strip {
+            // Strip AT MOST one trailing `/v1` (never more — `n(n(u)) == n(u)`).
+            let stripped = if has_v1 {
+                pathname[..pathname.len() - 3].to_string()
+            } else {
+                pathname
+            };
+            url.set_path(if stripped.is_empty() { "/" } else { &stripped });
+            return match stripped.as_str() {
+                // A root whose ENTIRE path was `/v1` becomes the BARE root:
+                // the `url::Url` display of an empty path is `/`
+                // (`https://x/`, and `https://x/?q=1` with a query), so the
+                // authority slash is removed by hand — the helper's contract
+                // is the root (`https://x`, `https://x?q=1`).
+                "" => strip_authority_slash(url.to_string()),
+                _ => url.to_string(),
+            };
+        }
+        if has_v1 {
+            url.set_path(&pathname); // drop any trailing slash
+        } else {
+            url.set_path(&format!("{pathname}/v1"));
+        }
+        return url.to_string();
+    }
+    // Fallback (unparseable): a plain suffix check on the trimmed string.
+    let without_trailing = trimmed.trim_end_matches('/');
+    let has_v1 = without_trailing.to_lowercase().ends_with("/v1");
+    if strip {
+        if has_v1 {
+            // `x/v1` → `x`; a bare `/v1` → the empty root.
+            without_trailing[..without_trailing.len() - 3].to_string()
+        } else {
+            without_trailing.to_string()
+        }
+    } else if has_v1 {
+        without_trailing.to_string()
+    } else {
+        format!("{without_trailing}/v1")
+    }
+}
+
+/// Remove the authority slash the `url::Url` display inserts when the path is
+/// empty/root: `https://x/` → `https://x`, `https://x/?q=1` → `https://x?q=1`.
+/// Only the FIRST `/` after the scheme separator is touched, and only when
+/// nothing but a query / fragment follows it (a real path segment survives).
+fn strip_authority_slash(url: String) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after = scheme_end + 3;
+        if let Some(slash) = url[after..].find('/') {
+            let idx = after + slash;
+            let rest = &url[idx + 1..];
+            if rest.is_empty() || rest.starts_with('?') || rest.starts_with('#') {
+                let mut out = String::with_capacity(url.len());
+                out.push_str(&url[..idx]);
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+    url
 }
 
 /// The accumulated per-block tool-call state for the Anthropic wire (a
@@ -510,6 +609,10 @@ pub struct AnthropicProvider {
     pub base_url: String,
     /// The `x-api-key` header value.
     pub api_key: String,
+    /// The provider's expanded + validated CUSTOM headers (R1, issue #129) —
+    /// applied by `build_client` as `default_headers` on every completion
+    /// request. `None` = no custom headers (the byte-identical default).
+    pub custom_headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// The Anthropic WIRE shape of a content block: `Text` →
@@ -677,6 +780,67 @@ fn anthropic_thinking(level: &str) -> Value {
     json!({ "type": "enabled", "budget_tokens": budget })
 }
 
+/// The Claude-family model-id prefix (T3b / #131): a Claude model keeps its
+/// model id when it is routed through LiteLLM, so the prefix alone identifies
+/// the family (the `anthropic-messages` WIRE is gated at the caller — this
+/// builder is only reachable from `AnthropicProvider::complete`).
+fn is_claude_model(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("claude-")
+}
+
+/// The CAP on cached system blocks (T3b / #131): a long system prompt is
+/// chunked on paragraph boundaries, but the block count never grows past this
+/// number — the excess is FOLDED INTO THE LAST block (no text is dropped) and
+/// the cache point still attaches to that last block.
+const MAX_SYSTEM_BLOCKS: usize = 10;
+
+/// The Anthropic prompt-caching marker (body-level, ADR 0026's wave-4
+/// amendment): a `cache_control` on the LAST system block + on every tool
+/// block makes the system + tool definitions a cached prefix.
+fn ephemeral_cache_control() -> Value {
+    json!({ "type": "ephemeral" })
+}
+
+/// The system text → the CACHED block array: chunked on paragraph boundaries
+/// (the natural block shape Anthropic's own examples use), capped at
+/// [`MAX_SYSTEM_BLOCKS`] by folding the remainder into the LAST chunk (nothing
+/// dropped), every block a `{ "type": "text", "text" }` and the LAST carrying
+/// `cache_control: { "type": "ephemeral" }`.
+fn cached_system_blocks(system: &str) -> Vec<Value> {
+    // The chunking: split on the paragraph separator the folding in
+    // [`ModelRequest::system_text`] itself uses, so a multi-message system
+    // becomes one block per message.
+    let mut chunks: Vec<String> = system
+        .split("\n\n")
+        .filter(|c| !c.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if chunks.is_empty() {
+        chunks.push(system.to_string());
+    }
+    if chunks.len() > MAX_SYSTEM_BLOCKS {
+        // Fold EVERYTHING past the cap into the last kept chunk (the block
+        // count caps, the text survives verbatim — joined back with the same
+        // separator it was split on).
+        let head: Vec<String> = chunks[..MAX_SYSTEM_BLOCKS - 1].to_vec();
+        let tail = chunks[MAX_SYSTEM_BLOCKS - 1..].join("\n\n");
+        chunks = head;
+        chunks.push(tail);
+    }
+    let last = chunks.len() - 1;
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let mut block = json!({ "type": "text", "text": chunk });
+            if i == last {
+                block["cache_control"] = ephemeral_cache_control();
+            }
+            block
+        })
+        .collect()
+}
+
 /// Build the Anthropic Messages request body from a [`ModelRequest`]
 /// (`max_tokens` is ALWAYS present — Anthropic requires it; `system` is
 /// present only when non-empty; `thinking` is present only when a
@@ -692,13 +856,29 @@ fn anthropic_request_body(req: &ModelRequest) -> Value {
         "messages": Value::Array(anthropic_messages(req)),
         "stream": req.options.stream,
     });
-    if !system.is_empty() {
+    // Prompt caching (T3b / #131, acceptance 1). The EXACT condition (no
+    // hidden gate): a Claude model AND (tools OR a non-empty system). The
+    // three no-caching branches exhaust the rest:
+    //   (a) a non-Claude model → the plain-string `system` + flat tools
+    //       (byte-identical to today);
+    //   (b) a Claude model with NO tools AND no system text → no `system` key,
+    //       no `tools` key, no `cache_control` anywhere (byte-identical);
+    //   (c) a Claude model with an EMPTY tools list but NON-EMPTY system text →
+    //       the cached system array (the tools branch below simply stays out).
+    let cache = is_claude_model(&req.model) && (!req.tools.is_empty() || !system.is_empty());
+    if cache {
+        if !system.is_empty() {
+            // The ARRAY form with the cache point on the LAST block (the
+            // prefix covering the system text).
+            body["system"] = Value::Array(cached_system_blocks(&system));
+        }
+    } else if !system.is_empty() {
         body["system"] = json!(system);
     }
     if !req.tools.is_empty() {
         // Flat `{ name, description, input_schema }` — the OpenAI
         // `function` nesting + `parameters` key do NOT apply.
-        body["tools"] = req
+        let mut tools: Vec<Value> = req
             .tools
             .iter()
             .map(|t| {
@@ -708,8 +888,16 @@ fn anthropic_request_body(req: &ModelRequest) -> Value {
                     "input_schema": t.parameters,
                 })
             })
-            .collect::<Vec<_>>()
-            .into();
+            .collect();
+        if cache {
+            // The tool definitions are part of the cached prefix: EVERY tool
+            // block carries the same ephemeral `cache_control` (a bounded set —
+            // the tools list is the harness's own, never user-grown).
+            for t in &mut tools {
+                t["cache_control"] = ephemeral_cache_control();
+            }
+        }
+        body["tools"] = tools.into();
     }
     if let Some(t) = req.options.temperature {
         body["temperature"] = json!(t);
@@ -749,8 +937,9 @@ impl Provider for AnthropicProvider {
         // values — `build_client`'s docs: a generous CONNECT bound + a
         // `read_timeout` (the time BETWEEN BYTES on the body)).
         let client = build_client(
-            Duration::from_secs(30),     // a generous CONNECT bound
-            Duration::from_secs(5 * 60), // 5 min of SILENCE = a stalled provider
+            Duration::from_secs(30),      // a generous CONNECT bound
+            Duration::from_secs(5 * 60),  // 5 min of SILENCE = a stalled provider
+            self.custom_headers.as_ref(), // R1 (issue #129): the ONE completion seam
         );
         // `x-api-key` is ALWAYS sent (a keyless Anthropic endpoint is a
         // misconfiguration, but sending an empty value is harmless and
@@ -892,6 +1081,91 @@ mod tests {
         // Empty / whitespace → empty (no `/v1` appended to nothing).
         assert_eq!(normalize_anthropic_base_url(""), "");
         assert_eq!(normalize_anthropic_base_url("   "), "");
+    }
+
+    // ── `normalize_wire_base_url` (T3b / #131 — the per-wire rule) ─────
+
+    /// The Messages rule: the ROOT (a trailing `/v1` is stripped, never
+    /// stripped further — the idempotency contract).
+    #[test]
+    fn normalize_wire_base_url_root_for_messages() {
+        let messages = WireApi::AnthropicMessages;
+        assert_eq!(
+            normalize_wire_base_url("https://x/v1", messages),
+            "https://x",
+            "a `{{root}}/v1` base becomes the root (the client appends `/v1/messages`)",
+        );
+        assert_eq!(
+            normalize_wire_base_url("https://x/v1/", messages),
+            "https://x",
+            "the trailing slash is dropped before the strip"
+        );
+        assert_eq!(normalize_wire_base_url("https://x", messages), "https://x");
+        // IDEMPOTENCY: applying the helper twice == applying it once.
+        let once = normalize_wire_base_url("https://x/v1", messages);
+        assert_eq!(normalize_wire_base_url(&once, messages), once);
+        // A query string survives the path surgery.
+        assert_eq!(
+            normalize_wire_base_url("https://x/v1?q=1", messages),
+            "https://x?q=1"
+        );
+        // An unparseable base → the plain suffix strip.
+        assert_eq!(normalize_wire_base_url("x/v1", messages), "x");
+        assert_eq!(normalize_wire_base_url("x", messages), "x");
+        let once = normalize_wire_base_url("x/v1", messages);
+        assert_eq!(normalize_wire_base_url(&once, messages), once);
+        // Empty / whitespace → empty (nothing to normalize).
+        assert_eq!(normalize_wire_base_url("", messages), "");
+    }
+
+    /// The Completions / Responses rule: `{root}/v1` (appended
+    /// idempotently — the shape `normalize_anthropic_base_url` produces).
+    #[test]
+    fn normalize_wire_base_url_v1_for_completions_and_responses() {
+        for api in [WireApi::OpenAiCompletions, WireApi::OpenAiResponses] {
+            assert_eq!(
+                normalize_wire_base_url("https://x", api),
+                "https://x/v1",
+                "{api:?}: a bare root gains `/v1`"
+            );
+            assert_eq!(
+                normalize_wire_base_url("https://x/", api),
+                "https://x/v1",
+                "{api:?}: the trailing slash is dropped, `/v1` appended"
+            );
+            assert_eq!(
+                normalize_wire_base_url("https://x/v1", api),
+                "https://x/v1",
+                "{api:?}: an already-normalized base is left alone (no double-append)"
+            );
+            // IDEMPOTENCY at the helper level.
+            let once = normalize_wire_base_url("https://x", api);
+            assert_eq!(normalize_wire_base_url(&once, api), once);
+            // A query string survives.
+            assert_eq!(
+                normalize_wire_base_url("https://x?a=1", api),
+                "https://x/v1?a=1"
+            );
+            // An unparseable base → the plain suffix append.
+            assert_eq!(normalize_wire_base_url("x", api), "x/v1");
+            let once = normalize_wire_base_url("x", api);
+            assert_eq!(normalize_wire_base_url(&once, api), once);
+        }
+    }
+
+    /// `litellm` is a DISCOVERY MODE whose completion wire IS
+    /// `openai-completions` (ADR 0026) — so its base normalizes as
+    /// Completions.
+    #[test]
+    fn normalize_wire_base_url_litellm_uses_v1() {
+        assert_eq!(
+            normalize_wire_base_url("https://x", WireApi::LiteLLM),
+            "https://x/v1"
+        );
+        assert_eq!(
+            normalize_wire_base_url("https://x/v1", WireApi::LiteLLM),
+            "https://x/v1"
+        );
     }
 
     // ── the Anthropic Messages wire (`event:`-tagged SSE) ──────────────
@@ -1583,6 +1857,7 @@ mod tests {
         let provider: Box<dyn Provider> = Box::new(AnthropicProvider {
             base_url: "https://api.anthropic.com/v1".to_string(),
             api_key: "k".to_string(),
+            custom_headers: None,
         });
         let _ = provider;
     }
@@ -1929,5 +2204,178 @@ mod tests {
         );
         // `None` → the field is ABSENT.
         assert!(req(None).get("thinking").is_none());
+    }
+
+    // ── prompt caching on Claude models (T3b / #131) ────────────────────
+
+    /// A request for ONE model with an optional system + optional tools.
+    fn cache_request(model: &str, system: Option<&str>, tools: usize) -> Value {
+        let mut messages = Vec::new();
+        if let Some(s) = system {
+            messages.push(chat_message(
+                ChatRole::System,
+                MessageContent::Text(s.to_string()),
+                None,
+                None,
+            ));
+        }
+        messages.push(chat_message(
+            ChatRole::User,
+            MessageContent::Text("hi".to_string()),
+            None,
+            None,
+        ));
+        let r = ModelRequest {
+            model: model.to_string(),
+            messages,
+            tools: (0..tools)
+                .map(|i| ToolSpec {
+                    name: format!("tool_{i}"),
+                    description: "d".to_string(),
+                    parameters: json!({ "type": "object" }),
+                })
+                .collect(),
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: Some(64),
+                reasoning_effort: None,
+                stream: true,
+            },
+            session_id: None,
+        };
+        anthropic_request_body(&r)
+    }
+
+    /// (acceptance 1) A Claude model with tools + a system: the `system`
+    /// becomes an ARRAY of text blocks with `cache_control` on the LAST block,
+    /// and EVERY tool block carries `cache_control`.
+    #[test]
+    fn anthropic_request_body_claude_model_caches_system_and_tools() {
+        let body = cache_request("claude-3-5-sonnet", Some("sys one\n\nsys two"), 2);
+        let system = body["system"]
+            .as_array()
+            .expect("the cached system is an ARRAY of blocks");
+        assert_eq!(system.len(), 2, "one block per paragraph chunk");
+        assert_eq!(system[0]["text"], "sys one");
+        assert!(
+            system[0].get("cache_control").is_none(),
+            "only the LAST block carries the cache point"
+        );
+        assert_eq!(system[1]["text"], "sys two");
+        assert_eq!(system[1]["cache_control"], json!({ "type": "ephemeral" }));
+        for i in 0..2 {
+            assert_eq!(
+                body["tools"][i]["cache_control"],
+                json!({ "type": "ephemeral" }),
+                "every tool block is part of the cached prefix"
+            );
+            assert_eq!(body["tools"][i]["name"], format!("tool_{i}"));
+        }
+    }
+
+    /// The cap: a system beyond `MAX_SYSTEM_BLOCKS` chunks caps the BLOCK
+    /// COUNT at the const, the exceeding text is FOLDED into the last block
+    /// (nothing dropped), and the last block still carries the cache point.
+    #[test]
+    fn anthropic_request_body_max_system_blocks_cap_holds() {
+        // MAX_SYSTEM_BLOCKS + 5 paragraphs (each distinct so the fold is
+        // observable in the text).
+        let paragraphs: Vec<String> = (0..(MAX_SYSTEM_BLOCKS + 5))
+            .map(|i| format!("para-{i}"))
+            .collect();
+        let system = paragraphs.join("\n\n");
+        let body = cache_request("claude-3-5-sonnet", Some(&system), 0);
+        let blocks = body["system"]
+            .as_array()
+            .expect("the cached system is an array");
+        assert_eq!(blocks.len(), MAX_SYSTEM_BLOCKS, "the block count caps");
+        // NOTHING dropped: every paragraph survives, the tail folded into the
+        // last block (joined back with the separator it was split on).
+        let joined = blocks
+            .iter()
+            .map(|b| b["text"].as_str().expect("a text block"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert_eq!(joined, system, "no text is dropped by the fold");
+        assert_eq!(
+            blocks[MAX_SYSTEM_BLOCKS - 1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        // The fold holds the tail: the LAST kept block starts at the first
+        // paragraph the cap cut, and holds every paragraph after it.
+        let last = blocks[MAX_SYSTEM_BLOCKS - 1]["text"]
+            .as_str()
+            .expect("a text block");
+        assert!(
+            last.starts_with(&format!("para-{}", MAX_SYSTEM_BLOCKS - 1)),
+            "the last kept block starts at the cap boundary: {last}"
+        );
+        assert!(
+            last.contains(&format!("para-{}", MAX_SYSTEM_BLOCKS + 4)),
+            "the last kept block folds EVERY paragraph past the cap: {last}"
+        );
+    }
+
+    /// (branch (a)) A NON-Claude model keeps today's shape byte-identically:
+    /// the plain-string `system`, flat tools, NO `cache_control` anywhere.
+    #[test]
+    fn anthropic_request_body_non_claude_model_is_byte_identical() {
+        let body = cache_request("gpt-4o", Some("sys"), 1);
+        assert_eq!(
+            body["system"],
+            json!("sys"),
+            "the system stays a plain string"
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        // The whole body carries NO cache_control anywhere.
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "no caching on a non-Claude model: {body}"
+        );
+    }
+
+    /// (branch (b)) A Claude model with NO tools AND NO system text: the
+    /// pre-existing shape (no `system` key at all, no `tools`, no
+    /// `cache_control`) — byte-identical to today.
+    #[test]
+    fn anthropic_request_body_claude_without_tools_keeps_string_system() {
+        let body = cache_request("claude-3-5-sonnet", None, 0);
+        assert!(body.get("system").is_none(), "an empty system emits no key");
+        assert!(body.get("tools").is_none());
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "the no-tools empty-system case caches nothing: {body}"
+        );
+    }
+
+    /// (branch (c)) A Claude model with NO tools but NON-EMPTY system text:
+    /// the system IS the cached array (the caching condition is tools OR
+    /// system — no hidden second gate).
+    #[test]
+    fn anthropic_request_body_claude_system_only_caches() {
+        let body = cache_request("claude-3-5-sonnet", Some("only system"), 0);
+        let system = body["system"]
+            .as_array()
+            .expect("the system-only branch still caches");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(body.get("tools").is_none());
+    }
+
+    /// The family predicate's truth table (a `claude-` prefix check — the
+    /// model id survives LiteLLM routing verbatim).
+    #[test]
+    fn is_claude_model_matches_the_family() {
+        for model in [
+            "claude-3-5-sonnet",
+            "claude-opus-4",
+            "Claude-3-Haiku",
+            "claude-3-7-sonnet",
+        ] {
+            assert!(is_claude_model(model), "{model}");
+        }
+        for model in ["gpt-4o", "m", "sonnet-3-claude", "claude", "lit/claude-x"] {
+            assert!(!is_claude_model(model), "{model} is NOT the family");
+        }
     }
 }

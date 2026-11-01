@@ -28,21 +28,54 @@ pub struct CallbackServer {
 }
 
 impl CallbackServer {
-    /// Bind 127.0.0.1 on a random free port. A bind failure is `Err`
-    /// (the caller surfaces the manual-URL path).
+    /// Bind 127.0.0.1 on a random free port (the MCP shape — a bare-host
+    /// redirect URI with NO path). Identical behaviour to before `bind_with`
+    /// existed: it delegates to [`Self::bind_with`] with the ephemeral port and
+    /// the empty path, so the `redirect_uri` string stays
+    /// `http://127.0.0.1:<port>` (the MCP call sites and the tests that derive
+    /// the port from it are untouched).
     pub async fn bind() -> Result<Self, String> {
+        Self::bind_with(0, "").await
+    }
+
+    /// Bind 127.0.0.1 on `port` (`0` = ephemeral, the OS assigns) with the
+    /// redirect URI path `path` (`""` = bare host — the MCP shape). The
+    /// handler still matches ANY request path (the port is the discriminator —
+    /// grounding §2.5's decision (a)); only the `redirect_uri` string changes.
+    ///
+    /// Binding the SAME port twice is an `Err` (the caller — T5's `login` or
+    /// T6's `bind_callback` loop — treats a bind failure as "this port is
+    /// taken, try the next one / fall back to ephemeral"). The redirect URI is
+    /// `format!("http://127.0.0.1:{port}{path}")` — `path` is appended AFTER
+    /// the port and returned verbatim (bracket or leading-`/` preserved), so
+    /// `bind_with(port, "/callback")` yields exactly
+    /// `http://127.0.0.1:{port}/callback` (the shape T5's S3 test and T6 §0
+    /// both pin).
+    ///
+    /// ADDITIVE ONLY: this is the entry point T6's sequential `redirect_ports`
+    /// strategy calls (interface ruling R3/R4); `bind()`'s behaviour is
+    /// byte-identical to the pre-`bind_with` implementation.
+    pub async fn bind_with(port: u16, path: &str) -> Result<Self, String> {
         // A `std` bind to pick a free port (a `Result` — a failure is
         // surfaced, not a panic), then a tokio `bind` on that port (a
         // `from_std` is unsupported in a runtime; the rebind race is
-        // negligible — the port was just freed).
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        let port = std_listener.local_addr().map_err(|e| e.to_string())?.port();
-        drop(std_listener);
+        // negligible — the port was just freed). With an EXPLICIT port the std
+        // probe is skipped entirely (the tokio bind reports the collision
+        // itself — "this port is taken" is the caller's signal to move on).
+        let port = if port == 0 {
+            let std_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+            let free = std_listener.local_addr().map_err(|e| e.to_string())?.port();
+            drop(std_listener);
+            free
+        } else {
+            port
+        };
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            redirect_uri: format!("http://127.0.0.1:{port}"),
+            redirect_uri: format!("http://127.0.0.1:{port}{path}"),
             listener,
         })
     }
@@ -121,7 +154,8 @@ impl CallbackServer {
         let Some(state) = state else {
             return Err(reject(&mut stream, "the callback has no `state`").await);
         };
-        if state != expected_state {
+        // The CSRF guard, compared in CONSTANT TIME (see [`constant_time_eq`]).
+        if !constant_time_eq(state.as_bytes(), expected_state.as_bytes()) {
             return Err(reject(
                 &mut stream,
                 "the callback `state` does not match (a possible CSRF)",
@@ -136,6 +170,43 @@ impl CallbackServer {
         drop(self.listener);
         Ok(CallbackResult { code })
     }
+}
+
+/// A constant-time byte comparison (the callback `state` CSRF guard): an
+/// XOR-accumulate over the full length with NO early exit on mismatch — the
+/// iteration count depends only on the input lengths, never on the data (the
+/// 16-byte base64url `state` makes the equal-length case the norm; a length
+/// difference is public information anyway and returns `false`). Deliberately
+/// NOT `subtle` — adding a dependency for ~8 lines is the wrong trade
+/// (grounding §2.4).
+///
+/// THE ONE implementation (interface §10, ruling R4): `provider_auth`'s T6
+/// `oidc.rs` IMPORTS THIS instead of writing a second compare — `provider_auth`
+/// already depends on `mcp::callback` via T5's `bind_with`, so a duplicate
+/// security primitive buys nothing. T6 (and T6 only) may
+/// `use crate::agent::mcp::callback::constant_time_eq`; nothing else copies
+/// this primitive.
+///
+/// Honest note on what pins this: `cargo test` cannot OBSERVE timing, so the
+/// property is pinned three ways (plan §5a) — the behavior tests below (equal /
+/// first-byte / last-byte / length-mismatch), a structural LINT in
+/// `tests/provider_oauth_flow.rs` that reddens if this region reverts to a
+/// `String !=` comparison, and MCP's own callback tests staying green (the
+/// behavior pin). No test claims to measure timing.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // The length difference is public (both lengths are visible to the
+    // attacker — the state travels in the URL), so it may short-circuit; the
+    // byte COMPARE over the shared length never does.
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    // `diff == 0` iff every byte matched; the fold ran over ALL bytes either
+    // way (no `?`, no `break`, no early return on mismatch).
+    diff == 0
 }
 
 /// Write a minimal `HTTP/1.1` response (status line + `Content-Type` +
@@ -248,6 +319,23 @@ mod tests {
             .next()
             .and_then(|p| p.parse().ok())
             .expect("the redirect URI has a port")
+    }
+
+    /// The port of a redirect URI that MAY carry a path. (`port_of` above parses
+    /// the bare-host MCP shape only — the plan §5b's note that a `/callback`
+    /// suffix "keeps parsing" is WRONG: `rsplit(':').next()` yields
+    /// `"34567/callback"`, which is not numeric and panics its `expect`. The
+    /// existing helper stays byte-identical as MCP's behavior pin, so the
+    /// path-carrying shape gets its own splitter.)
+    fn port_of_uri(redirect_uri: &str) -> u16 {
+        let after_port = redirect_uri
+            .strip_prefix("http://127.0.0.1:")
+            .expect("a loopback redirect URI");
+        after_port
+            .split('/')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("the redirect URI has a numeric port before any path")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -393,5 +481,114 @@ mod tests {
         assert_eq!(url_decode("abc"), "abc");
         assert_eq!(url_decode("ab%20cd"), "ab cd");
         assert_eq!(url_decode("%41%42"), "AB");
+    }
+
+    // ── the constant-time `state` comparison (T5, issue #126) ──────────────
+    //
+    // These tests pin BEHAVIOR (equal → true, any difference → false). They do
+    // NOT claim to measure timing — the constant-time PROPERTY is pinned by the
+    // shape of the loop (no early return on a byte mismatch) plus the structural
+    // lint in `tests/provider_oauth_flow.rs` that reddens on a revert to
+    // `String !=` (plan §5a, stated honestly).
+
+    #[test]
+    fn constant_time_eq_accepts_equal_bytes() {
+        assert!(constant_time_eq(b"the-state", b"the-state"));
+        assert!(constant_time_eq(b"", b""), "two empty inputs are equal");
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_a_first_byte_difference() {
+        // The PAIR with the next test exists to document data-independence: a
+        // short-circuiting compare returns at byte 0 here and only discovers the
+        // mismatch at the LAST byte in the sibling test — both must be `false`,
+        // and the loop must have run over every byte in both cases.
+        assert!(!constant_time_eq(b"Xthe-state", b"the-state"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_a_last_byte_difference() {
+        assert!(!constant_time_eq(b"the-statX", b"the-state"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_a_length_mismatch() {
+        // A length difference is public information (the state rides in the URL)
+        // so it may return early — and it returns `false`.
+        assert!(!constant_time_eq(b"the-state", b"the-state-longer"));
+        assert!(!constant_time_eq(b"the-state-longer", b"the-state"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bind_with_binds_the_named_path_into_the_redirect_uri() {
+        // The REQUIRED additive entry point (interface R3/R4 — T6's
+        // `redirect_ports` strategy calls this exact signature). Two things are
+        // pinned: the `redirect_uri` STRING carries the path appended after the
+        // port verbatim, and a callback landing on that path still succeeds
+        // (the handler matches any path — the port is the discriminator).
+        let server = CallbackServer::bind_with(0, "/callback")
+            .await
+            .expect("binds on an ephemeral port");
+        let uri = server.redirect_uri().to_string();
+        let port = port_of_uri(&uri);
+        assert_eq!(
+            uri,
+            format!("http://127.0.0.1:{port}/callback"),
+            "the path is appended AFTER the port and returned verbatim"
+        );
+        let handle = tokio::spawn(async move {
+            server
+                .wait(
+                    "the-state",
+                    Duration::from_secs(5),
+                    &CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send_callback(port, "/callback?code=the-code&state=the-state")
+            .await
+            .expect("sends");
+        let result = handle.await.expect("joins");
+        assert_eq!(
+            result,
+            Ok(CallbackResult {
+                code: "the-code".into()
+            }),
+            "a callback on the bound path completes the flow"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bind_with_an_empty_path_keeps_the_bare_mcp_host_shape() {
+        // The additive-only pin: `bind()` delegates here with `(0, "")` and the
+        // MCP redirect URI string is UNCHANGED (no path, no trailing slash) —
+        // the `manager.rs` call sites and the `port_of` tests keep parsing it.
+        let server = CallbackServer::bind_with(0, "").await.expect("binds");
+        let uri = server.redirect_uri().to_string();
+        let port = port_of(&uri);
+        assert_eq!(uri, format!("http://127.0.0.1:{port}"));
+        let via_bind = CallbackServer::bind().await.expect("binds");
+        assert!(
+            !via_bind.redirect_uri().ends_with('/'),
+            "bind()'s shape is byte-identical to the pre-bind_with one: {:?}",
+            via_bind.redirect_uri()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bind_with_a_held_port_is_an_error_the_caller_can_act_on() {
+        // T6's sequential `redirect_ports` loop needs a bind collision to be an
+        // `Err` (try the next port), never a panic and never a silent rebind.
+        let held = CallbackServer::bind_with(0, "/callback")
+            .await
+            .expect("binds");
+        let port = port_of_uri(held.redirect_uri());
+        let again = CallbackServer::bind_with(port, "/callback").await;
+        assert!(
+            again.is_err(),
+            "binding the SAME port twice is an Err the caller handles (port {port})"
+        );
     }
 }

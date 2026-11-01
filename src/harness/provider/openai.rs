@@ -94,17 +94,41 @@ pub struct OpenAiCompatibleProvider {
     /// REJECTED for mentioning it — from then on every request omits it.
     /// Internal per-instance state (NOT a knob), hence not `pub`.
     accepts_stream_options: AtomicBool,
+    /// The provider's expanded + validated CUSTOM headers (R1, issue #129) —
+    /// applied by `build_client` as `default_headers` on every completion
+    /// request. `None` = no custom headers (the byte-identical default).
+    pub custom_headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl OpenAiCompatibleProvider {
     /// The production constructor (a fresh client — usage reporting ON
     /// until this instance learns otherwise; the latch is PER INSTANCE, so
     /// one hostile proxy does not disable usage for the whole process).
+    /// The `None`-headers shorthand: no custom headers (issue #129).
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             base_url,
             api_key,
             accepts_stream_options: AtomicBool::new(true),
+            custom_headers: None,
+        }
+    }
+
+    /// The header-carrying constructor (issue #129, R1): the same client as
+    /// [`Self::new`], but the provider's EXPANDED + VALIDATED custom-header
+    /// map rides every completion request via `build_client`'s
+    /// `default_headers`. A struct literal cannot replace this — the private
+    /// `accepts_stream_options` latch is set only by these constructors.
+    pub fn with_custom_headers(
+        base_url: String,
+        api_key: String,
+        custom_headers: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Self {
+        Self {
+            base_url,
+            api_key,
+            accepts_stream_options: AtomicBool::new(true),
+            custom_headers,
         }
     }
 
@@ -707,8 +731,9 @@ impl Provider for OpenAiCompatibleProvider {
         //   `RetryPolicy`'s backoff; a healthy slow stream that dribbles
         //   bytes keeps flowing, no matter how long it runs).
         let client = build_client(
-            Duration::from_secs(30),     // a generous CONNECT bound
-            Duration::from_secs(5 * 60), // 5 min of SILENCE = a stalled provider
+            Duration::from_secs(30),      // a generous CONNECT bound
+            Duration::from_secs(5 * 60),  // 5 min of SILENCE = a stalled provider
+            self.custom_headers.as_ref(), // R1 (issue #129): the ONE completion seam
         );
         // The request + status gate (the `stream_options` retry-and-latch
         // lives in `send_model_request`).
@@ -871,15 +896,47 @@ fn request_body(req: &ModelRequest, ask_usage: bool) -> Value {
     if let Some(m) = req.options.max_tokens {
         body["max_tokens"] = json!(m);
     }
+    // Vendor quirk (GPT-5.5+ over Chat Completions — the OpenAI API rejects
+    // `reasoning_effort` alongside function tools: "Function tools with
+    // reasoning_effort are not supported"). Suppressed for the `gpt-5.5`
+    // family WHEN THE REQUEST CARRIES TOOLS; the Responses wire accepts both
+    // (which is exactly why responses-mode models derive there — see
+    // `is_gpt_5_5_or_newer_completions_quirk`). A suppressed level means
+    // "provider default" for that turn — what the 400 would force anyway.
+    //
+    // THE GATE IS EXACT (plan VF#5b): it fires ONLY on the Chat Completions
+    // wire — this is `OpenAiCompatibleProvider`'s ONE body builder and
+    // `responses.rs` has its own `responses_request_body` (it never calls
+    // this function), so `reasoning` on the Responses wire is untouched.
+    // Predicate: `is_gpt_5_5_or_newer_completions_quirk(&req.model)
+    // && !req.tools.is_empty()`.
+    let suppress_reasoning =
+        is_gpt_5_5_or_newer_completions_quirk(&req.model) && !req.tools.is_empty();
     if let Some(r) = &req.options.reasoning_effort {
-        body["reasoning_effort"] = json!(r);
+        if !suppress_reasoning {
+            body["reasoning_effort"] = json!(r);
+        }
     }
     body
 }
 
+/// The GPT-5.5+ Chat-Completions quirk family (T3b / #131): a CONSERVATIVE
+/// model-name prefix list. `req.model` is the catalog's BARE id (the loop's
+/// `model_request` uses `model.id`), matched case-insensitively.
+///
+/// Deliberately narrow: the `gpt-5.5` family (plus the `gpt-5.6` / `gpt-5.7`
+/// minors if they appear) and NOTHING else — a future `gpt-6` or a renamed
+/// family is NOT blindly matched; extending the list is this one line. No other
+/// model-name branching exists in this file (the wire is derived, not guessed).
+fn is_gpt_5_5_or_newer_completions_quirk(model: &str) -> bool {
+    const PREFIXES: [&str; 3] = ["gpt-5.5", "gpt-5.6", "gpt-5.7"];
+    let lower = model.to_ascii_lowercase();
+    PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::collect;
+    use super::super::test_util::{chat_message, collect};
     use super::super::types::{ChatMessage, ChatRole, MessageContent, ModelOptions, ToolSpec};
     use super::*;
     use crate::agent::tools::{ContentBlock, ImageRef};
@@ -2174,6 +2231,123 @@ mod tests {
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    // ── the GPT-5.5+ Chat-Completions quirk (T3b / #131) ────────────────
+
+    /// A request for ONE model, with or without tools, carrying a level.
+    fn quirk_request(model: &str, tools: bool) -> ModelRequest {
+        ModelRequest {
+            model: model.to_string(),
+            messages: vec![chat_message(
+                ChatRole::User,
+                MessageContent::Text("hi".to_string()),
+                None,
+                None,
+            )],
+            tools: if tools {
+                vec![ToolSpec {
+                    name: "read".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: json!({ "type": "object" }),
+                }]
+            } else {
+                vec![]
+            },
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: Some(64),
+                reasoning_effort: Some("high".to_string()),
+                stream: true,
+            },
+            session_id: None,
+        }
+    }
+
+    /// The quirk: OpenAI rejects `reasoning_effort` together with function
+    /// tools on Chat Completions — the level is SUPPRESSED for the `gpt-5.5`
+    /// family when the request carries tools.
+    #[test]
+    fn request_body_suppresses_reasoning_effort_with_tools_on_gpt_5_5() {
+        for model in ["gpt-5.5", "gpt-5.5-mini", "GPT-5.5"] {
+            let body = request_body(&quirk_request(model, true), true);
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{model} + tools must NOT carry `reasoning_effort` (the provider 400s): {body}"
+            );
+            // The rest of the body is untouched (tools still ride).
+            assert_eq!(body["tools"][0]["function"]["name"], "read");
+            assert_eq!(body["model"], model);
+        }
+    }
+
+    /// No tools → no conflict → the level stays (the quirk is the PAIR).
+    #[test]
+    fn request_body_keeps_reasoning_effort_without_tools_on_gpt_5_5() {
+        let body = request_body(&quirk_request("gpt-5.5", false), true);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("tools").is_none());
+    }
+
+    /// No regression: every OTHER model keeps `reasoning_effort` alongside
+    /// tools (the permissive default is unchanged).
+    #[test]
+    fn request_body_keeps_reasoning_effort_with_tools_on_other_models() {
+        for model in [
+            "gpt-4o",
+            // The near-miss the CONSERVATIVE prefix list must not match: a
+            // plain `gpt-5` is not the 5.5 family.
+            "gpt-5",
+            "gpt-5-mini",
+            // A future major version is NOT blindly matched.
+            "gpt-6",
+            "claude-3-5-sonnet",
+            "m",
+        ] {
+            let body = request_body(&quirk_request(model, true), true);
+            assert_eq!(
+                body["reasoning_effort"], "high",
+                "{model} + tools keeps `reasoning_effort` (no regression)"
+            );
+        }
+    }
+
+    /// The permissive default: an unknown model with no tools still carries the
+    /// level (the gate is the model prefix AND the tools, never either alone).
+    #[test]
+    fn request_body_keeps_reasoning_effort_when_no_tools_and_unknown_model() {
+        let body = request_body(&quirk_request("some-unknown-model", false), true);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    /// The predicate's truth table (a documented prefix list — extending the
+    /// family is one line, NOT a pattern match).
+    #[test]
+    fn is_gpt_5_5_or_newer_completions_quirk_prefix_truth_table() {
+        for model in [
+            "gpt-5.5",
+            "gpt-5.5-2026-01",
+            "gpt-5.6",
+            "gpt-5.7",
+            "GPT-5.5",
+        ] {
+            assert!(is_gpt_5_5_or_newer_completions_quirk(model), "{model}");
+        }
+        for model in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-4o",
+            "gpt-6",
+            "o3",
+            "claude-3-5-sonnet",
+            "5.5",
+            "gpt-55",
+        ] {
+            assert!(
+                !is_gpt_5_5_or_newer_completions_quirk(model),
+                "{model} is NOT the quirk family"
+            );
+        }
     }
 
     // ── the `stream_options` latch vs the overflow tier (ADR 0045) ──────

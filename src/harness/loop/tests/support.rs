@@ -372,6 +372,79 @@ pub(super) fn build_loop_with_sink(
     (space, loop_, db)
 }
 
+/// `build_loop_with_db` with a REAL settings home carrying the provider's
+/// custom headers (issue #129, R1 — the mid-session-switch fixture).
+///
+/// The header-less builders cannot pin R1: `build_loop_with_db` threads a
+/// bare `None` as the loop's `config_dir`, so `set_model`'s re-lookup would
+/// have nothing to read and a switch test built on it could never fire the
+/// header assert. This builder therefore
+/// 1. writes a scratch `settings.json` whose provider row (`id ==
+///    provider_id`) carries `headers` (the RAW template map — expanded here
+///    through the SAME `provider_auth::headers::expand_map` the production
+///    spine calls, so the test asserts the EXPANDED value on the wire),
+/// 2. hands that dir to `build_loop_with_sink` as `config_dir` (so
+///    `AgentLoop::set_model` re-resolves from it), and
+/// 3. returns the settings-home guard FIRST — the #96 rule: never
+///    `.0`-project a builder result to discard a guard; bind it.
+///
+/// The caller builds the INITIAL provider itself (through
+/// `build_provider_with_headers`) so a test can distinguish the initial
+/// provider's headers from the switched one's.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_loop_with_headers_and_db(
+    provider: Box<dyn Provider>,
+    events: mpsc::UnboundedSender<RpcEvent>,
+    turn_cancel: Arc<StdMutex<CancellationToken>>,
+    settle_tx: watch::Sender<u64>,
+    retry: RetryPolicy,
+    models: Vec<Model>,
+    provider_id: &str,
+    headers: HashMap<String, String>,
+    sink: Arc<dyn EventSink>,
+) -> (ScratchDir, ScratchDir, AgentLoop, Arc<Db>) {
+    // The settings home (a scratch dir holding `settings.json`).
+    let config_home = crate::test_support::ScratchDir::in_env_temp("provider-headers-", "settings");
+    let settings = crate::config::Settings {
+        providers: vec![crate::config::ProviderConfig {
+            id: provider_id.to_string(),
+            name: provider_id.to_string(),
+            // The row's base URL is IRRELEVANT here — the `Model` carries the
+            // wire's base URL; this row exists so the header re-lookup in
+            // `set_model` finds a row whose `id == model.provider`.
+            base_url: "https://example.invalid/v1".to_string(),
+            api_key: String::new(),
+            api: "openai-completions".to_string(),
+            key_url: None,
+            auth_mode: "api_key".to_string(),
+            // The RAW template map (the shape `settings.json` holds — the
+            // expansion happens in `provider_headers_for`, exactly as in
+            // production).
+            headers: Some(headers),
+            allow_insecure_http: false,
+            // (issue #128) The mechanical additive grow: `ProviderConfig`
+            // gained T4's `use_gcloud_token_auth`; this fixture does not use
+            // the ADC flow.
+            use_gcloud_token_auth: false,
+            // (issue #127) The mechanical additive grow: no OIDC login on this fixture.
+            oidc: None,
+        }],
+        ..crate::config::Settings::default()
+    };
+    crate::config::write_settings(&config_home, &settings).expect("settings.json writes");
+    let (space, loop_, db) = build_loop_with_sink(
+        provider,
+        events,
+        turn_cancel,
+        settle_tx,
+        retry,
+        models,
+        Some(&config_home),
+        sink,
+    );
+    (config_home, space, loop_, db)
+}
+
 /// Build an `AgentLoop` (drops the `Db` — the tests that need the
 /// `Db` use `build_loop_with_db`). The scratch guard is the first element
 /// for the reason recorded on `build_loop_with_db`: never `.0`-project a

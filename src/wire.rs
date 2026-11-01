@@ -19,8 +19,17 @@ pub enum WireApi {
     AnthropicMessages,
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
-    /// The LiteLLM DISCOVERY mode (ADR 0026, its wire is
-    /// `openai-completions`).
+    /// The LiteLLM DISCOVERY mode (ADR 0026) — NOT a fourth wire. `litellm`
+    /// selects the DISCOVERY shape (`GET {base}/model/info`); the per-model
+    /// WIRE is DERIVED from the discovery payload (T3b #131: `mode ==
+    /// "responses"` → [`WireApi::OpenAiResponses`]; a Claude-adapter route with
+    /// the `/v1/messages` probe latch true → [`WireApi::AnthropicMessages`];
+    /// otherwise the completions fallback) and lands in `Model.api` at
+    /// `EffectiveCatalog::resolve`. The completions fallback KEEPS this value
+    /// on the row (it is wire-equivalent to [`WireApi::OpenAiCompletions`] —
+    /// `build_provider`'s default arm — while additionally carrying the
+    /// discovery shape `discover_models` dispatches on), so this string is what
+    /// `settings.json` and the Worker IPC `StartEnv` carry, byte-identically.
     #[serde(rename = "litellm")]
     LiteLLM,
 }

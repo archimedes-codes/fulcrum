@@ -6,6 +6,7 @@
 //! (OpenAI-completions / Anthropic / OpenAI-Responses) — they are
 //! wire-agnostic (ADR 0024) and live here once now.
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use super::overflow::is_context_overflow_text;
@@ -30,18 +31,67 @@ pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 ///
 /// The client also identifies itself: a `User-Agent` header ([`USER_AGENT`])
 /// so the provider's logs can attribute the traffic to the app.
-pub(crate) fn build_client(connect_timeout: Duration, read_timeout: Duration) -> reqwest::Client {
+///
+/// `custom_headers` (issue #129, R1) is the provider's EXPANDED + VALIDATED
+/// custom-header map (resolved at provider construction from `settings.json`
+/// by `provider::provider_headers_for` and stored on the provider struct);
+/// applied as `default_headers` so every request the client makes — the
+/// streaming `complete()` and any retry — carries them. This is the SINGLE
+/// header-application point for the COMPLETION path (the discovery seam is
+/// [`apply_custom_headers`]). `None` = current behaviour (no custom headers;
+/// the existing call sites stay byte-identical).
+pub(crate) fn build_client(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    custom_headers: Option<&std::collections::BTreeMap<String, String>>,
+) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::USER_AGENT,
         reqwest::header::HeaderValue::from_static(USER_AGENT),
     );
+    if let Some(map) = custom_headers {
+        for (name, value) in map {
+            // Validated upstream (`headers::expand_map`) — a header NAME must
+            // be a valid token and a VALUE visible-ASCII, so
+            // `HeaderValue::from_str` cannot panic; the map is a `BTreeMap`,
+            // so the iteration order is stable for a golden-header test.
+            headers.append(
+                reqwest::header::HeaderName::from_str(name).expect("validated header name"),
+                reqwest::header::HeaderValue::from_str(value).expect("validated header value"),
+            );
+        }
+    }
     reqwest::Client::builder()
         .connect_timeout(connect_timeout)
         .read_timeout(read_timeout)
         .default_headers(headers)
         .build()
         .expect("the reqwest client builds (fixed connect + read timeouts)")
+}
+
+/// Apply a provider's CUSTOM headers to a request builder (issue #129).
+/// `headers` is the EXPANDED + VALIDATED map (`provider_auth::headers::expand_map`
+/// — names are header tokens, values visible-ASCII; the validation there is what
+/// makes this call panic-free: `reqwest::RequestBuilder::header` PANICS on an
+/// invalid value). This is the SINGLE header-application point for the DISCOVERY
+/// path: the three discovery arms (`catalog.rs`) call it. It never re-adds
+/// session / request tracking headers (that stays [`litellm_headers`]'s job —
+/// interface §9), and it never touches [`build_client`] (whose per-call
+/// `default_headers` is the COMPLETION-wire seam — T2b's byte).
+pub(crate) fn apply_custom_headers(
+    builder: reqwest::RequestBuilder,
+    headers: Option<&std::collections::BTreeMap<String, String>>,
+) -> reqwest::RequestBuilder {
+    if let Some(map) = headers {
+        let mut b = builder;
+        for (name, value) in map {
+            b = b.header(name.as_str(), value.as_str());
+        }
+        b
+    } else {
+        builder
+    }
 }
 
 /// Map an HTTP status to a [`ProviderError`] (the two-tier message contract
@@ -351,7 +401,7 @@ mod tests {
             .expect("the listener binds");
         let addr = listener.local_addr().expect("the listener has an address");
         let server = raw_http_server(listener, true).await;
-        let client = build_client(Duration::from_secs(30), Duration::from_millis(200));
+        let client = build_client(Duration::from_secs(30), Duration::from_millis(200), None);
         let resp = client
             .post(format!("http://{addr}/chat/completions"))
             .send()
@@ -372,7 +422,7 @@ mod tests {
             .expect("the listener binds");
         let addr = listener.local_addr().expect("the listener has an address");
         let server = raw_http_server(listener, false).await;
-        let client = build_client(Duration::from_secs(30), Duration::from_millis(200));
+        let client = build_client(Duration::from_secs(30), Duration::from_millis(200), None);
         let resp = client
             .post(format!("http://{addr}/chat/completions"))
             .send()
@@ -492,7 +542,7 @@ mod tests {
             // body is complete — the client closes the connection).
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
-        let client = build_client(Duration::from_secs(30), Duration::from_millis(200));
+        let client = build_client(Duration::from_secs(30), Duration::from_millis(200), None);
         let _resp = client
             .post(format!("http://{addr}/chat/completions"))
             .send()
@@ -508,6 +558,193 @@ mod tests {
         assert_eq!(
             header,
             format!("user-agent: archimedes/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// (issue #129, R1) The COMPLETION seam: `build_client` with
+    /// `Some(&map)` puts every entry of the expanded map on the wire as
+    /// `default_headers` (stable `BTreeMap` order, appended after the
+    /// `User-Agent`), and `None` sends exactly what the client sent before —
+    /// the `User-Agent` and nothing custom (byte-identical). Same capture-
+    /// server shape as the `the_request_sends_a_user_agent_header` test.
+    #[tokio::test]
+    async fn build_client_applies_custom_headers_as_default_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // One server instance, two connections (the Some-map request, then
+        // the None request) — each captures its request head to the channel.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the listener binds");
+        let addr = listener.local_addr().expect("the listener has an address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut data = Vec::new();
+                    while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        data.extend_from_slice(&buf[..n]);
+                    }
+                    let _ = tx.send(data).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: [DONE]\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("x-env-test".to_string(), "expanded-value".to_string());
+        map.insert("x-second".to_string(), "two".to_string());
+
+        // (1) Some(&map): both entries ride every request the client makes.
+        let client = build_client(
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+            Some(&map),
+        );
+        let _resp = client
+            .post(format!("http://{addr}/chat/completions"))
+            .send()
+            .await
+            .expect("the request sends");
+        let raw = rx.recv().await.expect("the server captured the request");
+        let request = String::from_utf8(raw).expect("the request is valid UTF-8");
+        for (name, value) in &map {
+            let line = request
+                .lines()
+                .find(|l| l.to_lowercase().starts_with(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("the request carries `{name}`:\n{request}"));
+            assert_eq!(
+                line[name.len() + 1..].trim(),
+                value.as_str(),
+                "the custom header `{name}` rides the completion request: {line}"
+            );
+        }
+        // The User-Agent survives alongside the custom headers.
+        assert!(request.to_lowercase().contains("user-agent: archimedes/"));
+
+        // (2) None: byte-identical to today — the User-Agent, nothing custom.
+        let client = build_client(Duration::from_secs(30), Duration::from_millis(200), None);
+        let _resp = client
+            .post(format!("http://{addr}/chat/completions"))
+            .send()
+            .await
+            .expect("the request sends");
+        let raw = rx.recv().await.expect("the server captured the request");
+        let request = String::from_utf8(raw).expect("the request is valid UTF-8");
+        assert!(
+            !request.to_lowercase().contains("x-env-test")
+                && !request.to_lowercase().contains("x-second"),
+            "None must attach nothing custom:\n{request}"
+        );
+        assert!(request.to_lowercase().contains("user-agent: archimedes/"));
+    }
+
+    /// (issue #129) The DISCOVERY seam: `apply_custom_headers` attaches every
+    /// entry of the expanded map to the builder, and `None` leaves the builder
+    /// untouched (no header, no panic). Same capture-server shape as the
+    /// `the_request_sends_a_user_agent_header` test above.
+    #[tokio::test]
+    async fn apply_custom_headers_puts_each_entry_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the listener binds");
+        let addr = listener.local_addr().expect("the listener has an address");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            let _ = tx.send(data).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+                .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("x-env-test".to_string(), "expanded-value".to_string());
+        map.insert("x-second".to_string(), "two".to_string());
+
+        let client = reqwest::Client::new();
+        let builder =
+            apply_custom_headers(client.get(format!("http://{addr}/v1/models")), Some(&map));
+        let _resp = builder.send().await.expect("the request sends");
+        let raw = rx.recv().await.expect("the server captured the request");
+        let request = String::from_utf8(raw).expect("the request is valid UTF-8");
+        for (name, value) in &map {
+            let line = request
+                .lines()
+                .find(|l| l.to_lowercase().starts_with(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("the request carries `{name}`:\n{request}"));
+            assert_eq!(line[name.len() + 1..].trim(), value.as_str(), "{line}");
+        }
+    }
+
+    /// (issue #129) The `None` half of the seam: a provider with no custom
+    /// headers sends exactly what it sent before — the pass-through builder.
+    #[tokio::test]
+    async fn apply_custom_headers_with_none_sends_nothing_extra() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the listener binds");
+        let addr = listener.local_addr().expect("the listener has an address");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            let _ = tx.send(data).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+                .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let client = reqwest::Client::new();
+        let builder = apply_custom_headers(client.get(format!("http://{addr}/v1/models")), None);
+        let _resp = builder.send().await.expect("the request sends");
+        let raw = rx.recv().await.expect("the server captured the request");
+        let request = String::from_utf8(raw).expect("the request is valid UTF-8");
+        assert!(
+            !request.to_lowercase().contains("x-env-test"),
+            "None must attach nothing:\n{request}"
         );
     }
 

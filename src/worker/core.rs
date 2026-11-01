@@ -23,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::events::EventSink;
 use crate::agent::events::RpcEvent;
 use crate::agent::harness::prompt::{build_main_prompt, PromptContext};
-use crate::agent::harness::provider::build_provider;
 use crate::agent::harness::provider::openai::content_is_effectively_empty;
 use crate::agent::harness::r#loop::{AgentLoop, ControlCmd, PromptTurn, SudoDeps};
 use crate::agent::harness::retry::RetryPolicy;
@@ -263,11 +262,22 @@ pub fn default_build_loop(
         let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
         let (settle_tx, _settle_rx) = watch::channel(0u64);
         // (2) `AgentLoop::new` with the Task-1 seams, Worker-backed
-        // (`build_provider(&env.model)` — the envelope's `Model` carries
-        // the provider config; the CORE's maps — the `PermissionResponse`
-        // / `InteractiveResponse` handlers resolve the loop's gate
-        // oneshots through them — + the shared `StaticTrustSource` + the
-        // `TodoStore`).
+        // (`build_provider_with_headers` — the envelope's `Model` carries
+        // the provider config; the provider's CUSTOM headers (issue #129,
+        // R1) are re-resolved from `settings.json` at this construction site
+        // (`env.config_dir` is in scope; the CORE's maps — the
+        // `PermissionResponse` / `InteractiveResponse` handlers resolve the
+        // loop's gate oneshots through them — + the shared `StaticTrustSource`
+        // + the `TodoStore`). A model with no configured headers → `None` —
+        // byte-identical to the old `build_provider(&env.model)`.
+        let provider = crate::agent::harness::provider::build_provider_with_headers(
+            &env.model,
+            crate::agent::harness::provider::provider_headers_for(
+                std::path::Path::new(&env.config_dir),
+                &env.model,
+            )
+            .as_ref(),
+        );
         let store: Arc<dyn Store> = Arc::new(IpcStore::new(outbound.clone()));
         let trust: Option<Arc<dyn TrustSource>> = trust.clone().map(|t| t as Arc<dyn TrustSource>);
         let sink: Arc<dyn EventSink> = Arc::new(IpcEventSink::new(outbound.clone()));
@@ -286,7 +296,7 @@ pub fn default_build_loop(
             env.session_id.clone(),
             cwd.clone(),
             env.model.clone(),
-            build_provider(&env.model),
+            provider,
             env.catalog.clone(),
             store,
             events_tx,

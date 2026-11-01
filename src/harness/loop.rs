@@ -661,7 +661,20 @@ impl AgentLoop {
     pub fn set_model(&mut self, model: Model) {
         let switched = ModelKey::from(&self.model) != ModelKey::from(&model);
         if switched {
-            self.provider = crate::agent::harness::provider::build_provider(&model);
+            // Re-resolve the provider's custom headers from `settings.json`
+            // via the loop's ALREADY-STORED config dir (issue #129, R1 — no
+            // new field, no factory hand-off; a header edit between spawn and
+            // this switch is picked up, never a stale spawn-time snapshot).
+            // `config_dir: None` → `None` → byte-identical to the old
+            // `build_provider(&model)`.
+            let headers = self
+                .config_dir
+                .as_deref()
+                .and_then(|dir| crate::agent::harness::provider::provider_headers_for(dir, &model));
+            self.provider = crate::agent::harness::provider::build_provider_with_headers(
+                &model,
+                headers.as_ref(),
+            );
         }
         self.compactor = Compactor::new(self.catalog.compaction, model.context_window);
         self.model = model;
