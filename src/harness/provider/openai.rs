@@ -23,6 +23,7 @@ use super::types::{
     cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
     Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage, WireToolCall,
 };
+use crate::agent::tools::ContentBlock;
 
 // ── (issue #122) the shared sanitisation-placeholder vocabulary ───────────
 //
@@ -74,11 +75,26 @@ pub(crate) fn content_is_the_sanitise_placeholder(text: &str) -> bool {
 /// here" is the decision to make — the outbound `request_body` guard (an empty
 /// assistant `content` is exactly what LiteLLM rewrites, so it must never be
 /// sent) and the subagent guards (a child that produced nothing is not a
-/// `Completed`). NOT for the streaming drop sites — see
+/// `Completed`). Also used per text block (and per `Text` content) by
+/// `tool_content_wire` and the Anthropic tool-result sanitiser (issue #148),
+/// where an effectively-empty text must become `TOOL_EMPTY_OUTPUT_PLACEHOLDER`.
+/// NOT for the streaming drop sites — see
 /// [`content_is_the_sanitise_placeholder`].
 pub(crate) fn content_is_effectively_empty(text: &str) -> bool {
     text.trim().is_empty() || content_is_the_sanitise_placeholder(text)
 }
+
+/// (issue #148) The placeholder an EMPTY tool result is sent as on the wire.
+///
+/// LiteLLM → Vertex AI Claude turns a `role: "tool"` message into an Anthropic
+/// `tool_result` and applies prompt caching; an empty text block there is
+/// rejected with HTTP 400 `cache_control cannot be set for empty text
+/// blocks`. A `tool` message must keep its `content` (it pairs with
+/// `tool_call_id`), so an empty one is REPLACED with this literal — the same
+/// string the UI shows for empty tool output. Shared with the Anthropic wire
+/// (`anthropic.rs`), which imports it from here. Shaping happens only where
+/// the request is built (ADR 0054); the durable transcript is never rewritten.
+pub(crate) const TOOL_EMPTY_OUTPUT_PLACEHOLDER: &str = "(no output)";
 
 /// A client for the OpenAI-compatible chat-completions API (OpenAI,
 /// OpenRouter, `tama`, …).
@@ -760,14 +776,67 @@ fn is_stream_options_rejection(err: &ProviderError) -> bool {
         .contains("stream_options")
 }
 
+/// (issue #148) The OpenAI WIRE form of a `tool` message's content, with the
+/// empty cases replaced by [`TOOL_EMPTY_OUTPUT_PLACEHOLDER`].
+///
+/// * `Text` that is empty / whitespace-only / the LiteLLM sanitise banner
+///   ([`content_is_effectively_empty`]) → the placeholder string.
+/// * `Blocks` → the same OpenAI content parts as [`MessageContent::to_wire`]
+///   (`text` / `image_url` data-URI), but with every effectively-empty text
+///   block dropped; images are always kept. If no part is left (`Blocks([])`,
+///   or only empty text) → the placeholder string, never an empty array.
+/// * Anything else is passed through verbatim.
+///
+/// Only used for `ChatRole::Tool`: `MessageContent::to_wire` stays untouched
+/// because it also serves user / assistant content.
+fn tool_content_wire(content: &MessageContent) -> Value {
+    let placeholder = || Value::String(TOOL_EMPTY_OUTPUT_PLACEHOLDER.to_string());
+    match content {
+        MessageContent::Text(t) => {
+            if content_is_effectively_empty(t) {
+                placeholder()
+            } else {
+                Value::String(t.clone())
+            }
+        }
+        MessageContent::Blocks(blocks) => {
+            let mut parts: Vec<Value> = Vec::with_capacity(blocks.len());
+            for b in blocks {
+                match b {
+                    ContentBlock::Text { text } => {
+                        if !content_is_effectively_empty(text) {
+                            parts.push(json!({ "type": "text", "text": text }));
+                        }
+                    }
+                    ContentBlock::Image { image } => {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", image.mime_type, image.data),
+                            },
+                        }));
+                    }
+                }
+            }
+            if parts.is_empty() {
+                placeholder()
+            } else {
+                Value::Array(parts)
+            }
+        }
+    }
+}
+
 /// Build the OpenAI-compatible request body from a [`ModelRequest`]
 /// (`stream: true` is always sent; `None` options are omitted). The
 /// message `content` goes through the OpenAI WIRE form
-/// ([`MessageContent::to_wire`]) — a plain string for `Text`, an array
-/// of OpenAI content parts (`text` / `image_url` data-URIs) for
-/// `Blocks` — and an assistant `tool_calls` is serialized in the
-/// OpenAI shape (`{ id, type: "function", function: { name, arguments:
-/// <string> } }`).
+/// ([`MessageContent::to_wire`]) for every role EXCEPT `tool` — a plain
+/// string for `Text`, an array of OpenAI content parts (`text` /
+/// `image_url` data-URIs) for `Blocks`. A `tool` message goes through
+/// [`tool_content_wire`], which replaces empty content with
+/// [`TOOL_EMPTY_OUTPUT_PLACEHOLDER`] (issue #148). An assistant
+/// `tool_calls` is serialized in the OpenAI shape (`{ id, type: "function",
+/// function: { name, arguments: <string> } }`).
 ///
 /// `stream_options.include_usage` is sent when `ask_usage` is set (the
 /// provider's latch — see `send_model_request`), on TOP of the request's
@@ -815,7 +884,7 @@ fn request_body(req: &ModelRequest, ask_usage: bool) -> Value {
                 // Shaping HERE, not in the transcript — ADR 0054: the wire's shape
                 // is corrected where the request is built.
                 //
-                // Deliberately narrow, and pinned by the three tests above:
+                // Deliberately narrow, and pinned by the tests below:
                 //   * only a `Text` that is empty-ish / the placeholder, AND only
                 //     on a message that carries `tool_calls`, is omitted;
                 //   * a tool-call-less assistant message keeps its `"content": ""`
@@ -824,13 +893,21 @@ fn request_body(req: &ModelRequest, ask_usage: bool) -> Value {
                 //     letting it round-trip);
                 //   * `Blocks` is untouched (an array fails LiteLLM's `str` check);
                 //   * a `tool` message's `"content"` is REQUIRED to pair with its
-                //     `tool_call_id`, so it is never dropped.
+                //     `tool_call_id`, so it is never dropped — but (issue #148) an
+                //     EMPTY one is REPLACED with `TOOL_EMPTY_OUTPUT_PLACEHOLDER` by
+                //     `tool_content_wire`, because LiteLLM → Vertex Claude rejects
+                //     an empty `tool_result` text block under prompt caching.
                 let empty_text_with_calls = m.tool_calls.is_some()
                     && match &m.content {
                         MessageContent::Text(t) => content_is_effectively_empty(t),
                         MessageContent::Blocks(_) => false,
                     };
-                if !empty_text_with_calls {
+                if m.role == ChatRole::Tool {
+                    // (issue #148) Never an empty `""` / empty text part: the
+                    // placeholder REPLACES it. Never omitted either — a `tool`
+                    // message's `content` pairs with its `tool_call_id`.
+                    obj.insert("content".to_string(), tool_content_wire(&m.content));
+                } else if !empty_text_with_calls {
                     obj.insert("content".to_string(), m.content.to_wire());
                 }
                 if let Some(id) = &m.tool_call_id {
@@ -2126,8 +2203,10 @@ mod tests {
     /// The other two guard rails: a `Blocks` content is never an empty `str` on
     /// the wire (LiteLLM's `isinstance(content, str)` is false for an array, so
     /// there is nothing to sanitize), and a `tool` message's `"content"` is
-    /// REQUIRED to pair with its `tool_call_id` — even an empty one is kept, and
-    /// a real text is never touched.
+    /// REQUIRED to pair with its `tool_call_id`, so it is never omitted — an
+    /// empty one is REPLACED with the `(no output)` placeholder (issue #148:
+    /// LiteLLM → Vertex Claude rejects an empty `tool_result` text block under
+    /// prompt caching), and real text is never touched.
     #[test]
     fn request_body_keeps_content_for_blocks_tool_messages_and_real_text() {
         let req = ModelRequest {
@@ -2180,14 +2259,234 @@ mod tests {
         );
         assert_eq!(
             body["messages"][1]["content"],
-            Value::String(String::new()),
-            "a `tool` message keeps its `content` (it pairs with `tool_call_id`)"
+            Value::String(TOOL_EMPTY_OUTPUT_PLACEHOLDER.to_string()),
+            "an empty `tool` message keeps a `content` (it pairs with \
+             `tool_call_id`) — the `(no output)` placeholder, never `\"\"`"
         );
         assert_eq!(
             body["messages"][2]["content"],
             Value::String("real".to_string()),
             "real text is never touched"
         );
+    }
+
+    #[test]
+    fn request_body_assistant_with_tool_calls_followed_by_empty_tool_result() {
+        let req = ModelRequest {
+            model: "m".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: MessageContent::Text(String::new()),
+                    tool_call_id: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({ "path": "/test" }),
+                    }]),
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: MessageContent::Text(String::new()),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_calls: None,
+                },
+            ],
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: true,
+            },
+            session_id: None,
+        };
+        let body = request_body(&req, true);
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 2);
+
+        // Assistant content is omitted
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert!(
+            msgs[0].get("content").is_none(),
+            "assistant content must be omitted when empty with tool_calls: {}",
+            msgs[0]
+        );
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_1");
+
+        // Tool message content is "(no output)"
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "call_1");
+        assert_eq!(msgs[1]["content"], TOOL_EMPTY_OUTPUT_PLACEHOLDER);
+    }
+
+    /// Serialize ONE `tool` message with `content` through `request_body` and
+    /// return that message's wire object (`messages[0]` — there is no system
+    /// message, so the tool message is first).
+    fn tool_message_wire(content: MessageContent) -> Value {
+        let req = ModelRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage {
+                role: ChatRole::Tool,
+                content,
+                tool_call_id: Some("call_1".to_string()),
+                tool_calls: None,
+            }],
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: true,
+            },
+            session_id: None,
+        };
+        request_body(&req, true)["messages"][0].clone()
+    }
+
+    /// (issue #148) An empty, whitespace-only, or sanitise-banner `Text` in a
+    /// `tool` message must serialize as `(no output)` on the OpenAI wire
+    /// to avoid Vertex AI Claude rejecting empty text blocks with HTTP 400.
+    #[test]
+    fn request_body_replaces_empty_tool_text_with_no_output_placeholder() {
+        for empty in [
+            String::new(),
+            "   ".to_string(),
+            "\n\t ".to_string(),
+            EMPTY_CONTENT_SANITISE_PLACEHOLDER.to_string(),
+        ] {
+            let m = tool_message_wire(MessageContent::Text(empty.clone()));
+            assert_eq!(
+                m["content"],
+                Value::String(TOOL_EMPTY_OUTPUT_PLACEHOLDER.to_string()),
+                "empty tool text {empty:?} must be replaced by `{TOOL_EMPTY_OUTPUT_PLACEHOLDER}`"
+            );
+            assert_eq!(
+                m["tool_call_id"], "call_1",
+                "tool_call_id pairing must survive"
+            );
+            assert_eq!(m["role"], "tool");
+        }
+    }
+
+    /// (issue #148) `Blocks` in a `tool` message that are empty or contain only
+    /// effectively-empty text must serialize as the string `(no output)` (never
+    /// an empty array or an array of empty text objects).
+    #[test]
+    fn request_body_replaces_empty_tool_blocks_with_no_output_placeholder() {
+        let cases = [
+            MessageContent::Blocks(vec![]),
+            MessageContent::Blocks(vec![ContentBlock::Text {
+                text: String::new(),
+            }]),
+            MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "  ".to_string(),
+                },
+                ContentBlock::Text {
+                    text: EMPTY_CONTENT_SANITISE_PLACEHOLDER.to_string(),
+                },
+            ]),
+        ];
+        for content in cases {
+            let m = tool_message_wire(content);
+            assert!(
+                m["content"].is_string(),
+                "empty tool blocks must serialize as a string, not an array: {}",
+                m["content"]
+            );
+            assert_eq!(
+                m["content"],
+                Value::String(TOOL_EMPTY_OUTPUT_PLACEHOLDER.to_string()),
+                "empty tool blocks must be replaced by `{TOOL_EMPTY_OUTPUT_PLACEHOLDER}`"
+            );
+            assert_eq!(
+                m["tool_call_id"], "call_1",
+                "tool_call_id pairing must survive"
+            );
+            assert_eq!(m["role"], "tool");
+        }
+    }
+
+    /// (issue #148) Real text and images in tool messages are preserved; in a
+    /// mixed `Blocks` the empty text block is dropped and the image kept; a
+    /// longer string quoting the banner is untouched.
+    #[test]
+    fn request_body_preserves_real_text_and_mixed_tool_blocks() {
+        // Text("real output") -> "real output"
+        let m = tool_message_wire(MessageContent::Text("real output".to_string()));
+        assert_eq!(m["content"], Value::String("real output".to_string()));
+
+        // Blocks with multiple text lines
+        let m = tool_message_wire(MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: "line one".to_string(),
+            },
+            ContentBlock::Text {
+                text: "line two".to_string(),
+            },
+        ]));
+        assert_eq!(
+            m["content"],
+            json!([
+                { "type": "text", "text": "line one" },
+                { "type": "text", "text": "line two" }
+            ])
+        );
+
+        // Blocks with empty text and image -> empty text dropped, image kept
+        let m = tool_message_wire(MessageContent::Blocks(vec![
+            ContentBlock::Text {
+                text: String::new(),
+            },
+            ContentBlock::Image {
+                image: ImageRef {
+                    data: "AAAA".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            },
+        ]));
+        assert_eq!(
+            m["content"],
+            json!([
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AAAA"
+                    }
+                }
+            ])
+        );
+
+        // Blocks with image and text caption keeps both in order
+        let m = tool_message_wire(MessageContent::Blocks(vec![
+            ContentBlock::Image {
+                image: ImageRef {
+                    data: "AAAA".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            },
+            ContentBlock::Text {
+                text: "caption".to_string(),
+            },
+        ]));
+        assert_eq!(
+            m["content"],
+            json!([
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AAAA"
+                    }
+                },
+                { "type": "text", "text": "caption" }
+            ])
+        );
+
+        // Quoted banner inside longer sentence is untouched
+        let quoted = format!("saw {EMPTY_CONTENT_SANITISE_PLACEHOLDER} in the log");
+        let m = tool_message_wire(MessageContent::Text(quoted.clone()));
+        assert_eq!(m["content"], Value::String(quoted));
     }
 
     /// The display wire keeps the FLAT `ToolCall` shape (`{ id, name,

@@ -15,7 +15,9 @@ use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use serde_json::Value;
 
-use super::openai::{parse_arguments, LineAssembler};
+use super::openai::{
+    content_is_effectively_empty, parse_arguments, LineAssembler, TOOL_EMPTY_OUTPUT_PLACEHOLDER,
+};
 use super::transport::{build_client, litellm_headers, map_response, ANTHROPIC_API_VERSION};
 use super::types::{
     cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
@@ -615,6 +617,14 @@ pub struct AnthropicProvider {
     pub custom_headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
+/// The text sent for an effectively-empty `Text` or all-empty `Blocks`
+/// user/assistant message with no `tool_calls` to carry (where no usable
+/// content is left once empty text blocks are dropped). Anthropic rejects
+/// an empty string, an empty `content` array, and empty text blocks, and
+/// dropping the whole message would break the strict user/assistant
+/// alternation, so a visible stand-in is sent instead.
+pub(crate) const EMPTY_USER_MESSAGE_PLACEHOLDER: &str = "(empty)";
+
 /// The Anthropic WIRE shape of a content block: `Text` →
 /// `{ "type": "text", "text" }`; `Image` →
 /// `{ "type": "image", "source": { "type": "base64", "media_type",
@@ -635,14 +645,43 @@ fn anthropic_block_wire(b: &ContentBlock) -> Value {
     }
 }
 
-/// The `content` of a `tool_result` block: the `Text` string verbatim;
-/// `Blocks` → an array of the Anthropic block shapes (a `Text` block →
-/// `{ type: "text", text }`, an `Image` block → the image shape above).
+/// The Anthropic wire blocks for a `Blocks` list with every effectively-empty
+/// `Text` block DROPPED (Anthropic rejects empty text blocks). `Image` blocks
+/// are always kept. May return an empty `Vec` — the callers decide what to do then.
+fn anthropic_nonempty_blocks(blocks: &[ContentBlock]) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter(|b| match b {
+            ContentBlock::Text { text } => !content_is_effectively_empty(text),
+            ContentBlock::Image { .. } => true,
+        })
+        .map(anthropic_block_wire)
+        .collect()
+}
+
+/// The `content` of a `tool_result` block: a `Text` string is sent verbatim
+/// unless effectively empty, in which case it is replaced by
+/// [`TOOL_EMPTY_OUTPUT_PLACEHOLDER`] (`"(no output)"`). A `Blocks` list is an
+/// array of the Anthropic block shapes with effectively-empty text blocks
+/// dropped (Anthropic rejects empty text blocks). If nothing is left, it is
+/// the [`TOOL_EMPTY_OUTPUT_PLACEHOLDER`] string. An image-only result stays
+/// an array containing the image.
 fn anthropic_tool_result_content(c: &MessageContent) -> Value {
     match c {
-        MessageContent::Text(t) => Value::String(t.clone()),
+        MessageContent::Text(t) => {
+            if content_is_effectively_empty(t) {
+                Value::String(TOOL_EMPTY_OUTPUT_PLACEHOLDER.to_string())
+            } else {
+                Value::String(t.clone())
+            }
+        }
         MessageContent::Blocks(blocks) => {
-            Value::Array(blocks.iter().map(anthropic_block_wire).collect())
+            let wire = anthropic_nonempty_blocks(blocks);
+            if wire.is_empty() {
+                Value::String(TOOL_EMPTY_OUTPUT_PLACEHOLDER.to_string())
+            } else {
+                Value::Array(wire)
+            }
         }
     }
 }
@@ -690,7 +729,10 @@ fn merge_content(existing: &mut Value, next: &Value) {
 /// assistant `tool_calls` as `tool_use` blocks (the `input` is a JSON
 /// **object** — the OpenAI wire's string form does not apply; an assistant
 /// message with `tool_calls` and EMPTY `Text` content → `tool_use` blocks
-/// ONLY, no empty `text` block).
+/// ONLY, no empty `text` block). Effectively-empty text blocks in `Blocks`
+/// content are dropped; an effectively-empty `Text` or all-empty `Blocks`
+/// message with no `tool_calls` is sent as `"(empty)"` (string or single
+/// text block).
 fn anthropic_messages(req: &ModelRequest) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for m in req.messages.iter().filter(|m| m.role != ChatRole::System) {
@@ -720,9 +762,26 @@ fn anthropic_messages(req: &ModelRequest) -> Vec<Value> {
             "user"
         };
         let mut content = match &m.content {
-            MessageContent::Text(t) => Value::String(t.clone()),
+            MessageContent::Text(s) => {
+                if content_is_effectively_empty(s)
+                    && m.tool_calls.as_ref().is_none_or(|c| c.is_empty())
+                {
+                    Value::String(EMPTY_USER_MESSAGE_PLACEHOLDER.to_string())
+                } else {
+                    Value::String(s.clone())
+                }
+            }
             MessageContent::Blocks(blocks) => {
-                Value::Array(blocks.iter().map(anthropic_block_wire).collect())
+                let wire = anthropic_nonempty_blocks(blocks);
+                if wire.is_empty() && m.tool_calls.as_ref().is_none_or(|c| c.is_empty()) {
+                    Value::Array(vec![
+                        json!({ "type": "text", "text": EMPTY_USER_MESSAGE_PLACEHOLDER }),
+                    ])
+                } else {
+                    // Non-empty, OR empty but `tool_calls` follow: the `tool_use`
+                    // blocks are appended below and carry the message.
+                    Value::Array(wire)
+                }
             }
         };
         if let Some(calls) = &m.tool_calls {
@@ -738,12 +797,15 @@ fn anthropic_messages(req: &ModelRequest) -> Vec<Value> {
                 })
                 .collect();
             if content.is_string() {
-                // An EMPTY `Text` → `tool_use` blocks ONLY (no empty `text`
-                // block); a non-empty `Text` → a `text` block followed by
-                // the `tool_use` blocks.
+                // An effectively-empty `Text` (empty, whitespace-only, or the LiteLLM banner)
+                // → `tool_use` blocks ONLY (no empty `text` block); a non-empty `Text` → a `text`
+                // block followed by the `tool_use` blocks.
                 let text = std::mem::take(&mut content);
                 let mut blocks = Vec::new();
-                if text.as_str().is_some_and(|s| !s.is_empty()) {
+                if text
+                    .as_str()
+                    .is_some_and(|s| !content_is_effectively_empty(s))
+                {
                     blocks.push(json!({ "type": "text", "text": text }));
                 }
                 blocks.extend(tool_blocks);
@@ -2086,6 +2148,53 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_request_body_consecutive_tool_messages_empty_and_real_merge() {
+        let req = ModelRequest {
+            model: "m".to_string(),
+            messages: vec![
+                chat_message(
+                    ChatRole::Tool,
+                    MessageContent::Text(String::new()),
+                    Some("t1"),
+                    None,
+                ),
+                chat_message(
+                    ChatRole::Tool,
+                    MessageContent::Text("real output".to_string()),
+                    Some("t2"),
+                    None,
+                ),
+            ],
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: true,
+            },
+            session_id: None,
+        };
+        let body = anthropic_request_body(&req);
+        let messages = body["messages"].as_array().expect("messages are present");
+        assert_eq!(
+            messages.len(),
+            1,
+            "two consecutive tool messages merge into ONE user message"
+        );
+        assert_eq!(messages[0]["role"], "user");
+        let content = messages[0]["content"]
+            .as_array()
+            .expect("the merged content is a block array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "t1");
+        assert_eq!(content[0]["content"], "(no output)");
+        assert_eq!(content[1]["type"], "tool_result");
+        assert_eq!(content[1]["tool_use_id"], "t2");
+        assert_eq!(content[1]["content"], "real output");
+    }
+
+    #[test]
     fn anthropic_request_body_image_block_wire_shape() {
         // The Anthropic image wire shape: `source.data` is the base64
         // VERBATIM (NO `data:` prefix — unlike the OpenAI data-URI
@@ -2126,6 +2235,395 @@ mod tests {
                     "data": "BASE64DATA",
                 },
             })
+        );
+    }
+
+    fn req_body(messages: Vec<ChatMessage>) -> Value {
+        let r = ModelRequest {
+            model: "m".to_string(),
+            messages,
+            tools: vec![],
+            options: ModelOptions {
+                temperature: None,
+                max_tokens: None,
+                reasoning_effort: None,
+                stream: true,
+            },
+            session_id: None,
+        };
+        anthropic_request_body(&r)
+    }
+
+    fn img() -> ContentBlock {
+        ContentBlock::Image {
+            image: ImageRef {
+                data: "BASE64DATA".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+        }
+    }
+
+    fn text_block(t: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: t.to_string(),
+        }
+    }
+
+    fn one_call() -> Option<Vec<ToolCall>> {
+        Some(vec![ToolCall {
+            id: "tu_1".to_string(),
+            name: "read".to_string(),
+            arguments: json!({}),
+        }])
+    }
+
+    #[test]
+    fn anthropic_tool_result_content_replaces_empty_text_with_no_output_placeholder() {
+        for empty in [
+            "",
+            "   ",
+            "\n",
+            "[System: Empty message content sanitised to satisfy protocol]",
+        ] {
+            assert_eq!(
+                anthropic_tool_result_content(&MessageContent::Text(empty.to_string())),
+                Value::String("(no output)".to_string()),
+                "empty tool text {empty:?} must be replaced by \"(no output)\""
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_result_content_replaces_empty_blocks_with_no_output_placeholder() {
+        for blocks in [
+            vec![],
+            vec![text_block("")],
+            vec![text_block("  "), text_block("")],
+        ] {
+            assert_eq!(
+                anthropic_tool_result_content(&MessageContent::Blocks(blocks)),
+                Value::String("(no output)".to_string()),
+                "empty blocks must be replaced by \"(no output)\""
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_result_content_preserves_real_text_and_images() {
+        assert_eq!(
+            anthropic_tool_result_content(&MessageContent::Text("hello".to_string())),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            anthropic_tool_result_content(&MessageContent::Text("  padded  ".to_string())),
+            Value::String("  padded  ".into())
+        );
+        assert_eq!(
+            anthropic_tool_result_content(&MessageContent::Blocks(vec![text_block(""), img()])),
+            json!([
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "BASE64DATA",
+                    },
+                }
+            ])
+        );
+        let mixed = anthropic_tool_result_content(&MessageContent::Blocks(vec![
+            text_block("a"),
+            text_block(""),
+            img(),
+        ]));
+        let arr = mixed.as_array().expect("array of blocks");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], json!({ "type": "text", "text": "a" }));
+        assert_eq!(
+            arr[1],
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "BASE64DATA",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_drops_empty_text_block_in_mixed_image_message() {
+        let body = req_body(vec![chat_message(
+            ChatRole::User,
+            MessageContent::Blocks(vec![img(), text_block("")]),
+            None,
+            None,
+        )]);
+        let content = body["messages"][0]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
+
+        let body_rev = req_body(vec![chat_message(
+            ChatRole::User,
+            MessageContent::Blocks(vec![text_block(""), img()]),
+            None,
+            None,
+        )]);
+        let content_rev = body_rev["messages"][0]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(content_rev.len(), 1);
+        assert_eq!(content_rev[0]["type"], "image");
+    }
+
+    #[test]
+    fn anthropic_messages_all_empty_blocks_without_tool_calls_become_empty_placeholder() {
+        let body1 = req_body(vec![chat_message(
+            ChatRole::User,
+            MessageContent::Blocks(vec![]),
+            None,
+            None,
+        )]);
+        assert_eq!(
+            body1["messages"][0]["content"],
+            json!([{ "type": "text", "text": "(empty)" }])
+        );
+
+        let body2 = req_body(vec![chat_message(
+            ChatRole::User,
+            MessageContent::Blocks(vec![text_block("")]),
+            None,
+            None,
+        )]);
+        assert_eq!(
+            body2["messages"][0]["content"],
+            json!([{ "type": "text", "text": "(empty)" }])
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_empty_text_without_tool_calls_becomes_empty_placeholder() {
+        for empty in [
+            "",
+            "   ",
+            "\n\t ",
+            "[System: Empty message content sanitised to satisfy protocol]",
+        ] {
+            let body_user = req_body(vec![chat_message(
+                ChatRole::User,
+                MessageContent::Text(empty.to_string()),
+                None,
+                None,
+            )]);
+            assert_eq!(
+                body_user["messages"][0]["content"],
+                json!("(empty)"),
+                "empty user text {empty:?} must emit placeholder"
+            );
+
+            let body_assistant = req_body(vec![
+                chat_message(
+                    ChatRole::User,
+                    MessageContent::Text("hello".to_string()),
+                    None,
+                    None,
+                ),
+                chat_message(
+                    ChatRole::Assistant,
+                    MessageContent::Text(empty.to_string()),
+                    None,
+                    None,
+                ),
+            ]);
+            assert_eq!(
+                body_assistant["messages"][1]["content"],
+                json!("(empty)"),
+                "empty assistant text {empty:?} must emit placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_messages_assistant_tool_use_with_empty_blocks_omits_text_block() {
+        let body = req_body(vec![
+            chat_message(
+                ChatRole::User,
+                MessageContent::Text("hi".to_string()),
+                None,
+                None,
+            ),
+            chat_message(
+                ChatRole::Assistant,
+                MessageContent::Blocks(vec![text_block("")]),
+                None,
+                one_call(),
+            ),
+        ]);
+        let content = body["messages"][1]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "tu_1");
+        assert!(
+            !content.iter().any(|b| b["type"] == "text"),
+            "no text block should be present"
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_assistant_whitespace_text_with_tool_calls_omits_text_block() {
+        let body = req_body(vec![
+            chat_message(
+                ChatRole::User,
+                MessageContent::Text("hi".to_string()),
+                None,
+                None,
+            ),
+            chat_message(
+                ChatRole::Assistant,
+                MessageContent::Text("  ".to_string()),
+                None,
+                one_call(),
+            ),
+        ]);
+        let content = body["messages"][1]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+
+        // Keep side: non-empty thinking text
+        let body_keep = req_body(vec![
+            chat_message(
+                ChatRole::User,
+                MessageContent::Text("hi".to_string()),
+                None,
+                None,
+            ),
+            chat_message(
+                ChatRole::Assistant,
+                MessageContent::Text("thinking".to_string()),
+                None,
+                one_call(),
+            ),
+        ]);
+        let content_keep = body_keep["messages"][1]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(content_keep.len(), 2);
+        assert_eq!(
+            content_keep[0],
+            json!({ "type": "text", "text": "thinking" })
+        );
+        assert_eq!(content_keep[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_request_body_tool_result_never_contains_empty_text() {
+        // Text("") case
+        let body_text = req_body(vec![
+            chat_message(
+                ChatRole::User,
+                MessageContent::Text("hi".to_string()),
+                None,
+                None,
+            ),
+            chat_message(
+                ChatRole::Assistant,
+                MessageContent::Text("".to_string()),
+                None,
+                one_call(),
+            ),
+            chat_message(
+                ChatRole::Tool,
+                MessageContent::Text("".to_string()),
+                Some("tu_1"),
+                None,
+            ),
+        ]);
+        assert_eq!(
+            body_text["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
+        assert_eq!(
+            body_text["messages"][2]["content"][0]["content"],
+            "(no output)"
+        );
+
+        // Blocks([text_block("")]) case
+        let body_blocks = req_body(vec![
+            chat_message(
+                ChatRole::User,
+                MessageContent::Text("hi".to_string()),
+                None,
+                None,
+            ),
+            chat_message(
+                ChatRole::Assistant,
+                MessageContent::Text("".to_string()),
+                None,
+                one_call(),
+            ),
+            chat_message(
+                ChatRole::Tool,
+                MessageContent::Blocks(vec![text_block("")]),
+                Some("tu_1"),
+                None,
+            ),
+        ]);
+        assert_eq!(
+            body_blocks["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
+        assert_eq!(
+            body_blocks["messages"][2]["content"][0]["content"],
+            "(no output)"
+        );
+
+        assert!(
+            !body_text.to_string().contains("\"text\":\"\""),
+            "body_text must not contain empty text: {body_text}"
+        );
+        assert!(
+            !body_blocks.to_string().contains("\"text\":\"\""),
+            "body_blocks must not contain empty text: {body_blocks}"
+        );
+    }
+
+    #[test]
+    fn anthropic_request_body_tool_result_keeps_image_only_blocks() {
+        let body = req_body(vec![
+            chat_message(
+                ChatRole::User,
+                MessageContent::Text("hi".to_string()),
+                None,
+                None,
+            ),
+            chat_message(
+                ChatRole::Assistant,
+                MessageContent::Text("".to_string()),
+                None,
+                one_call(),
+            ),
+            chat_message(
+                ChatRole::Tool,
+                MessageContent::Blocks(vec![img()]),
+                Some("tu_1"),
+                None,
+            ),
+        ]);
+        let tool_content = body["messages"][2]["content"][0]["content"]
+            .as_array()
+            .expect("array content");
+        assert_eq!(tool_content.len(), 1);
+        assert_eq!(tool_content[0]["type"], "image");
+        assert!(
+            !body.to_string().contains("(no output)"),
+            "image-only result should not contain '(no output)': {body}"
         );
     }
 
