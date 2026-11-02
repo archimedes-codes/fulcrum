@@ -10,6 +10,13 @@
 //! `CancellationToken` (a Stop cancels the call — the process is
 //! killed) and a per-request timeout (a stalled server ERRORS, it does
 //! not hang the turn).
+//!
+//! The client is SHAREABLE (`Sync`, held behind an `Arc` by the manager):
+//! every receiver is `&self`, because the only mutated state is interior —
+//! the `pending` map (a `Mutex`, locked only to insert/remove, never across an
+//! await, so replies serialize by `id`) and the `next_id` counter (atomic);
+//! the child sits behind a lock solely because `kill` must wait on it. Two
+//! concurrent requests on ONE `&StdioClient` therefore both proceed.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -37,8 +44,10 @@ pub struct StdioClient {
     /// lines by `id`).
     pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<RpcResponse>>>>,
     next_id: AtomicU64,
-    /// The child (killed on drop — `kill_on_drop` — and by `close`).
-    child: tokio::process::Child,
+    /// The child (killed on drop — `kill_on_drop` — and by `close`). Behind a
+    /// lock ONLY because `kill` must wait on it; the request path never touches
+    /// it, so calls never contend on it.
+    child: tokio::sync::Mutex<tokio::process::Child>,
     /// Set by the reader when the process exits (EOF on stdout).
     exited_rx: watch::Receiver<bool>,
 }
@@ -144,11 +153,11 @@ impl StdioClient {
             let _ = exited_for_reader.send(true);
         });
 
-        let mut client = StdioClient {
+        let client = StdioClient {
             tx,
             pending,
             next_id: AtomicU64::new(1),
-            child,
+            child: tokio::sync::Mutex::new(child),
             exited_rx,
         };
 
@@ -187,7 +196,7 @@ impl StdioClient {
     /// `Err` (a JSON-RPC `error` response, a timeout, a cancel, or the
     /// process exiting).
     async fn request_inner(
-        &mut self,
+        &self,
         method: &str,
         params: Value,
         timeout: Duration,
@@ -213,6 +222,10 @@ impl StdioClient {
             self.pending.lock().unwrap().remove(&id);
             return Err("the server process exited".to_string());
         }
+        // A clone of the exit watch (see the `wait_for` note in the `select!`
+        // below — `wait_for` needs `&mut`, and a clone is the `&self`-compatible
+        // handle on the SAME value).
+        let mut exited_rx = self.exited_rx.clone();
         let outcome = tokio::select! {
             r = tokio::time::timeout(timeout, rx) => match r {
                 Ok(Ok(resp)) => Ok(resp),
@@ -220,7 +233,10 @@ impl StdioClient {
                 Err(_) => Err(format!("timed out after {timeout:?}")),
             },
             _ = cancel.cancelled() => Err("cancelled".to_string()),
-            _ = self.exited_rx.wait_for(|&exited| exited) => Err("the server process exited".to_string()),
+            // `wait_for` takes `&mut self` (it registers a waker), so this races
+            // a CLONE of the watch receiver — a cheap handle on the same value,
+            // which is what keeps the receiver `&self`.
+            _ = exited_rx.wait_for(|&exited| exited) => Err("the server process exited".to_string()),
         };
         // Drop the pending (a late response is discarded).
         self.pending.lock().unwrap().remove(&id);
@@ -234,7 +250,7 @@ impl StdioClient {
     /// `tools/list` → the server's tools (name + description +
     /// `inputSchema`).
     pub async fn list_tools(
-        &mut self,
+        &self,
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<Vec<ToolInfo>, String> {
@@ -265,7 +281,7 @@ impl StdioClient {
     /// `tools/call` → the normalized result (the `content[]` text joined +
     /// the non-text count + `isError`).
     pub async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         args: &Value,
         timeout: Duration,
@@ -283,9 +299,12 @@ impl StdioClient {
     }
 
     /// Kill + reap the process (idempotent — `close_session` / a drop).
-    pub async fn kill(&mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+    /// `&self` because the child sits behind a lock (`kill`/`wait` need the
+    /// child by `&mut`, which the guard provides).
+    pub async fn kill(&self) {
+        let mut child = self.child.lock().await;
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 }
 
@@ -403,7 +422,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn connect_list_and_call_round_trip() {
-        let mut client = StdioClient::connect(
+        let client = StdioClient::connect(
             &fake_def(),
             &session_cwd(),
             Duration::from_secs(5),
@@ -439,7 +458,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hanging_tool_call_times_out() {
-        let mut client = StdioClient::connect(
+        let client = StdioClient::connect(
             &fake_def(),
             &session_cwd(),
             Duration::from_secs(5),
@@ -461,7 +480,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cancel_cancels_the_call() {
-        let mut client = StdioClient::connect(
+        let client = StdioClient::connect(
             &fake_def(),
             &session_cwd(),
             Duration::from_secs(5),
@@ -489,7 +508,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_json_rpc_error_is_an_error() {
-        let mut client = StdioClient::connect(
+        let client = StdioClient::connect(
             &fake_def(),
             &session_cwd(),
             Duration::from_secs(5),
@@ -511,7 +530,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dead_process_fails_pending_calls() {
-        let mut client = StdioClient::connect(
+        let client = StdioClient::connect(
             &fake_def(),
             &session_cwd(),
             Duration::from_secs(5),

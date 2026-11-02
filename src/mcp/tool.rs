@@ -118,23 +118,22 @@ fn miss_result(message: String, skipped: &[(String, String)]) -> ToolResult {
 /// `Error` — not auto-retried) contributes nothing, and IS reported: the
 /// caller must not answer "no such tool" when the answer was computed over a
 /// partial server set (issue #68).
-async fn collect_tools(manager: &mut McpManager, cancel: &CancellationToken) -> Collected {
+async fn collect_tools(manager: &McpManager, cancel: &CancellationToken) -> Collected {
     let mut out = Collected {
         tools: Vec::new(),
         skipped: Vec::new(),
     };
     for name in manager.server_names() {
         let outcome = manager.list_tools(&name, cancel, TIMEOUT).await;
-        // NOTE: bind the `Result` first — in a `let … else` the scrutinee's
-        // mutable borrow of `manager` is still live inside the `else` block, so
-        // reading `manager.state_of(&name)` there is a borrow error.
         match outcome {
             Ok(tools) => out
                 .tools
                 .extend(tools.into_iter().map(|t| (name.clone(), t))),
             Err(err) => {
+                // `state_of` returns an OWNED clone (the state lives behind a
+                // mutex) — there is no borrow of `manager` to juggle here.
                 let reason = match manager.state_of(&name) {
-                    Some(state) => skip_reason(state, &err),
+                    Some(state) => skip_reason(&state, &err),
                     // An unknown name (it was just in `server_names()`) — defensive.
                     None => format!("not usable: {err}"),
                 };
@@ -439,8 +438,11 @@ fn describe_block(name: &str, server: &str, tool: &super::types::ToolInfo) -> St
 /// computed over an empty scope is not an answer. `search` / `describe` filter
 /// their ANSWER by `server` too, so a scope never answers with a tool from
 /// outside itself.
+/// A `&McpManager` — the manager is a SHARED handle (`Arc<McpManager>` on the
+/// loop), so nested codemode calls (`Promise.all`) drive parallel `call_tool`s
+/// through it without borrowing the manager mutably.
 pub async fn mcp_tool(
-    manager: &mut McpManager,
+    manager: &McpManager,
     args: &Value,
     cancel: &CancellationToken,
 ) -> ToolResult {
@@ -850,39 +852,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn status_no_servers() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({}));
-        let r = mcp_tool(&mut manager, &serde_json::json!({}), &cancel()).await;
+        let (manager, _dir) = manager_with(&serde_json::json!({}));
+        let r = mcp_tool(&manager, &serde_json::json!({}), &cancel()).await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "No MCP servers configured.");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn status_lists_the_servers() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
-        let r = mcp_tool(&mut manager, &serde_json::json!({}), &cancel()).await;
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let r = mcp_tool(&manager, &serde_json::json!({}), &cancel()).await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "a: Disconnected");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn connect_action() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "connect": "a" }),
-            &cancel(),
-        )
-        .await;
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let r = mcp_tool(&manager, &serde_json::json!({ "connect": "a" }), &cancel()).await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "a: connected");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn search_finds_the_tool() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "search": "echo" }),
             &cancel(),
         )
@@ -892,28 +889,23 @@ mod tests {
         // line is the name `tool` / `describe` accept, so the model never has to
         // guess how to spell a server's tool.
         assert_eq!(text(&r), "[a] a_echo — echo its text argument");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn search_no_match() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "search": "zzz" }),
-            &cancel(),
-        )
-        .await;
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let r = mcp_tool(&manager, &serde_json::json!({ "search": "zzz" }), &cancel()).await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "No tools matching \"zzz\"");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn describe_shows_the_schema() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "echo" }),
             &cancel(),
         )
@@ -923,18 +915,13 @@ mod tests {
         assert!(t.contains("echo (a)"), "the tool + server: {t}");
         assert!(t.contains("\"type\": \"object\""), "the schema: {t}");
         assert!(t.contains("\"text\""), "the schema's property: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_lists_its_tools() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "server": "a" }),
-            &cancel(),
-        )
-        .await;
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let r = mcp_tool(&manager, &serde_json::json!({ "server": "a" }), &cancel()).await;
         assert!(!r.is_error);
         // The fake server's three tools (one per line), each under the CALLABLE
         // form (issue #118): this listing is scoped to ONE known server, so the
@@ -949,7 +936,7 @@ mod tests {
         // the call path accepts, so a copied name works verbatim.
         let callable = "a_echo";
         let d = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": callable }),
             &cancel(),
         )
@@ -959,61 +946,56 @@ mod tests {
             "`describe` accepts the printed name: {}",
             text(&d)
         );
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn call_tool_with_an_object_args() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "echo", "args": { "text": "hi" } }),
             &cancel(),
         )
         .await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "hi");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn call_tool_with_a_json_string_args() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "echo", "args": "{\"text\": \"hi\"}" }),
             &cancel(),
         )
         .await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "hi");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn call_tool_with_an_invalid_json_string_args_is_an_error() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "echo", "args": "not json" }),
             &cancel(),
         )
         .await;
         assert!(r.is_error, "a JSON-string parse failure is a tool error");
         assert!(text(&r).contains("Invalid JSON in args"), "{:?}", text(&r));
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ambiguous_tool_name_requires_the_server_param() {
         // Two servers (both the fake binary) — both have an `echo` tool.
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake", "b": "fake" }));
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "tool": "echo" }),
-            &cancel(),
-        )
-        .await;
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake", "b": "fake" }));
+        let r = mcp_tool(&manager, &serde_json::json!({ "tool": "echo" }), &cancel()).await;
         assert!(r.is_error, "an ambiguous tool name is an error");
         let t = text(&r);
         assert!(t.contains("ambiguous"), "{t}");
@@ -1023,14 +1005,14 @@ mod tests {
         );
         // With the `server` param, the ambiguity is resolved.
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "echo", "server": "a", "args": { "text": "x" } }),
             &cancel(),
         )
         .await;
         assert!(!r.is_error);
         assert_eq!(text(&r), "x");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[test]
@@ -1062,30 +1044,30 @@ mod tests {
     async fn the_auth_action_on_a_non_oauth_server_is_an_error() {
         // A stdio server is not an OAuth server → the `auth` action is an
         // error.
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "action": "auth", "server": "a" }),
             &cancel(),
         )
         .await;
         assert!(r.is_error);
         assert!(text(&r).contains("OAuth"), "{:?}", text(&r));
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_unknown_action_is_an_error() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "action": "bogus" }),
             &cancel(),
         )
         .await;
         assert!(r.is_error);
         assert!(text(&r).contains("Unknown action"), "{:?}", text(&r));
-        manager.close_all();
+        manager.close_all().await;
     }
 
     // ── issue #68: a skipped server FAILS the call ───────────────────
@@ -1152,14 +1134,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_skipped_server_fails_the_bare_call_and_names_it() {
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "tool": "nope" }),
-            &cancel(),
-        )
-        .await;
+        let r = mcp_tool(&manager, &serde_json::json!({ "tool": "nope" }), &cancel()).await;
         assert!(
             r.is_error,
             "a partial server set is not a successful 'not found'"
@@ -1168,15 +1145,15 @@ mod tests {
         assert!(t.contains("Tool not found: nope"), "{t}");
         assert!(t.contains("Skipped servers:"), "{t}");
         assert!(t.contains("dead"), "the skipped server is named: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn describe_fails_and_names_a_skipped_server() {
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "nope" }),
             &cancel(),
         )
@@ -1185,7 +1162,7 @@ mod tests {
         let t = text(&r);
         assert!(t.contains("Tool not found: nope"), "{t}");
         assert!(t.contains("dead"), "the skipped server is named: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1193,34 +1170,24 @@ mod tests {
         // A declared decision: a search computed over a partial server set is
         // not an answer — it fails, keeping the accurate `No tools matching`
         // prefix and naming what was skipped.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "search": "zzz" }),
-            &cancel(),
-        )
-        .await;
+        let r = mcp_tool(&manager, &serde_json::json!({ "search": "zzz" }), &cancel()).await;
         assert!(r.is_error, "a search over a partial server set fails");
         let t = text(&r);
         assert!(t.contains("No tools matching \"zzz\""), "{t}");
         assert!(t.contains("dead"), "the skipped server is named: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_plain_not_found_is_still_a_success_when_every_server_answered() {
         // The all-healthy case is unchanged: the same bytes, still a SUCCESS.
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "tool": "nope" }),
-            &cancel(),
-        )
-        .await;
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let r = mcp_tool(&manager, &serde_json::json!({ "tool": "nope" }), &cancel()).await;
         assert!(!r.is_error, "every server answered → a plain not found");
         assert_eq!(text(&r), "Tool not found: nope");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1229,10 +1196,10 @@ mod tests {
         // check. The named server answered → the search is complete over the
         // set the user asked about, so the plain `No tools matching` wording is
         // a SUCCESS (the same bytes as the all-healthy case).
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "search": "zzz", "server": "ok" }),
             &cancel(),
         )
@@ -1243,15 +1210,15 @@ mod tests {
             text(&r)
         );
         assert_eq!(text(&r), "No tools matching \"zzz\"");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_describe_scoped_to_an_answering_server_is_not_poisoned_by_a_dead_sibling() {
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "nope", "server": "ok" }),
             &cancel(),
         )
@@ -1262,17 +1229,17 @@ mod tests {
             text(&r)
         );
         assert_eq!(text(&r), "Tool not found: nope");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_search_scoped_to_the_skipped_server_still_fails_and_names_it() {
         // The other half of the rule: when the NAMED server is the one that
         // failed, the scoped set is partial and the call still fails naming it.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "search": "zzz", "server": "dead" }),
             &cancel(),
         )
@@ -1283,22 +1250,17 @@ mod tests {
         assert!(t.contains("Skipped servers: dead"), "{t}");
         // The healthy sibling answered — it is not a skip, named or not.
         assert!(!t.contains("ok ("), "only the scoped skip is named: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_unscoped_search_still_reports_every_skipped_server() {
         // The unscoped call's whole value is naming EVERY dead sibling — the
         // fix must leave those bytes alone.
-        let (mut manager, _dir) = manager_with(
+        let (manager, _dir) = manager_with(
             &serde_json::json!({ "ok": "fake", "dead": dead_server(), "dead2": dead_server() }),
         );
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "search": "zzz" }),
-            &cancel(),
-        )
-        .await;
+        let r = mcp_tool(&manager, &serde_json::json!({ "search": "zzz" }), &cancel()).await;
         assert!(
             r.is_error,
             "an unscoped search over a partial server set fails"
@@ -1311,17 +1273,17 @@ mod tests {
             !t.contains("ok ("),
             "the answering server is not a skip: {t}"
         );
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_call_on_a_healthy_server_is_not_broken_by_a_skipped_one() {
         // The rule must not over-apply: a successful call is never downgraded
         // because an unrelated server is dead.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "echo", "args": { "text": "hi" } }),
             &cancel(),
         )
@@ -1331,14 +1293,14 @@ mod tests {
         // The same with the server named explicitly: the resolution never
         // consults the dead sibling, so the call is untouched by it.
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "echo", "server": "ok", "args": { "text": "scoped" } }),
             &cancel(),
         )
         .await;
         assert!(!r.is_error, "a server-scoped call stays a success");
         assert_eq!(text(&r), "scoped");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     // ── the `server` param scopes the ANSWER, not just the failure wording ──
@@ -1349,10 +1311,10 @@ mod tests {
         // `narrow` must answer about `narrow` — the scope the caller named —
         // and never hand back `ok`'s tool. `narrow` ANSWERED, so the scoped miss
         // is the success-shaped "not found" the scoping rule promises.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "narrow": narrow_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "echo", "server": "narrow" }),
             &cancel(),
         )
@@ -1370,23 +1332,23 @@ mod tests {
         // The unscoped call still finds it — the tool exists, the SCOPE lacked
         // it (the two facts must stay distinguishable).
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "echo" }),
             &cancel(),
         )
         .await;
         assert!(!r.is_error);
         assert!(text(&r).contains("echo (ok)"), "{t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_describe_scoped_to_the_server_that_serves_the_tool_is_unchanged() {
         // The scoping fix must not cost the happy path its bytes.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "narrow": narrow_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "echo", "server": "ok" }),
             &cancel(),
         )
@@ -1395,7 +1357,7 @@ mod tests {
         let t = text(&r);
         assert!(t.contains("echo (ok)"), "the tool + server: {t}");
         assert!(t.contains("\"text\""), "the schema's property: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1403,10 +1365,10 @@ mod tests {
         // `dead` exists and was skipped; `no-such-server` never existed at all.
         // The second case must NOT read as the clean negative `No tools
         // matching "…"` — the scope named nothing, so nothing was searched.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "search": "echo", "server": "no-such-server" }),
             &cancel(),
         )
@@ -1421,15 +1383,15 @@ mod tests {
             !t.contains("No tools matching"),
             "the clean-negative wording must not be reachable this way: {t}"
         );
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_describe_scoped_to_a_never_configured_server_fails_naming_it() {
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "echo", "server": "no-such-server" }),
             &cancel(),
         )
@@ -1444,7 +1406,7 @@ mod tests {
             !t.contains("Tool not found"),
             "the tool DOES exist — the scope did not: {t}"
         );
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1452,10 +1414,10 @@ mod tests {
         // The model's next move is to retry with a real name, so the failure
         // carries the configured names (the authoritative list — the same one
         // `collect_tools` walks).
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "narrow": narrow_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "search": "echo", "server": "typo" }),
             &cancel(),
         )
@@ -1465,7 +1427,7 @@ mod tests {
         assert!(t.contains("Unknown MCP server: typo"), "{t}");
         assert!(t.contains("ok"), "the real names are offered: {t}");
         assert!(t.contains("narrow"), "the real names are offered: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1474,10 +1436,10 @@ mod tests {
         // def is what makes it a server), it simply cannot be reached. It is a
         // SKIP — the issue #68 rule — not an unknown name, and the empty-config
         // case says so in its own words.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "nope", "server": "dead" }),
             &cancel(),
         )
@@ -1489,7 +1451,7 @@ mod tests {
             "a configured server is never 'unknown': {t}"
         );
         assert!(t.contains("Skipped servers: dead"), "{t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1497,13 +1459,13 @@ mod tests {
         // The list path and a `server`-pinned call take the SAME scope rule as
         // `search` / `describe` — one vocabulary for "that server does not
         // exist", wherever the model meets it.
-        let (mut manager, _dir) =
+        let (manager, _dir) =
             manager_with(&serde_json::json!({ "ok": "fake", "dead": dead_server() }));
         for args in [
             serde_json::json!({ "server": "ghost" }),
             serde_json::json!({ "tool": "echo", "server": "ghost", "args": { "text": "x" } }),
         ] {
-            let r = mcp_tool(&mut manager, &args, &cancel()).await;
+            let r = mcp_tool(&manager, &args, &cancel()).await;
             assert!(r.is_error, "{args} → a failure: {:?}", text(&r));
             let t = text(&r);
             assert!(t.contains("Unknown MCP server: ghost"), "{t}");
@@ -1511,12 +1473,7 @@ mod tests {
         }
         // A CONFIGURED scope is untouched by the guard: the list path keeps its
         // own shape (a server that exists is listed, not rejected).
-        let r = mcp_tool(
-            &mut manager,
-            &serde_json::json!({ "server": "ok" }),
-            &cancel(),
-        )
-        .await;
+        let r = mcp_tool(&manager, &serde_json::json!({ "server": "ok" }), &cancel()).await;
         assert!(!r.is_error, "a configured scope is untouched");
         assert!(text(&r).contains("echo:"), "{:?}", text(&r));
         // And a configured-but-UNREACHABLE one on the list path keeps the
@@ -1524,7 +1481,7 @@ mod tests {
         // its name. (The list path is un-collected, so it never reaches the
         // `Skipped servers:` note; this pins that the guard did not swallow it.)
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "server": "dead" }),
             &cancel(),
         )
@@ -1538,16 +1495,16 @@ mod tests {
             !t.contains("Unknown MCP server"),
             "a configured server is never 'unknown': {t}"
         );
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_unknown_server_scope_on_an_empty_config_says_so() {
         // No servers at all: the failure still names the scope and states the
         // real reason rather than listing an empty candidate set.
-        let (mut manager, _dir) = manager_with(&serde_json::json!({}));
+        let (manager, _dir) = manager_with(&serde_json::json!({}));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "search": "echo", "server": "anything" }),
             &cancel(),
         )
@@ -1556,7 +1513,7 @@ mod tests {
         let t = text(&r);
         assert!(t.contains("Unknown MCP server: anything"), "{t}");
         assert!(t.contains("no MCP servers are configured"), "{t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1568,12 +1525,12 @@ mod tests {
         // message no longer claims the server was never CONFIGURED, which would
         // contradict the user's own settings file, and that it names the drop
         // reasons the manager can see without a settings read.
-        let (mut manager, _dir) = manager_with(&serde_json::json!({
+        let (manager, _dir) = manager_with(&serde_json::json!({
             "ok": "fake",
             "switched-off": { "command": fake_bin(), "disabled": true },
         }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "search": "echo", "server": "switched-off" }),
             &cancel(),
         )
@@ -1594,7 +1551,7 @@ mod tests {
             t.contains("disabled"),
             "and the message says a switched-off entry is not held: {t}"
         );
-        manager.close_all();
+        manager.close_all().await;
     }
 
     // ── issue #118: server-prefixed tool names (`<server>_<tool>`) ────
@@ -1604,9 +1561,9 @@ mod tests {
         // TWO servers both serving `echo`: the prefixed spelling names ONE of
         // them, so the ambiguity rule must not fire — a resolved prefix already
         // decided the server, and the raw-name tie arm is not this call's path.
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake", "b": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake", "b": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "a_echo", "args": { "text": "x" } }),
             &cancel(),
         )
@@ -1617,21 +1574,21 @@ mod tests {
         assert!(!t.contains("ambiguous"), "a prefix names one server: {t}");
         // The `mcp__<server>__<tool>` alias is the same call.
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "mcp__a__echo", "args": { "text": "y" } }),
             &cancel(),
         )
         .await;
         assert!(!r.is_error, "the alias form resolves: {:?}", text(&r));
         assert_eq!(text(&r), "y");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_prefixed_describe_shows_the_schema() {
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "a_echo" }),
             &cancel(),
         )
@@ -1643,7 +1600,7 @@ mod tests {
         assert!(t.contains("a_echo (a)"), "the tool + server: {t}");
         assert!(t.contains("\"type\": \"object\""), "the schema: {t}");
         assert!(t.contains("\"text\""), "the schema's property: {t}");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1652,12 +1609,12 @@ mod tests {
         // `github_enterprise`: splitting on the FIRST `_` would read server
         // `github` + tool `enterprise_echo`, a pair nobody serves, so this call
         // would fail. Success pins the LONGEST known-server prefix win.
-        let (mut manager, _dir) = manager_with(&serde_json::json!({
+        let (manager, _dir) = manager_with(&serde_json::json!({
             "github": narrow_server(),
             "github_enterprise": "fake",
         }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "github_enterprise_echo", "args": { "text": "x" } }),
             &cancel(),
         )
@@ -1668,7 +1625,7 @@ mod tests {
             text(&r)
         );
         assert_eq!(text(&r), "x");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1677,9 +1634,9 @@ mod tests {
         // prefix that no server answers to is a wrong claim about where the tool
         // lives, so it must not read as the plain `Tool not found` success the
         // raw-name rule gives (issue #118 layered onto #68, not replacing it).
-        let (mut manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
+        let (manager, _dir) = manager_with(&serde_json::json!({ "a": "fake" }));
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "tool": "atlassian_echo" }),
             &cancel(),
         )
@@ -1690,14 +1647,14 @@ mod tests {
         assert!(t.contains("a_echo"), "the likely spelling is named: {t}");
         // Same for `describe`.
         let r = mcp_tool(
-            &mut manager,
+            &manager,
             &serde_json::json!({ "describe": "atlassian_echo" }),
             &cancel(),
         )
         .await;
         assert!(r.is_error, "a wrong prefix fails a describe too");
         assert!(text(&r).contains("a_echo"), "{:?}", text(&r));
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[test]

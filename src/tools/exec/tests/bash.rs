@@ -361,6 +361,8 @@ async fn bash_cancel_kills_child() {
         home: None,
         web: Default::default(),
         render_requester: None,
+        // (B1) No event sink: emitting is a silent no-op here.
+        event_sink: None,
     };
     let handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -524,6 +526,8 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
         home: None,
         web: Default::default(),
         render_requester: None,
+        // (B1) No event sink: emitting is a silent no-op here.
+        event_sink: None,
     };
     let handle = tokio::spawn(async move {
         execute_tool(

@@ -48,6 +48,8 @@ pub(crate) fn ctx(cwd: &Path) -> ToolCtx {
         home: None,
         web: Default::default(),
         render_requester: None,
+        // (B1) No event sink: emitting is a silent no-op here.
+        event_sink: None,
     }
 }
 

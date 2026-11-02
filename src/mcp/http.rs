@@ -27,12 +27,19 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 pub type TokenProvider = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// A connected streamable-HTTP MCP server.
+///
+/// Shareable (`Sync`, held behind an `Arc` by the manager): every receiver is
+/// `&self`, and the only mutated state is interior — `next_id` (atomic) and
+/// `session_id` (a lock, held only to read or write the id itself).
 pub struct HttpClient {
     client: reqwest::Client,
     url: String,
     /// The `Mcp-Session-Id` (set by the server's `initialize` response —
-    /// resent on every subsequent request).
-    session_id: Option<String>,
+    /// resent on every subsequent request). Behind a lock because a `&self`
+    /// request path must WRITE it (the server first returns it on
+    /// `initialize`); a concurrent call's update serializes against the read
+    /// that decides this call's header.
+    session_id: tokio::sync::Mutex<Option<String>>,
     /// The static `Authorization` header (a `Bearer` token / env-resolved
     /// token; `None` for an OAuth server — its token comes from the
     /// `get_token` provider per request).
@@ -98,10 +105,10 @@ impl HttpClient {
             AuthSpec::OAuth { .. } => None,
         };
         let client = build_client(timeout);
-        let mut http = HttpClient {
+        let http = HttpClient {
             client,
             url: def.url.clone(),
-            session_id: None,
+            session_id: tokio::sync::Mutex::new(None),
             auth_header,
             get_token,
             is_oauth: matches!(def.auth, AuthSpec::OAuth { .. }),
@@ -130,8 +137,15 @@ impl HttpClient {
     /// is a JSON object OR an SSE stream — `read_sse_response` handles the
     /// latter): `Ok(result)` / `Err` (a JSON-RPC `error`, a 401 →
     /// `needs-auth` (OAuth) / HTTP error, a timeout, a cancel).
+    ///
+    /// CONCURRENT-SAFE: `&self` — the shared state is `next_id` (atomic) and
+    /// `session_id`, and the `session_id` lock is held ONLY to read or write
+    /// the id itself (never across the `send` / body awaits), so a concurrent
+    /// call's `session_id` update simply serializes against this call's read.
+    /// The response is matched by this request's own `id`, so no per-call
+    /// interleaving hazard exists.
     async fn send_request(
-        &mut self,
+        &self,
         method: &str,
         params: Value,
         cancel: &CancellationToken,
@@ -143,8 +157,13 @@ impl HttpClient {
         let mut req = self.client.post(&self.url);
         req = req.header("Content-Type", "application/json");
         req = req.header("Accept", "application/json, text/event-stream");
-        if let Some(session) = &self.session_id {
-            req = req.header("Mcp-Session-Id", session);
+        {
+            // The lock is released before the request is sent (the header is
+            // an owned clone by then).
+            let session = self.session_id.lock().await;
+            if let Some(sid) = session.as_ref() {
+                req = req.header("Mcp-Session-Id", sid);
+            }
         }
         // The `Authorization` header: the static `Bearer` token, else (an
         // OAuth server) the current token from the provider (the Task 5
@@ -165,13 +184,15 @@ impl HttpClient {
         }
         .map_err(|e| e.to_string())?;
         // The `Mcp-Session-Id` response header (stored + resent on every
-        // subsequent request).
-        if let Some(sid) = resp
+        // subsequent request). The clone takes the value OUT of the header map
+        // so the `session_id` lock is never held across an await.
+        let sid = resp
             .headers()
             .get("Mcp-Session-Id")
             .and_then(|v| v.to_str().ok())
-        {
-            self.session_id = Some(sid.to_string());
+            .map(str::to_string);
+        if let Some(sid) = sid {
+            *self.session_id.lock().await = Some(sid);
         }
         let status = resp.status();
         if status.as_u16() == 401 {
@@ -224,7 +245,7 @@ impl HttpClient {
     /// delivers the `message` event times out on the `read_timeout`). Raced
     /// against `cancel`.
     async fn read_sse_response(
-        &mut self,
+        &self,
         resp: reqwest::Response,
         id: u64,
         cancel: &CancellationToken,
@@ -265,13 +286,17 @@ impl HttpClient {
     }
 
     /// A notification (NO `id` — no response expected; best-effort).
-    async fn send_notification(&mut self, method: &str) -> Result<(), String> {
+    async fn send_notification(&self, method: &str) -> Result<(), String> {
         let body = json!({ "jsonrpc": "2.0", "method": method });
         let mut req = self.client.post(&self.url);
         req = req.header("Content-Type", "application/json");
         req = req.header("Accept", "application/json, text/event-stream");
-        if let Some(session) = &self.session_id {
-            req = req.header("Mcp-Session-Id", session);
+        {
+            // The lock covers only the header read (released before the send).
+            let session = self.session_id.lock().await;
+            if let Some(sid) = session.as_ref() {
+                req = req.header("Mcp-Session-Id", sid);
+            }
         }
         if let Some(a) = self
             .auth_header
@@ -291,10 +316,7 @@ impl HttpClient {
 
     /// `tools/list` → the server's tools (name + description +
     /// `inputSchema`).
-    pub async fn list_tools(
-        &mut self,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<ToolInfo>, String> {
+    pub async fn list_tools(&self, cancel: &CancellationToken) -> Result<Vec<ToolInfo>, String> {
         let result = self.send_request("tools/list", json!({}), cancel).await?;
         Ok(result
             .get("tools")
@@ -320,7 +342,7 @@ impl HttpClient {
     /// `tools/call` → the normalized result (the `content[]` text joined +
     /// the non-text count + `isError`).
     pub async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         args: &Value,
         cancel: &CancellationToken,
@@ -526,7 +548,7 @@ mod tests {
         let handler: Arc<Mutex<TestHandler>> = Arc::new(Mutex::new(json_handler("")));
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let server = http_server(listener, handler, recorded.clone());
-        let mut client = HttpClient::connect(
+        let client = HttpClient::connect(
             &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
             Duration::from_secs(5),
             &cancel(),
@@ -558,7 +580,7 @@ mod tests {
         let handler: Arc<Mutex<TestHandler>> = Arc::new(Mutex::new(sse_handler(false)));
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let server = http_server(listener, handler, recorded.clone());
-        let mut client = HttpClient::connect(
+        let client = HttpClient::connect(
             &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
             Duration::from_secs(5),
             &cancel(),
@@ -585,7 +607,7 @@ mod tests {
             Arc::new(Mutex::new(json_handler("\r\nMcp-Session-Id: sess-123")));
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let server = http_server(listener, handler, recorded.clone());
-        let mut client = HttpClient::connect(
+        let client = HttpClient::connect(
             &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
             Duration::from_secs(5),
             &cancel(),
@@ -707,7 +729,7 @@ mod tests {
         // 20× headroom proves it as well as 4× did, and stops the coin
         // flip. The bound stays SMALL on purpose: it must stay far below
         // what a genuinely hung stream would take to trip some OTHER test.
-        let mut client = HttpClient::connect(
+        let client = HttpClient::connect(
             &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
             Duration::from_secs(1),
             &cancel(),
@@ -859,7 +881,7 @@ mod tests {
             // 10 s: LONG, so NOTHING but the cancel can end the call (the
             // fixture stalls 6 s, the `connect_timeout` is 5 s — a short read
             // bound here would let a timeout masquerade as the observable).
-            let mut client = HttpClient::connect(
+            let client = HttpClient::connect(
                 &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
                 Duration::from_secs(10),
                 &cancel(),
@@ -938,7 +960,7 @@ mod tests {
             // writes a byte every 50 ms, so the IDLE bound never trips on a
             // healthy stream — that is `http_a_slow_sse_stream_completes`'s
             // territory; here the bound only has to stay out of the way.)
-            let mut client = HttpClient::connect(
+            let client = HttpClient::connect(
                 &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
                 Duration::from_secs(20),
                 &cancel(),
@@ -1169,7 +1191,7 @@ mod tests {
             let handler: Arc<Mutex<TestHandler>> = Arc::new(Mutex::new(error_handler(sse)));
             let recorded = Arc::new(Mutex::new(Vec::new()));
             let server = http_server(listener, handler, recorded);
-            let mut client = HttpClient::connect(
+            let client = HttpClient::connect(
                 &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
                 Duration::from_secs(5),
                 &cancel(),
@@ -1205,7 +1227,7 @@ mod tests {
         let handler: Arc<Mutex<TestHandler>> = Arc::new(Mutex::new(json_handler("")));
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let server = http_server(listener, handler, recorded.clone());
-        let mut client = HttpClient::connect(
+        let client = HttpClient::connect(
             &http_def(
                 &format!("http://{addr}/mcp"),
                 AuthSpec::Bearer {
@@ -1267,7 +1289,7 @@ mod tests {
         let handler: Arc<Mutex<TestHandler>> = Arc::new(Mutex::new(json_handler("")));
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let server = http_server(listener, handler, recorded.clone());
-        let mut client = HttpClient::connect(
+        let client = HttpClient::connect(
             &http_def(&format!("http://{addr}/mcp"), AuthSpec::None),
             Duration::from_secs(5),
             &cancel(),
@@ -1350,7 +1372,7 @@ mod tests {
         // this test's whole point includes the static-header loop at `:160`.
         let mut def = http_def(&format!("http://{addr}/mcp"), AuthSpec::None);
         def.headers = BTreeMap::from([("X-Custom".to_string(), "v1".to_string())]);
-        let mut client = HttpClient::connect(&def, Duration::from_secs(5), &cancel(), None)
+        let client = HttpClient::connect(&def, Duration::from_secs(5), &cancel(), None)
             .await
             .expect("the handshake completes");
         let _ = client

@@ -48,6 +48,29 @@ const BASH_DESCRIPTION: &str = "Run a shell command (cmd.exe /d /s /c; the strin
     failed; `timeout /t` cannot run here (this child has no console input) — wait with \
     `ping -n 20 127.0.0.1 > NUL`.";
 
+/// The `codemode` tool description — the ONE literal (ADR 0017: the prompt's
+/// `<tools>` section and the API `tools[]` both render `advertised_specs`, so
+/// a second copy could only drift).
+///
+/// HARD CONSTRAINT on the wording, identical to [`BASH_DESCRIPTION`]'s: the
+/// string must contain NEITHER the substring `read` NOR the substring
+/// `subagent`, because `src-tauri/tests/worker_e2e.rs`
+/// (`full_turn_real_worker_canned_provider`) asserts
+/// `!tools_section.contains("read") && !tools_section.contains("subagent")`
+/// over the rendered `<tools>` section — and that section is rendered from
+/// this literal on every platform, so a stray `reads` / `thread` / `spread`
+/// reddens the Windows CI leg. `the_codemode_description_never_names_another_advertised_tool`
+/// keeps the ban visible from Linux. Hence `Evaluate`, `callable`, `discover`,
+/// `built-in` — never `read`, `reads`, `thread`, `spread`, `already`.
+const CODEMODE_DESCRIPTION: &str = "Evaluate a JavaScript program and return its final \
+    value. The program runs in an embedded JavaScript VM with memory, stack and wall-clock \
+    limits; those limits bound the run, they are not a permission boundary. The program may \
+    call any built-in or MCP tool through `tools.<name>(args)`, await them like any Promise, \
+    and discover the full callable set through `ALL_TOOLS` / `searchTools` / `describeTool`. \
+    Every nested call passes the same policy gate as a direct call, so a script cannot \
+    reach past a denial — and a script that calls a gated tool in a loop can prompt you \
+    once per call.";
+
 /// The tool specs sent to the model (the built-ins + the suite tools —
 /// the schemas mirror the `tools.ts` override). `pub(crate)` so the
 /// `dispatch_native` driver derives the child's tool set (the names
@@ -64,6 +87,17 @@ pub(crate) fn tool_specs() -> Vec<ToolSpec> {
                     "timeout_ms": { "type": "number" }
                 },
                 "required": ["command"]
+            }),
+        },
+        ToolSpec {
+            name: "codemode".into(),
+            description: CODEMODE_DESCRIPTION.into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string" }
+                },
+                "required": ["code"]
             }),
         },
         ToolSpec {
@@ -518,9 +552,10 @@ mod tests {
         }
     }
 
-    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 12] {
+    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 13] {
         [
             ("bash", &["command", "timeout_ms"]),
+            ("codemode", &["code"]),
             ("read", &["path", "offset", "limit"]),
             ("write", &["path", "content"]),
             ("edit", &["path", "old_text", "new_text", "replace_all"]),
@@ -1063,6 +1098,34 @@ mod tests {
             "same guard as above for `subagent`: the e2e asserts the <tools> section \
              with only `bash` enabled contains neither tool name, and a description \
              that trips it reddens the Worker e2e. got {d:?}"
+        );
+    }
+
+    /// The `codemode` description carries the SAME ban as `bash`'s — `read`
+    /// and `subagent` may not appear as substrings, on any platform — for the
+    /// same reason, with one extra sharpness: `codemode`'s own prose is ABOUT
+    /// calling other tools, so the ban is far easier to trip by accident than
+    /// `bash`'s is (a sentence saying what the script may "read" is the natural
+    /// phrasing this forbids). `worker_e2e.rs`'s enabled-only `<tools>` section
+    /// renders every advertised description, so the trip is a Windows-CI-only
+    /// failure without this pin.
+    #[test]
+    fn the_codemode_description_never_names_another_advertised_tool() {
+        let d = tool_specs()
+            .into_iter()
+            .find(|s| s.name == "codemode")
+            .expect("`codemode` is advertised")
+            .description;
+        assert!(
+            !d.contains("read"),
+            "`worker_e2e.rs`'s `full_turn_real_worker_canned_provider` asserts the \
+             rendered <tools> section does not contain `read`; the section is built \
+             from this description, so the substring is banned outright. got {d:?}"
+        );
+        assert!(
+            !d.contains("subagent"),
+            "same guard as above for `subagent`: a description that trips it reddens \
+             the Worker e2e on the Windows leg. got {d:?}"
         );
     }
 

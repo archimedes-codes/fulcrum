@@ -68,6 +68,28 @@ impl ToolResult {
     }
 }
 
+/// The stream a tool call reports ITS partial progress to (the bridge's
+/// nested calls emit live `tool_execution_update` rows through this).
+///
+/// (B1) The `AgentLoop` implements the pipeline behind this trait — the
+/// `ToolCtx` carries only a shareable HANDLE to it, because the codemode
+/// bridge holds a cloned `&ToolCtx` and can never reach the loop.
+pub trait ToolEventSink: Send + Sync {
+    /// Report one live `tool_execution_update` for one call.
+    ///
+    /// `tool_call_id` is supplied by the CALLER — per the frozen cross-task
+    /// contract it is the PARENT call's id, so the frame merges into the row
+    /// the parent's `tool_execution_start` already announced instead of
+    /// minting a stray top-level transcript row per nested call.
+    fn emit_tool_execution_update(
+        &self,
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+        partial_result: Value,
+    );
+}
+
 /// The execution context for a tool call: the session's `cwd` (the base of
 /// the path-param tools' sandbox), the boundary / policy the executor
 /// enforces (ADR 0030), and the cancellation token wired to the tool's
@@ -153,4 +175,40 @@ pub struct ToolCtx {
     pub web: crate::agent::web::config::WebConfig,
     /// Render requester for escalated headless webview fetches (Task 7).
     pub render_requester: Option<std::sync::Arc<dyn crate::agent::web::RenderRequester>>,
+    /// (B1) The stream this tool call reports LIVE partial progress to — a
+    /// `None` handle (every direct fixture) is a silent no-op. `Arc` so the
+    /// derived `Clone` SHARES the sink: the codemode bridge clones the ctx it
+    /// was given and the clone must keep streaming.
+    pub event_sink: Option<std::sync::Arc<dyn ToolEventSink>>,
+}
+
+impl ToolCtx {
+    /// (B1) Report one live `tool_execution_update` for THIS call (the
+    /// codemode bridge's per-nested-call streaming). No-ops when the ctx
+    /// carries no sink (every test fixture). `tool_call_id` is the id the
+    /// caller owns — per the frozen contract the bridge passes the PARENT
+    /// codemode call's id, the SAME id the normalized `tool_call_update` row
+    /// addresses (a nested `<parentCallId>/<n>` id would mint a stray
+    /// top-level row — the hazard `normalize.rs` documents at its
+    /// `TurnState::announced_tool_calls` field).
+    pub fn emit_tool_execution_update(
+        &self,
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        args: Value,
+        partial_result: Value,
+    ) {
+        // `if let`, not `.map(..)`: a unit-returning `map` is
+        // `clippy::option_map_unit_fn` and this repo gates on zero clippy
+        // warnings. The plan's `map(..)` spelling was cosmetic — the `None`
+        // no-op (every harness-free fixture) is identical either way.
+        if let Some(sink) = self.event_sink.as_ref() {
+            sink.emit_tool_execution_update(
+                tool_call_id.into(),
+                tool_name.into(),
+                args,
+                partial_result,
+            );
+        }
+    }
 }

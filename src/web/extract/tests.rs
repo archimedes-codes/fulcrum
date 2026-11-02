@@ -28,6 +28,8 @@ fn test_ctx() -> ToolCtx {
         home: None,
         web: crate::agent::web::config::WebConfig::default(),
         render_requester: None,
+        // (B1) No event sink: emitting is a silent no-op here.
+        event_sink: None,
     }
 }
 

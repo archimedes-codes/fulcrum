@@ -83,7 +83,7 @@ fn allow_rule(path: &str) -> String {
 /// empty scratch home: the read boundary is then EXACTLY the `cwd` and
 /// the deny-list is whatever the test created, never whatever happens to
 /// be in the developer's real `~/.agents`.
-fn build_policy_loop(
+pub(super) fn build_policy_loop(
     provider: Box<dyn Provider>,
     events: mpsc::UnboundedSender<RpcEvent>,
     sink: Arc<dyn EventSink>,
@@ -131,7 +131,7 @@ fn read_call(id: &str, path: &str) -> ToolCall {
 /// frontend copies the emitted value back verbatim, so the guard pins pass the
 /// string they read out of the recorded `permission-request`, NEVER a
 /// fabricated one). The boundary clicks (`allow` / `trust-space`) pass `None`.
-async fn answer_permission(
+pub(super) async fn answer_permission(
     pending: PendingPermissions,
     session: &str,
     option: &str,

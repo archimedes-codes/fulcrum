@@ -28,4 +28,4 @@ pub fn shell_sandbox_available() -> bool {
 }
 
 pub use exec::execute_tool;
-pub use types::{ContentBlock, ImageRef, ToolCtx, ToolResult};
+pub use types::{ContentBlock, ImageRef, ToolCtx, ToolEventSink, ToolResult};

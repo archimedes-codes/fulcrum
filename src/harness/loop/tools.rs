@@ -160,9 +160,25 @@ impl AgentLoop {
                 // mid-mcp-call cancels the in-flight request + kills the stdio
                 // child; the flow's internal `cancel` is the TURN token too).
                 tokio::select! {
-                    r = mcp_tool(&mut self.mcp, &tc.arguments, turn) => r,
+                    r = mcp_tool(&self.mcp, &tc.arguments, turn) => r,
                     _ = turn.cancelled() => Self::cancelled_tool_result(),
                 }
+            }
+            "codemode" => {
+                // The `&mut self` here is exactly WHY the bridge takes `&AgentLoop`
+                // and dispatches nested built-ins through `execute_tool` on a
+                // CLONED `ToolCtx`: a script's nested call cannot re-enter this
+                // method, so the gate corridor is re-implemented in
+                // `loop/codemode.rs` against `&self` instead of reused from here.
+                // The engine is per-call (no field on the loop) and the turn token
+                // is the one cancellation authority.
+                crate::agent::harness::r#loop::codemode::exec_codemode(
+                    self,
+                    &tc.id,
+                    &tc.arguments,
+                    turn,
+                )
+                .await
             }
             other => ToolResult {
                 content: vec![ContentBlock::Text {

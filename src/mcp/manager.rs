@@ -7,9 +7,18 @@
 //! propagates with `?` instead and leaves the entry in `Connecting` — a
 //! documented gap, `docs/features/mcp-known-gaps.md` ("A stdio connect failure
 //! never reaches `McpState::Error`").
+//!
+//! The manager is SHARED as `Arc<McpManager>` (the harness holds it that way);
+//! per-server state is behind per-entry mutexes (`std::sync::Mutex` for
+//! `state`/`tools`, so the sync readers stay sync, `tokio::sync::Mutex` for
+//! `client`) — which is what lets every receiver be `&self` and any number of
+//! `call_tool`s be in flight concurrently. The client GUARD is never held
+//! across a transport await (the `Arc<Client>` is cloned out first); holding
+//! it would serialize same-server calls.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -33,7 +42,7 @@ impl Client {
     /// `tools/list` (the `timeout` is the stdio bound; an HTTP client uses
     /// its own `read_timeout` — the `timeout` is ignored).
     async fn list_tools(
-        &mut self,
+        &self,
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<Vec<ToolInfo>, String> {
@@ -46,7 +55,7 @@ impl Client {
     /// `tools/call` (the `timeout` is the stdio bound; an HTTP client uses
     /// its own `read_timeout` — the `timeout` is ignored).
     async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         args: &Value,
         timeout: Duration,
@@ -61,14 +70,27 @@ impl Client {
 
 /// A manager's per-server entry (the def + the connection state + the
 /// connected client (if any) + the cached `tools/list`).
+///
+/// The three mutable fields are individually locked, and the split is
+/// load-bearing:
+/// - `state` / `tools` are `std::sync::Mutex`es because `status_lines` and
+///   `state_of` read `state` from a SYNC `&self` method and must never await —
+///   every lock scope on these two is await-free;
+/// - `client` is a `tokio::sync::Mutex` over an `Arc<Client>`: it is the
+///   lazy-connect serializer (a second concurrent caller waits at it, sees
+///   `Some`, and returns), and its guard is NEVER held across a transport
+///   await — `call_tool` / `list_tools` clone the `Arc` out and drop the guard
+///   first, so calls on the SAME server run concurrently too (the stdio
+///   pending map routes replies by id; the HTTP `session_id` + `next_id` are
+///   internally serialized).
 struct ServerEntry {
     def: ServerDef,
-    state: McpState,
-    client: Option<Client>,
-    tools: Option<Vec<ToolInfo>>,
+    state: std::sync::Mutex<McpState>,
+    client: tokio::sync::Mutex<Option<Arc<Client>>>,
+    tools: std::sync::Mutex<Option<Vec<ToolInfo>>>,
 }
 
-/// The MCP server manager (one per `AgentLoop`).
+/// The MCP server manager (one per `AgentLoop`, shared as `Arc<McpManager>`).
 pub struct McpManager {
     servers: BTreeMap<String, ServerEntry>,
     project_cwd: PathBuf,
@@ -97,9 +119,9 @@ impl McpManager {
                     name,
                     ServerEntry {
                         def,
-                        state: McpState::Disconnected,
-                        client: None,
-                        tools: None,
+                        state: std::sync::Mutex::new(McpState::Disconnected),
+                        client: tokio::sync::Mutex::new(None),
+                        tools: std::sync::Mutex::new(None),
                     },
                 )
             })
@@ -122,8 +144,18 @@ impl McpManager {
 
     /// A server's current state (`None` = no such server). For callers that must
     /// report WHY a server was unavailable, not just that it was.
-    pub fn state_of(&self, name: &str) -> Option<&McpState> {
-        self.servers.get(name).map(|entry| &entry.state)
+    ///
+    /// Returns an OWNED clone (the state lives behind a `std::sync::Mutex`, so
+    /// there is no reference to hand out) and stays SYNC — a caller must be able
+    /// to ask this from a sync path (see `status_lines`).
+    pub fn state_of(&self, name: &str) -> Option<McpState> {
+        self.servers.get(name).map(|entry| {
+            entry
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        })
     }
 
     /// The server names (for the tests / the `status` action).
@@ -139,9 +171,12 @@ impl McpManager {
         }
         self.servers
             .iter()
-            .map(|(name, entry)| match &entry.state {
-                McpState::Error { text } => format!("{name}: error ({text})"),
-                other => format!("{name}: {other:?}"),
+            .map(|(name, entry)| {
+                let state = entry.state.lock().unwrap_or_else(|p| p.into_inner());
+                match &*state {
+                    McpState::Error { text } => format!("{name}: error ({text})"),
+                    other => format!("{name}: {other:?}"),
+                }
             })
             .collect()
     }
@@ -149,27 +184,42 @@ impl McpManager {
     /// Lazy connect (the first `list_tools` / `call_tool` connects; a
     /// `NeedsAuth` / `Error` state is NOT auto-retried — an explicit
     /// `connect` / `auth` is required).
+    ///
+    /// The per-entry `client` lock is the connect serializer: a second
+    /// concurrent caller waits at it, sees `Some`, and returns `Ok(())` — the
+    /// same "the second call reuses the connection" the `&mut`-serialized
+    /// manager gave, now without serializing the CALLS (the guard is dropped
+    /// before any transport await by the callers).
     async fn ensure_connected(
-        &mut self,
+        &self,
         name: &str,
         cancel: &CancellationToken,
         timeout: Duration,
     ) -> Result<(), String> {
         let entry = self
             .servers
-            .get_mut(name)
+            .get(name)
             .ok_or_else(|| format!("unknown MCP server: {name}"))?;
-        if entry.client.is_some() {
-            return Ok(()); // already connected.
+        // The `NeedsAuth` / `Error` guard. The state lock is READ and released
+        // BEFORE the client lock is taken — the client lock is the only manager
+        // lock ever held across an await, and this keeps the two from nesting on
+        // the guard path (`status_lines` then never blocks on a connect).
+        {
+            let state = entry.state.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(*state, McpState::NeedsAuth | McpState::Error { .. }) {
+                return Err(format!(
+                    "the server is in a {state:?} state (use the `connect` / `auth` action)",
+                    state = *state
+                ));
+            }
         }
-        // A `NeedsAuth` / `Error` state is NOT auto-retried.
-        if matches!(entry.state, McpState::NeedsAuth | McpState::Error { .. }) {
-            return Err(format!(
-                "the server is in a {state:?} state (use the `connect` / `auth` action)",
-                state = entry.state
-            ));
+        // Held across the connect (the ONLY manager lock held across an await —
+        // the connect never re-enters the manager's own locks).
+        let mut client_guard = entry.client.lock().await;
+        if client_guard.is_some() {
+            return Ok(()); // already connected (a raced second caller lands here).
         }
-        entry.state = McpState::Connecting;
+        *entry.state.lock().unwrap_or_else(|p| p.into_inner()) = McpState::Connecting;
         let client = match &entry.def {
             ServerDef::Stdio(def) => {
                 Client::Stdio(StdioClient::connect(def, &self.project_cwd, timeout, cancel).await?)
@@ -185,45 +235,67 @@ impl McpManager {
                 match HttpClient::connect(def, timeout, cancel, get_token).await {
                     Ok(c) => Client::Http(c),
                     Err(e) if e == "needs-auth" => {
-                        entry.state = McpState::NeedsAuth;
+                        *entry.state.lock().unwrap_or_else(|p| p.into_inner()) =
+                            McpState::NeedsAuth;
                         return Err("the server requires authentication (use the `auth` action)"
                             .to_string());
                     }
                     Err(e) => {
-                        entry.state = McpState::Error { text: e.clone() };
+                        *entry.state.lock().unwrap_or_else(|p| p.into_inner()) =
+                            McpState::Error { text: e.clone() };
                         return Err(e);
                     }
                 }
             }
         };
-        entry.client = Some(client);
-        entry.state = McpState::Connected;
+        *client_guard = Some(Arc::new(client));
+        *entry.state.lock().unwrap_or_else(|p| p.into_inner()) = McpState::Connected;
         Ok(())
     }
 
     /// `tools/list` (lazy connect; the result is cached per connection).
     pub async fn list_tools(
-        &mut self,
+        &self,
         name: &str,
         cancel: &CancellationToken,
         timeout: Duration,
     ) -> Result<Vec<ToolInfo>, String> {
         self.ensure_connected(name, cancel, timeout).await?;
-        let entry = self.servers.get_mut(name).expect("the server exists");
-        if let Some(tools) = &entry.tools {
-            return Ok(tools.clone());
+        let entry = self.servers.get(name).expect("the server exists");
+        // The cache read (clone under the std lock, released before the call).
+        {
+            let tools = entry.tools.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(tools) = &*tools {
+                return Ok(tools.clone());
+            }
         }
-        let Some(client) = entry.client.as_mut() else {
+        let client_guard = entry.client.lock().await;
+        let Some(client) = client_guard.as_ref() else {
             return Err("the server is not connected".to_string());
         };
+        // Clone the OWNED `Arc` out — the guard's borrow is done with it.
+        let client = Arc::clone(client);
+        // MUST release the lock BEFORE the call await: holding it would
+        // serialize same-server `tools/list`s (and deadlock a caller that needs
+        // this entry while a list is in flight).
+        drop(client_guard);
+        // Routed through `Client` (the transport seam) on the OWNED Arc — the
+        // manager holds no lock here, so the two arms await concurrently with
+        // any other call.
         let tools = client.list_tools(timeout, cancel).await?;
-        entry.tools = Some(tools.clone());
+        // A concurrent second `list_tools` races here benignly (last writer
+        // wins, both wrote the same shape).
+        *entry.tools.lock().unwrap_or_else(|p| p.into_inner()) = Some(tools.clone());
         Ok(tools)
     }
 
     /// `tools/call` (lazy connect).
+    ///
+    /// `&self`: the client is cloned out of the entry's lock and the guard is
+    /// dropped BEFORE the transport await, so any number of calls — same
+    /// server or different servers — are in flight together.
     pub async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         tool: &str,
         args: &Value,
@@ -231,17 +303,27 @@ impl McpManager {
         timeout: Duration,
     ) -> Result<ToolCallResult, String> {
         self.ensure_connected(name, cancel, timeout).await?;
-        let entry = self.servers.get_mut(name).expect("the server exists");
-        let Some(client) = entry.client.as_mut() else {
+        let entry = self.servers.get(name).expect("the server exists");
+        let client_guard = entry.client.lock().await;
+        let Some(client) = client_guard.as_ref() else {
             return Err("the server is not connected".to_string());
         };
+        // Clone the OWNED `Arc` out — the guard's borrow is done with it.
+        let client = Arc::clone(client);
+        // MUST release the lock BEFORE the call await (the load-bearing move —
+        // otherwise the held guard serializes every call to this server, and a
+        // second call on the same entry could never get through).
+        drop(client_guard);
+        // Routed through `Client` (the transport seam) on the OWNED Arc: the
+        // manager holds NO lock across this await, so this call and any other —
+        // same server or a different one — are in flight together.
         client.call_tool(tool, args, timeout, cancel).await
     }
 
     /// Eagerly connect a server (the `connect` action). An OAuth server in
     /// `NeedsAuth` is NOT authenticated here (the `auth` action is).
     pub async fn connect(
-        &mut self,
+        &self,
         name: &str,
         cancel: &CancellationToken,
         timeout: Duration,
@@ -255,12 +337,13 @@ impl McpManager {
     /// `connect` / `call` uses it) and drops the connection so the NEXT use
     /// reconnects with the fresh token — no reconnect happens here.
     pub async fn authenticate(
-        &mut self,
+        &self,
         name: &str,
         cancel: &CancellationToken,
     ) -> Result<String, String> {
         // Clone FIRST: `self.authenticate_with(…, &self.auth_file)` would borrow
-        // `*self` mutably (the receiver) and immutably (the argument) at once.
+        // `*self` (the receiver) and the field at once under the same borrow
+        // family.
         let auth_file = self.auth_file.clone();
         self.authenticate_with(name, cancel, &auth_file).await
     }
@@ -268,7 +351,7 @@ impl McpManager {
     /// The body of `authenticate` with the credentials path injected (the test
     /// seam — a test writes a temp `mcp-auth.json`, never the developer's).
     async fn authenticate_with(
-        &mut self,
+        &self,
         name: &str,
         cancel: &CancellationToken,
         auth_file: &Path,
@@ -315,21 +398,26 @@ impl McpManager {
         // server dead for the rest of the session), and drop the cached
         // `tools/list` (the tool set can change with the identity — and
         // `ensure_connected` does not clear it).
-        if let Some(entry) = self.servers.get_mut(name) {
-            entry.client = None;
-            entry.state = McpState::Disconnected;
-            entry.tools = None;
+        if let Some(entry) = self.servers.get(name) {
+            *entry.client.lock().await = None;
+            *entry.state.lock().unwrap_or_else(|p| p.into_inner()) = McpState::Disconnected;
+            *entry.tools.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
         Ok(format!("{name}: authenticated"))
     }
 
     /// Session teardown: kill the stdio children (dropping a `StdioClient`
     /// kills the child via `kill_on_drop`) + clear the state.
-    pub fn close_all(&mut self) {
-        for entry in self.servers.values_mut() {
-            entry.client = None;
-            entry.state = McpState::Disconnected;
-            entry.tools = None;
+    ///
+    /// `&self` (so the teardown works on the shared `Arc<McpManager>` handle):
+    /// writing `None` drops the entry's last `Arc<Client>`, which is what fires
+    /// `kill_on_drop` for the stdio child — the same teardown semantics the
+    /// `&mut` version had. The `await`s are on the per-entry client lock.
+    pub async fn close_all(&self) {
+        for entry in self.servers.values() {
+            *entry.client.lock().await = None;
+            *entry.state.lock().unwrap_or_else(|p| p.into_inner()) = McpState::Disconnected;
+            *entry.tools.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
 }
@@ -510,7 +598,7 @@ pub async fn test_server(
     let cancel = CancellationToken::new();
     let tools = match def {
         ServerDef::Stdio(def) => {
-            let mut client = StdioClient::connect(def, project_cwd, timeout, &cancel).await?;
+            let client = StdioClient::connect(def, project_cwd, timeout, &cancel).await?;
             let tools = client.list_tools(timeout, &cancel).await?;
             drop(client); // kill the child.
             tools
@@ -526,7 +614,7 @@ pub async fn test_server(
                 }
                 _ => None,
             };
-            let mut client = HttpClient::connect(def, timeout, &cancel, get_token).await?;
+            let client = HttpClient::connect(def, timeout, &cancel, get_token).await?;
             let tools = client.list_tools(&cancel).await?;
             drop(client);
             tools
@@ -629,7 +717,7 @@ mod tests {
 
     #[test]
     fn status_shows_the_error_state() {
-        let (mut manager, _dir) = manager_with(
+        let (manager, _dir) = manager_with(
             r#"{ "mcpServers": { "a": { "url": "http://127.0.0.1:1/mcp" } } }"#,
             None,
         );
@@ -656,7 +744,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/target/debug/fake_mcp_stdio"
         ));
-        let (mut manager, _dir) = manager_with(&stdio_server_json(bin), None);
+        let (manager, _dir) = manager_with(&stdio_server_json(bin), None);
         assert_eq!(manager.server_names(), vec!["a"]);
         // The first `call_tool` connects (lazy).
         let cancel = CancellationToken::new();
@@ -685,7 +773,7 @@ mod tests {
             .await
             .expect("the second call reuses the connection");
         assert_eq!(r.text, "again");
-        manager.close_all();
+        manager.close_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -736,14 +824,14 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/target/debug/fake_mcp_stdio"
         ));
-        let (mut manager, _dir) = manager_with(&stdio_server_json(bin), None);
+        let (manager, _dir) = manager_with(&stdio_server_json(bin), None);
         let cancel = CancellationToken::new();
         manager
             .connect("a", &cancel, Duration::from_secs(5))
             .await
             .expect("connects");
         assert_eq!(manager.status_lines(), vec!["a: Connected"]);
-        manager.close_all();
+        manager.close_all().await;
         // `close_all` → `Disconnected` (the client is dropped — the stdio
         // child is killed via `kill_on_drop`).
         assert_eq!(manager.status_lines(), vec!["a: Disconnected"]);
@@ -861,7 +949,7 @@ mod tests {
         // header-recording server (as `an_expired_token_is_refreshed…` does).
         let (mcp_url, mcp_server) = start_401_server().await;
         let (auth_base, auth_server) = start_auth_server().await;
-        let (mut manager, _dir) = manager_with(
+        let (manager, _dir) = manager_with(
             &serde_json::json!({
                 "mcpServers": { "a": {
                     "url": mcp_url,
@@ -1786,7 +1874,7 @@ mod tests {
         // subsequent `call_tool` is NOT auto-retried (an explicit `auth` is
         // required).
         let (url, server) = start_401_server().await;
-        let (mut manager, _dir) = manager_with(
+        let (manager, _dir) = manager_with(
             &serde_json::json!({
                 "mcpServers": { "a": { "url": url, "auth": "oauth" } }
             })
@@ -1824,5 +1912,149 @@ mod tests {
             "a `NeedsAuth` state is not auto-retried: {e}"
         );
         server.abort();
+    }
+
+    /// A `mcp.json` with TWO stdio servers (`a` + `b`), each a separate
+    /// instance of the fake binary with its OWN `--name=` label — so every
+    /// answer carries the label of the instance that produced it.
+    fn two_stdio_server_json(bin: &std::path::Path) -> String {
+        serde_json::json!({
+            "mcpServers": {
+                "a": { "command": bin.display().to_string(), "args": ["--name=A"] },
+                "b": { "command": bin.display().to_string(), "args": ["--name=B"] },
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_call_tools_on_different_servers_are_in_flight_concurrently() {
+        // The acceptance test for the `&self` receiver lower: TWO `call_tool`s
+        // on TWO DIFFERENT servers through ONE shared manager are in flight at
+        // the same time.
+        //
+        // Why this proves overlap WITHOUT any timing: each server holds its
+        // `hold` request unanswered until its `release` arrives (the fake's
+        // order-independent pairing). The test spawns both holds as independent
+        // tasks and only THEN sends both releases from the main task — so a
+        // held call can only complete while the other held call is still
+        // waiting, and neither release could have been sent before both spawns
+        // were issued. A `&mut self` receiver could not express this shape at
+        // all: the two spawns would both need to borrow the manager mutably,
+        // and the main task's `release` would be a borrow error while the holds
+        // are outstanding. That is the compile-side half of the proof.
+        let bin = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/debug/fake_mcp_stdio"
+        ));
+        let (manager, _dir) = manager_with(&two_stdio_server_json(bin), None);
+        // Never touch the developer's real `mcp-auth.json` (both servers are
+        // stdio, so nothing reads it — but the seam is the house rule).
+        let manager =
+            std::sync::Arc::new(manager.with_auth_file(_dir.path().join("mcp-auth.json")));
+        assert_eq!(manager.server_names(), vec!["a", "b"]);
+        let cancel = CancellationToken::new();
+        let hold_bound = Duration::from_secs(10);
+
+        // 1. Both servers answer an `echo` (the two lazy connects, both on the
+        //    shared `&self` handle — the label prefix proves which answered).
+        for (name, expected) in [("a", "A:hi"), ("b", "B:hi")] {
+            let r = manager
+                .call_tool(
+                    name,
+                    &format!("{name}_echo"),
+                    &serde_json::json!({ "text": "hi" }),
+                    &cancel,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("the echo answers");
+            assert_eq!(r.text, expected, "the labelled server answered");
+            assert!(!r.is_error);
+        }
+
+        // 2. BOTH holds, spawned as independent tasks over their own `Arc`
+        //    handles of the SAME manager. Neither can complete on its own —
+        //    each waits for its server's `release`.
+        let handle_a = {
+            let manager = std::sync::Arc::clone(&manager);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                manager
+                    .call_tool("a", "a_hold", &serde_json::json!({}), &cancel, hold_bound)
+                    .await
+            })
+        };
+        let handle_b = {
+            let manager = std::sync::Arc::clone(&manager);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                manager
+                    .call_tool("b", "b_hold", &serde_json::json!({}), &cancel, hold_bound)
+                    .await
+            })
+        };
+
+        // 3. NOW — while both holds are outstanding — release each server from
+        //    the main task, on the manager's own handle.
+        let ra = manager
+            .call_tool(
+                "a",
+                "a_release",
+                &serde_json::json!({}),
+                &cancel,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("a's release is answered");
+        let rb = manager
+            .call_tool(
+                "b",
+                "b_release",
+                &serde_json::json!({}),
+                &cancel,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("b's release is answered");
+        assert_eq!(ra.text, "A:released");
+        assert_eq!(rb.text, "B:released");
+        assert!(!ra.is_error && !rb.is_error);
+
+        // 4. Both holds completed — each by the server that HELD it (the label
+        //    prefix is the routing proof: `A:released` can only come from
+        //    server `a`).
+        let ha = handle_a
+            .await
+            .expect("task a runs")
+            .expect("a's hold completes");
+        let hb = handle_b
+            .await
+            .expect("task b runs")
+            .expect("b's hold completes");
+        assert_eq!(ha.text, "A:released", "a's hold answered from a");
+        assert_eq!(hb.text, "B:released", "b's hold answered from b");
+        assert!(!ha.is_error && !hb.is_error);
+
+        // The handle is still usable afterwards, on the same non-`mut` binding.
+        let r = manager
+            .call_tool(
+                "a",
+                "a_echo",
+                &serde_json::json!({ "text": "hi" }),
+                &cancel,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the manager still works after the burst");
+        assert_eq!(r.text, "A:hi");
+
+        // Teardown resets BOTH entries (and `close_all` is `&self` + await, so
+        // it runs on the shared handle with no `&mut` of the manager).
+        manager.close_all().await;
+        assert_eq!(
+            manager.status_lines(),
+            vec!["a: Disconnected", "b: Disconnected"]
+        );
     }
 }

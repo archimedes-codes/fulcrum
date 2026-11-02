@@ -1,3 +1,4 @@
+mod codemode;
 mod compaction_overflow;
 mod context_usage;
 mod cost;

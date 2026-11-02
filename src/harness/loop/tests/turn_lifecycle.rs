@@ -1509,7 +1509,7 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
     );
     // Swap in the temp-config MCP manager (the `build_loop` default reads
     // the real home — this one reads the temp `mcp.json`).
-    loop_.mcp = McpManager::new(dir.to_path_buf(), dir.to_path_buf(), None);
+    loop_.mcp = Arc::new(McpManager::new(dir.to_path_buf(), dir.to_path_buf(), None));
     loop_.handle_prompt(&text_prompt("call the mcp tool")).await;
     // The `mcp` tool result round-tripped (the `echo` → "hi").
     let end = wait_for_event(
@@ -1590,7 +1590,7 @@ async fn a_stop_mid_mcp_call_cancels() {
         watch::channel(0u64).0,
         RetryPolicy::new_with(5, Duration::from_millis(1)),
     );
-    loop_.mcp = McpManager::new(dir.to_path_buf(), dir.to_path_buf(), None);
+    loop_.mcp = Arc::new(McpManager::new(dir.to_path_buf(), dir.to_path_buf(), None));
     let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("call mcp")).await });
     // The `mcp` tool starts (the `hang` never answers). This wait covers
     // SPAWNING the MCP server process + handshake inside a spawned task,

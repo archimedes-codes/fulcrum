@@ -1,12 +1,153 @@
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
-use super::AgentLoop;
-use crate::agent::events::RpcEvent;
+use super::{AgentLoop, PermissionContext};
+use crate::agent::events::{EventSink, RpcEvent};
 use crate::agent::harness::provider::{ChatRole, FinishReason, ToolCall, Usage};
 use crate::agent::harness::store::role_str;
-use crate::agent::normalize::{compute_display_rows, normalize};
+use crate::agent::harness::store::Store;
+use crate::agent::normalize::{compute_display_rows, normalize, ThoughtState, TurnState};
+use crate::agent::tools::ToolEventSink;
+
+/// The borrowed view of ONE emit pipeline's state (B1).
+///
+/// The extraction of `AgentLoop::emit`'s body needs eight pieces of state,
+/// which is past `clippy::too_many_arguments` as free parameters — so they
+/// travel as this view instead. BOTH owners of a pipeline hand one over:
+/// `AgentLoop::emit` borrows the loop's own fields, and `LoopEventSinkInner`
+/// borrows its owned copies. That is what makes "the same pipeline" a type
+/// fact rather than a comment.
+struct EmitPipeline<'a> {
+    session_id: &'a str,
+    sink: &'a Arc<dyn EventSink>,
+    store: &'a Arc<dyn Store>,
+    turn_state: &'a StdMutex<TurnState>,
+    text_acc: &'a StdMutex<HashMap<String, String>>,
+    tool_state: &'a StdMutex<HashMap<String, Value>>,
+    thought_state: &'a StdMutex<ThoughtState>,
+    events: &'a mpsc::UnboundedSender<RpcEvent>,
+}
+
+impl EmitPipeline<'_> {
+    /// Run the shared emit pipeline (B1): `RpcEvent` -> `normalize` -> one
+    /// `session-update` sink frame per update -> `compute_display_rows` ->
+    /// `Store::persist_display` -> `events.send`. Extracted VERBATIM from
+    /// `AgentLoop::emit` so the `LoopEventSink` handle runs the SAME pipeline
+    /// the loop does — a nested call's live rows land in the same display
+    /// table and the same raw-event channel BY CONSTRUCTION, not by a second
+    /// copy of the logic that can drift.
+    ///
+    /// The `AgentLoop::emit` settle-watch arm deliberately stays OUTSIDE this
+    /// method (it is the loop's own supervision concern, and the handle has no
+    /// settle channel).
+    fn run(&self, ev: RpcEvent) {
+        let updates = normalize(
+            &ev,
+            &mut self.turn_state.lock().unwrap_or_else(|p| p.into_inner()),
+        );
+        for u in &updates {
+            self.sink.emit(
+                "session-update",
+                json!({ "sessionId": self.session_id, "update": u }),
+            );
+            let rows = compute_display_rows(u, self.text_acc, self.tool_state, self.thought_state);
+            let _ = self.store.persist_display(self.session_id, &rows);
+        }
+        let _ = self.events.send(ev);
+    }
+}
+
+/// (B1) The `ToolEventSink` the loop attaches to every ctx it builds: an
+/// `Arc` inner so a CLONE of the ctx shares ONE sink (the bridge clones the
+/// ctx it was given).
+///
+/// Owns a FRESH `TurnState` + accumulators — deliberately NOT the loop's:
+/// nested-call ids (`<parentCallId>/<n>`) are minted by the bridge, never by
+/// this state, and `normalize`'s `tool_execution_update` arm mutates NO turn
+/// state (it returns a frame reading only `tool_call_id` / `partial_result`),
+/// so a desync between the two states is impossible; `compute_display_rows`'s
+/// `tool_call_update` arm works from an EMPTY map (it inserts, then
+/// `merge_json`s into the fresh entry).
+struct LoopEventSink {
+    inner: Arc<LoopEventSinkInner>,
+}
+
+struct LoopEventSinkInner {
+    session_id: String,
+    sink: Arc<dyn EventSink>,
+    store: Arc<dyn Store>,
+    events: mpsc::UnboundedSender<RpcEvent>,
+    turn_state: StdMutex<TurnState>,
+    text_acc: StdMutex<HashMap<String, String>>,
+    tool_state: StdMutex<HashMap<String, Value>>,
+    thought_state: StdMutex<ThoughtState>,
+}
+
+impl LoopEventSinkInner {
+    /// The same borrowed view `AgentLoop::emit` builds from its own fields —
+    /// one `run` body serves both owners.
+    fn pipeline(&self) -> EmitPipeline<'_> {
+        EmitPipeline {
+            session_id: &self.session_id,
+            sink: &self.sink,
+            store: &self.store,
+            turn_state: &self.turn_state,
+            text_acc: &self.text_acc,
+            tool_state: &self.tool_state,
+            thought_state: &self.thought_state,
+            events: &self.events,
+        }
+    }
+}
+
+impl ToolEventSink for LoopEventSink {
+    fn emit_tool_execution_update(
+        &self,
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+        partial_result: Value,
+    ) {
+        self.inner.pipeline().run(RpcEvent::tool_execution_update {
+            tool_call_id,
+            tool_name,
+            args,
+            partial_result,
+        });
+    }
+}
+
+impl PermissionContext {
+    /// (B1) The ONE seeding step: `AgentLoop::new` calls this right after
+    /// `PermissionContext::new` (which cannot see the loop's sink/store/events
+    /// — they are constructor parameters that do not exist as the bundle is
+    /// built). `pub(super)` (`loop.rs` is the `super` here) so `to_tool_ctx`,
+    /// defined in `loop.rs`, can read the field it populates.
+    pub(super) fn attach_tool_event_sink(
+        &mut self,
+        session_id: String,
+        sink: Arc<dyn EventSink>,
+        store: Arc<dyn Store>,
+        events: mpsc::UnboundedSender<RpcEvent>,
+    ) {
+        self.tool_event_sink = Some(Arc::new(LoopEventSink {
+            inner: Arc::new(LoopEventSinkInner {
+                session_id,
+                sink,
+                store,
+                events,
+                turn_state: StdMutex::new(TurnState::default()),
+                text_acc: StdMutex::new(HashMap::new()),
+                tool_state: StdMutex::new(HashMap::new()),
+                thought_state: StdMutex::new(ThoughtState::default()),
+            }),
+        }));
+    }
+}
 
 impl AgentLoop {
     /// Emit the `context_usage_update` frame (session-scoped bookkeeping:
@@ -195,29 +336,43 @@ impl AgentLoop {
     /// persistence) AND onto the `events` channel (the raw `RpcEvent`
     /// values — the UNBOUNDED `send` never fails — ADR 0025: nothing is
     /// dropped; a closed channel (the driver gone) is a silent no-op).
+    /// The pipeline itself is the shared [`EmitPipeline::run`] (B1) — the SAME
+    /// code the `LoopEventSink` handle runs, so a nested call's live rows
+    /// reach the identical sink + display table + raw-event channel. Only the
+    /// settle-watch arm stays here: it is this loop's supervision concern
+    /// (the handle has no settle channel).
+    ///
     /// The settle is NOT taken from the (lossy) `events` channel: an
     /// `agent_settled` is ALSO written to the settle watch (a watch send
     /// is NEVER dropped — the driver's settle watch fires regardless, so
     /// the turn settle is never lost).
+    ///
+    /// (B1) One behavioural consequence of the extraction, accepted: the old
+    /// body wrote the settle watch BEFORE `events.send`; now the shared
+    /// pipeline sends the raw event first and the watch write follows. Those
+    /// are two INDEPENDENT bus endpoints (the unbounded `events` channel vs
+    /// the `watch::Sender`) and every consumer in the tree reads one or the
+    /// other, never one before the other (`worker/client.rs` +
+    /// `worker/core.rs` detect the settle off the channel; the loop tests
+    /// await the watch) — so no consumer can observe the swap.
     pub(super) fn emit(&self, ev: RpcEvent) {
-        let updates = normalize(
-            &ev,
-            &mut self.turn_state.lock().unwrap_or_else(|p| p.into_inner()),
-        );
-        for u in &updates {
-            self.sink.emit(
-                "session-update",
-                json!({ "sessionId": self.session_id, "update": u }),
-            );
-            let rows =
-                compute_display_rows(u, &self.text_acc, &self.tool_state, &self.thought_state);
-            let _ = self.store.persist_display(&self.session_id, &rows);
+        EmitPipeline {
+            session_id: &self.session_id,
+            sink: &self.sink,
+            store: &self.store,
+            turn_state: &self.turn_state,
+            text_acc: &self.text_acc,
+            tool_state: &self.tool_state,
+            thought_state: &self.thought_state,
+            events: &self.events,
         }
+        // `ev.clone()` because the settle arm below matches on `ev` AFTER the
+        // move into the pipeline (which sends the raw event on the channel).
+        .run(ev.clone());
         if matches!(ev, RpcEvent::agent_settled) {
             let n = self.settle_count.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = self.settle_tx.send(n);
         }
-        let _ = self.events.send(ev);
     }
 }
 
@@ -243,5 +398,111 @@ impl TurnAccumulator {
             }),
             None => json!({ "inputTokens": 0, "outputTokens": 0 }),
         }
+    }
+}
+
+/// B1's acceptance test.
+///
+/// WHY THIS LIVES HERE and not in `src-tauri/tests/skill_tools_boundary.rs`:
+/// that file is an INTEGRATION test — it links against `archimedes_lib`'s
+/// `pub` surface only, and the production population chain this test must
+/// drive (`PermissionContext::new` → `attach_tool_event_sink` →
+/// `to_tool_ctx`) is `pub(crate)` / module-private. A child module sees its
+/// ancestors' private items: `emit.rs` is `mod emit;` inside the `loop`
+/// module, so `PermissionContext` and its private methods are visible here —
+/// exactly the shape `loop/tests/mod.rs` already uses. A test that built the
+/// sink handle directly instead would pass even with the production wiring
+/// broken, which is the failure this placement exists to prevent.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::events::EventSink;
+    use crate::agent::harness::store::NoopStore;
+    use crate::test_support::env_lock;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio_util::sync::CancellationToken;
+
+    /// Records EVERY emission, `(event, payload)` (the `AllEventsSink`
+    /// pattern from `loop/tests/support.rs`).
+    #[derive(Default)]
+    struct TestSink {
+        frames: Arc<StdMutex<Vec<(String, Value)>>>,
+    }
+
+    impl EventSink for TestSink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((event.to_string(), payload));
+        }
+    }
+
+    /// B1 acceptance: code holding ONLY a CLONED `&ToolCtx` (the codemode
+    /// bridge's shape) produces a `tool_execution_update` that a subscriber
+    /// on the EXISTING `events` channel receives, AND the matching
+    /// `session-update` frame reaches the `EventSink` — through the SAME
+    /// normalize → sink → `persist_display` → `events.send` pipeline
+    /// `AgentLoop::emit` runs.
+    #[test]
+    fn a_cloned_tool_ctx_streams_tool_execution_update_through_the_loop_pipeline() {
+        // `PermissionContext::new` reads `$HOME` (boundary::read_roots) —
+        // the same env lock every HOME-reading test in the crate takes.
+        let _lock = env_lock();
+        let space = crate::test_support::ScratchDir::in_env_temp("b1-sink-", "space");
+        let cwd = space.path();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel::<RpcEvent>();
+        let frames = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::new(TestSink {
+            frames: frames.clone(),
+        });
+        let store = Arc::new(NoopStore);
+
+        // THE PRODUCTION POPULATION CHAIN — no hand-built handle:
+        let mut permissions = PermissionContext::new(None, cwd);
+        permissions.attach_tool_event_sink(
+            "s1".to_string(),
+            sink.clone(),
+            store.clone(),
+            events_tx.clone(),
+        );
+        let ctx = permissions.to_tool_ctx(cwd.to_path_buf(), CancellationToken::new());
+
+        // THE BRIDGE SHAPE: clone the ctx, hold ONLY the clone, emit through it.
+        let cloned = ctx.clone();
+        // The id is the PARENT codemode call's id (the frozen contract: the
+        // bridge supplies the parent id, never a nested `<parent>/<n>` one).
+        cloned.emit_tool_execution_update(
+            "tc-parent-7",
+            "bash",
+            json!({ "cmd": "ls" }),
+            json!({ "exitCode": 0, "stdout": "src" }),
+        );
+
+        // 1) the raw RpcEvent on the EXISTING events channel:
+        match events_rx.try_recv() {
+            Ok(RpcEvent::tool_execution_update {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+            }) => {
+                assert_eq!(tool_call_id, "tc-parent-7");
+                assert_eq!(tool_name, "bash");
+                assert_eq!(args, json!({ "cmd": "ls" }));
+                assert_eq!(partial_result, json!({ "exitCode": 0, "stdout": "src" }));
+            }
+            other => panic!("expected tool_execution_update, got {other:?}"),
+        }
+        assert!(events_rx.try_recv().is_err(), "no other raw event expected");
+
+        // 2) the matching session-update frame on the EventSink:
+        let received = frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(received.len(), 1, "one session-update frame");
+        assert_eq!(received[0].0, "session-update");
+        let u = &received[0].1["update"];
+        assert_eq!(u["sessionUpdate"], "tool_call_update");
+        assert_eq!(u["toolCallId"], "tc-parent-7");
+        assert_eq!(u["rawOutput"], json!({ "exitCode": 0, "stdout": "src" }));
     }
 }
