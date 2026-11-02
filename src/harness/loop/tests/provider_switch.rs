@@ -285,3 +285,61 @@ async fn set_model_reapplies_custom_headers_after_a_switch() {
         "the post-switch turn went to server B, not the retained provider"
     );
 }
+
+/// Issue #146: the level a reasoning model was given must not reach a
+/// no-levels model's request. Drives the REAL request path (wiremock) and
+/// asserts on the wire body, because the bug is what is sent, not what the
+/// session mirror says.
+#[tokio::test]
+async fn a_loop_switched_to_a_model_without_levels_sends_no_reasoning_effort() {
+    let server = MockServer::start().await;
+    mount_chat_completions(&server).await;
+
+    let mut reasoning = fake_model("m-reason");
+    reasoning.provider = "prov".to_string();
+    reasoning.base_url = server.uri();
+    reasoning.api = Some("litellm".to_string());
+    reasoning.supports_thinking = true;
+    reasoning.thinking_levels = vec!["high".to_string()];
+
+    let mut plain = fake_model("m-plain");
+    plain.provider = "prov".to_string();
+    plain.base_url = server.uri();
+    plain.api = Some("litellm".to_string());
+
+    let models = vec![reasoning.clone(), plain.clone()];
+    let provider = build_provider(&reasoning);
+
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+    let (settle_tx, _settle_rx) = watch::channel(0u64);
+    let retry = RetryPolicy::new_with(0, Duration::from_millis(1));
+
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        provider,
+        events_tx,
+        turn_cancel,
+        settle_tx,
+        retry,
+        models,
+        None,
+    );
+
+    // A level is set on the reasoning model, then the loop switches to the
+    // no-levels model with the level CLEARED (what the session's switch arm
+    // now sends on that path).
+    loop_.set_thinking_level(Some("high".to_string()));
+    loop_.set_model(plain.clone());
+    loop_.set_thinking_level(None);
+
+    loop_.handle_prompt(&text_prompt("hello")).await;
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1, "one model request was sent");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("a JSON request body");
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "a no-levels model must not receive a stale reasoning_effort, got {body}"
+    );
+}

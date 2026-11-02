@@ -561,9 +561,24 @@ impl WorkerHandle {
         thinking: Option<&str>,
         trusted: Option<bool>,
     ) -> Result<(), WorkerError> {
+        self.send_config_clearing(model, thinking, false, trusted)
+    }
+
+    /// A config update that can also CLEAR the thinking level (issue #146).
+    /// `clear_thinking` resets the loop to the model's default (no
+    /// `reasoning_effort`); it is independent of `thinking`, whose `None`
+    /// means "leave the level alone".
+    pub fn send_config_clearing(
+        &self,
+        model: Option<&Model>,
+        thinking: Option<&str>,
+        clear_thinking: bool,
+        trusted: Option<bool>,
+    ) -> Result<(), WorkerError> {
         self.send_inbound_frame(Inbound::Config {
             model: model.cloned(),
             thinking: thinking.map(str::to_string),
+            clear_thinking,
             trusted,
         })
     }

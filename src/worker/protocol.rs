@@ -67,6 +67,15 @@ pub enum Inbound {
     Config {
         model: Option<crate::agent::harness::catalog::Model>,
         thinking: Option<String>,
+        /// Clear the loop's thinking level to "the model's default" (no
+        /// `reasoning_effort` on the request). Distinct from `thinking: None`,
+        /// which means "leave the level alone": a native model switch to a
+        /// model that advertises NO levels must drop the previous model's
+        /// level (issue #146), and `None` alone cannot say that. `serde(default)`
+        /// so a frame from a caller that predates the field still decodes as
+        /// "no clear".
+        #[serde(default)]
+        clear_thinking: bool,
         trusted: Option<bool>,
     },
     #[serde(rename = "abort")]
@@ -578,6 +587,39 @@ mod tests {
         }
     }
 
+    /// Issue #146: a `config` frame that predates `clearThinking` (no field on
+    /// the wire) still decodes, with the clear OFF — so an older Supervisor
+    /// cannot accidentally clear a level. A `clearThinking: true` frame decodes
+    /// to a clear.
+    #[test]
+    fn config_clear_thinking_defaults_off_and_decodes_when_set() {
+        let legacy = r#"{"type":"config","model":null,"thinking":"high","trusted":null}"#;
+        match decode_inbound(legacy).expect("a legacy config frame decodes") {
+            Inbound::Config {
+                thinking,
+                clear_thinking,
+                ..
+            } => {
+                assert_eq!(thinking.as_deref(), Some("high"));
+                assert!(!clear_thinking, "a frame without the field must not clear");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+        let clear =
+            r#"{"type":"config","model":null,"thinking":null,"clearThinking":true,"trusted":null}"#;
+        match decode_inbound(clear).expect("a clear config frame decodes") {
+            Inbound::Config {
+                thinking,
+                clear_thinking,
+                ..
+            } => {
+                assert_eq!(thinking, None);
+                assert!(clear_thinking);
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
     /// Every `Inbound` variant round-trips through `encode_line` +
     /// `decode_inbound` (including the `PermissionResponse` carrying
     /// `Selected { option_id: "trust-space" }` and the
@@ -593,6 +635,7 @@ mod tests {
             Inbound::Config {
                 model: Some(test_model()),
                 thinking: Some("low".to_string()),
+                clear_thinking: false,
                 trusted: Some(true),
             },
             Inbound::Compact {

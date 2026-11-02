@@ -84,6 +84,18 @@ pub struct LoopControl {
     pub cancel: CancellationToken,
 }
 
+/// The loop command a `Config` frame's thinking fields mean (issue #146).
+/// `clear_thinking` wins over `thinking`: a clear is the explicit "no level"
+/// and a caller sending both is asking for it. `None` for both is no command,
+/// so the loop keeps its level. Pure, so the mapping is testable without a loop.
+fn thinking_command(thinking: Option<String>, clear_thinking: bool) -> Option<ControlCmd> {
+    if clear_thinking {
+        Some(ControlCmd::SetThinkingLevel(None))
+    } else {
+        thinking.map(|l| ControlCmd::SetThinkingLevel(Some(l)))
+    }
+}
+
 /// The testable core (NO stdio I/O — a pure message handler so tests
 /// drive it directly): one inbound message → zero or more outbound
 /// frames (the store / sink frames ride the outbound channel).
@@ -560,6 +572,7 @@ impl WorkerCore {
             Inbound::Config {
                 model,
                 thinking,
+                clear_thinking,
                 trusted,
             } => {
                 if let Some(ctl) = &self.loop_control {
@@ -568,12 +581,8 @@ impl WorkerCore {
                             eprintln!("worker: control send failed: {e}");
                         }
                     }
-                    if let Some(l) = thinking {
-                        if let Err(e) = ctl
-                            .control_tx
-                            .send(ControlCmd::SetThinkingLevel(Some(l)))
-                            .await
-                        {
+                    if let Some(cmd) = thinking_command(thinking, clear_thinking) {
+                        if let Err(e) = ctl.control_tx.send(cmd).await {
                             eprintln!("worker: control send failed: {e}");
                         }
                     }
@@ -1393,6 +1402,26 @@ mod tests {
         assert_eq!(res.final_url, "https://example.com/final");
     }
 
+    /// Issue #146: a `clear_thinking` frame is an explicit clear, and it wins
+    /// over a level sent alongside it. A bare `thinking: None` is NO command, so
+    /// the loop keeps whatever level it has.
+    #[test]
+    fn thinking_command_maps_clear_and_level_and_leave() {
+        assert!(matches!(
+            thinking_command(None, true),
+            Some(ControlCmd::SetThinkingLevel(None))
+        ));
+        assert!(matches!(
+            thinking_command(Some("high".into()), true),
+            Some(ControlCmd::SetThinkingLevel(None))
+        ));
+        assert!(matches!(
+            thinking_command(Some("high".into()), false),
+            Some(ControlCmd::SetThinkingLevel(Some(ref l))) if l == "high"
+        ));
+        assert!(thinking_command(None, false).is_none());
+    }
+
     /// `Config { trusted: Some(true) }` flips the `StaticTrustSource`
     /// (the `config` message's trust update).
     #[tokio::test]
@@ -1408,6 +1437,7 @@ mod tests {
         core.handle(Inbound::Config {
             model: None,
             thinking: None,
+            clear_thinking: false,
             trusted: Some(true),
         })
         .await;
