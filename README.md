@@ -8,8 +8,9 @@ application — it decides what an agent does, and knows nothing about windows,
 trays, or the UI that shows it.
 
 It was extracted from
-[`archimedes-codes/desktop`](https://github.com/archimedes-codes/desktop), which
-is its first and primary consumer. That extraction is what makes the same engine
+[`archimedes-codes/archimedes`](https://github.com/archimedes-codes/archimedes)
+(the desktop app, renamed from `archimedes-codes/desktop` after this extraction),
+which is its first and primary consumer. That extraction is what makes the same engine
 runnable somewhere the desktop is not: a headless daemon on a socket, a worker on
 another machine, a test harness that drives a session without a GUI.
 
@@ -53,7 +54,7 @@ cargo test
 > the crate's tests spawn those binaries *by path* (a lib's unit tests get no
 > `CARGO_BIN_EXE_*`). On a cold target dir, a bare `cargo test` fails 66 tests
 > with `ENOENT`. `cargo build --all-targets` first, or let `cargo test` build the
-> whole graph — and note that `crates/fulcrum-core/tests/fixture_bins.rs` is what
+> whole graph — and note that `tests/fixture_bins.rs` is what
 > makes that target exist, so it is part of the build contract, not a test that
 > happens to be here.
 
