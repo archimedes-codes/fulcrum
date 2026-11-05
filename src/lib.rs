@@ -229,22 +229,49 @@ pub mod provider_auth;
 // of the workspace and built as its own package: it COMPILES standalone,
 // `--all-targets` clean, and all 9 `boundary_pins` pass there — no `crate::`
 // path, no manifest line, and no `test_support` helper reaches the desktop. What
-// does NOT survive is TEST FIXTURES, not code. All 1300 of the crate's tests
-// COMPILE and RUN standalone; 1231 pass. The 69 that fail do so for two reasons,
-// both about files outside the crate, and both LOUD (every one panics or fails
-// an assert — zero pass silently, which is the failure mode this audit existed to
-// hunt):
-//   * 65 spawn `fake_worker` or `fake_mcp_stdio`, which are BINS OF THE DESKTOP
-//     PACKAGE (`src-tauri/src/bin/`) and therefore do not exist next to an
-//     extracted crate — `ENOENT` at the spawn, or the `is_file()` witness in the
-//     two fixture-path guards;
+// does NOT survive is TEST FIXTURES, not code.
+//
+// S8b.1 RE-MEASURED THE FAILURES (the numbers below are the S8b.1 run at
+// `eb8ac18b`: **0 compile errors, 1320 passed, 71 failed, 1 ignored** — S8.5
+// reported 1231/69 from a run that reached fewer targets, so the split is
+// restated from the re-measurement rather than transcribed):
+//   * 66 spawn `fake_worker` / `fake_mcp_stdio`, which were BINS OF THE DESKTOP
+//     PACKAGE (`src-tauri/src/bin/`) and so did not exist next to an extracted
+//     crate — `ENOENT` at the spawn, or the `is_file()` witness in the two
+//     fixture-path guards;
 //   * 4 are `childproc`'s census pins, which walk BOTH packages' `src/` trees on
 //     purpose (a one-root walk reports a clean bill for the half it never
-//     opened) and panic naming the missing root rather than scanning nothing.
-// T8b must decide where the two fixture bins live and how the census learns it
-// has one package. Recorded here because it is the only thing standing between
-// the extraction and a green-looking suite with 69 holes.
+//     opened) and panic naming the missing root rather than scanning nothing;
+//   * 1 is `childproc::target_debug_dir_is_where_cargo_actually_builds`, which
+//     S8.5 did not separate out: the resolver itself assumed the crate is a
+//     workspace MEMBER (it walked the manifest up TWO levels), so in a standalone
+//     copy it named a directory no build writes. This one was NOT a fixture
+//     problem and renaming the bins did not fix it — S8b.1 had to move the
+//     resolver to `current_exe()`.
+// ALL 66 FIXTURE FAILURES ARE GONE (measured after S8b.1: 1387 passed, 4 failed).
+// The 4 that remain are the census pins, LEFT FAILING ON PURPOSE — that is
+// S8b.2's job, and a pin that quietly no-ops when its root is missing is the
+// fail-open this design exists to avoid. See `crate::fixtures` for where the two
+// bins live now and why the crate's carry a `_core` suffix.
 pub mod worker;
+
+// S8b.1 — the two process fixtures this crate's tests spawn, as LIB code (not
+// bins, not a dev-dep crate, not examples: every alternative was measured and
+// fails; see the module docs). The crate's `src/bin/fake_worker_core.rs` and
+// `src/bin/fake_mcp_stdio_core.rs` are 3-line shims over these bodies, and so
+// are the desktop's `src-tauri/src/bin/{fake_worker,fake_mcp_stdio}.rs` — one
+// body, four bins, and FOUR DISTINCT BIN NAMES so nothing collides on an output
+// filename in the shared `target/debug/`.
+//
+// NON-GATED ON PURPOSE: `#[cfg(test)]` does not survive into an rlib, so a bin
+// (a separate crate) could not reach a test-gated item. That is why this code
+// links into the desktop binary, and the size cost of it is measured and
+// reported rather than argued away. `#[doc(hidden)]` on both submodules keeps
+// them out of the public docs. This module is NOT the test-support module
+// below (`test_support`, `#[cfg(test)]`, in-process helpers) — the two stay
+// separate because one ships and one does not.
+#[doc(hidden)]
+pub mod fixtures;
 
 // S8.4: the crate's Worker-mode entry, re-exported at the root so
 // `fulcrum_core::run_worker()` is the literal spelling. Both parameter types

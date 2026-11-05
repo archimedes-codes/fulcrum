@@ -1491,7 +1491,7 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
     // directory`) while everything still COMPILED. `test_support::target_debug_dir`
     // walks up TWO levels and `childproc::target_debug_dir_is_where_cargo_actually_builds`
     // pins it against `current_exe()`, so it cannot go green on a wrong level count.
-    let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+    let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio_core");
     std::fs::write(
         dir.join(".pi/mcp.json"),
         serde_json::json!({
@@ -1580,7 +1580,7 @@ async fn a_stop_mid_mcp_call_cancels() {
     // directory`) while everything still COMPILED. `test_support::target_debug_dir`
     // walks up TWO levels and `childproc::target_debug_dir_is_where_cargo_actually_builds`
     // pins it against `current_exe()`, so it cannot go green on a wrong level count.
-    let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+    let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio_core");
     std::fs::write(
         dir.join(".pi/mcp.json"),
         serde_json::json!({

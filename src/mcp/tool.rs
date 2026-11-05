@@ -795,20 +795,23 @@ pub async fn mcp_tool(
 mod tests {
     use super::*;
 
-    /// The `fake_mcp_stdio` test-double binary (built by `cargo test`).
+    /// The crate's own `fake_mcp_stdio_core` test-double binary (built by
+    /// `cargo test` — S8b.1: the crate owns this bin now; the body is
+    /// `crate::fixtures::mcp_stdio`, shared with the desktop's `fake_mcp_stdio`).
     ///
     /// T5/S3 (Step A-bis): see `mcp/stdio.rs::fake_mcp_bin` — same trap, same
-    /// fix, one resolver (`crate::test_support::target_debug_dir`, TWO levels
-    /// up), pinned by `childproc::target_debug_dir_is_where_cargo_actually_builds`.
+    /// fix, one resolver (`crate::test_support::target_debug_dir`, since S8b.1
+    /// derived from `current_exe()`), pinned by
+    /// `childproc::target_debug_dir_is_where_cargo_actually_builds`.
     fn fake_bin() -> String {
         crate::test_support::target_debug_dir()
-            .join("fake_mcp_stdio")
+            .join("fake_mcp_stdio_core")
             .display()
             .to_string()
     }
 
     /// A temp `McpManager` over a temp config (the servers point at the fake
-    /// stdio binary — `target/debug/fake_mcp_stdio`).
+    /// stdio binary — `target/debug/fake_mcp_stdio_core`).
     fn manager_with(servers_json: &Value) -> (McpManager, tempfile::TempDir) {
         let bin = fake_bin();
         let dir = tempfile::tempdir().expect("a temp dir");

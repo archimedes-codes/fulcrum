@@ -382,16 +382,19 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The `fake_mcp_stdio` test-double binary (built by `cargo test`).
+    /// The crate's own `fake_mcp_stdio_core` test-double binary (built by
+    /// `cargo test` — S8b.1: the crate owns this bin now; the body is
+    /// `crate::fixtures::mcp_stdio`, shared with the desktop's `fake_mcp_stdio`).
     ///
     /// T5/S3 (Step A-bis): this resolved `CARGO_MANIFEST_DIR.parent()`, which was
     /// the repo root while this file lived in `src-tauri/` and is `crates/` now
     /// that it lives in `crates/fulcrum-core/`. `target_debug_dir()` is the
-    /// crate's ONE resolver (TWO levels up) and the `childproc` pin
+    /// crate's ONE resolver (`current_exe()`-derived since S8b.1) and the
+    /// `childproc` pin
     /// `target_debug_dir_is_where_cargo_actually_builds` is what proves it —
     /// nothing here does, because this spawner has no vacuity guard of its own.
     fn fake_mcp_bin() -> PathBuf {
-        crate::test_support::target_debug_dir().join("fake_mcp_stdio")
+        crate::test_support::target_debug_dir().join("fake_mcp_stdio_core")
     }
 
     /// A `StdioDef` pointing at the fake binary.

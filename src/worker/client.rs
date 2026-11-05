@@ -1164,8 +1164,16 @@ mod tests {
     /// integration-test targets, never inside a lib's `#[cfg(test)]` (T4's
     /// two-shape rule), which is why the manifest-derived resolver is the only
     /// correct form at this depth.
+    ///
+    /// S8b.1 repointed the NAME from `fake_worker` to `fake_worker_core`: the
+    /// crate now owns its fixture bin (declared in `Cargo.toml`, body in
+    /// `crate::fixtures::worker`), and `_core` is what keeps the two packages'
+    /// bins from colliding on one output file in the shared `target/debug/`.
+    /// Before that, every test in this module spawned a bin owned by the desktop
+    /// package — which is why 11 of them failed `ENOENT` the moment the crate was
+    /// built alone.
     pub fn fixture_path() -> std::path::PathBuf {
-        crate::test_support::fixture_bin("fake_worker")
+        crate::test_support::fixture_bin("fake_worker_core")
     }
 
     /// T4's pin, REWRITTEN in S8.3 — the old form was VACUOUS for the exact
@@ -1197,21 +1205,28 @@ mod tests {
         // (their `EXE_SUFFIX` is empty). `test_support::exe_file_name` carries
         // the rule and `the_fixture_binary_name_carries_the_platform_exe_suffix`
         // pins both arms of it on every OS.
-        let want_name = format!("fake_worker{}", std::env::consts::EXE_SUFFIX);
+        let want_name = format!("fake_worker_core{}", std::env::consts::EXE_SUFFIX);
         assert_eq!(
             p.file_name().and_then(|s| s.to_str()),
             Some(want_name.as_str()),
-            "still the fake_worker fixture, under the name cargo builds it as"
+            "still the crate's own fake_worker fixture (`fake_worker_core` — the \
+             `_core` suffix is what keeps it from colliding with the desktop's \
+             `fake_worker` bin on one output file), under the name cargo builds it as"
         );
-        // (1) The equality half — the ONLY resolver, two levels up. Spelled
-        //     against `target_debug_dir()` and NOT against `fixture_bin`, so it
-        //     still discriminates a wrong LEVEL count instead of agreeing with
-        //     the body by construction.
+        // (1) The equality half — the ONLY resolver. Spelled against
+        //     `target_debug_dir()` and NOT against `fixture_bin`, so it still
+        //     catches a `fixture_path` that stopped going through the shared
+        //     resolver. SINCE S8b.1 IT IS NOT THE LEVEL-COUNT WITNESS ANY MORE:
+        //     the resolver's body is now `current_exe()`-derived too (see
+        //     `test_support::target_debug_dir`), so this half agrees with the
+        //     body by construction and cannot go red on a level count. Half (2)
+        //     — which computes `built_into` from `current_exe()` ITSELF, without
+        //     calling the resolver — is what still discriminates.
         assert_eq!(
             p,
             crate::test_support::target_debug_dir().join(&want_name),
-            "the fixture must resolve through the crate's ONE two-levels-up \
-             resolver, not a manifest-parent guess"
+            "the fixture must resolve through the crate's ONE resolver, not a \
+             manifest-parent guess"
         );
         // (2) The load-bearing half: compare against where cargo BUILT this test
         // binary. A lib test lives in `target/debug/deps/`, so its grandparent is

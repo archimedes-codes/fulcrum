@@ -791,7 +791,7 @@ mod tests {
         // pre-S3 spelling here would have spawned an ENOENT path — and this
         // spawner has no vacuity guard, so nothing but
         // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
-        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio_core");
         let (manager, _dir) = manager_with(&stdio_server_json(&bin), None);
         assert_eq!(manager.server_names(), vec!["a"]);
         // The first `call_tool` connects (lazy).
@@ -834,7 +834,7 @@ mod tests {
         // pre-S3 spelling here would have spawned an ENOENT path — and this
         // spawner has no vacuity guard, so nothing but
         // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
-        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio_core");
         let def = ServerDef::Stdio(StdioDef {
             command: bin.display().to_string(),
             args: vec![],
@@ -877,7 +877,7 @@ mod tests {
         // pre-S3 spelling here would have spawned an ENOENT path — and this
         // spawner has no vacuity guard, so nothing but
         // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
-        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio_core");
         let (manager, _dir) = manager_with(&stdio_server_json(&bin), None);
         let cancel = CancellationToken::new();
         manager
@@ -2209,7 +2209,7 @@ mod tests {
         // pre-S3 spelling here would have spawned an ENOENT path — and this
         // spawner has no vacuity guard, so nothing but
         // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
-        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio_core");
         let (manager, _dir) = manager_with(&two_stdio_server_json(&bin), None);
         // Never touch the developer's real `mcp-auth.json` (both servers are
         // stdio, so nothing reads it — but the seam is the house rule).

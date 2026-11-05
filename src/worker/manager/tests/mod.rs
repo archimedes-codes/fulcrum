@@ -24,8 +24,10 @@ type EventLog = Arc<StdMutex<Vec<(String, bool, WorkerInboundEvent)>>>;
 type SinkMap = Arc<StdMutex<HashMap<String, Arc<CollectorSink>>>>;
 type SinkEvents = Arc<StdMutex<Vec<(String, Value)>>>;
 
-/// The `fake_worker` fixture — resolved through the crate's ONE `target/debug`
-/// resolver (S8.3, the same re-point `worker/client.rs::fixture_path` carries).
+/// The crate's OWN `fake_worker_core` fixture (S8b.1 — the body lives in
+/// `crate::fixtures::worker`, the bin in `src/bin/`) — resolved through the
+/// crate's ONE `target/debug` resolver (S8.3, the same re-point
+/// `worker/client.rs::fixture_path` carries).
 ///
 /// The old body derived the root from `env!("CARGO_MANIFEST_DIR").parent()`,
 /// which was right in `src-tauri/` (one level under the root) and is WRONG here:
@@ -39,7 +41,7 @@ type SinkEvents = Arc<StdMutex<Vec<(String, Value)>>>;
 /// THIS helper to it, so a wrong level count fails loudly rather than silently
 /// green.
 fn fixture_path() -> std::path::PathBuf {
-    crate::test_support::fixture_bin("fake_worker")
+    crate::test_support::fixture_bin("fake_worker_core")
 }
 
 /// The vacuity guard this module did not have (the lesson `childproc.rs`
@@ -59,11 +61,11 @@ fn fixture_root_is_where_cargo_actually_builds() {
     // `worker/client.rs::fixture_path_resolves_to_the_workspace_root_target`.
     // `is_file()` below does not append an exe suffix the way `CreateProcess`
     // does, which is what reddened this witness on `windows-latest`.
-    let want_name = format!("fake_worker{}", std::env::consts::EXE_SUFFIX);
+    let want_name = format!("fake_worker_core{}", std::env::consts::EXE_SUFFIX);
     assert_eq!(
         p,
         crate::test_support::target_debug_dir().join(&want_name),
-        "the fixture must resolve through the crate's ONE two-levels-up resolver"
+        "the fixture must resolve through the crate's ONE resolver"
     );
     let exe = std::env::current_exe().expect("a test binary has a path");
     let built_into = exe

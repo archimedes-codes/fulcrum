@@ -604,33 +604,186 @@ mod tests {
         text: String,
     }
 
-    /// The workspace root — `CARGO_MANIFEST_DIR` TWO levels up.
-    ///
-    /// T5/S2 (Step A-bis) moved this file from `src-tauri/` to
-    /// `crates/fulcrum-core/`, so `CARGO_MANIFEST_DIR` is no longer the package
-    /// that owns the code the census polices, and its `.parent()` is `crates/`,
-    /// not the repo root. Everything below resolves through HERE so there is one
-    /// definition of "where the workspace is" in the crate.
-    fn workspace_root() -> std::path::PathBuf {
+    /// This package's manifest directory — the one anchor the census reads, and
+    /// the ONLY one. Every other path is derived by READING a manifest or from
+    /// `current_exe()`, never by counting `.parent()`s.
+    fn manifest_dir() -> &'static std::path::Path {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("crates/fulcrum-core has a grandparent (the repo root)")
-            .to_path_buf()
     }
 
-    /// The shared cargo `target/` dir. From `crates/fulcrum-core` that is TWO
-    /// levels up, NOT one — the trap T4 left and Step A-bis exists to close.
+    /// Which checkout the census is running in. S8b.2.
     ///
-    /// T5/S3 MOVED THIS HERE (`test_support::target_debug_dir`) and left a
-    /// one-line alias below. The reason is Step A-bis's own instruction — "fix
-    /// once, not eight times" — and S3 is where it stops being hypothetical: the
-    /// first consumers arrived (`mcp/stdio.rs`, `mcp/tool.rs`, `mcp/manager.rs`,
-    /// four `fake_mcp_stdio` spawners). A second definition of "where cargo
-    /// builds" inside the same crate is exactly the drift this helper exists to
-    /// prevent, so the census keeps its local `workspace_root()` (it needs the
-    /// ROOT, to walk two `src/` trees) and defers the `target/debug` half to the
-    /// shared one.
+    /// # Why this is a DISCRIMINATOR and not a fallback
+    ///
+    /// `env!("CARGO_MANIFEST_DIR")` is `<repo>/crates/fulcrum-core` while the
+    /// crate is a workspace member and `<the copy>` when it stands alone — so
+    /// its DEPTH differs between the two layouts, and the pre-S8b.2 resolver
+    /// (`.parent().parent()`) silently named the user's home directory in a
+    /// standalone checkout. The fix cannot be "use the grandparent when it looks
+    /// like a workspace and the manifest dir when it does not": a census that
+    /// shrinks its own corpus to whatever resolves is the fail-open
+    /// [`source_roots`] exists to prevent, and every "zero violations" claim
+    /// below would then be true of half the code. So a layout is a CLAIM with a
+    /// witness: `WorkspaceMember` demands the desktop root exists (loud panic if
+    /// not), and `SinglePackage` demands no desktop tree sits beside the build
+    /// output (loud panic if one does). Neither branch can quietly be blind.
+    #[derive(Debug)]
+    enum Layout {
+        /// An ancestor manifest declares a `[workspace]` that names this
+        /// package. The desktop package's `src/` is policed from
+        /// `workspace_root/src-tauri/src`, and it MUST resolve.
+        WorkspaceMember { workspace_root: std::path::PathBuf },
+        /// No ancestor manifest claims this package: a single-package checkout
+        /// (the T8b condition — this crate copied out on its own). One root.
+        SinglePackage,
+    }
+
+    impl Layout {
+        /// Whether the desktop package's tree is in this census's scope.
+        fn polices_the_desktop(&self) -> bool {
+            matches!(self, Layout::WorkspaceMember { .. })
+        }
+    }
+
+    /// `CARGO_MANIFEST_DIR` relative to `ancestor`, `/`-normalised (so a Windows
+    /// `\` cannot defeat a `starts_with` against a manifest's `/`-written member).
+    fn relative_to_manifest(ancestor: &std::path::Path) -> Option<String> {
+        let rest = manifest_dir().strip_prefix(ancestor).ok()?;
+        Some(rest.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Every double-quoted string in a manifest. A deliberately dumb scanner: it
+    /// does not parse TOML, it asks one question of it — "does this manifest name
+    /// my directory?" — and a manifest that fools it fails LOUD (see
+    /// [`declaring_workspace_root`]'s assert), never silently.
+    fn quoted_strings(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            match after.find('"') {
+                Some(close) => {
+                    out.push(after[..close].to_string());
+                    rest = &after[close + 1..];
+                }
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Whether the text declares a `[workspace]` table (`[workspace]` itself or
+    /// any `[workspace.…]` sub-table, which cargo treats as declaring it too).
+    fn declares_workspace_table(text: &str) -> bool {
+        text.lines()
+            .map(str::trim)
+            .any(|line| line == "[workspace]" || line.starts_with("[workspace."))
+    }
+
+    /// Whether one `members` entry names this package: a literal path
+    /// (`crates/fulcrum-core`), or a glob (`crates/*` — matched on its prefix,
+    /// because a glob workspace is the one form that does not spell the name).
+    fn member_entry_names_us(entry: &str, rel: &str, package: &str) -> bool {
+        if let Some((prefix, _)) = entry.split_once('*') {
+            let prefix = prefix.trim_end_matches('/');
+            return if prefix.is_empty() {
+                true
+            } else {
+                rel.starts_with(&format!("{prefix}/"))
+            };
+        }
+        rel == entry || package == entry
+    }
+
+    /// The nearest ANCESTOR `Cargo.toml` that declares a `[workspace]` naming
+    /// this package — the workspace root, WITHOUT counting levels.
+    ///
+    /// `None` means no manifest anywhere above `CARGO_MANIFEST_DIR` claims us,
+    /// which is what a genuine single-package checkout looks like. An ancestor
+    /// that declares a workspace and does NOT name us is a LOUD panic, not a
+    /// `None`: guessing here is exactly how a census ends up policing less than
+    /// it claims. (A `members` entry naming us only via a glob is handled; a
+    /// workspace that claims us through `exclude` while pointing `package.workspace`
+    /// elsewhere is not — it panics, which is the safe direction.)
+    fn declaring_workspace_root() -> Option<std::path::PathBuf> {
+        let package = env!("CARGO_PKG_NAME");
+        let mut dir = manifest_dir().parent()?;
+        loop {
+            let candidate = dir.join("Cargo.toml");
+            if let Ok(text) = std::fs::read_to_string(&candidate) {
+                if declares_workspace_table(&text) {
+                    let rel = relative_to_manifest(dir);
+                    let names_us = rel.is_some_and(|rel| {
+                        quoted_strings(&text)
+                            .iter()
+                            .any(|entry| member_entry_names_us(entry, &rel, package))
+                    });
+                    assert!(
+                        names_us,
+                        "`{}` declares a `[workspace]` but does not name `{}` (nor its \
+                         path {:?}) among its members — the census cannot tell whether it \
+                         is inside a two-package checkout, and it refuses to guess: either \
+                         name the member, or move this package out of that workspace.",
+                        candidate.display(),
+                        package,
+                        manifest_dir(),
+                    );
+                    return Some(dir.to_path_buf());
+                }
+            }
+            dir = dir.parent()?;
+        }
+    }
+
+    /// The layout, as measured — never as assumed.
+    fn detect_layout() -> Layout {
+        match declaring_workspace_root() {
+            Some(workspace_root) => Layout::WorkspaceMember { workspace_root },
+            None => Layout::SinglePackage,
+        }
+    }
+
+    /// The second witness of the layout: is there a DESKTOP TREE anywhere above
+    /// this package — asked of the FILESYSTEM, with no manifest parsed and no
+    /// `[workspace]` consulted?
+    ///
+    /// `Some(dir)` means `<dir>/src-tauri/src` exists for some ancestor of
+    /// `CARGO_MANIFEST_DIR`. That is the shape of a two-package checkout, and it
+    /// is the ONLY thing that can catch a broken [`declaring_workspace_root`]:
+    /// every desktop-specific floor is conditional on the layout, so if the
+    /// discriminator wrongly answers `SinglePackage`, those floors do not fail —
+    /// they VANISH, and the census certifies a corpus it never opened. The
+    /// `SinglePackage` branch therefore demands this return `None`.
+    ///
+    /// It is deliberately not derived from `current_exe()`/`target/`: a relocated
+    /// `--target-dir` would make a build-output-derived witness answer "no tree
+    /// anywhere", which is the silent-no answer this must never be.
+    fn desktop_tree_above() -> Option<std::path::PathBuf> {
+        let mut dir = Some(manifest_dir());
+        while let Some(current) = dir {
+            if current.join("src-tauri").join("src").is_dir() {
+                return Some(current.to_path_buf());
+            }
+            dir = current.parent();
+        }
+        None
+    }
+
+    /// The shared cargo `target/` dir — a one-line ALIAS for
+    /// `test_support::target_debug_dir`, which since S8b.1 resolves it from
+    /// `current_exe()` rather than by counting manifest levels (see that helper for
+    /// why: a standalone `cargo test` in this package builds into
+    /// `<package>/target/`, so the grandparent names a directory no build writes).
+    ///
+    /// T5/S3 MOVED THE BODY HERE and left this alias. The reason is Step A-bis's
+    /// own instruction — "fix once, not eight times" — and S3 is where it stops
+    /// being hypothetical: the first consumers arrived (`mcp/stdio.rs`,
+    /// `mcp/tool.rs`, `mcp/manager.rs`, four `fake_mcp_stdio` spawners). A second
+    /// definition of "where cargo builds" inside the same crate is exactly the
+    /// drift this helper exists to prevent, so the census keeps its local
+    /// `workspace_root()` (it needs the ROOT, to walk two `src/` trees — and that
+    /// two-package assumption is what S8b.2 must teach to detect a single-package
+    /// checkout) and defers the `target/debug` half to the shared one.
     ///
     /// NO S2 FILE CONSUMES THIS, and that was a measured finding, not an
     /// oversight: nothing in `{tools, web, boundary, policy, definition_permission,
@@ -672,19 +825,23 @@ mod tests {
     /// The ground truth is `current_exe()`: the test binary IS
     /// `target/debug/deps/<name>-<hash>`, cargo put it there, so walking up twice
     /// from it gives the real `target/debug` with NO manifest arithmetic involved.
-    /// If the crate's TWO-level resolution drifts to ONE level
-    /// (`crates/target/debug`), it stops equaling the ground truth and this
-    /// reddens. Since S8.3 the crate CAN call `worker/client.rs::fixture_path()`
-    /// directly (same package, both `#[cfg(test)]`) and does — in that module's
-    /// own equality pin — so this pin is now the resolver-level half of a pair
-    /// rather than the only witness.
+    /// If the resolver drifts a level in either direction it stops equaling the
+    /// ground truth and this reddens. Since S8.3 the crate CAN call
+    /// `worker/client.rs::fixture_path()` directly (same package, both
+    /// `#[cfg(test)]`) and does — in that module's own equality pin — so this pin
+    /// is the resolver-level half of a pair rather than the only witness.
     ///
     /// # Verified non-vacuous
     ///
-    /// Collapsing `workspace_root()`'s `.parent().and_then(|p| p.parent())` to a
-    /// single `.parent()` makes this fail: the assertion quotes both sides, so the
-    /// failure names `crates/target/debug` against the real one. That is the T4
-    /// lesson applied — a pin that cannot go red is not a pin.
+    /// S8b.1 re-ran the mutation on the resolver's CURRENT body (the helper moved
+    /// to `test_support` long ago, so the original wording here named
+    /// `workspace_root()`, which this pin does not call — a stale claim, corrected
+    /// rather than left). Dropping one `.parent()` from
+    /// `test_support::target_debug_dir`'s body reddens THIS pin and three others in
+    /// three other files; each of the two shape asserts below was additionally
+    /// tripped on its own with the equality disabled, so neither hides behind the
+    /// other. That is the T4 lesson applied — a pin that cannot go red is not a
+    /// pin, and the claim needs a mutation behind it, not a sentence.
     #[test]
     fn target_debug_dir_is_where_cargo_actually_builds() {
         let claimed = target_debug_dir();
@@ -701,8 +858,55 @@ mod tests {
              binary into {ground_truth:?}/deps — the two disagree, so every fixture \
              path the crate derives from `target_debug_dir()` would spawn an ENOENT \
              path (or, at a `let _ =` site, quietly nothing). The crate manifest is \
-             {}; the workspace root must be its GRANDPARENT (T5/S2 Step A-bis).",
+             {}.",
             env!("CARGO_MANIFEST_DIR"),
+        );
+
+        // ⚠️ **WHY THIS EQUALITY STILL HAS TEETH AFTER S8b.1.** The resolver's
+        // BODY moved to `current_exe()` in S8b.1 (see
+        // `test_support::target_debug_dir` for why: a standalone `cargo test` in
+        // this package builds into `<package>/target/`, so the manifest's
+        // grandparent names a directory no build ever writes, and 66 fixture
+        // spawns stayed ENOENT until the ROOT was fixed — not just the bin names).
+        // That COULD have turned this pin into an identity — two copies of one
+        // expression cannot disagree — and it did not, because `ground_truth`
+        // above is this pin's OWN `current_exe()` walk, written here and not
+        // borrowed from the helper it checks. Vacuity is a claim about mutations,
+        // so it was tested rather than asserted: **dropping one `.parent()` from
+        // the resolver's body reddens this pin** (measured: it reports
+        // `target/debug/deps` against the real `target/debug`), and the same
+        // mutation separately reddens `worker/client.rs`,
+        // `worker/manager/tests/mod.rs` and `test_support`'s own exe-suffix pin —
+        // four witnesses in four files.
+        //
+        // The two shape asserts below are a SECOND, INDEPENDENT kind of teeth, and
+        // they were each tripped on their own (with the equality disabled, so
+        // neither one hides behind the other): assert (1) fires on a path named
+        // `deps`, assert (2) on one named `target`. They also survive what the
+        // equality's own arithmetic cannot promise — they check the resolved NAME,
+        // so they hold for a workspace member, a standalone package, a relocated
+        // `--target-dir`, and a cross-compiled `target/<triple>/debug`.
+
+        // (1) ONE LEVEL TOO FEW: dropping a `.parent()` leaves
+        // `target/debug/deps`, whose file name is `deps`, not `debug`.
+        assert_eq!(
+            claimed.file_name().and_then(|s| s.to_str()),
+            Some("debug"),
+            "`target_debug_dir()` must name the `debug` profile directory, not a \
+             level inside it or above it — resolved {claimed:?}. A dropped \
+             `.parent()` lands on `deps` (where the TEST binaries live, so every \
+             fixture spawn would exec a `deps/<name>` that cargo never writes)."
+        );
+        //
+        // (2) ONE LEVEL TOO MANY: adding a `.parent()` lands on `target`, which
+        // has no `deps/` child. Together (1) and (2) bracket the level count in
+        // BOTH directions without naming a level, which is what lets them survive
+        // the layout change instead of encoding it.
+        assert!(
+            claimed.join("deps").is_dir(),
+            "`{claimed:?}` must be the PARENT of `deps/` — the directory cargo \
+             built this very test binary's siblings into. A level too high names \
+             `target/`, which has no `deps` child."
         );
 
         // The existence witness. It used to carry a different job: while
@@ -728,7 +932,8 @@ mod tests {
         path: std::path::PathBuf,
     }
 
-    /// BOTH packages' `src/` trees.
+    /// EVERY `src/` tree the census is entitled to police, given the layout it
+    /// measured. S8b.2.
     ///
     /// THE REASON THIS IS TWO ROOTS AND NOT ONE: the census asserts ABSENCES
     /// ("no `Command::new(` outside `childproc`", "no `.creation_flags(` outside
@@ -737,39 +942,254 @@ mod tests {
     /// policed code sits in TWO packages, and a scan of either one alone reports a
     /// clean bill of health for the half it never opened — the fail-OPEN shape
     /// this repo keeps recording (the same class as the 18c census scan roots and
-    /// the five-edge scan). So: walk both, always.
+    /// the five-edge scan). So: walk both, whenever both exist.
+    ///
+    /// # Why dropping the desktop root in a standalone checkout is NOT that fail-open
+    ///
+    /// A root is dropped ONLY when the LAYOUT says the tree is not there, and the
+    /// layout is measured twice, independently:
+    ///
+    ///   1. `cargo`'s own manifest graph — an ancestor `Cargo.toml` declaring a
+    ///      `[workspace]` that names this package ([`declaring_workspace_root`]).
+    ///   2. `cargo`'s own build output — the directory that owns the `target/`
+    ///      this very test binary was built into ([`build_output_owner`], derived
+    ///      from `current_exe()`, which shares NO expression with (1)).
+    ///
+    /// `WorkspaceMember` asserts the desktop root EXISTS (a missing one is a
+    /// resolution bug and panics, naming the resolution). `SinglePackage` asserts
+    /// no `src-tauri/src` sits beside the build output — so a census that wrongly
+    /// concluded "single package" while actually standing in the two-package repo
+    /// PANICS instead of quietly policing half the tree. That second assert is the
+    /// only thing that can catch a broken discriminator, because every
+    /// desktop-specific floor is conditional on the layout and would simply
+    /// vanish with it. It is measured, not asserted: mutation 1 of S8b.2 forces
+    /// the single-package branch inside the workspace and this is what reddens.
     ///
     /// The workspace root itself is deliberately NOT a walk root: it holds
     /// `target/`, whose `build/` trees carry generated `*.rs` (and tens of GB).
-    /// Walking it would both hang and invent violations in generated code. Two
-    /// named `src/` dirs is the exact scope.
+    /// Walking it would both hang and invent violations in generated code. Named
+    /// `src/` dirs is the exact scope.
     fn source_roots() -> Vec<SourceRoot> {
-        let root = workspace_root();
-        let roots = vec![
-            SourceRoot {
-                label: "fulcrum-core/",
-                path: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            },
-            SourceRoot {
+        let layout = detect_layout();
+        let mut roots = vec![SourceRoot {
+            // The crate's own tree. The label is a CONSTANT, not a derived path,
+            // so it survives the layout change: `SELF` and every labelled entry
+            // below resolve against this root in BOTH layouts.
+            label: "fulcrum-core/",
+            path: manifest_dir().join("src"),
+        }];
+        if let Layout::WorkspaceMember { workspace_root } = &layout {
+            roots.push(SourceRoot {
                 label: "archimedes/",
-                path: root.join("src-tauri").join("src"),
-            },
-        ];
+                path: workspace_root.join("src-tauri").join("src"),
+            });
+        } else {
+            // The filesystem witness. A census that calls this layout
+            // `SinglePackage` while an ancestor directory still holds the
+            // desktop's `src/` would drop that root and report a clean bill of
+            // health for code it never opened — so the claim gets checked
+            // against the tree around it, which no manifest parsing can fake.
+            // This is the ONLY guard against a broken discriminator: the
+            // desktop-specific floors are conditional on the layout and would
+            // disappear with it rather than fail.
+            let strays = desktop_tree_above();
+            assert!(
+                strays.is_none(),
+                "the census concluded this is a SINGLE-PACKAGE checkout (no ancestor \
+                 `Cargo.toml` declares a `[workspace]` naming `{}`), but an ancestor \
+                 directory — {:?} — holds a desktop tree at `src-tauri/src`. Two-package \
+                 layout with an undetected workspace: dropping the desktop root here would \
+                 silently un-police it, so this is a resolution bug and not a layout \
+                 (CARGO_MANIFEST_DIR={}).",
+                env!("CARGO_PKG_NAME"),
+                strays,
+                env!("CARGO_MANIFEST_DIR"),
+            );
+        }
         for r in &roots {
             // Loud, not fail-open: a root that does not resolve would empty its
             // half of the corpus, and every "zero violations" below would then be
-            // true of nothing. The message names the root, per the guard's own
-            // convention.
+            // true of nothing. The message names the root AND the layout that
+            // produced it, per the guard's own convention.
             assert!(
                 r.path.is_dir(),
                 "the census resolved the wrong root: {} is not a directory \
-                 (workspace root resolved to {:?} from CARGO_MANIFEST_DIR={})",
+                 (layout {:?}, CARGO_MANIFEST_DIR={})",
                 r.path.display(),
-                root,
+                layout,
                 env!("CARGO_MANIFEST_DIR"),
             );
         }
         roots
+    }
+
+    /// What the census actually SAW inside ONE root. S8b.2 makes the vacuity
+    /// floors PER ROOT for the reason measured at `$BASE`: the aggregate floor
+    /// (`>= 8` calls, `>= 4` files, `>= 1` `command_std`) is satisfied by the
+    /// crate root ALONE in shape — 8 calls across 6 files — so an aggregate-only
+    /// guard cannot tell "both trees walked" from "the desktop half never
+    /// opened". Each root therefore reports its own eyesight.
+    struct RootTally {
+        label: &'static str,
+        /// Files the walk opened (any `.rs`, whether or not it holds a call).
+        files_scanned: usize,
+        /// `childproc::command(` + `childproc::command_std(` lines.
+        calls: usize,
+        /// Distinct files holding at least one of them.
+        call_files: usize,
+        /// The `command_std(` subset.
+        std_calls: usize,
+        /// `childproc::append_cmd_c(` lines outside [`SELF`].
+        append_callers: usize,
+    }
+
+    impl RootTally {
+        fn of(label: &'static str, regions: &[(String, Vec<SourceLine>)]) -> RootTally {
+            let mine = regions.iter().filter(|(rel, _)| rel.starts_with(label));
+            let mut t = RootTally {
+                label,
+                files_scanned: 0,
+                calls: 0,
+                call_files: 0,
+                std_calls: 0,
+                append_callers: 0,
+            };
+            for (rel, region) in mine {
+                t.files_scanned += 1;
+                let calls = region
+                    .iter()
+                    .filter(|l| l.text.contains("childproc::command("))
+                    .count();
+                // `childproc::command(` is not a substring of
+                // `childproc::command_std(` (the `(` differs), so the two
+                // tallies do not double-count.
+                let std = region
+                    .iter()
+                    .filter(|l| l.text.contains("childproc::command_std("))
+                    .count();
+                if calls + std > 0 {
+                    t.calls += calls + std;
+                    t.std_calls += std;
+                    t.call_files += 1;
+                }
+                if rel != SELF {
+                    t.append_callers += region
+                        .iter()
+                        .filter(|l| l.text.contains("childproc::append_cmd_c("))
+                        .count();
+                }
+            }
+            t
+        }
+    }
+
+    /// The floor one root MUST clear, and the number that was measured there.
+    /// Kept as a struct so both roots read through one code path and a floor
+    /// cannot be quietly dropped for one of them.
+    struct RootFloor {
+        label: &'static str,
+        files_scanned: usize,
+        calls: usize,
+        call_files: usize,
+        std_calls: usize,
+        append_callers: usize,
+        measured: &'static str,
+    }
+
+    /// The floors, asserted per root, against the corpus the walk actually saw.
+    ///
+    /// None of these is headroom. Each sits at or just under what the root
+    /// contributes TODAY (measured at `$BASE` 75550d0a — see each entry), so a
+    /// root that goes blind, stops descending, or loses the call the census
+    /// exists to watch reddens the pin instead of shrinking the claim. The
+    /// `files_scanned` floor is the DISCRIMINATOR for a walk that stops
+    /// descending: a flat `read_dir` of `crates/fulcrum-core/src` reads 36 files
+    /// and finds ZERO constructor calls (every caller lives in a subtree), so
+    /// the `calls` floor alone already catches it — the file floor is the second
+    /// witness, and both are far above the shallow count.
+    fn assert_root_floors(tally: &RootTally, floor: &RootFloor) {
+        assert_eq!(
+            tally.label, floor.label,
+            "the census tallied `{}` against `{}`'s floor — a root and its floor \
+             must be paired by name or a floor can be swapped onto the wrong half",
+            tally.label, floor.label
+        );
+        let blind = tally.files_scanned < floor.files_scanned
+            || tally.calls < floor.calls
+            || tally.call_files < floor.call_files
+            || tally.std_calls < floor.std_calls
+            || tally.append_callers < floor.append_callers;
+        if blind {
+            panic!(
+                "the census is BLIND in `{}`: it found {} `childproc::command*` calls in \
+                 {} distinct file(s) ({} of them `command_std`), {} \
+                 `childproc::append_cmd_c(` caller(s) outside `{SELF}`, across {} scanned \
+                 file(s) — the floor is >= {} calls in >= {} file(s) with >= {} \
+                 `command_std` and >= {} `append_cmd_c` caller(s) over >= {} file(s) \
+                 (measured at `$BASE`: {}). At or below the floor either the root \
+                 resolved somewhere else, the walk stopped descending, or the match \
+                 strings drifted from the API — and every ABSENCE invariant in this census \
+                 would then be true of nothing.",
+                tally.label,
+                tally.calls,
+                tally.call_files,
+                tally.std_calls,
+                tally.append_callers,
+                tally.files_scanned,
+                floor.calls,
+                floor.call_files,
+                floor.std_calls,
+                floor.append_callers,
+                floor.files_scanned,
+                floor.measured,
+            );
+        }
+    }
+
+    /// `crates/fulcrum-core/src` — measured at `$BASE`: **8 constructor calls
+    /// across 6 files** (`interactive/sudo_exec.rs` 1, `mcp/stdio.rs` 1,
+    /// `provider_auth/key_helper.rs` 1, `tools/exec/bash.rs` 2,
+    /// `tools/exec/search.rs` 2, `worker/client.rs` 1), **0 `command_std`**, **1
+    /// `append_cmd_c` caller** (`tools/exec/bash.rs:161`), **148 `.rs` files**.
+    ///
+    /// `std_calls: 0` is a MEASURED fact and is deliberately NOT raised to 1: no
+    /// crate production site calls `command_std` today, and inventing a floor
+    /// above the measurement would be a pin that fails on a correct tree. The
+    /// desktop root's floor is where `command_std` is watched.
+    fn crate_floor() -> RootFloor {
+        RootFloor {
+            label: "fulcrum-core/",
+            files_scanned: 40,
+            calls: 8,
+            call_files: 4,
+            std_calls: 0,
+            append_callers: 1,
+            measured: "8 calls / 6 files / 0 std / 1 append caller / 148 files",
+        }
+    }
+
+    /// `src-tauri/src`, POLICIED ONLY in the workspace-member layout — measured
+    /// at `$BASE`: **1 `command_std` call in 1 file**
+    /// (`commands/update.rs:608`, the Linux relaunch path, verified NOT inside
+    /// `#[cfg(test)]`; its other `Command::new` at `:1216` is test code), **0**
+    /// `append_cmd_c` callers, **52 `.rs` files**.
+    ///
+    /// This floor is the reason the desktop root is worth walking at all: it is
+    /// ONE PRODUCTION call, and it reaches the crate's API through
+    /// `src-tauri/src/agent/mod.rs`'s re-export shell, so the match string still
+    /// names the crate's own API. It is NOT conditional on anything but the
+    /// layout — a workspace-member census that loses this root fails HERE, which
+    /// is the fail-open S8b.2 exists to close.
+    fn desktop_floor() -> RootFloor {
+        RootFloor {
+            label: "archimedes/",
+            calls: 1,
+            call_files: 1,
+            std_calls: 1,
+            append_callers: 0,
+            files_scanned: 20,
+            measured: "1 call / 1 file / 1 std / 0 append callers / 52 files",
+        }
     }
 
     /// The census's own path, `/`-normalised and prefixed with its ROOT LABEL —
@@ -939,50 +1359,28 @@ mod tests {
     ///   worse bug than the hang this fixes.
     #[test]
     fn production_source_has_exactly_one_child_constructor() {
-        // TWO roots, because after T5/S2 the policed code lives in two packages.
-        // A one-root version of this test would keep passing while seeing only
-        // half the tree — invariants A and B assert ABSENCES, so a missing root
-        // is a silent green, not a red.
+        // Roots are LAYOUT-dependent since S8b.2 (see `source_roots`), so the
+        // vacuity floors below are PER ROOT: the pre-S8b.2 guard was AGGREGATE
+        // across both roots, and the measured split at `$BASE` (crate 8 calls /
+        // 6 files, desktop 1 call / 1 file) means the crate half alone satisfies
+        // a `>= 8 calls / >= 4 files` shape — so an aggregate-only floor stays
+        // GREEN while the desktop half is un-policed. That is the fail-open this
+        // step exists to close, and it is why each root reports its own eyesight
+        // rather than contributing to one shared sum.
         let roots = source_roots();
+        let layout = detect_layout();
         let regions = scan_all(&roots);
 
-        // ── Vacuity guard, FIRST: a scanner that sees nothing must fail loudly,
-        // not report a clean bill of health for an empty corpus (the same trick
-        // `hostenv::tainted_patch` plays by asserting its patch is non-empty).
-        // Deliberately NOT "files scanned >= N": the walk visits 100+ files
-        // whether or not it resolved the root, so that guard can never fail.
-        // These counts are the census's own eyesight.
-        let mut constructors = 0usize;
-        let mut std_constructors = 0usize;
-        let mut constructor_files: Vec<&String> = Vec::new();
-        for (rel, region) in &regions {
-            let tokio = region
-                .iter()
-                .filter(|l| l.text.contains("childproc::command("))
-                .count();
-            // `childproc::command(` is not a substring of
-            // `childproc::command_std(` (the `(` differs), so the two tallies
-            // do not double-count.
-            let std = region
-                .iter()
-                .filter(|l| l.text.contains("childproc::command_std("))
-                .count();
-            if tokio + std > 0 {
-                constructors += tokio + std;
-                std_constructors += std;
-                constructor_files.push(rel);
-            }
+        // ── Vacuity guard, FIRST, PER ROOT: a scanner that sees nothing must
+        // fail loudly, not report a clean bill of health for an empty corpus (the
+        // same trick `hostenv::tainted_patch` plays by asserting its patch is
+        // non-empty). Deliberately NOT a bare "files scanned >= N" — the walk
+        // visits 100+ files whether or not the CALLS are visible — so each root
+        // is floored on the calls it must see as well as on how far it descended.
+        assert_root_floors(&RootTally::of("fulcrum-core/", &regions), &crate_floor());
+        if layout.polices_the_desktop() {
+            assert_root_floors(&RootTally::of("archimedes/", &regions), &desktop_floor());
         }
-        assert!(
-            constructors >= 8 && constructor_files.len() >= 4 && std_constructors >= 1,
-            "the census is BLIND: it found {constructors} `childproc::command*` calls in {} \
-             distinct file(s) ({std_constructors} of them `command_std`) while scanning {} \
-             files — the expectation is >= 8 calls in >= 4 files with >= 1 `command_std`, so \
-             either the root resolved wrongly or the match strings drifted from the API, and \
-             every invariant below would be vacuous",
-            constructor_files.len(),
-            regions.len()
-        );
 
         // ── Invariant A.
         let mut constructors_outside: Vec<String> = Vec::new();
@@ -1089,13 +1487,22 @@ mod tests {
         // `interactive/sudo_exec.rs` are in the crate now. The label is not
         // cosmetic — `region_of` PANICS when a labelled path names no file, so a
         // stale entry is a red test rather than a file the census skipped.
-        for runtime_child in [
+        let mut runtime_children = vec![
             "fulcrum-core/mcp/stdio.rs",
             // T8/S8.3: moved into this crate — the label follows the file.
             "fulcrum-core/worker/client.rs",
             "fulcrum-core/interactive/sudo_exec.rs",
-            "archimedes/commands/update.rs",
-        ] {
+        ];
+        // `commands/update.rs` is the DESKTOP's relaunch path, so it is in scope
+        // only while the desktop tree is (see `source_roots`). Listing it
+        // unconditionally would panic in a single-package checkout — and listing
+        // it in a way that SKIPPED it when the label failed to resolve would be
+        // the fail-open, which is why `region_of` panics on a missing file and
+        // the desktop floors above gate the same root.
+        if layout.polices_the_desktop() {
+            runtime_children.push("archimedes/commands/update.rs");
+        }
+        for runtime_child in runtime_children {
             let found = mentions(region_of(runtime_child), "closed_stdin");
             assert_eq!(
                 found, 0,
@@ -1109,6 +1516,11 @@ mod tests {
     /// The crash-log module's path, `/`-normalised and LABELLED like [`SELF`] —
     /// it stayed desktop, so it carries the `archimedes/` root label.
     const CRASHLOG: &str = "archimedes/agent/crashlog.rs";
+
+    /// The CRATE-side half of the same invariant: the seam that installs the
+    /// hook. `run_worker_inner` resolves the base dir at INSTALL time and hands
+    /// it to the injected closure; the crate itself must never own the hook slot.
+    const CRASH_HOOK: &str = "fulcrum-core/worker/mod.rs";
 
     /// Invariant D — `agent/crashlog.rs` may not resolve a data dir.
     ///
@@ -1156,7 +1568,69 @@ mod tests {
     /// imply the region is exact.
     #[test]
     fn production_crashlog_never_resolves_a_data_dir() {
-        let crashlog_path = resolve_labeled(&source_roots(), CRASHLOG);
+        let roots = source_roots();
+        let layout = detect_layout();
+
+        // ── THE CRATE-SIDE HALF, which runs in BOTH layouts. `crashlog.rs`
+        // itself is desktop, so in a single-package checkout it is not merely
+        // absent, it is OUT OF THE BUILT PACKAGE — and a pin whose only subject
+        // file vanishes is a pin that reports "no resolvers" for a corpus it
+        // never opened. So the invariant keeps a subject the crate always has:
+        // the seam that resolves the base dir and hands it to the injected hook.
+        // Two claims, both measured at `$BASE`:
+        //
+        //   * `dirs::data_dir()` appears EXACTLY ONCE in `run_worker_inner`'s
+        //     production region, at install time, beside the hook it feeds — a
+        //     second resolver would be a new one in a new place, which is the
+        //     shape of the 862-file bug. The `1` is meant to be brittle.
+        //   * the crate claims NO hook slot (`set_hook` / `take_hook`: zero).
+        //     The crate resolves the DIRECTORY and passes it across; owning the
+        //     slot is what puts a test thread's panic into the user's data dir.
+        let hook_region = region_of_labeled(&roots, CRASH_HOOK);
+        let installed = hook_region
+            .iter()
+            .filter(|l| l.text.contains("hook(base.join"))
+            .count();
+        let resolved = hook_region
+            .iter()
+            .filter(|l| l.text.contains("dirs::data_dir()"))
+            .count();
+        assert_eq!(
+            (installed, resolved),
+            (1, 1),
+            "the crash-log invariant is BLIND on its crate-side half: the production \
+             region of `{CRASH_HOOK}` ({} surviving lines) holds {installed} copy(ies) of \
+             `hook(base.join` and {resolved} of `dirs::data_dir()`, expected (1, 1) — the \
+             install-time seam the desktop's hook is fed through. At 0 the region was cut \
+             short or the seam moved, and the hook-slot check below would pass having read \
+             nothing.",
+            hook_region.len(),
+        );
+        let slot_claims: Vec<String> = hook_region
+            .iter()
+            .filter(|l| l.text.contains("set_hook") || l.text.contains("take_hook"))
+            .map(|l| format!("{CRASH_HOOK}:{}", l.line))
+            .collect();
+        assert!(
+            slot_claims.is_empty(),
+            "Invariant D, crate half: `{CRASH_HOOK}` claims the process-global panic hook \
+             slot at {slot_claims:?} — the crate hands a DIRECTORY across the seam and the \
+             desktop installs the hook. `std::panic` has ONE slot for the whole process, so \
+             a hook owned here would decide where every thread's crash log lands, including \
+             a test thread's in the real data dir (the 862-file bug).",
+        );
+
+        // ── THE DESKTOP-SIDE HALF, in the layout that still contains it.
+        // Skipped ONLY when the desktop tree is out of the built package, and
+        // `source_roots` has already PANICKED if that conclusion is wrong — so
+        // this is a scope boundary with a witness, not a quiet no-op. The gap it
+        // leaves after T8b (nothing in the new crate repo polices the desktop's
+        // `update.rs` / `crashlog.rs`) is recorded in the roadmap status file for
+        // S8b.4 to settle; it is NOT closed here by guessing at a mechanism.
+        if !layout.polices_the_desktop() {
+            return;
+        }
+        let crashlog_path = resolve_labeled(&roots, CRASHLOG);
         // One file is the whole scope of this invariant — no tree walk. The
         // call panics rather than skipping if the file is unreadable, so a
         // wrong root fails loudly here instead of silently emptying the region.
@@ -1237,14 +1711,24 @@ mod tests {
     ///   outside view.
     #[test]
     fn production_code_never_appends_a_raw_command_line_itself() {
-        // TWO roots (see `source_roots`): invariant E asserts an ABSENCE, so a
-        // scan of one package alone would certify the other half unseen.
+        // Roots are layout-dependent since S8b.2 (see `source_roots`): invariant
+        // E asserts an ABSENCE, so a scan of one package alone would certify the
+        // other half unseen. The per-root floors below are what stop that — the
+        // `caller_count == 1` under this comment is an AGGREGATE and, measured at
+        // `$BASE`, its single hit lives in the CRATE (`tools/exec/bash.rs:161`),
+        // so on its own it stays green with the desktop root dropped.
         let roots = source_roots();
+        let layout = detect_layout();
         let regions = scan_all(&roots);
 
-        // ── Vacuity guard FIRST, in the census's own style: a scanner that sees
-        // nothing must fail loudly, not report a clean bill. Exactly ONE
-        // production caller of [`append_cmd_c`] is expected, and it is
+        // ── Vacuity guard FIRST, PER ROOT (see `assert_root_floors`), then the
+        // aggregate that pins this invariant's own API.
+        assert_root_floors(&RootTally::of("fulcrum-core/", &regions), &crate_floor());
+        if layout.polices_the_desktop() {
+            assert_root_floors(&RootTally::of("archimedes/", &regions), &desktop_floor());
+        }
+
+        // Exactly ONE production caller of [`append_cmd_c`] is expected, and it is
         // `exec/bash.rs` (`crate::childproc::append_cmd_c(` contains the
         // needle). This does double duty: it proves the scanner can SEE the API
         // it polices, and it pins that the `bash` child's command line still
@@ -1299,5 +1783,86 @@ mod tests {
              un-hides every child and re-opens a console window per command (ADR 0060). \
              Append the tail through `childproc::append_cmd_c` instead.",
         );
+    }
+
+    /// S8b.2 — the two INDEPENDENT witnesses of the checkout layout must agree.
+    ///
+    /// Every other pin in this census reads the layout; this one reads it TWICE
+    /// and compares, which is what makes a wrong answer LOUD instead of merely
+    /// smaller:
+    ///
+    ///   * **Witness 1 — cargo's manifest graph.** An ancestor `Cargo.toml`
+    ///     declaring a `[workspace]` that names this package
+    ///     ([`declaring_workspace_root`]).
+    ///   * **Witness 2 — the filesystem around the package.** Whether any ancestor
+    ///     directory holds `src-tauri/src` ([`desktop_tree_above`]).
+    ///
+    /// They share no expression and no failure mode: one parses manifests, the
+    /// other only stats directories. Disagreement is a panic in BOTH directions:
+    ///
+    ///   * witness 1 says member but witness 2 sees no desktop tree → the desktop
+    ///     root would resolve to a directory that does not exist (the pre-S8b.2
+    ///     bug: 4 red pins in a standalone copy);
+    ///   * witness 1 says single package but witness 2 sees one → the census would
+    ///     DROP that root and certify it unseen. That is the fail-open, and it is
+    ///     what mutation 1 of S8b.2 reddens.
+    #[test]
+    fn the_two_layout_witnesses_agree() {
+        let layout = detect_layout();
+        let seen = desktop_tree_above();
+
+        match &layout {
+            Layout::WorkspaceMember { workspace_root } => {
+                let expected = workspace_root.join("src-tauri").join("src");
+                assert!(
+                    expected.is_dir(),
+                    "the census's witnesses DISAGREE: the manifest graph says this package \
+                     is a workspace MEMBER (root {workspace_root:?}), but the desktop root \
+                     it implies — {} — is not a directory (witness 2 saw {seen:?}; \
+                     CARGO_MANIFEST_DIR={}). The desktop half of the census would walk a \
+                     path that does not exist.",
+                    expected.display(),
+                    env!("CARGO_MANIFEST_DIR"),
+                );
+                assert_eq!(
+                    seen.as_deref(),
+                    Some(workspace_root.as_path()),
+                    "the census's witnesses DISAGREE about WHICH directory holds the \
+                     desktop: the manifest graph names {workspace_root:?} as the workspace \
+                     root, the nearest ancestor holding `src-tauri/src` is {seen:?}. \
+                     Policing one checkout from inside another would certify files that are \
+                     not part of this build (CARGO_MANIFEST_DIR={}).",
+                    env!("CARGO_MANIFEST_DIR"),
+                );
+            }
+            Layout::SinglePackage => assert!(
+                seen.is_none(),
+                "the census concluded this is a SINGLE-PACKAGE checkout, but an ancestor \
+                 directory {seen:?} holds `src-tauri/src`. Dropping the desktop root on \
+                 that conclusion would certify a corpus this scan never opened — the \
+                 fail-open `source_roots` documents (CARGO_MANIFEST_DIR={}).",
+                env!("CARGO_MANIFEST_DIR"),
+            ),
+        }
+
+        // ── The pin's own arming: the two witnesses must be capable of
+        // DISAGREEING, i.e. witness 2 must be able to answer "no tree" at all.
+        // `desktop_tree_above` is an ancestor walk that returns the FIRST hit;
+        // if it always returned `Some` (a `join` that matched the manifest dir
+        // itself, say) then the `SinglePackage` arm could never fire and this
+        // whole comparison would be an identity. So: the answer it gives must be
+        // a directory that is NOT inside this package, and in the layout where it
+        // answers `Some`, that directory must be an ANCESTOR of the manifest dir
+        // rather than the manifest dir itself.
+        if let Some(dir) = &seen {
+            assert!(
+                manifest_dir().starts_with(dir) && dir != manifest_dir(),
+                "witness 2 answered {dir:?} as the directory holding `src-tauri/src`, which \
+                 is not a STRICT ancestor of `CARGO_MANIFEST_DIR={}` — the walk is matching \
+                 something other than what it claims, so a `Some` answer proves nothing and \
+                 the agreement asserts above are vacuous.",
+                env!("CARGO_MANIFEST_DIR"),
+            );
+        }
     }
 }

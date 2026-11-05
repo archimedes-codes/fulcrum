@@ -104,13 +104,23 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 ///
 /// Two fixture binaries. This helper resolves the DIRECTORY; `fixture_bin`
 /// resolves the binary itself by adding the platform exe suffix:
-///   * `fake_mcp_stdio` — `mcp/stdio.rs`, `mcp/tool.rs`, four sites in
+///   * `fake_mcp_stdio_core` — `mcp/stdio.rs`, `mcp/tool.rs`, four sites in
 ///     `mcp/manager.rs`'s tests, and two in
 ///     `harness/loop/tests/turn_lifecycle.rs`;
-///   * `fake_worker` — `worker/client.rs::fixture_path` and
+///   * `fake_worker_core` — `worker/client.rs::fixture_path` and
 ///     `worker/manager/tests/mod.rs::fixture_path` (both re-pointed here in
 ///     T8/S8.3; before that they did their own manifest-parent arithmetic and
 ///     resolved to a directory no build writes to).
+///
+/// BOTH NAMES CARRY `_core` since S8b.1, and that suffix is what makes the
+/// crate buildable alone. These are the crate's OWN bins (`src/bin/`, declared
+/// in `Cargo.toml`), whose bodies live in `crate::fixtures`; the DESKTOP keeps
+/// bins named `fake_worker` / `fake_mcp_stdio` over the same bodies, because
+/// `CARGO_BIN_EXE_<name>` is package-local and 7 desktop integration tests name
+/// `fake_worker` exactly. Two members may NOT declare the same bin name — they
+/// share one output file in the workspace `target/debug/`, cargo only warns, and
+/// the last writer silently wins (cargo#6313). Full measurements:
+/// `crate::fixtures`.
 ///
 /// The `mcp` spawners still carry no vacuity guard of their own, which is why
 /// the `childproc` pin above is what stands between a wrong root and a
@@ -128,14 +138,43 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// file, so the missing suffix is harmless there — `CreateProcess` fills it in.
 /// The two `fake_worker` sites also assert `is_file()`, and that is where the
 /// suffix became load-bearing; see `fixture_bin` for the full story.
+/// # Why it resolves from `current_exe()` and not from the manifest (S8b.1)
+///
+/// Until S8b.1 this walked `CARGO_MANIFEST_DIR` up TWO levels and appended
+/// `target/debug`. That was right for exactly one checkout shape — this crate as
+/// a MEMBER of a two-package workspace, where the grandparent IS the root that
+/// owns `target/` — and it is WRONG for the shape T8b creates: a standalone
+/// `cargo test` inside this package builds into `<package>/target/debug/`, so the
+/// two-levels-up expression names a directory no build ever writes. Measured at
+/// S8b.1 by copying the crate out of the workspace AFTER the fixture bins had
+/// been moved in and the spawner names re-pointed: still **71 failed**, because
+/// every one of the 66 fixture spawns resolved past the package into a
+/// non-existent grandparent. Renaming the bins could not fix that; only the root
+/// can.
+///
+/// `current_exe()` is the authoritative answer, and `childproc` already called it
+/// "the ground truth": cargo put the test binary at `<target>/debug/deps/<name>`
+/// and it puts the crate's bins at `<target>/debug/<name>` — SIBLINGS of `deps/`.
+/// Two `parent()` steps from the running binary therefore names the directory the
+/// fixtures are in BY DEFINITION, in every layout: workspace member, standalone
+/// package, `--target-dir` relocation, or a cross-compiled `target/<triple>/debug`
+/// (which manifest arithmetic gets wrong too, and which the census-side sibling
+/// `childproc::target_debug_dir_is_where_cargo_actually_builds` still asserts).
+/// There is no LEVEL COUNT to get right, which is the point: the trap this
+/// function's own docs were written about — manifest arithmetic going stale when
+/// a file moves depth — stops being expressible.
+///
+/// It is `#[cfg(test)]` for the pre-existing reason: the only callers are test
+/// modules, and an ungated `pub(crate)` fn with no production caller is
+/// `dead_code`, which the gate's `-D warnings` rejects.
 #[cfg(test)]
 pub(crate) fn target_debug_dir() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("crates/fulcrum-core has a grandparent (the repo root)")
-        .join("target")
-        .join("debug")
+    let exe = std::env::current_exe()
+        .expect("a test binary has a path — this test-only resolver has no production caller");
+    exe.parent() // target/debug/deps
+        .and_then(|deps| deps.parent()) // target/debug
+        .expect("the test binary lives in target/debug/deps")
+        .to_path_buf()
 }
 
 /// The file name cargo gives the bin target `name` on the platform whose
@@ -489,18 +528,19 @@ mod tests {
     #[test]
     fn the_fixture_binary_name_carries_the_platform_exe_suffix() {
         // The rule, both platforms, on every OS.
-        assert_eq!(exe_file_name("fake_worker", ""), "fake_worker");
+        assert_eq!(exe_file_name("fake_worker_core", ""), "fake_worker_core");
         assert_eq!(
-            exe_file_name("fake_worker", ".exe"),
-            "fake_worker.exe",
-            "a Windows fixture binary is `fake_worker.exe` — the name cargo writes"
+            exe_file_name("fake_worker_core", ".exe"),
+            "fake_worker_core.exe",
+            "a Windows fixture binary is `fake_worker_core.exe` — the name cargo \
+             writes for this crate's bin"
         );
 
         // The resolver applies the rule for the REAL platform, and keeps the
-        // directory half untouched (the two-levels-up root that
+        // directory half untouched (the `current_exe()`-derived root that
         // `target_debug_dir_is_where_cargo_actually_builds` pins).
-        let p = fixture_bin("fake_worker");
-        let want_name = format!("fake_worker{}", std::env::consts::EXE_SUFFIX);
+        let p = fixture_bin("fake_worker_core");
+        let want_name = format!("fake_worker_core{}", std::env::consts::EXE_SUFFIX);
         assert_eq!(
             p.file_name().and_then(|s| s.to_str()),
             Some(want_name.as_str()),
@@ -509,7 +549,7 @@ mod tests {
         assert_eq!(
             p.parent(),
             Some(target_debug_dir().as_path()),
-            "fixture_bin resolves through the crate's ONE two-levels-up resolver"
+            "fixture_bin resolves through the crate's ONE resolver"
         );
 
         // The existence witness that went red on Windows, now through the

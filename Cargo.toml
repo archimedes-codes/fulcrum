@@ -4,6 +4,31 @@ version = "0.11.0"
 edition = "2021"
 description = "The Fulcrum agent engine core — extracted from archimedes (T5-T8)"
 
+# S8b.1 — the crate's OWN fixture binaries, so `cargo test` inside this package
+# (including a copy of it standing alone, which is the T8b condition) builds the
+# two process fixtures it spawns instead of reaching for bins owned by the
+# desktop package.
+#
+# Declared explicitly rather than left to `src/bin/` auto-discovery for two
+# reasons: the name is the whole design (`_core` — see below and
+# `src/fixtures/mod.rs` for the measured cargo#6313 output-filename collision
+# this avoids) and an explicit `[[bin]]` documents that these are fixtures, not
+# shipped executables. They are NOT feature-gated: a gated bin is not built
+# unless someone turns the feature on, and turning it on from the desktop's
+# normal dependency list would ship fixture code into the app anyway.
+#
+# The NAMES MUST NOT COLLIDE with the desktop's `fake_worker` /
+# `fake_mcp_stdio` bins, and the desktop's MUST keep their unsuffixed names
+# forever: `CARGO_BIN_EXE_<name>` is package-local, so the desktop's 7
+# integration tests can only resolve a bin of its own.
+[[bin]]
+name = "fake_worker_core"
+path = "src/bin/fake_worker_core.rs"
+
+[[bin]]
+name = "fake_mcp_stdio_core"
+path = "src/bin/fake_mcp_stdio_core.rs"
+
 # The dependencies the crate's sources actually name — nothing else. Adding a
 # dependency the crate does not use is a silent widening of what the engine is
 # allowed to reach for, so each line below is justified by a `grep`-able use in
