@@ -1,0 +1,21 @@
+# The Rust toolchain this crate builds and lint-checks against. rustup resolves it
+# from this directory, so plain `cargo test` / `cargo clippy` anywhere in this repo
+# — and CI — use the SAME compiler. That is the whole point of the file:
+# `cargo clippy` is the gate (AGENTS.md), and a lint that floats in a newer rustc
+# reddens `main` while staying unreproducible locally. The precedent that earned
+# this file: `clippy::drain_collect` shipped in 1.99 and could not be reproduced on
+# 1.95. Bump it deliberately, and re-run the AGENTS.md bar in the same change.
+#
+# `components` is required, not boilerplate: both gates run here
+# (`cargo fmt --all -- --check`, `cargo clippy --all-targets`), a minimal profile
+# installs neither, and `rustup toolchain install --component …` on the command
+# line is IGNORED when no toolchain is named — the file is the only place the pair
+# is reliably recorded.
+#
+# No `targets`: ci.yml runs one job per OS and each builds its own host, so nothing
+# cross-compiles in CI. The `cargo check --target x86_64-pc-windows-gnu` proof in
+# AGENTS.md is a LOCAL convenience and needs that target installed out-of-band,
+# exactly as it does in the desktop repo this crate came from.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

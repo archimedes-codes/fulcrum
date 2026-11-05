@@ -193,3 +193,18 @@ tokio = { version = "1", features = [
     "rt",
     "test-util",
 ] }
+
+# Copied verbatim from the desktop workspace root, where it lived while this
+# package was a member: cargo reads profiles from the WORKSPACE ROOT ONLY, so a
+# standalone build silently gets its defaults without this block. `lto` /
+# `codegen-units` / `opt-level` / `strip` are size and build-time; `panic` is the
+# ADR 0025 consequence and must never become `abort` — a Worker panic stays in the
+# Worker (the process dies, the app lives). Cargo's default is already `unwind`, so
+# omitting the line would not change behaviour; it is spelled out because the
+# intent must not be "optimised" away by someone chasing binary size.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "unwind"
+strip = true

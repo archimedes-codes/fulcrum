@@ -1,0 +1,20 @@
+# Cargo's build output. This package IS the workspace root now, so `target/`
+# lives here.
+/target
+
+# `cargo test` writes a junit report only when asked; keep the door closed
+# against committing one by accident.
+*.junit.xml
+
+# Editor and OS droppings.
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.sw?
+
+# Logs and local scratch.
+*.log
+/logs
+.research/
+.tmp/

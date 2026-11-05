@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    # `feature/*`, not a named branch: the merge bar is a per-branch promise, and
+    # a pinned branch name silently stops making it.
+    branches: [main, feature/*]
+  pull_request:
+
+jobs:
+  lint-test:
+    name: Lint and test (${{ matrix.os }})
+    # All three OSes, because the engine carries deliberate
+    # `#[cfg(unix)]` / `#[cfg(target_os = "linux")]` process hygiene that only a
+    # Windows and a macOS compile proves. Both of this repo's Windows-only defects
+    # so far (a hand-escaped JSON fixture path; `Path::is_file()` not appending
+    # `EXE_SUFFIX`) were invisible on Linux and caught on the Windows leg.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No toolchain version named here on purpose: the repo-root
+      # `rust-toolchain.toml` is the pin, and naming one in this step fights it
+      # (`rustup default` loses to the directory override, so the version
+      # installed is the version NOT used, and its clippy/rustfmt land on a
+      # toolchain nothing runs).
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustc --version
+
+      - name: Cache the Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      # No system-package step, deliberately. This crate's TLS is `rustls` +
+      # `ring` (verified against Cargo.lock: no `openssl-sys`, no `native-tls`),
+      # and `ring` builds on the stock runner toolchain — a cold
+      # `cargo build --all-targets` here needed no apt packages. The desktop
+      # repo's webkit2gtk list is Tauri's, not the engine's.
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` is the gate; without it the integration tests are never
+      # linted. Runs on all three OSes, and that matters: an import that is used
+      # only inside `#[cfg(unix)]` is an unused-import warning on Windows, which
+      # `-D warnings` turns into a build failure here.
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # ⚠ NO `cargo build --all-targets` step before the tests, and do not add
+      # one. Cargo materialises a package's binaries at the top of `target/debug/`
+      # only when it builds an integration-test target, and 66 of this crate's
+      # tests spawn the fixture binaries BY PATH (a lib's unit tests get no
+      # `CARGO_BIN_EXE_*`). `tests/fixture_bins.rs` is the target that forces it.
+      # Measured on a target dir that had never existed: a bare `cargo test` gives
+      # 1397 passed / 0 failed, so no build step is needed — and adding one would
+      # re-arm the exact trap it appears to guard, because it would keep the suite
+      # green after someone deleted `tests/fixture_bins.rs`. The failure is meant
+      # to be loud.
+
+      - name: cargo test
+        run: cargo test
+
+      # The guard on the real build graph. WHY A CHECK AND NOT A TEST: a dependency
+      # turning on rquickjs's `rust-alloc`/`allocator` makes `set_memory_limit` a
+      # documented no-op, so codemode's 256 MiB cap stops enforcing while every
+      # test that measures the cap's BEHAVIOUR still sees a cap. Only the resolver
+      # knows what got unified. This crate owns that cap, so the guard travels with
+      # it (unlike the desktop's temp-dir census, which does not).
+      - name: Prove the rquickjs allocator guard can fail
+        run: bash scripts/check-rquickjs-allocator.sh --self-test
+
+      - name: Check the rquickjs build graph
+        run: bash scripts/check-rquickjs-allocator.sh
