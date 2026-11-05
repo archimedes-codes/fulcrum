@@ -149,6 +149,18 @@ pub mod worker_types;
 #[cfg(test)]
 mod boundary_pins;
 
+/// The ONE definition of "read the production region of a source file", shared by
+/// `childproc`'s census and the source-text lints in [`mod@source_lints`].
+/// `#[cfg(test)]` for the same reason as `boundary_pins`: it exists only to read
+/// source text from a test, and nothing at runtime needs it.
+#[cfg(test)]
+mod lint_scan;
+
+/// The source-text lints that moved INTO this crate in T8b/S8b.4, because a
+/// desktop-side `../crates/fulcrum-core/...` read cannot survive the crate
+/// becoming a git dependency (a cargo git checkout has no stable path).
+#[cfg(test)]
+mod source_lints;
 // ── T5/S5b — THE MOVE: the harness, and the three files that reference it ───
 //
 // `harness` is the last piece of the closure and it moves as ONE unit: `loop`

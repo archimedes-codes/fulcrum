@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 /// need to be. Its job is to stop matching text a human wrote ABOUT a forbidden
 /// name while still matching the name in a statement, and
 /// [`prose_is_stripped_but_code_is_not`] is the pin that holds it to that.
-fn strip_comments(source: &str) -> String {
+pub(crate) fn strip_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut in_block = false;
     for line in source.lines() {
@@ -125,7 +125,7 @@ fn strip_string_literals(source: &str) -> String {
 /// unmatchable, and all three source scans then passed a deliberately planted
 /// settings read and reported green. That is what
 /// [`the_needles_are_the_identifiers_they_stand_for`] exists to prevent.
-fn needle(escaped_first: char, rest: &str) -> String {
+pub(crate) fn needle(escaped_first: char, rest: &str) -> String {
     format!("{escaped_first}{rest}")
 }
 

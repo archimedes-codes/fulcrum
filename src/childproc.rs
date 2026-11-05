@@ -599,10 +599,14 @@ mod tests {
 
     /// One surviving line of a production region: its 1-based number in the
     /// file (so a violation reads as `file:line`) and its text.
-    struct SourceLine {
-        line: usize,
-        text: String,
-    }
+    ///
+    /// S8b.4 MOVED this (and `is_comment` / `production_region`) into
+    /// [`crate::lint_scan`], because the source-text lints that arrived with S8b.4
+    /// need the same scanner and a second definition of "read the production
+    /// region of a file" inside one crate is the drift the helper exists to
+    /// prevent. These three `use` lines are the whole of the census's side of that
+    /// move; the scanner itself is unchanged.
+    use crate::lint_scan::{production_region, SourceLine};
 
     /// This package's manifest directory — the one anchor the census reads, and
     /// the ONLY one. Every other path is derived by READING a manifest or from
@@ -1253,62 +1257,16 @@ mod tests {
         out
     }
 
-    /// Whether a trimmed line is COMMENT text, which the census ignores — for
-    /// the `#[cfg(test)]` boundary and for every match. Not cosmetic: three
-    /// prose occurrences would otherwise be false positives or, worse, cut the
-    /// scanned region short (`src/commands/update.rs` has a doc comment
-    /// describing Tauri upstream's `Command::new(path)…`, this module's `//!`
-    /// header contains `Command::new(`, and `worker/manager.rs`'s doc comment
-    /// contains `` `#[cfg(test)]` ``, which under a "line contains" rule would
-    /// silently leave ~1,100 lines unscanned forever). `///`, `//!`, `/*` and
-    /// `*/` are already covered by `//` and `*`; they are listed anyway so the
-    /// rule reads as intended.
-    ///
-    /// The `*` prefix is the one honest COST of a line-based lint: it also drops
-    /// ~29 lines of deref ASSIGNMENTS (`*self.usage.lock()… = …`), so a
-    /// `Command::new(` written as the target of a deref-assignment on its own
-    /// line would be missed. No such line exists, and a spawn is a call on a
-    /// bound `let mut cmd` in this codebase, so the blind spot costs nothing
-    /// against the prose it buys — but it is a blind spot, not a subtlety.
-    fn is_comment(trimmed: &str) -> bool {
-        ["//", "///", "//!", "/*", "*", "*/"]
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix))
-    }
-
-    /// The PRODUCTION region of one file: every code line before the first line
-    /// whose trimmed text STARTS WITH `#[cfg(test)]` (an attribute in item
-    /// position — a boundary that merely *contains* the token is prose, and
-    /// must also survive [`is_comment`]), with comment lines already dropped.
-    /// Returns an empty `Vec` for paths matching `**/tests.rs` or containing
-    /// `/tests/`.
-    ///
-    /// Panics rather than skipping an unreadable/unparseable file: a census
-    /// that quietly stops at the first odd file is a census that passes for the
-    /// wrong reason.
-    fn production_region(path: &std::path::Path) -> Vec<SourceLine> {
-        let norm = path.to_string_lossy().replace('\\', "/");
-        if norm.ends_with("/tests.rs") || norm == "tests.rs" || norm.contains("/tests/") {
-            return Vec::new();
-        }
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("census cannot read {}: {e}", path.display()));
-        let mut region = Vec::new();
-        for (idx, raw) in text.lines().enumerate() {
-            let trimmed = raw.trim();
-            if trimmed.starts_with("#[cfg(test)]") && !is_comment(trimmed) {
-                break;
-            }
-            if is_comment(trimmed) {
-                continue;
-            }
-            region.push(SourceLine {
-                line: idx + 1,
-                text: raw.to_string(),
-            });
-        }
-        region
-    }
+    // `is_comment` and `production_region` now live in [`crate::lint_scan`] —
+    // S8b.4 moved them there so the source-text lints share this scanner instead
+    // of duplicating it. `production_region` is imported at the top of this
+    // module; `is_comment` is not, because nothing in here calls it directly
+    // anymore (the region scanner does, inside `lint_scan`), and an unused import
+    // is a clippy error under `-D warnings`. These two lines are plain comments
+    // rather than doc comments: a doc comment here documents NOTHING (the next
+    // item is `rust_files` below, which has its own), and clippy's
+    // `empty_line_after_doc_comments` is exactly the guard that catches a doc
+    // comment orphaned by a move like this one.
 
     /// Every `*.rs` under `dir`, recursively — hand-rolled `std::fs::read_dir`
     /// because a census test does not get to add a dependency (`walkdir` is not
@@ -1341,7 +1299,7 @@ mod tests {
     /// * **B — one owner of the flag.** No production line outside [`SELF`]
     ///   contains `.creation_flags(` — anchored on the CALL form, not the bare
     ///   token, because prose legitimately names it (this module's docs and the
-    ///   `CommandExt` comment; [`is_comment`] filters those anyway). A second
+    ///   `CommandExt` comment; `is_comment` filters those anyway). A second
     ///   caller anywhere silently un-hides every child, because
     ///   `creation_flags` REPLACES rather than ORs.
     /// * **C — stdin, Tool children only.** Stated as an algorithm, not a
@@ -1542,7 +1500,7 @@ mod tests {
     /// outside any panic path. The invariant is about the crash-log module
     /// because that is the module that runs while the process is dying.
     ///
-    /// **Why the region and not the file.** [`is_comment`] is what makes this
+    /// **Why the region and not the file.** `is_comment` is what makes this
     /// rule usable: `crashlog.rs` contains the literal string
     /// `dirs::data_dir()` THREE times and not one of them is code — twice in
     /// the module `//!` doc, which sits INSIDE the scanned region (so only the
@@ -1561,7 +1519,7 @@ mod tests {
     /// locate the occurrences with
     /// `grep -n 'dirs::data_dir()' src/agent/crashlog.rs` when you need them.
     ///
-    /// **Inherited blind spot:** this is [`is_comment`] with all its limits, so
+    /// **Inherited blind spot:** this is `is_comment` with all its limits, so
     /// the `*`-prefix rule silently drops any line whose trimmed text starts
     /// with `*` (see its docs) — a `dirs::data_dir()` written as the target of
     /// a deref-assignment on its own line would slip through. Name it, do not
@@ -1700,7 +1658,7 @@ mod tests {
     /// * This matches TEXT, so a string literal containing `.raw_arg(` also
     ///   trips it. That error goes the safe way — a false alarm costs one
     ///   rename, a false pass costs a window per command on someone's desktop.
-    /// * [`is_comment`]'s `*`-prefix rule still drops any line whose trimmed
+    /// * `is_comment`'s `*`-prefix rule still drops any line whose trimmed
     ///   text starts with `*`, so a `.raw_arg(` written as the target of a
     ///   deref-assignment on its own line would slip through.
     /// * E inherits the census's SCOPE rule: [`production_region`] returns an
@@ -1738,7 +1696,7 @@ mod tests {
         // contain `childproc::append_cmd_c(`. The `1` is meant to be brittle: a
         // second site wanting a `cmd.exe` tail must have this conversation, not
         // quietly widen the surface. Comment lines that mention the seam are
-        // dropped by [`is_comment`] before any match, so prose cannot inflate
+        // dropped by `is_comment` before any match, so prose cannot inflate
         // the count.
         let caller_count = regions
             .iter()
@@ -1763,7 +1721,7 @@ mod tests {
 
         // ── The invariant itself, anchored on the CALL form exactly as
         // invariant B anchors `.creation_flags(` (so prose naming `raw_arg`
-        // cannot false-positive; [`is_comment`] filters those anyway).
+        // cannot false-positive; `is_comment` filters those anyway).
         let mut violations: Vec<String> = Vec::new();
         for (rel, region) in &regions {
             if rel == SELF {
