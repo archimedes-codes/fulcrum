@@ -2,10 +2,10 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::AgentLoop;
-use crate::agent::harness::provider::ToolCall;
-use crate::agent::interactive::{sudo_run_flow, todo_apply};
-use crate::agent::mcp::mcp_tool;
-use crate::agent::tools::{execute_tool, ContentBlock, ToolResult};
+use crate::harness::provider::ToolCall;
+use crate::interactive::{sudo_run_flow, todo_apply};
+use crate::mcp::mcp_tool;
+use crate::tools::{execute_tool, ContentBlock, ToolResult};
 
 pub(super) fn cancelled_tool_result() -> ToolResult {
     ToolResult {
@@ -81,8 +81,16 @@ impl AgentLoop {
         // The `subagent` / `dispatch_subagent` alias (the single source of
         // truth is `is_subagent_call` — the parallel batch + this dispatch
         // share it; a future third alias updates only that one place).
-        if crate::agent::harness::dispatch::is_subagent_call(&tc.name) {
-            return self.dispatch_subagent(&tc.arguments, turn).await;
+        if crate::harness::dispatch::is_subagent_call(&tc.name) {
+            let (result, child_cost) = self.dispatch_subagent(&tc.arguments, turn).await;
+            // The child's money joins the session total HERE (the sequential
+            // path — `run_tool_batch`'s concurrent batch folds at its own
+            // consumption point). `dispatch_tool` is `&mut self`, so this is a
+            // legal writer for `cost_acc`; `dispatch_subagent` itself stays
+            // `&self` because the concurrent path calls it through a shared
+            // borrow inside the batch's futures.
+            self.fold_child_cost(child_cost);
+            return result;
         }
         match tc.name.as_str() {
             "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
@@ -144,7 +152,7 @@ impl AgentLoop {
                 }
             }
             "ask" => {
-                crate::agent::harness::ask::ask_flow(
+                crate::harness::ask::ask_flow(
                     &self.pending_bridge,
                     &self.sink,
                     &self.session_id,
@@ -172,13 +180,8 @@ impl AgentLoop {
                 // `loop/codemode.rs` against `&self` instead of reused from here.
                 // The engine is per-call (no field on the loop) and the turn token
                 // is the one cancellation authority.
-                crate::agent::harness::r#loop::codemode::exec_codemode(
-                    self,
-                    &tc.id,
-                    &tc.arguments,
-                    turn,
-                )
-                .await
+                crate::harness::r#loop::codemode::exec_codemode(self, &tc.id, &tc.arguments, turn)
+                    .await
             }
             other => ToolResult {
                 content: vec![ContentBlock::Text {
@@ -193,26 +196,35 @@ impl AgentLoop {
     /// Whether `name` passes the `enabled_tools` filter (`None` = all
     /// enabled). The logic lives in `harness::dispatch` (no loop state).
     pub(super) fn is_tool_enabled(&self, name: &str) -> bool {
-        crate::agent::harness::dispatch::is_tool_enabled(self.enabled_tools(), name)
+        crate::harness::dispatch::is_tool_enabled(self.enabled_tools(), name)
     }
 
     /// `subagent` dispatch — the thin wrapper that supplies the loop's
     /// fields; the dispatch flow itself lives in `harness::dispatch`.
+    ///
+    /// `&self`, NOT `&mut self`, and the child's cost comes back as the second
+    /// half of the return value rather than being folded here: the CONCURRENT
+    /// batch in `run_tool_batch` calls this through a shared borrow (`me`) so
+    /// several children can be in flight at once, and a `&mut self` fold inside
+    /// those futures is not expressible. The CALLER folds — `run_tool_batch` at
+    /// the point it consumes each outcome, `dispatch_tool` on the sequential
+    /// path — which is also where the fold's frame gets its order: one frame
+    /// per child, in the batch's tool-call order.
     pub(super) async fn dispatch_subagent(
         &self,
         params: &Value,
         turn: &CancellationToken,
-    ) -> ToolResult {
-        crate::agent::harness::dispatch::dispatch_subagent(
+    ) -> (ToolResult, Option<f64>) {
+        crate::harness::dispatch::dispatch_subagent(
             self.subagent.as_ref(),
-            &crate::agent::harness::dispatch::SubagentParent {
+            &crate::harness::dispatch::SubagentParent {
                 session_id: &self.session_id,
                 space_cwd: &self.space_cwd,
                 model: &self.model,
                 enabled_tools: self.enabled_tools(),
                 sink: &self.sink,
                 catalog: &self.catalog,
-                config_dir: self.config_dir.as_deref(),
+                agent_overrides: self.packaged_agent_overrides.as_ref(),
             },
             params,
             turn,

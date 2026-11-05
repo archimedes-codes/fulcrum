@@ -7,9 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::*;
 use super::support::*;
-use crate::agent::events::RpcEvent;
-use crate::agent::harness::provider::{FinishReason, ProviderEvent, ToolCall};
-use crate::agent::harness::retry::RetryPolicy;
+use crate::events::RpcEvent;
+use crate::harness::provider::{FinishReason, ProviderEvent, ToolCall};
+use crate::harness::retry::RetryPolicy;
 
 /// (finding 13b) `enabled_tools` is wired into `dispatch_tool`:
 /// a disabled tool (`bash`, with only `read` enabled) is a

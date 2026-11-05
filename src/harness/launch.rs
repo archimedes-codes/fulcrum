@@ -19,13 +19,13 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::agent::definition_permission::ToolKey;
-use crate::agent::harness::catalog::ModelCatalog;
-use crate::agent::harness::tool_specs;
-use crate::agent::harness::ModelRef;
-use crate::agent::subagent::{AgentNameResolution, LaunchConfig};
 use crate::agents::AgentDefinition;
-use crate::config::{AgentOverrideFields, Settings};
+use crate::config_types::{AgentOverrideFields, Settings};
+use crate::definition_permission::ToolKey;
+use crate::harness::catalog::ModelCatalog;
+use crate::harness::tool_specs;
+use crate::harness::ModelRef;
+use crate::subagent::{AgentNameResolution, LaunchConfig};
 
 /// The override layer (ADR 0066: ONE global map in `settings.json`, so ONE
 /// rung — there is no per-Space layer to merge, and ADR 0066's *Deferred:
@@ -36,7 +36,10 @@ use crate::config::{AgentOverrideFields, Settings};
 /// an empty map, and no entry under any casing of the name. All three mean
 /// "this layer has no opinion"; none of them may be confused with `Some(entry)`
 /// by a caller.
-pub(crate) struct OverrideLayer<'a> {
+// (Step A.3) RAISED from `pub(crate)` by this move: the STAYING desktop
+// `commands/agents.rs` names it (`stored_fields(layer: &…launch::OverrideLayer)`),
+// and a package boundary erases `pub(crate)`.
+pub struct OverrideLayer<'a> {
     pub global: Option<&'a AgentOverrideFields>,
 }
 
@@ -48,7 +51,11 @@ pub(crate) struct OverrideLayer<'a> {
 /// `commands::agents::agent_definition_reports` (the modal) and `resolve_launch` (the
 /// dispatch) both go through `resolve_agent_launch`, so a layer added to one
 /// and forgotten in the other is the drift this struct exists to prevent.
-pub(crate) struct ResolvedLaunch {
+// (Step A.3, and the compiler caught the leak in my own enumeration) This is
+// the RETURN TYPE of `resolve_agent_launch`, which the move raised to `pub`
+// because `commands/agents.rs` calls it — so a `pub(crate)` here is a private
+// type in a public signature, which rustc rejects outright. Raised with it.
+pub struct ResolvedLaunch {
     pub launch: LaunchConfig,
     /// Which layer supplied `model`; `Parent` when none did.
     pub model_source: OverrideSource,
@@ -149,7 +156,9 @@ fn first_speaking<T>(
 /// This is the shared seam ADR 0068 asks for — `resolve_launch` (the dispatch)
 /// and `list_agent_definition_reports` (the modal) call it, so filtering and soft
 /// degradation exist in exactly one place.
-pub(crate) fn resolve_agent_launch(
+// (Step A.3) RAISED from `pub(crate)`: `commands/agents.rs` calls it (the
+// Agents modal's shared entry point, ADR 0068).
+pub fn resolve_agent_launch(
     explicit: &LaunchConfig,
     def: &AgentDefinition,
     layer: &OverrideLayer<'_>,
@@ -170,7 +179,7 @@ pub(crate) fn resolve_agent_launch(
         let bare = ModelRef::parse(candidate)
             .map(|r| r.key.to_string())
             .unwrap_or_else(|| candidate.to_string());
-        crate::agent::session::resolve_composed_model(catalog, &bare)
+        crate::catalog::resolve_composed_model(catalog, &bare)
     };
     let soft = |candidate: &str| resolve(candidate).is_some();
     // The rungs, in order: the explicit param (NEVER degraded — see above), the
@@ -409,11 +418,45 @@ fn tool_key_name(key: &ToolKey) -> Option<&'static str> {
 /// `source` column already reports. The ADR 0066 layer is added by DELEGATING
 /// to that shared resolver, so the `config_dir: None` path goes through the
 /// same selector as the modal instead of hand-rolling "no layer".
-pub(crate) fn resolve_launch(
+/// The ADR 0066 override layer as the PACKAGED bridge (Fulcrum T3).
+///
+/// `None` → `None` (no settings value at all: "a layer that cannot speak" —
+/// today's `config_dir: None`); `Some(map)` → a SYNTHETIC `Settings` whose ONLY
+/// populated field is `agent_overrides`, so `override_layer` sees a settings
+/// document that says exactly what the packaged map says and nothing else.
+///
+/// Why a synthetic `Settings` and not a new `override_layer` parameter:
+/// `override_layer`'s signature
+/// (`pub fn override_layer<'a>(settings: Option<&'a Settings>, agent_name: &str)`)
+/// is shared with `commands::agents::agent_definition_reports` — the Agents
+/// modal, which holds a REAL `Settings` — and the two callers must not grow two
+/// selectors for one map (ADR 0068's whole point). Wrapping the map keeps ONE
+/// selector and leaves the modal compiling untouched.
+///
+/// `pub(crate)` so the launch tests can pin the `None`-vs-empty identity at the
+/// seam itself, not only through the collapsed `OverrideLayer`.
+// (Step A.3) RAISED from `pub(crate)` with the module: `crate::agent::harness::
+// launch::packaged_settings` is a path the desktop's `session/mod.rs` names.
+pub fn packaged_settings(
+    agent_overrides: Option<&std::collections::HashMap<String, AgentOverrideFields>>,
+) -> Option<Settings> {
+    agent_overrides.map(|map| Settings {
+        agent_overrides: map.clone(),
+        ..Settings::default()
+    })
+}
+
+/// The three causes the packaged path must keep apart, in ONE place:
+/// `resolve_launch`'s parameter is an `Option`, so the ABSENCE of a layer is
+/// still expressible after the file read is gone. Pinned by
+/// `packaged_settings_keeps_no_layer_and_an_empty_map_apart`.
+// (Step A.3) RAISED from `pub(crate)`: `commands/agents.rs` and the relocated
+// launch fixtures call it.
+pub fn resolve_launch(
     launch: &LaunchConfig,
     agent_name: &str,
     catalog: &ModelCatalog,
-    config_dir: Option<&Path>,
+    agent_overrides: Option<&std::collections::HashMap<String, AgentOverrideFields>>,
     space_cwd: &Path,
 ) -> (LaunchConfig, AgentNameResolution) {
     let name = agent_name.trim();
@@ -431,17 +474,20 @@ pub(crate) fn resolve_launch(
         // nothing downstream could tell a typo from a deliberate nameless call.
         return (launch.clone(), AgentNameResolution::Unmatched);
     };
-    // TWO bindings, never one. The one-statement form
-    // `override_layer(config_dir.map(load_settings).as_ref(), name)` is E0716
-    // ("temporary value dropped while borrowed"): `map` yields an owned
-    // `Option<Settings>` temporary, `.as_ref()` borrows it, and the returned
-    // `OverrideLayer<'_>` still borrows it when the statement ends. Verified
-    // against the pinned toolchain.
+    // TWO bindings, never one (the E0716 note below predates the disk read and
+    // still applies verbatim): the one-statement form
+    // `override_layer(packaged_settings(map).as_ref(), name)` borrows a
+    // temporary `Option<Settings>` that dies at the end of the statement while
+    // the returned `OverrideLayer<'_>` still points into it. Bind the owned
+    // value first, borrow it second.
     //
-    // Read at dispatch time (ADR 0023's property, kept): a settings edit takes
-    // effect on the NEXT dispatch, no restart; a missing/corrupt file yields
-    // the defaults → no override.
-    let settings = config_dir.map(crate::config::load_settings);
+    // Read at DISPATCH time (ADR 0023's property, kept): the map arrives from
+    // the parent loop's PACKAGED config, which the Supervisor overwrites on
+    // every `config-update` push — so a settings edit still takes effect on the
+    // NEXT dispatch with no restart, and it now takes effect for a Worker
+    // process that never opened `settings.json`. A `None` layer (an old
+    // envelope) is the same silent layer the missing/corrupt file used to be.
+    let settings = packaged_settings(agent_overrides);
     let layer = override_layer(settings.as_ref(), name);
     (
         resolve_agent_launch(launch, &def, &layer, catalog).launch,

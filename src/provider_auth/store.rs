@@ -202,7 +202,7 @@ pub fn load(path: &Path) -> ProviderAuthStore {
     }
     // The per-entry fallback: keep what parses, drop (and log) what does not.
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        crate::agent::debuglog::log(
+        crate::debuglog::log(
             "provider-auth: store unparseable — serving an empty store (the file stays as it is \
              until the next save rewrites it)",
         );
@@ -226,7 +226,7 @@ pub fn load(path: &Path) -> ProviderAuthStore {
                             // One line naming the dropped provider (the rest
                             // of the store survives — never a whole-store
                             // wipe over one bad entry).
-                            crate::agent::debuglog::log(&format!(
+                            crate::debuglog::log(&format!(
                                 "provider-auth: dropping provider `{id}` from the store: {e}"
                             ));
                             None

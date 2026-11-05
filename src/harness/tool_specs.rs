@@ -1,6 +1,6 @@
 use serde_json::{json, Map, Value};
 
-use crate::agent::harness::provider::{ToolCall, ToolSpec};
+use crate::harness::provider::{ToolCall, ToolSpec};
 
 /// What the `bash` tool tells the model about the shell it is about to get.
 ///
@@ -75,7 +75,7 @@ const CODEMODE_DESCRIPTION: &str = "Evaluate a JavaScript program and return its
 /// the schemas mirror the `tools.ts` override). `pub(crate)` so the
 /// `dispatch_native` driver derives the child's tool set (the names
 /// minus `subagent`) from it.
-pub(crate) fn tool_specs() -> Vec<ToolSpec> {
+pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash".into(),
@@ -487,7 +487,7 @@ pub(crate) fn unknown_param_error(specs: &[ToolSpec], tc: &ToolCall) -> Option<S
     // canonical tool, not the alias it guessed at.
     let spec = specs
         .iter()
-        .find(|s| s.name == crate::agent::harness::dispatch::effective_tool_name(&tc.name))?;
+        .find(|s| s.name == crate::harness::dispatch::effective_tool_name(&tc.name))?;
     let properties = spec.parameters.get("properties")?.as_object()?;
     let args = tc.arguments.as_object()?;
     let mut items: Vec<String> = args
@@ -1156,7 +1156,7 @@ mod tests {
     /// that changes, not this sentence.
     #[test]
     fn the_model_facing_web_prose_names_the_key_the_advertised_schema_requires() {
-        use crate::agent::web::tools::{
+        use crate::web::tools::{
             search_summary_empty, search_summary_head, truncation_note, RESPONSE_ID_PARAM,
         };
 

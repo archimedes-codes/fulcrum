@@ -1,7 +1,7 @@
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::tools::types::{ContentBlock, ToolCtx, ToolResult};
+use crate::tools::types::{ContentBlock, ToolCtx, ToolResult};
 
 /// A fresh temp dir as the sandbox `cwd`, OWNED (#96 task 08): removed when the
 /// caller drops it. NOT `Clone` — `to_path_buf()` is the escape hatch where a
@@ -34,10 +34,10 @@ pub(crate) fn ctx(cwd: &Path) -> ToolCtx {
         cancel: CancellationToken::new(),
         skill_roots: None,
         boundary: vec![cwd.to_path_buf()],
-        file_policy: crate::agent::policy::FilePolicy {
-            reads: crate::agent::policy::AccessPolicy::Sandboxed,
-            writes: crate::agent::policy::AccessPolicy::Sandboxed,
-            shell: crate::agent::policy::AccessPolicy::Allow,
+        file_policy: crate::policy::FilePolicy {
+            reads: crate::policy::AccessPolicy::Sandboxed,
+            writes: crate::policy::AccessPolicy::Sandboxed,
+            shell: crate::policy::AccessPolicy::Allow,
             rules: Vec::new(),
         },
         protected: Vec::new(),
@@ -54,7 +54,7 @@ pub(crate) fn ctx(cwd: &Path) -> ToolCtx {
 }
 
 /// The same ctx with one policy overridden (the tier tests).
-pub(crate) fn ctx_policy(cwd: &Path, policy: crate::agent::policy::FilePolicy) -> ToolCtx {
+pub(crate) fn ctx_policy(cwd: &Path, policy: crate::policy::FilePolicy) -> ToolCtx {
     ToolCtx {
         file_policy: policy,
         ..ctx(cwd)
@@ -68,7 +68,7 @@ pub(crate) fn ctx_policy(cwd: &Path, policy: crate::agent::policy::FilePolicy) -
 pub(crate) fn can_confine() -> bool {
     #[cfg(target_os = "linux")]
     {
-        crate::agent::tools::sandbox::landlock_available()
+        crate::tools::sandbox::landlock_available()
     }
     #[cfg(not(target_os = "linux"))]
     {

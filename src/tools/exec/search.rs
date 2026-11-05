@@ -3,7 +3,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use super::access::{read_backend, read_rule_refusal};
-use crate::agent::tools::types::{ToolCtx, ToolResult};
+use crate::tools::types::{ToolCtx, ToolResult};
 
 /// The default `max_results` for `exec_find` / `exec_grep`.
 pub(crate) const DEFAULT_MAX_RESULTS: u32 = 100;
@@ -86,7 +86,7 @@ pub async fn exec_find(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // the shape of the call is the reason they are decided together (issue
     // #81):
     //
-    // * the ENV — the AppImage scrub, `crate::agent::hostenv`, applied inside
+    // * the ENV — the AppImage scrub, `crate::hostenv`, applied inside
     //   the builder below. `fd` and `rg` are system binaries whose
     //   dependencies (`libpcre2-8.so.0`, `libcrypto`) the bundle also ships,
     //   so on a mounted host they bind the bundle's copies unversioned —
@@ -200,18 +200,12 @@ pub(crate) fn build_fd_command(
     max: u32,
     cwd: &Path,
 ) -> tokio::process::Command {
-    build_fd_command_with(
-        pattern,
-        resolved,
-        max,
-        cwd,
-        crate::agent::hostenv::for_child(),
-    )
+    build_fd_command_with(pattern, resolved, max, cwd, crate::hostenv::for_child())
 }
 
 /// [`build_fd_command`] with the patch as an argument.
 ///
-/// Production passes exactly [`for_child`](crate::agent::hostenv::for_child);
+/// Production passes exactly [`for_child`](crate::hostenv::for_child);
 /// the parameter exists because that cached patch is EMPTY under `cargo test`
 /// (its gate needs this exe under `$APPDIR`; under cargo it is
 /// `target/debug/deps/<hash>`), so a test driven through the wrapper could not
@@ -239,18 +233,18 @@ pub(crate) fn build_fd_command_with(
     resolved: &Path,
     max: u32,
     cwd: &Path,
-    patch: &crate::agent::hostenv::EnvPatch,
+    patch: &crate::hostenv::EnvPatch,
 ) -> tokio::process::Command {
-    // The constructor is `crate::agent::childproc`'s, which owns the child's
+    // The constructor is `crate::childproc`'s, which owns the child's
     // Windows console window policy (`CREATE_NO_WINDOW`). It is the ONLY
     // constructor for this tool — the wrapper above delegates rather than
     // building, because `agent/childproc.rs`'s census asserts exactly four
     // `childproc::command(` calls under `agent/tools/exec*`.
-    let mut cmd = crate::agent::childproc::command("fd");
+    let mut cmd = crate::childproc::command("fd");
     // A Tool child starts at EOF on stdin — see the note in `exec_bash`: an
     // inherited handle is a live pipe nothing can ever feed, so a `fd` that
     // read stdin would hang to the caller's deadline instead of failing.
-    crate::agent::childproc::closed_stdin(&mut cmd);
+    crate::childproc::closed_stdin(&mut cmd);
     cmd.args([
         "--max-results",
         &max.to_string(),
@@ -432,7 +426,7 @@ pub(crate) fn build_rg_command(
         max,
         ignore_case,
         cwd,
-        crate::agent::hostenv::for_child(),
+        crate::hostenv::for_child(),
     )
 }
 
@@ -450,7 +444,7 @@ pub(crate) fn build_rg_command_with(
     max: u32,
     ignore_case: bool,
     cwd: &Path,
-    patch: &crate::agent::hostenv::EnvPatch,
+    patch: &crate::hostenv::EnvPatch,
 ) -> tokio::process::Command {
     let mut args: Vec<String> = Vec::new();
     if ignore_case {
@@ -473,13 +467,13 @@ pub(crate) fn build_rg_command_with(
     args.push(pattern.to_string());
     args.push(resolved.to_string_lossy().into_owned());
 
-    // Same `crate::agent::childproc` constructor as `fd` — it owns the child's
+    // Same `crate::childproc` constructor as `fd` — it owns the child's
     // Windows console window policy (`CREATE_NO_WINDOW`) — and the ONLY one for
     // this tool, because `agent/childproc.rs`'s census asserts exactly four
     // constructors under `agent/tools/exec*`.
-    let mut cmd = crate::agent::childproc::command("rg");
+    let mut cmd = crate::childproc::command("rg");
     // Tool child → null stdin, for the same reason as `fd` and `bash` above.
-    crate::agent::childproc::closed_stdin(&mut cmd);
+    crate::childproc::closed_stdin(&mut cmd);
     cmd.args(&args);
     patch.apply(&mut cmd);
     // BEFORE this line `rg`'s `-g` globs were resolved against wherever the

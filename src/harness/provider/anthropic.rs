@@ -23,8 +23,8 @@ use super::types::{
     cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
     Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
 };
-use crate::agent::harness::WireApi;
-use crate::agent::tools::ContentBlock;
+use crate::harness::WireApi;
+use crate::tools::ContentBlock;
 
 /// Map an Anthropic `stop_reason` to a [`FinishReason`].
 fn map_anthropic_stop_reason(reason: &str) -> FinishReason {
@@ -1040,7 +1040,7 @@ mod tests {
     use super::super::test_util::{chat_message, collect};
     use super::super::types::{ChatMessage, ModelOptions, ToolSpec};
     use super::*;
-    use crate::agent::tools::ImageRef;
+    use crate::tools::ImageRef;
 
     /// Build an `AnthropicStream` over RAW byte chunks (the `&str`
     /// helper below cannot split a multi-byte codepoint mid-byte —

@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use super::AgentLoop;
-use crate::agent::definition_permission::{Action, ToolKey};
-use crate::agent::fs_backend::{FsBackend, FsError};
-use crate::agent::harness::provider::ToolCall;
-use crate::agent::permission::{native_permission_gate, permission_title, PermissionOutcome};
-use crate::agent::policy::{decision_for, AccessPolicy, Decision, PolicedTool};
-use crate::agent::tools::exec::protected_refusal_text;
-use crate::agent::tools::{ContentBlock, ToolResult};
+use crate::definition_permission::{Action, ToolKey};
+use crate::fs_backend::{FsBackend, FsError};
+use crate::harness::provider::ToolCall;
+use crate::permission::{native_permission_gate, permission_title, PermissionOutcome};
+use crate::policy::{decision_for, AccessPolicy, Decision, PolicedTool};
+use crate::tools::exec::protected_refusal_text;
+use crate::tools::{ContentBlock, ToolResult};
 
 /// `get_search_content` (network calls and cache reads are not filesystem
 /// operations and are not policy-gated, ADR 0056), `subagent` / `mcp` /
@@ -213,7 +213,7 @@ impl AgentLoop {
                 // executor enforces read rules) and the row-3 ASK is a
                 // write-direction question, so a read spends nothing here.
                 let resolved = (dir == PolicyDirection::Write)
-                    .then(|| crate::agent::fs_backend::canonicalize_lenient(Path::new(raw)));
+                    .then(|| crate::fs_backend::canonicalize_lenient(Path::new(raw)));
                 (policy, beyond, resolved)
             }
         };
@@ -314,9 +314,9 @@ impl AgentLoop {
     /// [`Self::guard_target`] (which hands the corridor the target a guard
     /// prompt must name). `rule_for` is the ONE resolver — per `policy.rs`'s
     /// module doc, "per ADR 0029/0030's one-canonicalizer rule the gate and
-    /// the executor must both go through [`crate::agent::policy::rule_for`],
+    /// the executor must both go through [`crate::policy::rule_for`],
     /// never a second matcher" — and the executor's twin in
-    /// [`crate::agent::tools::exec::access`] consults it with the SAME list
+    /// [`crate::tools::exec::access`] consults it with the SAME list
     /// (`ToolCtx::rules`, the per-turn concat) and the SAME resolved path, so
     /// the two layers cannot decide differently about one write.
     ///
@@ -342,18 +342,18 @@ impl AgentLoop {
         resolved: &Path,
         trusted: bool,
     ) -> Option<(Decision, Option<PathBuf>)> {
-        if let Some(rule) = crate::agent::policy::rule_for(
+        if let Some(rule) = crate::policy::rule_for(
             &self.permissions.rules,
-            crate::agent::policy::RuleDirection::Write,
+            crate::policy::RuleDirection::Write,
             resolved,
             self.permissions.rules_home.as_deref(),
         ) {
             return Some((
                 match rule.decision {
                     // Row 1.
-                    crate::agent::policy::RuleDecision::Deny => Decision::Deny,
+                    crate::policy::RuleDecision::Deny => Decision::Deny,
                     // Row 2 — silent; the posture is not consulted.
-                    crate::agent::policy::RuleDecision::Allow => Decision::Allow,
+                    crate::policy::RuleDecision::Allow => Decision::Allow,
                 },
                 None,
             ));
@@ -384,7 +384,7 @@ impl AgentLoop {
             return None;
         }
         let raw = tc.arguments.get("path").and_then(|v| v.as_str())?;
-        let resolved = crate::agent::fs_backend::canonicalize_lenient(Path::new(raw));
+        let resolved = crate::fs_backend::canonicalize_lenient(Path::new(raw));
         self.rule_or_guard_verdict(&resolved, self.space_trusted())?
             .1
     }
@@ -512,10 +512,10 @@ impl AgentLoop {
                     // SAME list the verdict used, so this cannot disagree with
                     // the check that produced the `Deny`.
                     None => match self.rule_deny_for(dir, path) {
-                        Some(rule) => crate::agent::tools::exec::access::rule_deny_text(
+                        Some(rule) => crate::tools::exec::access::rule_deny_text(
                             &tc.name,
                             rule,
-                            &crate::agent::fs_backend::canonicalize_lenient(path),
+                            &crate::fs_backend::canonicalize_lenient(path),
                         ),
                         None => self.escape_text(dir, &tc.name, path, raw),
                     },
@@ -539,20 +539,20 @@ impl AgentLoop {
         &self,
         dir: Option<PolicyDirection>,
         path: &Path,
-    ) -> Option<&crate::agent::policy::AccessRule> {
+    ) -> Option<&crate::policy::AccessRule> {
         let rdir = match dir? {
-            PolicyDirection::Read => crate::agent::policy::RuleDirection::Read,
-            PolicyDirection::Write => crate::agent::policy::RuleDirection::Write,
+            PolicyDirection::Read => crate::policy::RuleDirection::Read,
+            PolicyDirection::Write => crate::policy::RuleDirection::Write,
             // Rules never apply to `bash`.
             PolicyDirection::Shell => return None,
         };
-        crate::agent::policy::rule_for(
+        crate::policy::rule_for(
             &self.permissions.rules,
             rdir,
-            &crate::agent::fs_backend::canonicalize_lenient(path),
+            &crate::fs_backend::canonicalize_lenient(path),
             self.permissions.rules_home.as_deref(),
         )
-        .filter(|rule| rule.decision == crate::agent::policy::RuleDecision::Deny)
+        .filter(|rule| rule.decision == crate::policy::RuleDecision::Deny)
     }
 
     /// The escape rejection's text, in the executor's own words: the tool
@@ -628,9 +628,9 @@ impl AgentLoop {
         guard: Option<&Path>,
     ) -> bool {
         let options = match guard {
-            None => crate::agent::permission::permission_options(true),
+            None => crate::permission::permission_options(true),
             Some(target) => {
-                let mut options = crate::agent::permission::permission_options(false);
+                let mut options = crate::permission::permission_options(false);
                 // Index 1 is `allow-directory` BY CONSTRUCTION — the guard
                 // list is exactly `[allow, allow-directory, reject]`, pinned
                 // by `permission_options`'s own test

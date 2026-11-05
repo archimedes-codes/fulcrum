@@ -13,6 +13,24 @@
 //! merely MENTIONS — e.g. `A="$B"` plus `B=<secret>` turning `"$A"` into the
 //! secret. Scanning left to right exactly once and appending each substitution
 //! verbatim makes that impossible by construction, and the tests pin it.
+//!
+//! # Why this file is here and its directory is not (T5/S3)
+//!
+//! This was `src-tauri/src/agent/provider_auth/headers.rs`. The S3 RULING
+//! measured the crate's need for that whole directory at exactly ONE item —
+//! `expand_map`, called once by `harness/provider/mod.rs` — with zero crate-side
+//! consumers for `budget`, `refresh`, `cli_sso`, `gcloud`, `key_helper`,
+//! `litellm_oauth`, `oidc` or `store`. A module the crate does not need does not
+//! move because a plan's file list says so (the `web/render.rs` precedent), so
+//! only this file came, and the crate-side module is named `provider_headers` —
+//! for the one file, not for the directory it left behind. The desktop's
+//! `provider_auth/mod.rs` re-exports it AS `headers`, which is what keeps every
+//! existing path resolving; see the note there for why that is a `pub use` and
+//! not a `pub mod`.
+//!
+//! The `debuglog` calls below are why the move was even possible in S3 rather
+//! than later: `debuglog` moved in S1, so this file has no edge to a module the
+//! crate does not own.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -26,7 +44,7 @@ pub fn expand_map(headers: &std::collections::HashMap<String, String>) -> BTreeM
     let mut out = BTreeMap::new();
     for (name, value) in headers {
         if !is_valid_header_name(name) {
-            crate::agent::debuglog::log(&format!(
+            crate::debuglog::log(&format!(
                 "provider-auth: skipping custom header with an invalid name `{name}` \
                  (must be a non-empty header token)"
             ));
@@ -36,7 +54,7 @@ pub fn expand_map(headers: &std::collections::HashMap<String, String>) -> BTreeM
         if !is_valid_header_value(&expanded) {
             // The name is echoed, never the value — a header value is the secret
             // this whole module exists to move around.
-            crate::agent::debuglog::log(&format!(
+            crate::debuglog::log(&format!(
                 "provider-auth: skipping custom header `{name}` (expanded value contains CR, LF \
                  or a non-visible-ASCII byte)"
             ));

@@ -8,12 +8,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::*;
 use super::support::*;
-use crate::agent::events::CompactionReason;
-use crate::agent::events::RpcEvent;
-use crate::agent::harness::provider::{
+use crate::events::CompactionReason;
+use crate::events::RpcEvent;
+use crate::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
 };
-use crate::agent::harness::retry::RetryPolicy;
+use crate::harness::retry::RetryPolicy;
 
 /// (finding 4) `run_compaction` over a failing summary: the
 /// transcript is UNCHANGED (a failed compaction is never a lost

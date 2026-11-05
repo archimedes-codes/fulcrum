@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::cli_sso;
 use super::store::{self, OAuthCredential, ProviderCredential};
-use crate::agent::mcp::callback::CallbackServer;
+use crate::mcp::callback::CallbackServer;
 
 /// The interactive login's wire steps (T8 renders each variant; issue #126).
 ///

@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::agent::tools::exec::{ContentBlock, ToolCtx, ToolResult};
-use crate::agent::web::cache::{global_cache, StoredKind};
-use crate::agent::web::extract::Mode;
-use crate::agent::web::providers::registry::{all_providers, execute_search_with_providers};
-use crate::agent::web::providers::types::{SearchOpts, SearchProvider};
+use crate::tools::exec::{ContentBlock, ToolCtx, ToolResult};
+use crate::web::cache::{global_cache, StoredKind};
+use crate::web::extract::Mode;
+use crate::web::providers::registry::{all_providers, execute_search_with_providers};
+use crate::web::providers::types::{SearchOpts, SearchProvider};
 
 /// The parameter name the web tools' MODEL-VISIBLE prose calls the cache handle.
 ///
@@ -32,23 +32,23 @@ use crate::agent::web::providers::types::{SearchOpts, SearchProvider};
 /// is the UI's output contract (`exec.rs`: `content` is what the LLM sees,
 /// `details` is what the UI sees), the Client reads both spellings
 /// (`src/lib/toolOutput.ts`), and none of it is a parameter the model sends.
-pub(crate) const RESPONSE_ID_PARAM: &str = "response_id";
+pub const RESPONSE_ID_PARAM: &str = "response_id";
 
 /// The head line of a `web_search` result set, shown to the model. The handle is
 /// named by [`RESPONSE_ID_PARAM`] — see that doc for why the spelling matters.
-pub(crate) fn search_summary_head(response_id: &str) -> String {
+pub fn search_summary_head(response_id: &str) -> String {
     format!("Search results ({RESPONSE_ID_PARAM}: {response_id}):")
 }
 
 /// The empty-result counterpart of [`search_summary_head`].
-pub(crate) fn search_summary_empty(response_id: &str) -> String {
+pub fn search_summary_empty(response_id: &str) -> String {
     format!("No search results found ({RESPONSE_ID_PARAM}: {response_id})")
 }
 
 /// The tail `fetch_content` appends when it truncates: the ONE place the tools
 /// tell the model how to finish reading, so it is the sentence issue #82's
 /// interim had to keep honest.
-pub(crate) fn truncation_note(remaining: usize, response_id: &str) -> String {
+pub fn truncation_note(remaining: usize, response_id: &str) -> String {
     format!(
         "\n\n…[{remaining} chars truncated — get_search_content with \
          {RESPONSE_ID_PARAM} {response_id} for the rest]"
@@ -146,7 +146,7 @@ pub async fn exec_web_search_with_providers(
 
     match execute_search_with_providers(providers, &queries, &opts, &ctx.web, &ctx.cancel).await {
         Ok(outcome) => {
-            let response_id = crate::agent::web::cache::generate_id();
+            let response_id = crate::web::cache::generate_id();
 
             let mut formatted_entries = Vec::new();
             for r in &outcome.results {
@@ -218,8 +218,8 @@ pub async fn exec_fetch_content(ctx: &ToolCtx, params: &Value) -> ToolResult {
         .unwrap_or("readable");
 
     let mode = match mode_str {
-        "readable" => crate::agent::web::extract::Mode::Readable,
-        "raw" => crate::agent::web::extract::Mode::Raw,
+        "readable" => crate::web::extract::Mode::Readable,
+        "raw" => crate::web::extract::Mode::Raw,
         other => {
             let err_msg = format!(
                 "fetch_content: unknown mode `{}` (expected \"readable\" or \"raw\")",
@@ -242,12 +242,12 @@ pub async fn exec_fetch_content(ctx: &ToolCtx, params: &Value) -> ToolResult {
         .map(|n| (n as usize).clamp(200, 200_000))
         .unwrap_or(20_000);
 
-    match crate::agent::web::extract::extract(url, mode, ctx).await {
+    match crate::web::extract::extract(url, mode, ctx).await {
         Ok(mut doc) => {
             let mut renderer_note: Option<String> = None;
             let mut renderer_used: Option<&'static str> = None;
 
-            if mode != Mode::Raw && crate::agent::web::extract::looks_blocked(&doc) {
+            if mode != Mode::Raw && crate::web::extract::looks_blocked(&doc) {
                 if let Some(requester) = &ctx.render_requester {
                     tokio::select! {
                         _ = ctx.cancel.cancelled() => {
@@ -261,7 +261,7 @@ pub async fn exec_fetch_content(ctx: &ToolCtx, params: &Value) -> ToolResult {
                         render_res = requester.request_render(url, 30_000) => {
                             match render_res {
                                 Ok(rendered) => {
-                                    let mut rendered_doc = crate::agent::web::extract::article::extract(
+                                    let mut rendered_doc = crate::web::extract::article::extract(
                                         &rendered.html,
                                         &rendered.final_url,
                                         rendered.status,
@@ -479,10 +479,10 @@ mod tests {
             cancel: CancellationToken::new(),
             skill_roots: None,
             boundary: vec![PathBuf::from("/tmp")],
-            file_policy: crate::agent::policy::FilePolicy {
-                reads: crate::agent::policy::AccessPolicy::Sandboxed,
-                writes: crate::agent::policy::AccessPolicy::Sandboxed,
-                shell: crate::agent::policy::AccessPolicy::Allow,
+            file_policy: crate::policy::FilePolicy {
+                reads: crate::policy::AccessPolicy::Sandboxed,
+                writes: crate::policy::AccessPolicy::Sandboxed,
+                shell: crate::policy::AccessPolicy::Allow,
                 rules: Vec::new(),
             },
             protected: vec![],
@@ -490,7 +490,7 @@ mod tests {
             // home — the hermetic value every direct fixture passes.
             rules: Vec::new(),
             home: None,
-            web: crate::agent::web::config::WebConfig::default(),
+            web: crate::web::config::WebConfig::default(),
             render_requester: None,
             // (B1) No event sink: emitting is a silent no-op here.
             event_sink: None,
@@ -512,8 +512,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_web_search_failover_to_duckduckgo_wiremock() {
-        use crate::agent::web::providers::brave::BraveProvider;
-        use crate::agent::web::providers::duckduckgo::DuckDuckGoProvider;
+        use crate::web::providers::brave::BraveProvider;
+        use crate::web::providers::duckduckgo::DuckDuckGoProvider;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -569,8 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_web_search_explicit_provider_no_failover_wiremock() {
-        use crate::agent::web::providers::brave::BraveProvider;
-        use crate::agent::web::providers::duckduckgo::DuckDuckGoProvider;
+        use crate::web::providers::brave::BraveProvider;
+        use crate::web::providers::duckduckgo::DuckDuckGoProvider;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -871,19 +871,16 @@ mod tests {
     }
 
     struct MockRenderRequester {
-        reply: Result<crate::agent::web::RenderedPage, String>,
+        reply: Result<crate::web::RenderedPage, String>,
     }
 
-    impl crate::agent::web::RenderRequester for MockRenderRequester {
+    impl crate::web::RenderRequester for MockRenderRequester {
         fn request_render(
             &self,
             _url: &str,
             _timeout_ms: u64,
         ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<crate::agent::web::RenderedPage, String>>
-                    + Send,
-            >,
+            Box<dyn std::future::Future<Output = Result<crate::web::RenderedPage, String>> + Send>,
         > {
             let reply = self.reply.clone();
             Box::pin(async move { reply })
@@ -911,7 +908,7 @@ mod tests {
             "word ".repeat(90)
         );
         ctx.render_requester = Some(Arc::new(MockRenderRequester {
-            reply: Ok(crate::agent::web::RenderedPage {
+            reply: Ok(crate::web::RenderedPage {
                 html: rendered_html,
                 status: 200,
                 final_url: url.clone(),
@@ -947,7 +944,7 @@ mod tests {
         let url = format!("{}/blocked-raw", server.uri());
         let mut ctx = test_ctx();
         ctx.render_requester = Some(Arc::new(MockRenderRequester {
-            reply: Ok(crate::agent::web::RenderedPage {
+            reply: Ok(crate::web::RenderedPage {
                 html: "<html><body>Rendered</body></html>".into(),
                 status: 200,
                 final_url: url.clone(),
@@ -1009,7 +1006,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_web_search_content_formatting_and_cache() {
-        use crate::agent::web::providers::duckduckgo::DuckDuckGoProvider;
+        use crate::web::providers::duckduckgo::DuckDuckGoProvider;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1078,16 +1075,15 @@ mod tests {
             .await;
 
         struct HangingRenderRequester;
-        impl crate::agent::web::RenderRequester for HangingRenderRequester {
+        impl crate::web::RenderRequester for HangingRenderRequester {
             fn request_render(
                 &self,
                 _url: &str,
                 _timeout_ms: u64,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<
-                            Output = Result<crate::agent::web::RenderedPage, String>,
-                        > + Send,
+                    dyn std::future::Future<Output = Result<crate::web::RenderedPage, String>>
+                        + Send,
                 >,
             > {
                 Box::pin(async move {

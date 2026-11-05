@@ -1,18 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use crate::agent::fs_backend::FsBackend;
-use crate::agent::tools::types::ToolCtx;
+use crate::fs_backend::FsBackend;
+use crate::tools::types::ToolCtx;
 
 /// The read-direction backend for this context (ADR 0030): the executor's
 /// roots are `boundary::executor_roots` over `ctx.boundary` and
 /// `ctx.file_policy.reads`.
 pub(crate) fn read_backend(ctx: &ToolCtx) -> FsBackend {
     FsBackend {
-        roots: crate::agent::boundary::executor_roots(
-            &ctx.cwd,
-            &ctx.boundary,
-            ctx.file_policy.reads,
-        ),
+        roots: crate::boundary::executor_roots(&ctx.cwd, &ctx.boundary, ctx.file_policy.reads),
     }
 }
 
@@ -22,7 +18,7 @@ pub(crate) fn read_backend(ctx: &ToolCtx) -> FsBackend {
 /// are refused by `ctx.protected` regardless).
 pub(crate) fn write_backend(ctx: &ToolCtx) -> FsBackend {
     FsBackend {
-        roots: crate::agent::boundary::executor_roots(
+        roots: crate::boundary::executor_roots(
             &ctx.cwd,
             std::slice::from_ref(&ctx.cwd),
             ctx.file_policy.writes,
@@ -42,7 +38,7 @@ pub(crate) fn write_backend(ctx: &ToolCtx) -> FsBackend {
 /// (executor half) and the gate's twin `a_gate_denial_of_a_deny_rule_uses_the_protected_wording`
 /// — the two halves of the pair this spec renamed, whose old names asserted the
 /// every-policy claim this change removes.
-pub(crate) const PROTECTED_WRITE_ROUTE: &str = "This is by design: these directories are the agent's own instructions. Write the file under your session directory instead and ask the user to move it into place (the `ask` tool).";
+pub const PROTECTED_WRITE_ROUTE: &str = "This is by design: these directories are the agent's own instructions. Write the file under your session directory instead and ask the user to move it into place (the `ask` tool).";
 
 /// The write DENY-LIST check (ADR 0030 Deviation 3): a resolved path under
 /// one of `ctx.protected` (the user-level agent-definition dirs).
@@ -70,7 +66,7 @@ pub(crate) fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> O
 /// `exec_write` and `exec_edit` BEFORE any deny-list wording — the ONE resolver
 /// the harness gate's twin calls. Quoting `policy.rs`'s module doc: *"per ADR
 /// 0029/0030's one-canonicalizer rule the gate and the executor must both go
-/// through [`crate::agent::policy::rule_for`], never a second matcher."* The
+/// through [`crate::policy::rule_for`], never a second matcher."* The
 /// path fed here is the SAME `&resolved` the write itself uses
 /// (`FsBackend::resolve` under the `write_backend(ctx)` roots, bound straight
 /// after `validate`), and `ctx.home` is what expands a leading `~` in a rule
@@ -88,15 +84,15 @@ pub(crate) fn protected_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> O
 ///   its allow;
 /// * a rule that does not govern the `Write` direction.
 pub(crate) fn write_rule_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> Option<String> {
-    match crate::agent::policy::rule_for(
+    match crate::policy::rule_for(
         &ctx.rules,
-        crate::agent::policy::RuleDirection::Write,
+        crate::policy::RuleDirection::Write,
         resolved,
         ctx.home.as_deref(),
     ) {
         // Row 1: the DENY is real; only the SENTENCE varies with whether the
         // target also falls under the guard-membership list.
-        Some(rule) if rule.decision == crate::agent::policy::RuleDecision::Deny => {
+        Some(rule) if rule.decision == crate::policy::RuleDecision::Deny => {
             protected_refusal(ctx, tool, resolved)
                 .or_else(|| Some(rule_deny_text(tool, rule, resolved)))
         }
@@ -117,13 +113,13 @@ pub(crate) fn write_rule_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> 
 /// resolves inside the `cwd`, which no user rule names, so an absent-path call
 /// matches nothing and falls to row 4.
 pub(crate) fn read_rule_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> Option<String> {
-    crate::agent::policy::rule_for(
+    crate::policy::rule_for(
         &ctx.rules,
-        crate::agent::policy::RuleDirection::Read,
+        crate::policy::RuleDirection::Read,
         resolved,
         ctx.home.as_deref(),
     )
-    .filter(|rule| rule.decision == crate::agent::policy::RuleDecision::Deny)
+    .filter(|rule| rule.decision == crate::policy::RuleDecision::Deny)
     .map(|rule| rule_deny_text(tool, rule, resolved))
 }
 
@@ -133,11 +129,7 @@ pub(crate) fn read_rule_refusal(ctx: &ToolCtx, tool: &str, resolved: &Path) -> O
 /// explain, not say "escapes the sandbox" and send the model hunting for a
 /// boundary that is not the problem — but naming the RULE's path, which is the
 /// thing the user actually wrote and the thing they can go edit.
-pub(crate) fn rule_deny_text(
-    tool: &str,
-    rule: &crate::agent::policy::AccessRule,
-    resolved: &Path,
-) -> String {
+pub fn rule_deny_text(tool: &str, rule: &crate::policy::AccessRule, resolved: &Path) -> String {
     format!(
         "{tool}: {} is denied by the access rule `{}` (direction {:?}) you configured — refusing. Edit the rule in Settings if this access should be allowed.",
         resolved.display(),
@@ -201,7 +193,7 @@ pub(crate) fn rule_deny_text(
 /// The mirror case is just as much a mismatch: the GATE caller
 /// (`harness/loop.rs::deny_tool_result`) hands the model's RAW argument here,
 /// while its `protected` entries arrive CANONICAL from
-/// [`crate::agent::boundary::protected_dirs`]. Canonicalizing the entries
+/// [`crate::boundary::protected_dirs`]. Canonicalizing the entries
 /// cannot reach that at all — the mismatch is now on the other side, and a raw
 /// `/var/…` never prefix-matches the canonical `/private/var/…` entry (macOS),
 /// and a raw `C:\…` never matches the verbatim `\\?\C:\…` one (Windows).
@@ -224,7 +216,7 @@ pub(crate) fn rule_deny_text(
 /// prevent. That is the bug this canonicalization closes from the gate side.
 ///
 /// So the compared path goes through
-/// [`crate::agent::fs_backend::canonicalize_lenient`] — the peel-to-deepest-
+/// [`crate::fs_backend::canonicalize_lenient`] — the peel-to-deepest-
 /// existing-ancestor seam [`FsBackend::resolve`] itself uses, NOT a second
 /// canonicalizer, because the gate must agree with the executor about where a
 /// path lands. A not-yet-existing write target is exactly the shape the gate
@@ -248,12 +240,12 @@ pub(crate) fn rule_deny_text(
 /// canonicalized: lenient-canonicalizing them again is IDEMPOTENT (a canonical
 /// path canonicalizes to itself, so the peel stops on its first step and the
 /// comparison is unchanged). Their behaviour, and Linux CI, are byte-identical.
-pub(crate) fn protected_refusal_text(
+pub fn protected_refusal_text(
     protected: &[PathBuf],
     tool: &str,
     resolved: &Path,
 ) -> Option<String> {
-    let resolved = crate::agent::fs_backend::canonicalize_lenient(resolved);
+    let resolved = crate::fs_backend::canonicalize_lenient(resolved);
     // BOTH sides lenient (issue #92): the entry may name a dir that does not
     // exist yet, and a strict `canonicalize()` on it fails — which under
     // `is_ok_and` matched NOTHING, silently no-opping the deny-list for
@@ -261,7 +253,7 @@ pub(crate) fn protected_refusal_text(
     // CALLER's entry so the message names the directory as registered.
     let hit = protected
         .iter()
-        .find(|dir| resolved.starts_with(crate::agent::fs_backend::canonicalize_lenient(dir)))?;
+        .find(|dir| resolved.starts_with(crate::fs_backend::canonicalize_lenient(dir)))?;
     Some(format!(
         "{tool}: {} is a protected agent-definition directory ({}) — writing there is refused in every policy. {PROTECTED_WRITE_ROUTE}",
         resolved.display(),

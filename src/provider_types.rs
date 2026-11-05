@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
 
-use crate::agent::tools::ContentBlock;
+use crate::tools::ContentBlock;
 
 /// A model request (the `AgentLoop`'s `complete()` argument, Task 6).
 #[derive(Debug, Clone)]
@@ -173,17 +173,23 @@ pub struct ToolCall {
 /// [`ToolCall`] shape, and `ChatMessage`'s own serialization (the DB /
 /// transcript) is untouched.
 ///
-/// `pub(super)`: `provider/mod.rs`'s `request_body` constructs these.
-pub(super) struct WireToolCall<'a> {
-    pub(super) id: &'a str,
-    pub(super) name: &'a str,
-    pub(super) arguments: &'a Value,
+/// `pub` (T5/S4, Step A.3): a package boundary erases `pub(super)`, and the
+/// desktop's `provider/openai.rs` — desktop then — constructed these in its
+/// `request_body`. T5/S5b moved that file into this crate as
+/// `harness/provider/openai.rs`, so the cross-package reason is gone and this is
+/// now constructed only inside the crate (grep-verified at T8/S8.5: zero
+/// references under `src-tauri/`). `pub` KEPT — see the note on
+/// `interactive::dispatch_params`; the same tighten candidate.
+pub struct WireToolCall<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub arguments: &'a Value,
 }
 
 /// The `function` object of a [`WireToolCall`].
-pub(super) struct WireFunction<'a> {
-    pub(super) name: &'a str,
-    pub(super) arguments: &'a Value,
+pub struct WireFunction<'a> {
+    pub name: &'a str,
+    pub arguments: &'a Value,
 }
 
 impl Serialize for WireToolCall<'_> {
@@ -315,7 +321,7 @@ pub enum ProviderEvent {
 }
 
 /// A provider error. The `AgentLoop`'s `RetryPolicy` (Task 6) retries on
-/// [`Retryable`].
+/// [`ProviderError::Retryable`].
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProviderError {
     /// Transient (HTTP 429 / 5xx, a network failure) — worth retrying.
@@ -379,7 +385,7 @@ pub trait Provider: Send + Sync {
 /// (pinned as a no-event case on the OpenAI side) — but one comparison is
 /// a cheap barrier between a future dependency change and an `$inf` on
 /// screen, so it stays.
-pub(crate) fn cost_usd_from_usage(usage: &Value) -> Option<f64> {
+pub fn cost_usd_from_usage(usage: &Value) -> Option<f64> {
     // The FIRST PRESENT field answers, in D4's order (`.flatten()` skips
     // only the ABSENT ones).
     let value = [
@@ -430,7 +436,7 @@ pub(crate) fn cost_usd_from_usage(usage: &Value) -> Option<f64> {
 /// exactly the behaviour the Anthropic wire has always had (the format
 /// string `"{kind}: {message}"` is byte-identical to that wire's, so its
 /// behaviour is preserved by construction).
-pub(crate) fn parse_error_chunk(v: &Value) -> Option<ProviderError> {
+pub fn parse_error_chunk(v: &Value) -> Option<ProviderError> {
     let error = v.get("error")?;
     let message = error
         .get("message")
@@ -440,7 +446,7 @@ pub(crate) fn parse_error_chunk(v: &Value) -> Option<ProviderError> {
     // (ADR 0045) THE ORDER IS LOAD-BEARING: the overflow check runs BEFORE
     // the `kind` match (see the doc above), and the exclusions run first
     // inside the check, so a throttle stays the tier its `kind` says.
-    if crate::agent::harness::provider::overflow::is_context_overflow_text(message) {
+    if crate::provider_overflow::is_context_overflow_text(message) {
         return Some(ProviderError::ContextOverflow(format!("{kind}: {message}")));
     }
     Some(match kind {

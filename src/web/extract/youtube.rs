@@ -6,9 +6,9 @@
 //! to the official oEmbed JSON endpoint, and ultimately to article HTML extraction.
 
 use super::ExtractedDoc;
-use crate::agent::tools::exec::ToolCtx;
-use crate::agent::web::extract::article;
-use crate::agent::web::net::{safe_fetch, FetchOpts};
+use crate::tools::exec::ToolCtx;
+use crate::web::extract::article;
+use crate::web::net::{safe_fetch, FetchOpts};
 use serde_json::Value;
 use url::Url;
 

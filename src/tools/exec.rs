@@ -1,6 +1,6 @@
 //! The Rust tool executors (native-agent-harness Task 1): one per built-in
 //! tool, each contained by the session's root set (via the existing
-//! [`FsBackend`](crate::agent::fs_backend::FsBackend)) and returning a pi-shaped
+//! [`FsBackend`](crate::fs_backend::FsBackend)) and returning a pi-shaped
 //! [`ToolResult`] — `content` is what the LLM sees, `details` is what the UI
 //! sees (matching pi's built-in renderers). The native harness (in-process)
 //! calls [`execute_tool`].
@@ -18,7 +18,7 @@ use serde_json::Value;
 
 pub use super::types::*;
 
-pub(crate) use access::protected_refusal_text;
+pub use access::protected_refusal_text;
 
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -51,11 +51,9 @@ pub async fn execute_tool(ctx: &ToolCtx, tool: &str, params: &Value) -> ToolResu
         "ls" => fs_tools::exec_ls(ctx, params).await,
         "list_skills" => skills::exec_list_skills(ctx, params).await,
         "read_skill" => skills::exec_read_skill(ctx, params).await,
-        "web_search" => crate::agent::web::tools::exec_web_search(ctx, params).await,
-        "fetch_content" => crate::agent::web::tools::exec_fetch_content(ctx, params).await,
-        "get_search_content" => {
-            crate::agent::web::tools::exec_get_search_content(ctx, params).await
-        }
+        "web_search" => crate::web::tools::exec_web_search(ctx, params).await,
+        "fetch_content" => crate::web::tools::exec_fetch_content(ctx, params).await,
+        "get_search_content" => crate::web::tools::exec_get_search_content(ctx, params).await,
         other => ToolResult::fail(format!("unknown tool: {other}"), None),
     }
 }

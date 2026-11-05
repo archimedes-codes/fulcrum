@@ -4,13 +4,13 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::agent::web::config::WebConfig;
-use crate::agent::web::providers::brave::BraveProvider;
-use crate::agent::web::providers::duckduckgo::DuckDuckGoProvider;
-use crate::agent::web::providers::perplexity::PerplexityProvider;
-use crate::agent::web::providers::searxng::SearXNGProvider;
-use crate::agent::web::providers::tavily::TavilyProvider;
-use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
+use crate::web::config::WebConfig;
+use crate::web::providers::brave::BraveProvider;
+use crate::web::providers::duckduckgo::DuckDuckGoProvider;
+use crate::web::providers::perplexity::PerplexityProvider;
+use crate::web::providers::searxng::SearXNGProvider;
+use crate::web::providers::tavily::TavilyProvider;
+use crate::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
 pub const AVAILABILITY_ORDER: &[&str] = &["brave", "tavily", "perplexity", "searxng", "duckduckgo"];
 

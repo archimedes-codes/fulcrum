@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
-use crate::agent::tools::types::{ContentBlock, ToolCtx, ToolResult};
+use crate::tools::types::{ContentBlock, ToolCtx, ToolResult};
 
 /// The default `bash` deadline when no `timeout_ms` is given (300 s —
 /// matching the interactive channel's `TOOL_EXEC_BASH_DEFAULT_TIMEOUT`: the native
@@ -29,7 +29,7 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 100 * 1024;
 /// The grace deadline for draining a killed `bash` child's pipes (2 s —
 /// the pipes may never close if a grandchild escaped the process group;
 /// a bounded wait, not an unbounded wait for EOF).
-pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(2);
+pub const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Deduplicated pipe-buffering collector for combined stdout+stderr streams.
 pub(crate) struct OutputCollector {
@@ -111,7 +111,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
         Some(c) => c.to_string(),
         None => return ToolResult::fail("bash: missing `command` parameter".to_string(), None),
     };
-    let confined = ctx.file_policy.shell == crate::agent::policy::AccessPolicy::Sandboxed;
+    let confined = ctx.file_policy.shell == crate::policy::AccessPolicy::Sandboxed;
     let timeout = params
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
@@ -125,7 +125,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // cancel; the orphaned grandchild outlives the call).
     #[cfg(unix)]
     let mut cmd = {
-        let mut c = crate::agent::childproc::command("sh");
+        let mut c = crate::childproc::command("sh");
         c.arg("-c");
         c.process_group(0);
         c
@@ -135,7 +135,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // argument below, by the module that owns the Windows shape of a child's
     // command line. `arg("/C")` + `arg(command)` is exactly what issue #79 is
     // about — see `childproc::append_cmd_c`.
-    let mut cmd = crate::agent::childproc::command("cmd");
+    let mut cmd = crate::childproc::command("cmd");
     // Tool child, so stdin is NULL, not inherited. Nothing can ever feed this
     // child: the Worker owns the only pipe a stdin could be (`worker/client.rs`
     // holds the `BufWriter<ChildStdin>` for its whole life) and `tokio`'s
@@ -146,7 +146,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // One call here covers BOTH `cfg` arms above (they bind the same `cmd`).
     // Deliberately NOT applied to Runtime children (the Worker's own stdin, an
     // MCP server's, `sudo_exec`'s password stdin) — we write those pipes.
-    crate::agent::childproc::closed_stdin(&mut cmd);
+    crate::childproc::closed_stdin(&mut cmd);
     // The command string reaches the shell UNMODIFIED on both platforms — that
     // is this tool's whole contract. Unix: `sh -c` takes it verbatim. Windows:
     // `arg` would wrap it in an outer quote pair and escape every embedded `"`
@@ -158,7 +158,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     #[cfg(unix)]
     cmd.arg(&command);
     #[cfg(not(unix))]
-    crate::agent::childproc::append_cmd_c(&mut cmd, &command);
+    crate::childproc::append_cmd_c(&mut cmd, &command);
     cmd.current_dir(&ctx.cwd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -182,7 +182,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     }
     #[cfg(target_os = "linux")]
     let sandbox = if confined {
-        match crate::agent::tools::sandbox::Sandbox::create(&ctx.cwd) {
+        match crate::tools::sandbox::Sandbox::create(&ctx.cwd) {
             Ok(sandbox) => {
                 sandbox.install(&mut cmd);
                 Some(sandbox)
@@ -217,7 +217,7 @@ pub async fn exec_bash(ctx: &ToolCtx, params: &Value) -> ToolResult {
     // outlive `spawn` (the child's forked fd table refers to the parent's
     // ruleset fd), and neither this statement nor a future env-aware `Sandbox`
     // may change that.
-    crate::agent::hostenv::for_child().apply(&mut cmd);
+    crate::hostenv::for_child().apply(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -473,7 +473,7 @@ pub(crate) fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 /// — appended to the text the MODEL reads — explains any outcome the bare
 /// code cannot (`bash_output_capped_at_max`'s cap applies to the captured
 /// output, not to this note).
-pub(crate) fn bash_exit_report(
+pub fn bash_exit_report(
     cancelled: bool,
     timed_out: bool,
     status: Option<std::process::ExitStatus>,
@@ -614,13 +614,13 @@ pub(crate) fn bash_exit_report(
 /// (and writing the marker file it was about to write).
 ///
 /// **The owner moved.** The syscall itself lives in
-/// [`crate::agent::childproc::kill_process_group`] — one owner for the
+/// [`crate::childproc::kill_process_group`] — one owner for the
 /// process-group kill, so every exec path latches the same way (ADR 0080's
 /// amendment, Finding 3). This wrapper keeps the `bash`-side NAME (its call
 /// sites and the `exec.rs` test-only re-export stay valid) and adds nothing but
 /// the delegation.
 pub(crate) async fn kill_bash_process_group(pid: Option<u32>, child: &mut tokio::process::Child) {
-    crate::agent::childproc::kill_process_group(pid, child).await;
+    crate::childproc::kill_process_group(pid, child).await;
 }
 
 #[cfg(test)]

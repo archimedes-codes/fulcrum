@@ -5,18 +5,16 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::agent::events::EventSink;
-use crate::agent::harness::catalog::{Model, ModelCatalog};
-use crate::agent::subagent::{
-    AgentNameResolution, LaunchConfig, SubagentFailureReason, SubagentOutcome,
-};
-use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
-use crate::agent::worker::manager::{
+use crate::events::EventSink;
+use crate::harness::catalog::{Model, ModelCatalog};
+use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentFailureReason, SubagentOutcome};
+use crate::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
+use crate::worker::manager::{
     feed_capture, finish_subagent, note_liveness_event, note_liveness_frame, note_liveness_gate,
     SubagentCapture, SubagentDrive, SubagentLiveness, SubagentOutcomeSink, WorkerFactory,
     WorkerManager,
 };
-use crate::agent::worker::protocol::{StartEnv, StartMode, SubagentDispatchWire};
+use crate::worker::protocol::{StartEnv, StartMode, SubagentDispatchWire};
 
 /// The test logging type aliases (the `clippy::type_complexity`
 /// bound — the `Arc<StdMutex<...>>` shapes are repeated across
@@ -26,14 +24,60 @@ type EventLog = Arc<StdMutex<Vec<(String, bool, WorkerInboundEvent)>>>;
 type SinkMap = Arc<StdMutex<HashMap<String, Arc<CollectorSink>>>>;
 type SinkEvents = Arc<StdMutex<Vec<(String, Value)>>>;
 
-/// The `fake_worker` fixture (the `fake_mcp_stdio` convention — the
-/// `CARGO_MANIFEST_DIR`/`target/debug` path; `cargo test` builds the
-/// bin targets).
+/// The `fake_worker` fixture — resolved through the crate's ONE `target/debug`
+/// resolver (S8.3, the same re-point `worker/client.rs::fixture_path` carries).
+///
+/// The old body derived the root from `env!("CARGO_MANIFEST_DIR").parent()`,
+/// which was right in `src-tauri/` (one level under the root) and is WRONG here:
+/// this crate is TWO levels down, so that expression names
+/// `<root>/crates/target/debug/fake_worker`, which no build writes to. All 30
+/// tests in this module spawn the fixture, so every one of them would fail with
+/// `SpawnFailed(Io(ENOENT))`. `test_support::target_debug_dir()` walks up TWO
+/// levels and is pinned against `current_exe()` by
+/// `childproc::target_debug_dir_is_where_cargo_actually_builds`; the equality +
+/// `current_exe()` asserts in `fixture_root_is_where_cargo_actually_builds` pin
+/// THIS helper to it, so a wrong level count fails loudly rather than silently
+/// green.
 fn fixture_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/fake_worker"
-    ))
+    crate::test_support::fixture_bin("fake_worker")
+}
+
+/// The vacuity guard this module did not have (the lesson `childproc.rs`
+/// teaches: a fixture spawner with no guard is a spawner that fails quietly).
+///
+/// Three halves, because a single `starts_with(<some root>)` is satisfied by the
+/// broken path too — `client.rs`'s original pin proved that by passing on
+/// `<root>/crates/target/debug/fake_worker`:
+///   1. EQUALITY against the crate's one resolver (not a prefix);
+///   2. the directory `current_exe()` proves cargo actually built into, so the
+///      claim is measured against reality and not against another guess;
+///   3. `is_file()`, the existence witness.
+#[test]
+fn fixture_root_is_where_cargo_actually_builds() {
+    let p = fixture_path();
+    // The name cargo builds on THIS platform — see the same note in
+    // `worker/client.rs::fixture_path_resolves_to_the_workspace_root_target`.
+    // `is_file()` below does not append an exe suffix the way `CreateProcess`
+    // does, which is what reddened this witness on `windows-latest`.
+    let want_name = format!("fake_worker{}", std::env::consts::EXE_SUFFIX);
+    assert_eq!(
+        p,
+        crate::test_support::target_debug_dir().join(&want_name),
+        "the fixture must resolve through the crate's ONE two-levels-up resolver"
+    );
+    let exe = std::env::current_exe().expect("a test binary has a path");
+    let built_into = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("the test binary sits under target/debug/deps");
+    assert_eq!(
+        p.parent(),
+        Some(built_into),
+        "the fixture resolves to {p:?}, but cargo built THIS test binary into \
+         {built_into:?} — a fixture path that is not a sibling of the built \
+         binaries spawns ENOENT (`crates/target/…` is exactly that)"
+    );
+    assert!(p.is_file(), "the fixture must exist: {p:?}");
 }
 
 /// The test factory (the `WorkerFactory` seam — the `fake_worker`
@@ -866,7 +910,7 @@ fn the_subagent_capture_captures_the_final_text_from_the_sink_frames() {
     );
     // The usage accumulation (the `message_update` `usage` field —
     // the metrics' token fields).
-    capture.observe_event(&crate::agent::events::RpcEvent::message_update {
+    capture.observe_event(&crate::events::RpcEvent::message_update {
         usage: serde_json::json!({ "inputTokens": 10, "outputTokens": 5 }),
         assistant_message_event: serde_json::json!({}),
     });
@@ -962,8 +1006,8 @@ fn liveness_view(manager: &WorkerManager, child_id: &str) -> (u64, Vec<String>) 
 
 /// A canned `tool_execution_start` (the ANNOUNCE frame the pump sees while
 /// the Provider still streams the `toolCall`).
-fn tool_start(tool_call_id: &str) -> crate::agent::events::RpcEvent {
-    crate::agent::events::RpcEvent::tool_execution_start {
+fn tool_start(tool_call_id: &str) -> crate::events::RpcEvent {
+    crate::events::RpcEvent::tool_execution_start {
         tool_call_id: tool_call_id.to_string(),
         tool_name: "bash".to_string(),
         args: serde_json::json!({ "command": "ls" }),
@@ -971,8 +1015,8 @@ fn tool_start(tool_call_id: &str) -> crate::agent::events::RpcEvent {
 }
 
 /// A canned `tool_execution_end` (the close of one announced call).
-fn tool_end(tool_call_id: &str) -> crate::agent::events::RpcEvent {
-    crate::agent::events::RpcEvent::tool_execution_end {
+fn tool_end(tool_call_id: &str) -> crate::events::RpcEvent {
+    crate::events::RpcEvent::tool_execution_end {
         tool_call_id: tool_call_id.to_string(),
         tool_name: "bash".to_string(),
         result: serde_json::json!({ "content": [], "isError": false }),
@@ -1047,7 +1091,7 @@ fn the_liveness_set_tracks_announced_and_closed_tool_calls() {
 
     // A DRIVING turn emits plenty of frames that are neither boundary —
     // they advance the liveness clock and leave the set alone.
-    let turn = crate::agent::events::RpcEvent::turn_start;
+    let turn = crate::events::RpcEvent::turn_start;
     feed_capture(&manager.state, "live1", |capture, liveness| {
         note_liveness_event(liveness, &turn);
         capture.observe_event(&turn);
@@ -1915,7 +1959,7 @@ async fn a_gate_whose_tool_closed_without_an_answer_is_still_closed() {
         parent_enabled_tools: vec!["bash".to_string()],
         agent_name: "tester".to_string(),
         name_resolution: AgentNameResolution::Matched,
-        launch: crate::agent::subagent::LaunchConfig::default(),
+        launch: crate::subagent::LaunchConfig::default(),
         task: "the parked task".to_string(),
         model_key: "fake/m1".to_string(),
     };
@@ -1972,7 +2016,7 @@ async fn an_answered_gates_card_is_not_closed_again_at_teardown() {
         .expect("the child handle is reachable")
         .send_permission_response(
             "p1",
-            &crate::agent::permission::PermissionOutcome::Selected {
+            &crate::permission::PermissionOutcome::Selected {
                 option_id: "allow".to_string(),
                 value: None,
             },
@@ -2101,25 +2145,32 @@ async fn the_subagent_ui_lifecycle_events_fire_on_the_parent_sink() {
     );
 }
 
-/// (issue #107) A REAL-ZERO child, end to end: the `__subagent_cost_0__`
-/// fixture emits ONE child-keyed `cost_update` frame carrying `costUsd: 0.0`,
-/// so the Supervisor's `SubagentCapture` sums it to `Some(0.0)` — the spelling
-/// that is a FIGURE — and BOTH consequences of the `Option` hand-off are
-/// observable on real processes:
+/// (issue #107 → Fulcrum T2's follow-up) A REAL-ZERO child, end to end on real
+/// processes: the `__subagent_cost_0__` fixture emits ONE child-keyed
+/// `cost_update` frame carrying `costUsd: 0.0`, so the Supervisor's
+/// `SubagentCapture` holds `Some(0.0)` — the spelling that is a FIGURE — and the
+/// two consequences observable from the Supervisor are:
 ///
 /// 1. the `subagent-closed` hand-off carries the NUMBER `0.0`, not `null` (the
 ///    never-priced child of the test above proves the other half — the two are
 ///    NOT interchangeable);
-/// 2. a real-zero child CONTRIBUTES a parent-keyed `cost_update` frame: the
-///    roll-up gate is the `Option`, not a `> 0.0` value filter, so a real zero
-///    still reaches the parent's money (the spec's "`$0.00` for a real zero"
-///    claim, pinned Rust-side at the emitter).
+/// 2. the Supervisor contributes **NO parent-keyed `cost_update` frame** — the
+///    roll-up is deleted, because a second writer on the parent's store key
+///    loses the child's money to the parent's next frame. The parent's total is
+///    built by the parent's own loop (`AgentLoop::fold_child_cost`), pinned
+///    loop-side in `harness/loop/tests/cost.rs`.
 ///
-/// The frame is asserted on the `on_event` observation point (this harness's
-/// `on_event` collector — production's `on_event` is `SessionManager::
-/// route_event`, which persists the frame and re-emits the SAME payload to the
-/// parent's UI sink; the harness has no router, so the sink leg is the
-/// production-only half and the `route_event` write is pinned in `router.rs`).
+/// Point 2 is the half that CHANGED. What did NOT change is the child's own
+/// frame: it still rides the CHILD's stream, still CHILD-keyed, still
+/// `is_subagent: true`, and it still lands on the child's own row and its own
+/// card — asserted below, because "no roll-up" must not quietly become "the
+/// child's money vanished".
+///
+/// Both frame counts are asserted on the `on_event` observation point (this
+/// harness's `on_event` collector — production's `on_event` is `SessionManager::
+/// route_event`, which persists and re-emits; the harness has no router, so the
+/// sink leg is production-only and the `route_event` write is pinned in
+/// `router.rs`).
 ///
 /// (On the name: the plan's title for this test, kept verbatim. The "null
 /// metrics" half is NOT what it asserts — this child's hand-off is the NUMBER
@@ -2160,18 +2211,25 @@ async fn a_real_zero_child_emits_null_metrics_and_a_parent_costs_zero() {
         "the hand-off stays keyed to the CHILD"
     );
 
-    // 2. The roll-up: EXACTLY ONE parent-keyed `cost_update` frame. The child's
-    // OWN frame rides the same channel (the pump delivers a child's frames to
-    // the PARENT's id, flagged `is_subagent: true`, and keyed to the CHILD) —
-    // that is the no-double-count half: different store keys. The roll-up is the
-    // `is_subagent: false`, PARENT-keyed frame.
-    let got = wait_for_event(&events, "u2", |e| {
-        matches!(e, WorkerInboundEvent::SinkFrame { event, payload }
-            if event == "interactive-event"
-                && payload["event"] == "cost_update"
-                && payload["sessionId"] == "u2")
+    // 2. THE ONE-WRITER RULE, end to end: ZERO parent-keyed frames, ONE
+    // child-keyed frame. The child's OWN frame rides the same channel (the pump
+    // delivers a child's frames to the PARENT's id, flagged `is_subagent: true`,
+    // and keyed to the CHILD) — that frame is the child's money on the child's
+    // key and it SURVIVES this change untouched. What is gone is the second,
+    // `is_subagent: false`, PARENT-keyed roll-up the Supervisor used to add:
+    // two writers on the parent's key is the money-loss defect.
+    // THE barrier: read the log AFTER the `subagent-result-ack`, which the
+    // fixture emits when the `SubagentResult` frame arrives — and that frame is
+    // the LAST thing `finish_subagent` sends. So by the time the ack is visible,
+    // every emission that function makes (including the deleted roll-up, should
+    // it ever come back) is already in the log: the zero-count assertion below
+    // cannot pass by having looked too early. The child's own frame arrives
+    // during the stream, strictly before it, so one barrier covers both counts.
+    wait_for_event(&events, "u2", |e| {
+        matches!(e, WorkerInboundEvent::SinkFrame { event, .. } if event == "subagent-result-ack")
     })
     .await;
+    let got = collect_now(&events, "u2");
     let rollups: Vec<&WorkerInboundEvent> = got
         .iter()
         .filter(|(is_sub, e)| {
@@ -2191,33 +2249,18 @@ async fn a_real_zero_child_emits_null_metrics_and_a_parent_costs_zero() {
                     if event == "interactive-event" && payload["event"] == "cost_update")
         })
         .count();
-    assert_eq!(
-        rollups.len(),
-        1,
-        "a real-zero child contributes exactly ONE PARENT-keyed roll-up frame: {got:?}"
+    assert!(
+        rollups.is_empty(),
+        "a real-zero child contributes NO PARENT-keyed `cost_update` frame — \
+         the Supervisor is not a writer of the parent's money key (its roll-up \
+         was a second writer, and a snapshot frame from it was erased by the \
+         parent's next frame): {got:?}"
     );
     assert_eq!(
         child_frames, 1,
-        "the child's OWN frame is the other one (CHILD-keyed, `is_subagent: \
-         true`) — the two never share a store key: {got:?}"
-    );
-    let frame = match rollups[0] {
-        WorkerInboundEvent::SinkFrame { payload, .. } => payload.clone(),
-        _ => unreachable!("filtered above"),
-    };
-    assert_eq!(
-        frame["sessionId"], "u2",
-        "the roll-up is keyed to the PARENT, never the child"
-    );
-    assert_ne!(
-        frame["sessionId"], child_id,
-        "the roll-up must NOT re-key the child's money to the child"
-    );
-    assert_eq!(frame["payload"]["source"], "subagent");
-    assert_eq!(
-        frame["payload"]["costUsd"].as_f64(),
-        Some(0.0),
-        "a real zero IS a figure and its frame lands on the parent's money"
+        "the child's OWN frame is still there (CHILD-keyed, `is_subagent: \
+         true`) — deleting the roll-up must not delete the child's own money: \
+         {got:?}"
     );
 
     drop(sink_events);

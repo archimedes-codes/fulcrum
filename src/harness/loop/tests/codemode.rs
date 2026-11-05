@@ -30,10 +30,10 @@ use tokio_util::sync::CancellationToken;
 use super::super::*;
 use super::policy_gate::{answer_permission, build_policy_loop};
 use super::support::*;
-use crate::agent::events::RpcEvent;
-use crate::agent::harness::provider::{FinishReason, ProviderEvent, ToolCall};
-use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::tools::ContentBlock;
+use crate::events::RpcEvent;
+use crate::harness::provider::{FinishReason, ProviderEvent, ToolCall};
+use crate::harness::retry::RetryPolicy;
+use crate::tools::ContentBlock;
 
 /// The text of a [`ToolResult`]'s first block (the `result_text` helper is
 /// test-only and lives beside the production dispatcher; this is the same read).
@@ -550,7 +550,7 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
     // renders it through `deny_tool_result`.
     assert_eq!(
         loop_.policy_verdict(&nested),
-        Some(crate::agent::policy::Decision::Deny),
+        Some(crate::policy::Decision::Deny),
         "the pin needs a real `Deny` — a read INSIDE the boundary would be `Allow`"
     );
     let direct_text = result_text(&loop_.deny_tool_result(&nested));
@@ -646,7 +646,7 @@ async fn a_nested_ask_prompts_on_the_nested_request_id_and_a_reject_denies_it() 
     };
     assert_eq!(
         loop_.policy_verdict(&nested),
-        Some(crate::agent::policy::Decision::Ask),
+        Some(crate::policy::Decision::Ask),
         "the pin needs a real `Ask` (untrusted Space, no trust source)"
     );
     let denial_wording = "permission denied".to_string();

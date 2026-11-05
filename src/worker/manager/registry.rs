@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use crate::agent::worker::client::WorkerHandle;
-use crate::agent::worker::protocol::StartEnv;
+use crate::worker::client::WorkerHandle;
+use crate::worker::protocol::StartEnv;
 
 use super::subagent_flow::SubagentDrive;
 use super::{WorkerFactory, WorkerHooks};

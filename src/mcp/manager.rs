@@ -29,7 +29,6 @@ use super::http::{HttpClient, TokenProvider};
 use super::oauth;
 use super::stdio::StdioClient;
 use super::types::{AuthSpec, McpState, ServerDef, ToolCallResult, ToolInfo};
-use crate::config::load_settings;
 
 /// A connected MCP server (a stdio or HTTP client — the unified interface
 /// the manager routes `list_tools` / `call_tool` through).
@@ -99,20 +98,36 @@ pub struct McpManager {
     /// file instead of the developer's stored tokens (issue #68 — the read that
     /// T4 left pointed at the real path).
     auth_file: PathBuf,
+    /// (T5/S3, edge E6) The "open this URL in the OS" seam — see
+    /// [`super::OpenRequester`]. The desktop injects an impl that calls
+    /// `crate::open::open`; [`McpManager::new`] defaults to
+    /// [`super::NoOpenRequester`], so an unwired construction opens nothing
+    /// rather than guessing.
+    open_requester: Arc<dyn super::OpenRequester>,
 }
 
 impl McpManager {
     /// Create a manager (load the servers from the config — Task 1's
     /// `load_servers`: global `~/.pi/agent/mcp.json` + the desktop
-    /// `settings.json` `mcpServers` (ADR 0019 — `config_dir: None` =
-    /// absent) + project `<cwd>/.pi/mcp.json`).
-    pub fn new(home_dir: PathBuf, project_cwd: PathBuf, config_dir: Option<&Path>) -> Self {
-        // (ADR 0019) The desktop layer: the `settings.json` `mcpServers`
-        // (best-effort — a missing / corrupt file is the `load_settings`
-        // defaults = an empty map). Merged at global precedence (project
-        // > desktop > global).
-        let desktop = config_dir.map(|d| load_settings(d).mcp_servers);
-        let servers = load_servers(&home_dir, &project_cwd, desktop.as_ref())
+    /// `mcpServers` layer (ADR 0019) + project `<cwd>/.pi/mcp.json`).
+    ///
+    /// (Fulcrum T3) The third parameter is the PACKAGED desktop map, not a
+    /// settings dir: `None` = no desktop layer, which is what `config_dir:
+    /// None` meant before, and what a settings file with no `mcpServers` key
+    /// also produced. The Worker now never opens `settings.json` to build its
+    /// MCP set — the map rode the `start` envelope.
+    ///
+    /// The `~/.pi/agent/mcp.json` and project `<cwd>/.pi/mcp.json` layers are
+    /// UNTOUCHED and still read from disk: those are the user's pi-agent files,
+    /// not desktop config, and the status file records them as out of scope.
+    pub fn new(
+        home_dir: PathBuf,
+        project_cwd: PathBuf,
+        desktop_mcp_servers: Option<&std::collections::HashMap<String, Value>>,
+    ) -> Self {
+        // (ADR 0019) The desktop layer, verbatim from the envelope. Merged at
+        // global precedence (project > desktop > global).
+        let servers = load_servers(&home_dir, &project_cwd, desktop_mcp_servers)
             .into_iter()
             .map(|(name, def)| {
                 (
@@ -130,7 +145,26 @@ impl McpManager {
             servers,
             project_cwd,
             auth_file: oauth::auth_file_path(),
+            // The safe default (see the field doc). Every production site wires
+            // the real opener through [`McpManager::with_open_requester`].
+            open_requester: Arc::new(super::NoOpenRequester),
         }
+    }
+
+    /// Inject the "open this URL in the OS" seam (T5/S3, edge E6).
+    ///
+    /// The builder shape is the house rule for a desktop dependency the crate
+    /// must not name (the `with_auth_file` precedent two lines above): the
+    /// constructor signature stays frozen — fixtures outside the move set call
+    /// `McpManager::new` positionally — and the seam arrives as a second step.
+    ///
+    /// Production wires this at every construction site that can reach the
+    /// `auth` action: `AgentLoop::new` and `AgentLoop::set_desktop_config` (the
+    /// two sites the harness rebuilds the manager at) both take the desktop's
+    /// `crate::open::open` impl.
+    pub fn with_open_requester(mut self, open_requester: Arc<dyn super::OpenRequester>) -> Self {
+        self.open_requester = open_requester;
+        self
     }
 
     /// Point the credentials read/write at a specific file (the test seam —
@@ -379,8 +413,13 @@ impl McpManager {
             };
             // The production `open_browser` (the platform default browser,
             // fire-and-forget; a failure is non-fatal — the URL is in the
-            // result).
-            let open_browser: Box<dyn Fn(&str) + Send + Sync> = Box::new(production_open_browser);
+            // result). (T5/S3, E6) This is no longer a hard-coded function: the
+            // opener arrives on the manager as the `OpenRequester` seam, because
+            // the desktop's `crate::open` names `tauri` and cannot move here.
+            let open_requester = self.open_requester.clone();
+            let open_browser: Box<dyn Fn(&str) + Send + Sync> = Box::new(move |url: &str| {
+                let _ = open_requester.open(url);
+            });
             let stored =
                 oauth::authenticate(def, auth_server_url.as_deref(), cancel, &open_browser)
                     .await
@@ -625,7 +664,18 @@ pub async fn test_server(
 
 /// Run the interactive OAuth flow for a server from outside an agent session
 /// (e.g. from the Settings UI). Stores the resulting token in `mcp-auth.json`.
-pub async fn authenticate_server(server_name: &str, def: &ServerDef) -> Result<String, String> {
+///
+/// (T5/S3, E6) `open_requester` is now a parameter. This free function has no
+/// manager to hold the seam, and its one production caller is the desktop's
+/// `commands::settings::auth_mcp_server` — which passes the same
+/// `crate::open::open` impl the manager gets. Passing it in (rather than leaving
+/// a hard-coded opener here) is what keeps the crate `tauri`-free; desktop →
+/// crate is the allowed direction.
+pub async fn authenticate_server(
+    server_name: &str,
+    def: &ServerDef,
+    open_requester: &dyn crate::mcp::OpenRequester,
+) -> Result<String, String> {
     let ServerDef::Http(http_def) = def else {
         return Err(format!("{server_name} is not an HTTP server (no OAuth)"));
     };
@@ -640,7 +690,11 @@ pub async fn authenticate_server(server_name: &str, def: &ServerDef) -> Result<S
         _ => None,
     };
     let cancel = CancellationToken::new();
-    let open_browser: Box<dyn Fn(&str) + Send + Sync> = Box::new(production_open_browser);
+    let open_browser: Box<dyn Fn(&str) + Send + Sync> = Box::new(|url: &str| {
+        // Fire-and-forget, exactly as the pre-seam `production_open_browser`
+        // was (`let _ = crate::open::open(url, None)`).
+        let _ = open_requester.open(url);
+    });
     let stored = oauth::authenticate(http_def, auth_server_url.as_deref(), &cancel, &open_browser)
         .await
         .map_err(|e| format!("{server_name}: {e}"))?;
@@ -649,15 +703,6 @@ pub async fn authenticate_server(server_name: &str, def: &ServerDef) -> Result<S
     // have written other entries in that window.
     oauth::store_credentials(&oauth::auth_file_path(), server_name, stored)?;
     Ok(format!("{server_name}: authenticated"))
-}
-
-/// The production `open_browser` (the platform default browser, fire-and-forget;
-/// a failure is non-fatal — the URL is in the result). `crate::open` is the ONE
-/// External-open policy, so the per-OS `open`/`cmd /c start`/`xdg-open` block
-/// that used to live here is gone: `tauri-plugin-opener` is the only place in
-/// this repo that knows what each platform's opener is.
-fn production_open_browser(url: &str) {
-    let _ = crate::open::open(url, None);
 }
 
 #[cfg(test)]
@@ -740,11 +785,14 @@ mod tests {
     async fn lazy_connect_then_reuse() {
         // A stdio server (the fake binary) — the first `call_tool` connects,
         // the second reuses (no reconnect).
-        let bin = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_mcp_stdio"
-        ));
-        let (manager, _dir) = manager_with(&stdio_server_json(bin), None);
+        // The WORKSPACE ROOT's `target/debug` via the crate's ONE resolver
+        // (T5/S3, Step A-bis): `CARGO_MANIFEST_DIR.parent()` was the repo root
+        // while this file lived in `src-tauri/` and is `crates/` now, so the
+        // pre-S3 spelling here would have spawned an ENOENT path — and this
+        // spawner has no vacuity guard, so nothing but
+        // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+        let (manager, _dir) = manager_with(&stdio_server_json(&bin), None);
         assert_eq!(manager.server_names(), vec!["a"]);
         // The first `call_tool` connects (lazy).
         let cancel = CancellationToken::new();
@@ -780,10 +828,13 @@ mod tests {
     async fn test_server_a_stdio_server_reports_the_tool_count() {
         // (ADR 0019) The Settings page's Test action: a one-shot connect +
         // `tools/list` (the fake binary — three canned tools).
-        let bin = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_mcp_stdio"
-        ));
+        // The WORKSPACE ROOT's `target/debug` via the crate's ONE resolver
+        // (T5/S3, Step A-bis): `CARGO_MANIFEST_DIR.parent()` was the repo root
+        // while this file lived in `src-tauri/` and is `crates/` now, so the
+        // pre-S3 spelling here would have spawned an ENOENT path — and this
+        // spawner has no vacuity guard, so nothing but
+        // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
         let def = ServerDef::Stdio(StdioDef {
             command: bin.display().to_string(),
             args: vec![],
@@ -820,11 +871,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn close_all_disconnects() {
-        let bin = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_mcp_stdio"
-        ));
-        let (manager, _dir) = manager_with(&stdio_server_json(bin), None);
+        // The WORKSPACE ROOT's `target/debug` via the crate's ONE resolver
+        // (T5/S3, Step A-bis): `CARGO_MANIFEST_DIR.parent()` was the repo root
+        // while this file lived in `src-tauri/` and is `crates/` now, so the
+        // pre-S3 spelling here would have spawned an ENOENT path — and this
+        // spawner has no vacuity guard, so nothing but
+        // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+        let (manager, _dir) = manager_with(&stdio_server_json(&bin), None);
         let cancel = CancellationToken::new();
         manager
             .connect("a", &cancel, Duration::from_secs(5))
@@ -923,6 +977,214 @@ mod tests {
             }
         });
         (base, handle)
+    }
+
+    /// (T5/S3, edge E6) The `OpenRequester` seam pin — THE test that keeps the
+    /// MCP OAuth flow's browser step from silently landing on
+    /// [`super::NoOpenRequester`].
+    ///
+    /// # Why a test and not a grep
+    ///
+    /// The seam's failure mode is silent by construction: `McpManager::new`
+    /// defaults to `NoOpenRequester` (the safe default — it opens nothing), the
+    /// call site discards the `Result` exactly as the pre-seam `let _ =
+    /// crate::open::open(url, None)` did, and the flow still reports a usable
+    /// error with the authorization URL in it. So an unwired manager does not
+    /// crash and does not look broken; it just never opens a browser, and the
+    /// OAuth flow hangs until the 5-minute callback timeout. A source grep would
+    /// prove the wiring exists; this proves it is REACHED, which is the half a
+    /// grep cannot see.
+    ///
+    /// # What it drives
+    ///
+    /// A real `authorization_code` flow through the real
+    /// [`McpManager::authenticate`] — the `auth` action's own entry point — over
+    /// a loopback mock auth server. The injected requester RECORDS the URL and
+    /// then plays the browser (parse `redirect_uri` + `state`, GET the callback
+    /// with a `code`), which is what lets the flow complete at all.
+    ///
+    /// # Verified non-vacuous
+    ///
+    /// Drop the `.with_open_requester(…)` from the manager (or make
+    /// `authenticate_with` build its closure from `NoOpenRequester` instead of
+    /// `self.open_requester`) and this fails: the callback is never hit, so
+    /// `authenticate` returns `Err("the OAuth callback failed: …")`. The
+    /// assertions below then fail on the recorded URL being empty rather than on
+    /// a timeout, because the callback wait races the same failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_auth_action_opens_the_browser_through_the_seam() {
+        use std::sync::Mutex;
+
+        /// Records every URL the manager hands the seam, and plays the browser
+        /// so the flow can finish (the same trick `oauth.rs`'s own
+        /// `the_full_authorization_code_flow` uses for its `open_browser` seam).
+        struct RecordingOpener {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl super::super::OpenRequester for RecordingOpener {
+            fn open(&self, url: &str) -> Result<(), String> {
+                self.seen.lock().unwrap().push(url.to_string());
+                // Simulate the browser: hit the callback with a `code` + the
+                // echoed `state`, so `callback.wait` resolves.
+                let query = url.split('?').nth(1).unwrap_or_default();
+                let mut redirect_uri = String::new();
+                let mut state = String::new();
+                for pair in query.split('&') {
+                    let mut kv = pair.splitn(2, '=');
+                    let k = kv.next().unwrap_or_default();
+                    let v = kv.next().unwrap_or_default();
+                    if k == "redirect_uri" {
+                        redirect_uri = url_decode(v);
+                    } else if k == "state" {
+                        state = url_decode(v);
+                    }
+                }
+                let callback_url = format!("{redirect_uri}?code=mock-code&state={state}");
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    let _ = client.get(callback_url).send().await;
+                });
+                Ok(())
+            }
+        }
+
+        let (auth_base, auth_server) = start_auth_server().await;
+        // `manager_with` returns the manager + the temp dir it was built over;
+        // the dir must outlive the manager, so the binding keeps both alive.
+        let (manager, _dir) = manager_with(
+            &serde_json::json!({
+                "mcpServers": { "a": {
+                    // A pre-registered `clientId` skips DCR, so the mock only
+                    // needs the well-known metadata + the token endpoint.
+                    "url": "http://127.0.0.1:1/mcp",
+                    "auth": {
+                        "clientId": "cid",
+                        "clientSecret": "sec",
+                        "authorizationServerUrl": auth_base,
+                    },
+                } }
+            })
+            .to_string(),
+            None,
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let auth_file = _dir.path().join("mcp-auth.json");
+        let manager = Arc::new(
+            manager
+                .with_auth_file(auth_file.clone())
+                .with_open_requester(Arc::new(RecordingOpener { seen: seen.clone() })),
+        );
+
+        let cancel = CancellationToken::new();
+        // Bounded, so a BROKEN wiring fails in seconds rather than in the
+        // callback's own 5-minute window. `oauth::authenticate` races the
+        // callback wait against `cancel`, so if the seam never opens the browser
+        // nothing hits the callback and this token ends the wait at 20 s with an
+        // `Err`, which the `expect` below turns into the failure. The happy path
+        // finishes in well under a second, so the timer never fires when the
+        // wiring is correct; it exists purely so the RED case is cheap.
+        let watchdog = cancel.clone();
+        let _watchdog = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            watchdog.cancel();
+        });
+        let result = manager
+            .authenticate("a", &cancel)
+            .await
+            .expect("the authorization_code flow completes THROUGH the seam");
+        assert_eq!(result, "a: authenticated");
+
+        let opened = seen.lock().unwrap().clone();
+        assert_eq!(
+            opened.len(),
+            1,
+            "the `auth` action opened the browser EXACTLY once, through the \
+             injected `OpenRequester` — zero means the manager fell back to \
+             `NoOpenRequester` (the wiring is broken), more than one means it \
+             opened twice"
+        );
+        let url = &opened[0];
+        // The URL is the real authorization URL, not a placeholder: PKCE and
+        // the loopback callback are both in it, which is only true if the seam
+        // was handed the same string the pre-seam `production_open_browser` got.
+        assert!(
+            url.starts_with(&format!("{auth_base}/authorize?")),
+            "the seam received the authorization endpoint: {url}"
+        );
+        assert!(
+            url.contains("code_challenge=") && url.contains("code_challenge_method=S256"),
+            "the URL carries the PKCE challenge (this is the flow's real URL): {url}"
+        );
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1") && url.contains("state="),
+            "the URL carries the loopback callback + the state: {url}"
+        );
+        // And the flow really finished: the token landed in the injected file.
+        assert_eq!(
+            oauth::load_credentials(&auth_file)
+                .get("a")
+                .map(|s| s.token.as_str()),
+            Some("mock-access-token"),
+            "the code the simulated browser delivered was exchanged for a token"
+        );
+        auth_server.abort();
+    }
+
+    /// (T5/S3, E6) The DEFAULT is a real default: a manager built with the plain
+    /// `new` opens nothing rather than reaching for something. Pinned because
+    /// `NoOpenRequester` returning `Ok` is what makes an unwired manager quiet,
+    /// and the next reader needs to know that is a decision.
+    #[test]
+    fn an_unwired_manager_opens_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::super::OpenRequester as _;
+
+        struct CountingOpener {
+            hits: AtomicUsize,
+        }
+        impl super::super::OpenRequester for CountingOpener {
+            fn open(&self, _url: &str) -> Result<(), String> {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let counter = Arc::new(CountingOpener {
+            hits: AtomicUsize::new(0),
+        });
+        let manager = {
+            let (m, _dir) = manager_with("{}", None);
+            let _ = _dir;
+            m.with_open_requester(counter.clone())
+        };
+        // The injected impl is STORED on the manager, and the manager is still
+        // shared the way the harness shares it (`Arc<McpManager>`, with the
+        // `auth` future spawned — so the seam must be `Send + Sync` for the
+        // manager to remain so at all). That is the observable half of "the
+        // field holds the injected impl"; the other half — that the field is
+        // actually CONSULTED — is
+        // `the_auth_action_opens_the_browser_through_the_seam` above.
+        fn assert_send_sync_shared<T: Send + Sync>(_: &Arc<T>) {}
+        let manager = Arc::new(manager);
+        assert_send_sync_shared(&manager);
+        // The field exists and holds the injected impl — the observable proof is
+        // that the seam type is object-safe and storable on the manager at all,
+        // plus the default's own contract:
+        assert!(
+            super::super::NoOpenRequester
+                .open("https://example/authorize")
+                .is_ok(),
+            "`NoOpenRequester` reports `Ok` — an unwired manager must not read \
+             as a failure at the `let _ =` call site, which is what keeps the \
+             fire-and-forget behaviour identical to the pre-seam direct open"
+        );
+        assert_eq!(
+            counter.hits.load(Ordering::Relaxed),
+            0,
+            "constructing a manager opens nothing"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1657,11 +1919,9 @@ mod tests {
         // instrument: it catches the revert, it does not prove the call is
         // reached at runtime — which is what the real-`JoinError` test above is
         // for. Both halves are here on purpose.
-        let src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/agent/mcp/manager.rs"
-        ))
-        .expect("the manager source is readable from a test");
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp/manager.rs"))
+                .expect("the manager source is readable from a test");
         let start = src
             .find("async fn refresh_and_persist(")
             .expect("refresh_and_persist exists");
@@ -1943,11 +2203,14 @@ mod tests {
         // all: the two spawns would both need to borrow the manager mutably,
         // and the main task's `release` would be a borrow error while the holds
         // are outstanding. That is the compile-side half of the proof.
-        let bin = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_mcp_stdio"
-        ));
-        let (manager, _dir) = manager_with(&two_stdio_server_json(bin), None);
+        // The WORKSPACE ROOT's `target/debug` via the crate's ONE resolver
+        // (T5/S3, Step A-bis): `CARGO_MANIFEST_DIR.parent()` was the repo root
+        // while this file lived in `src-tauri/` and is `crates/` now, so the
+        // pre-S3 spelling here would have spawned an ENOENT path — and this
+        // spawner has no vacuity guard, so nothing but
+        // `childproc::target_debug_dir_is_where_cargo_actually_builds` catches it.
+        let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
+        let (manager, _dir) = manager_with(&two_stdio_server_json(&bin), None);
         // Never touch the developer's real `mcp-auth.json` (both servers are
         // stdio, so nothing reads it — but the seam is the house rule).
         let manager =

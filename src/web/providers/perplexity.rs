@@ -3,12 +3,12 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::web::config::WebConfig;
-use crate::agent::web::net::{safe_fetch, FetchOpts};
-use crate::agent::web::providers::common::{
+use crate::web::config::WebConfig;
+use crate::web::net::{safe_fetch, FetchOpts};
+use crate::web::providers::common::{
     check_http_status, format_provider_error, truncate_results, validate_query,
 };
-use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
+use crate::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
 #[derive(Deserialize)]
 struct PerplexityResponse {

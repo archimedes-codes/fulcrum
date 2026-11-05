@@ -3,7 +3,7 @@ use super::github;
 use super::pdf;
 use super::youtube;
 use super::{extract, Mode};
-use crate::agent::tools::exec::ToolCtx;
+use crate::tools::exec::ToolCtx;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
@@ -15,10 +15,10 @@ fn test_ctx() -> ToolCtx {
         cancel: CancellationToken::new(),
         skill_roots: None,
         boundary: vec![PathBuf::from("/tmp")],
-        file_policy: crate::agent::policy::FilePolicy {
-            reads: crate::agent::policy::AccessPolicy::Sandboxed,
-            writes: crate::agent::policy::AccessPolicy::Sandboxed,
-            shell: crate::agent::policy::AccessPolicy::Allow,
+        file_policy: crate::policy::FilePolicy {
+            reads: crate::policy::AccessPolicy::Sandboxed,
+            writes: crate::policy::AccessPolicy::Sandboxed,
+            shell: crate::policy::AccessPolicy::Allow,
             rules: Vec::new(),
         },
         protected: vec![],
@@ -26,7 +26,7 @@ fn test_ctx() -> ToolCtx {
         // home — the hermetic value every direct fixture passes.
         rules: Vec::new(),
         home: None,
-        web: crate::agent::web::config::WebConfig::default(),
+        web: crate::web::config::WebConfig::default(),
         render_requester: None,
         // (B1) No event sink: emitting is a silent no-op here.
         event_sink: None,

@@ -8,9 +8,10 @@
 //!
 //! The `exe` PATH is a PARAMETER: production callers pass
 //! `std::env::current_exe()` (the self-exec); tests/e2e pass the
-//! `fake_worker` fixture path (the `CARGO_MANIFEST_DIR`/`target/debug`
-//! convention — a no-arg `current_exe()`-only version would point at
-//! the test-harness binary under `cargo test` — wrong).
+//! `fake_worker` fixture path — since S8.3 resolved through
+//! `test_support::target_debug_dir()`, the crate's ONE two-levels-up `target/`
+//! resolver (a no-arg `current_exe()`-only version would point at the
+//! test-harness binary under `cargo test` — wrong).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,14 +21,14 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::agent::debuglog;
-use crate::agent::events::RpcEvent;
-use crate::agent::harness::catalog::Model;
-use crate::agent::harness::provider::openai::EMPTY_CONTENT_SANITISE_PLACEHOLDER;
-use crate::agent::hostenv::EnvPatch;
-use crate::agent::permission::PermissionOutcome;
-use crate::agent::tools::ImageRef;
-use crate::agent::worker::protocol::{
+use crate::debuglog;
+use crate::events::RpcEvent;
+use crate::harness::catalog::Model;
+use crate::harness::provider::openai::EMPTY_CONTENT_SANITISE_PLACEHOLDER;
+use crate::hostenv::EnvPatch;
+use crate::permission::PermissionOutcome;
+use crate::tools::ImageRef;
+use crate::worker::protocol::{
     decode_outbound, encode_inbound, Inbound, Outbound, StartEnv, StoreFrame, SubagentDispatchWire,
 };
 
@@ -175,6 +176,15 @@ pub struct WorkerHandle {
     /// frame / the process exit before `ready` is an error — the
     /// `exited` watch races it).
     ready: watch::Sender<Option<String>>,
+    /// The protocol-version handshake (Fulcrum T1) — the read task
+    /// publishes the `protocolVersion` from the `hello` frame, the first
+    /// line the Worker writes. A SEPARATE watch from `ready`, because the
+    /// two answer different questions: `ready` is "which build is this"
+    /// (the BINARY version) and this is "which wire does it speak".
+    /// Deliberately NOT routed as a `WorkerInboundEvent` (a 12th variant
+    /// would force every consumer, including `session/router.rs`'s
+    /// exhaustive `route_event`, to account for a frame the UI never sees).
+    protocol_version: watch::Sender<Option<u32>>,
     /// The response round-trips (request `id` → oneshot resolved when
     /// the matching `permission-response` / `interactive-response` is
     /// sent — the `PermissionOutcome` / `Value` delivery proof).
@@ -193,6 +203,7 @@ impl Clone for WorkerHandle {
             stdin_tx: self.stdin_tx.clone(),
             events_tx: self.events_tx.clone(),
             ready: self.ready.clone(),
+            protocol_version: self.protocol_version.clone(),
             round_trips: self.round_trips.clone(),
             exited: self.exited.clone(),
         }
@@ -245,11 +256,11 @@ where
 /// was never spawned; it is called by production `spawn`, so it needs no `cfg`
 /// and no `allow`.
 fn build_command(exe: &std::path::Path) -> tokio::process::Command {
-    build_command_with(exe, crate::agent::hostenv::for_child())
+    build_command_with(exe, crate::hostenv::for_child())
 }
 
 /// [`build_command`] with the patch as an argument (production passes exactly
-/// [`for_child`](crate::agent::hostenv::for_child); the parameter exists
+/// [`for_child`](crate::hostenv::for_child); the parameter exists
 /// because that cached patch is EMPTY under `cargo test` — its gate needs this
 /// exe under `$APPDIR`, and under cargo it is `target/debug/deps/<hash>`).
 ///
@@ -265,11 +276,11 @@ fn build_command(exe: &std::path::Path) -> tokio::process::Command {
 /// pollution then stays INSIDE the Worker and never reaches the user's
 /// commands, because those sites scrub again on their own.
 ///
-/// The constructor is `crate::agent::childproc`'s — it owns the child's Windows
+/// The constructor is `crate::childproc`'s — it owns the child's Windows
 /// console window policy (`CREATE_NO_WINDOW`); the Worker's JSONL stdin is a
 /// Runtime pipe and stays untouched.
 fn build_command_with(exe: &std::path::Path, patch: &EnvPatch) -> tokio::process::Command {
-    let mut cmd = crate::agent::childproc::command(exe);
+    let mut cmd = crate::childproc::command(exe);
     cmd.arg("--worker");
     // The self-exec inherits the GUI process' tainted env IN FULL: inside an
     // AppImage `current_exe()` resolves THROUGH the mount (`/proc/<pid>/exe` →
@@ -351,6 +362,7 @@ impl WorkerHandle {
         // `UnboundedSender`'s receiver drops; `send_inbound_frame`
         // checks it directly for the deterministic error).
         let (ready_tx, _ready_rx) = watch::channel(None);
+        let (protocol_version_tx, _protocol_version_rx) = watch::channel(None);
         let (exited_tx, _exited_rx) = watch::channel(None);
         // The stdin writer task (drains `stdin_tx` → line writes,
         // `flush` per line — the unbounded channel never fails; a
@@ -390,6 +402,7 @@ impl WorkerHandle {
         let (events_tx, _events_keepalive) = tokio::sync::broadcast::channel(256);
         let events_tx2 = events_tx.clone();
         let ready_tx2 = ready_tx.clone();
+        let protocol_version_tx2 = protocol_version_tx.clone();
         let exited_tx2 = exited_tx.clone();
         let child_task = child.clone();
         tokio::spawn(async move {
@@ -419,6 +432,18 @@ impl WorkerHandle {
                                 continue;
                             }
                         };
+                        // The `hello` handshake (Fulcrum T1): the protocol
+                        // version lands on its own watch BEFORE routing,
+                        // because `route_outbound` deliberately drops the
+                        // frame (it is not a `WorkerInboundEvent`).
+                        // `send_replace` for the reason in the `ready` note
+                        // below — the receiver is subscribed after `spawn`.
+                        if let Outbound::Hello {
+                            protocol_version, ..
+                        } = &frame
+                        {
+                            protocol_version_tx2.send_replace(Some(*protocol_version));
+                        }
                         let Some(evt) = route_outbound(frame) else {
                             continue; // an unknown `type` — permissive.
                         };
@@ -473,6 +498,7 @@ impl WorkerHandle {
             stdin_tx,
             events_tx,
             ready: ready_tx,
+            protocol_version: protocol_version_tx,
             round_trips: std::sync::Arc::new(Mutex::new(HashMap::new())),
             exited: exited_tx,
         })
@@ -500,6 +526,53 @@ impl WorkerHandle {
                     Ok(code) => Err(WorkerError {
                         kind: WorkerErrorKind::Io(format!(
                             "the worker exited before ready (code {code:?})"
+                        )),
+                    }),
+                    Err(_) => Err(WorkerError {
+                        kind: WorkerErrorKind::ReadyTimeout,
+                    }),
+                }
+            }
+            _ = tokio::time::sleep(timeout) => Err(WorkerError {
+                kind: WorkerErrorKind::ReadyTimeout,
+            }),
+        }
+    }
+
+    /// The protocol-version handshake (Fulcrum T1 — the bounded twin of
+    /// `wait_ready`): the `protocolVersion` the Worker published in its
+    /// `hello` frame, the FIRST line it writes.
+    ///
+    /// A SEPARATE method from `wait_ready` rather than an extra return
+    /// value on it, because `wait_ready` answers "which build is this" and
+    /// has ≈20 callers (including the `worker_stderr` / `ipc` /
+    /// `worker_e2e` integration tests) whose contract must not move. The
+    /// two watches are set by the same read task off two consecutive lines,
+    /// so a Worker that answered `wait_ready` has almost always answered
+    /// this one already — but it is raced independently, because "the
+    /// handshake is at line 2" is a wire property this API must not assume.
+    pub async fn wait_protocol_version(&self, timeout: Duration) -> Result<u32, WorkerError> {
+        let mut version_rx = self.protocol_version.subscribe();
+        let mut exited_rx = self.exited.subscribe();
+        tokio::select! {
+            r = version_rx.wait_for(|v| v.is_some()) => match r {
+                // `(*v)` with NO `clone` — the deliberate divergence from
+                // `wait_ready` below, whose payload is a `String`. This one
+                // is `Copy`.
+                Ok(v) => Ok((*v).expect("the `is_some` predicate just held")),
+                // The sender is gone (the read task died without
+                // publishing — treat as a timeout, the `wait_ready` shape).
+                Err(_) => Err(WorkerError {
+                    kind: WorkerErrorKind::ReadyTimeout,
+                }),
+            },
+            r = exited_rx.wait_for(|v| v.is_some()) => {
+                // The process exited before the `hello` frame (a crash /
+                // an early exit — the negotiation never happened).
+                match r {
+                    Ok(code) => Err(WorkerError {
+                        kind: WorkerErrorKind::Io(format!(
+                            "the worker exited before the protocol handshake (code {code:?})"
                         )),
                     }),
                     Err(_) => Err(WorkerError {
@@ -580,6 +653,36 @@ impl WorkerHandle {
             thinking: thinking.map(str::to_string),
             clear_thinking,
             trusted,
+        })
+    }
+
+    /// Push the three live-reload desktop-config fields (Fulcrum T3) — the
+    /// `config-update` frame, the twin of [`Self::send_config`] for the
+    /// APP-level settings rather than the per-session composer controls.
+    ///
+    /// `None` for any field means "leave that one alone", so a caller that only
+    /// knows about one of the three cannot wipe the other two. That is also why
+    /// this takes the three values instead of a whole `Settings`: the frame is
+    /// additive on purpose, and an older Worker that never heard of a field
+    /// ignores it rather than decoding garbage.
+    ///
+    /// The return is "the frame was written to stdin", NOT "the loop applied
+    /// it" — the same contract [`Self::send_compact`] has. The Worker applies
+    /// it when its loop is IDLE, so the observable bound is the next prompt
+    /// (ADR 0030 Deviation 4's bound, which the per-turn `settings.json` re-read
+    /// this replaces could never beat either).
+    pub fn send_config_update(
+        &self,
+        file_policy: Option<crate::policy::FilePolicy>,
+        web: Option<crate::web::config::WebSettings>,
+        agent_overrides: Option<
+            std::collections::HashMap<String, crate::config_types::AgentOverrideFields>,
+        >,
+    ) -> Result<(), WorkerError> {
+        self.send_inbound_frame(Inbound::ConfigUpdate {
+            file_policy,
+            web,
+            agent_overrides,
         })
     }
 
@@ -747,13 +850,13 @@ impl WorkerHandle {
     /// belt-and-braces half, not the group half.
     ///
     /// The syscall itself lives in
-    /// [`crate::agent::childproc::kill_process_group`] (one owner for the
+    /// [`crate::childproc::kill_process_group`] (one owner for the
     /// process-group kill — ADR 0080's amendment).
     pub async fn kill(&self) -> Result<(), WorkerError> {
         let mut guard = self.child.lock().await;
         #[cfg(unix)]
         {
-            crate::agent::childproc::kill_process_group(self.pid, &mut guard).await;
+            crate::childproc::kill_process_group(self.pid, &mut guard).await;
         }
         #[cfg(not(unix))]
         {
@@ -815,10 +918,19 @@ fn clamp_placeholder_row(role: &str, content_json: String) -> String {
 
 /// Route one `Outbound` frame into the `WorkerInboundEvent` vocabulary
 /// (the 4 store-frame variants → `Store(StoreFrame::…)`; the control
-/// frames verbatim; `Unknown` → `None` — the surface is unversioned,
-/// an unknown `type` is ignored, never an error).
+/// frames verbatim; `Hello` → `None` — it lands on the `protocol_version`
+/// watch in the read task instead; `Unknown` → `None` — an unknown
+/// `type` is ignored, never an error, so a newer Worker cannot wedge an
+/// older Supervisor).
 fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
     Some(match frame {
+        // The version-negotiation opener is NOT routed as a
+        // `WorkerInboundEvent` — it lands on the `protocol_version`
+        // watch in the read task instead (adding a 12th variant here
+        // would force every `WorkerInboundEvent` consumer, including
+        // `session/router.rs`'s exhaustive `route_event`, to account for
+        // a frame the UI never sees).
+        Outbound::Hello { .. } => return None,
         Outbound::Ready { version, .. } => WorkerInboundEvent::Ready { version },
         Outbound::Event { event } => WorkerInboundEvent::Event(event),
         Outbound::TranscriptInsert {
@@ -898,8 +1010,9 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
             message,
             backtrace: _,
         } => WorkerInboundEvent::WorkerError { code, message },
-        // The surface is unversioned — an unknown outbound type is
-        // ignored (never an error).
+        // A newer Worker's frame this build predates — ignored, never an
+        // error (the permissive-decoder contract; the overall surface is
+        // negotiated on the `hello` frame, handled above).
         Outbound::Unknown { .. } => return None,
     })
 }
@@ -907,6 +1020,7 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::protocol::PROTOCOL_VERSION;
 
     // ── (issue #122) the store-row belt ────────────────────────────────
 
@@ -927,11 +1041,11 @@ mod tests {
              the row stays valid JSON with its `role` intact"
         );
         // It still parses as a `ChatMessage`, and its content is now empty.
-        let parsed: crate::agent::harness::provider::ChatMessage =
+        let parsed: crate::harness::provider::ChatMessage =
             serde_json::from_str(&clamped).expect("the clamped row is a valid row");
         assert_eq!(
             parsed.content,
-            crate::agent::harness::provider::MessageContent::Text(String::new()),
+            crate::harness::provider::MessageContent::Text(String::new()),
             "the clamped row round-trips to an empty `Text`"
         );
     }
@@ -1023,21 +1137,111 @@ mod tests {
         );
     }
 
-    /// The `fake_worker` fixture (the `fake_mcp_stdio` convention — the
-    /// `CARGO_MANIFEST_DIR`/`target/debug` path; `cargo test` builds the
-    /// bin targets).
+    /// The `fake_worker` fixture — resolved through the crate's ONE
+    /// `target/debug` resolver.
+    ///
+    /// **S8.3 RE-POINTED this, and the old body was not merely ugly, it was
+    /// wrong.** It read
+    /// `PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().join("target/debug/fake_worker")`,
+    /// which was correct while this file lived in `src-tauri/` — one level under
+    /// the repo root, so `.parent()` WAS the workspace root that owns `target/`.
+    /// This crate sits TWO levels under the root, so the same expression names
+    /// `<root>/crates/target/debug/fake_worker`: a directory no build ever writes
+    /// to. Every fixture-spawning test in this module (and all 30 in
+    /// `manager/tests`) dies on `SpawnFailed(Io(ENOENT))` — measured at this
+    /// commit before the re-point, `spawn_and_wait_ready_returns_the_version`
+    /// failed with `spawn the worker: No such file or directory (os error 2)`.
+    ///
+    /// `test_support::target_debug_dir()` walks up TWO levels and is the single
+    /// resolver S2 established for exactly this (the same fix `mcp/stdio.rs`,
+    /// `mcp/tool.rs` and `mcp/manager.rs` carry). It is `pub(crate) +
+    /// #[cfg(test)]`, which reaches this module — both are crate-internal test
+    /// code. `childproc::target_debug_dir_is_where_cargo_actually_builds` pins it
+    /// against `current_exe()`, so a wrong level count cannot go green there, and
+    /// the equality + `current_exe()` asserts below pin THIS helper to it.
+    ///
+    /// `CARGO_BIN_EXE_fake_worker` is NOT an option here: cargo sets it only for
+    /// integration-test targets, never inside a lib's `#[cfg(test)]` (T4's
+    /// two-shape rule), which is why the manifest-derived resolver is the only
+    /// correct form at this depth.
     pub fn fixture_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_worker"
-        ))
+        crate::test_support::fixture_bin("fake_worker")
+    }
+
+    /// T4's pin, REWRITTEN in S8.3 — the old form was VACUOUS for the exact
+    /// failure it existed to catch.
+    ///
+    /// T4 asserted two things: `p.starts_with(pkg_root.parent())` and
+    /// `!p.starts_with(pkg_root.join("target"))`. Both hold for the BROKEN
+    /// post-move path: `<root>/crates/target/debug/fake_worker` starts with
+    /// `<root>/crates` (this crate's manifest parent) and does not start with
+    /// `<root>/crates/fulcrum-core/target`. Measured at this commit with the old
+    /// body in place: **both asserts passed** and only the `is_file()` witness
+    /// failed — so a pin that trusted them would have printed "verified" while
+    /// ~45 fixture-spawning tests hit ENOENT.
+    ///
+    /// What discriminates now:
+    ///   1. EQUALITY against the crate's one resolver (the shape, not a prefix);
+    ///   2. the same directory `current_exe()` proves cargo actually builds into
+    ///      — the `childproc` discipline, so a wrong LEVEL count fails even on a
+    ///      machine where a stray `crates/target/` happened to exist;
+    ///   3. `is_file()`, the existence witness (the RED the old body produced).
+    #[test]
+    fn fixture_path_resolves_to_the_workspace_root_target() {
+        let p = fixture_path();
+        // The name the platform's cargo actually writes. `is_file()` — unlike
+        // `CreateProcess` — does NOT append an exe suffix, so on Windows the
+        // suffix-less literal below is a file that does not exist even though
+        // the spawn three lines away succeeds; that asymmetry is what reddened
+        // this witness on `windows-latest` while Linux and macOS stayed green
+        // (their `EXE_SUFFIX` is empty). `test_support::exe_file_name` carries
+        // the rule and `the_fixture_binary_name_carries_the_platform_exe_suffix`
+        // pins both arms of it on every OS.
+        let want_name = format!("fake_worker{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            p.file_name().and_then(|s| s.to_str()),
+            Some(want_name.as_str()),
+            "still the fake_worker fixture, under the name cargo builds it as"
+        );
+        // (1) The equality half — the ONLY resolver, two levels up. Spelled
+        //     against `target_debug_dir()` and NOT against `fixture_bin`, so it
+        //     still discriminates a wrong LEVEL count instead of agreeing with
+        //     the body by construction.
+        assert_eq!(
+            p,
+            crate::test_support::target_debug_dir().join(&want_name),
+            "the fixture must resolve through the crate's ONE two-levels-up \
+             resolver, not a manifest-parent guess"
+        );
+        // (2) The load-bearing half: compare against where cargo BUILT this test
+        // binary. A lib test lives in `target/debug/deps/`, so its grandparent is
+        // the `target/debug` the fixture must live in. The old manifest-parent
+        // body resolved to `<root>/crates/target/debug` and fails HERE, on any
+        // machine, with or without a stray directory on disk.
+        let exe = std::env::current_exe().expect("a test binary has a path");
+        let built_into = exe
+            .parent()
+            .and_then(|deps| deps.parent())
+            .expect("the test binary sits under target/debug/deps");
+        assert_eq!(
+            p.parent(),
+            Some(built_into),
+            "the fixture resolves to {p:?}, but cargo built THIS test binary into \
+             {built_into:?} — a fixture path that is not a sibling of the built \
+             binaries spawns ENOENT (`crates/target/…` is exactly that)"
+        );
+        // (3) The existence witness (the RED the pre-S8.3 body produced).
+        assert!(
+            p.is_file(),
+            "the fixture must exist (SpawnFailed is the old literal's red): {p:?}"
+        );
     }
 
     /// A test `StartEnv` (a fake model the fixture's `SubagentDispatch`
     /// `model_key` — `fake/m1` — resolves against).
     pub fn test_env(session_id: &str, enabled_tools: Option<Vec<String>>) -> StartEnv {
-        use crate::agent::harness::catalog::{Model, ModelCatalog};
-        use crate::agent::worker::protocol::StartMode;
+        use crate::harness::catalog::{Model, ModelCatalog};
+        use crate::worker::protocol::StartMode;
 
         fn model(id: &str) -> Model {
             Model {
@@ -1115,7 +1319,9 @@ mod tests {
         events
     }
 
-    /// `spawn` + the `ready` handshake (the version).
+    /// `spawn` + the `ready` handshake (the version), and the `hello`
+    /// handshake (the protocol version) — the two watches coexist, each
+    /// carrying its own axis (binary version vs wire version).
     #[tokio::test]
     async fn spawn_and_wait_ready_returns_the_version() {
         let handle = spawn_fixture().expect("the fixture binary exists (cargo test built it)");
@@ -1124,6 +1330,42 @@ mod tests {
             .await
             .expect("the ready handshake completes");
         assert!(!version.is_empty(), "the ready frame carries the version");
+        // The protocol version arrives on its OWN watch, off the `hello`
+        // line that precedes `ready` — proving the two handshakes do not
+        // disturb each other.
+        let protocol_version = handle
+            .wait_protocol_version(Duration::from_secs(10))
+            .await
+            .expect("the hello handshake completes");
+        assert_eq!(
+            protocol_version, PROTOCOL_VERSION,
+            "the fixture's `hello` advertises the current protocol version"
+        );
+        handle.send_close().expect("close encodes");
+        let code = handle.exited().await;
+        assert_eq!(code, Some(0), "close → exit 0");
+    }
+
+    /// The `hello` frame's `protocolVersion` reaches
+    /// `wait_protocol_version` through the client's read task (the frame
+    /// is NOT routed as a `WorkerInboundEvent`, so this watch is the only
+    /// way it surfaces — a route arm that swallowed it before the watch
+    /// write would show up here and nowhere else).
+    #[tokio::test]
+    async fn wait_protocol_version_reports_the_fixture_hello_version() {
+        let handle = spawn_fixture().expect("the fixture binary exists");
+        handle
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("ready");
+        let observed = handle
+            .wait_protocol_version(Duration::from_secs(10))
+            .await
+            .expect("the `hello` frame is observed by the read task");
+        assert_eq!(
+            observed, PROTOCOL_VERSION,
+            "the client reports the version the fixture negotiated"
+        );
         handle.send_close().expect("close encodes");
         let code = handle.exited().await;
         assert_eq!(code, Some(0), "close → exit 0");
@@ -1518,16 +1760,16 @@ mod tests {
     /// untouched.
     ///
     /// The patch is injected through the seam instead of read from
-    /// [`for_child`](crate::agent::hostenv::for_child): under `cargo test`
+    /// [`for_child`](crate::hostenv::for_child): under `cargo test`
     /// `current_exe()` is `target/debug/deps/<hash>`, the production gate is
     /// closed, and that patch is EMPTY on every host — a test built on it
     /// could not fail. The fabricated host in
-    /// [`fixtures`](crate::agent::hostenv::fixtures) is what makes a real patch
+    /// [`fixtures`](crate::hostenv::fixtures) is what makes a real patch
     /// flow through this seam.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_worker_self_spawn_gets_a_scrubbed_command() {
-        use crate::agent::hostenv::fixtures;
+        use crate::hostenv::fixtures;
         use std::ffi::{OsStr, OsString};
 
         let patch = fixtures::tainted_patch();

@@ -8,693 +8,13 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::support::*;
-use crate::agent::events::{EventSink, RpcEvent};
-use crate::agent::harness::catalog::{CompactionConfig, Model, ModelCatalog};
-use crate::agent::harness::dispatch::{InProcessDispatcher, SubagentDispatcher};
-use crate::agent::harness::provider::{
-    ChatRole, FinishReason, MessageContent, ProviderEvent, ToolCall,
-};
-use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::subagent::{
-    AgentNameResolution, LaunchConfig, SubagentOutcome, SubagentSessionManager,
-};
-use crate::agent::tools::ContentBlock;
-use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
-use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
-use crate::agent::worker::protocol::{StartEnv, StartMode};
-
-/// The `fake_worker` fixture factory (the `WorkerFactory` seam — the
-/// `CARGO_MANIFEST_DIR`/`target/debug` convention; `cargo test` builds
-/// the bin targets).
-struct FakeWorkerFactory;
-
-impl WorkerFactory for FakeWorkerFactory {
-    fn spawn(&self) -> Result<WorkerHandle, WorkerError> {
-        WorkerHandle::spawn(&std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_worker"
-        )))
-    }
-}
-
-/// A `WorkerManager` with the loop's parent session (`"s1"` — the
-/// `AgentLoop`'s `session_id`) `attach`ed (the ADR 0025 Task 5
-/// re-plumb — the subagent runs in a `fake_worker` process): the
-/// parent's `StartEnv` carries the given `models` catalog (the
-/// `dispatch_subagent` flow resolves the child's `model` against it)
-/// and the given `config_dir` (the settings' `subagentModels`
-/// override is resolved loop-side; the `config_dir` is the
-/// parent's). The `sink_for` lookup returns the given sink for the
-/// parent (the `subagent-session-started` / `subagent-closed` UI
-/// lifecycle events are delivered on the PARENT's sink).
-async fn make_worker_manager(
-    dead_bound: Duration,
-    models: Vec<Model>,
-    config_dir: Option<&std::path::Path>,
-    sink: Arc<dyn EventSink>,
-) -> Arc<WorkerManager> {
-    let factory: Arc<dyn WorkerFactory> = Arc::new(FakeWorkerFactory);
-    // The `on_event` closure mirrors the router's `SinkFrame` re-emit
-    // (the child's `SinkFrame`s — the `session_info` Start echo with
-    // the `systemPrompt` / `trusted` envelope fields — land on the
-    // test's sink; the `RpcEvent` stream is a no-op here).
-    let on_event_sink = sink.clone();
-    let wm = WorkerManager::new(
-        factory,
-        Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
-        Arc::new(
-            move |_id: String, is_subagent: bool, evt: WorkerInboundEvent| {
-                if is_subagent {
-                    if let WorkerInboundEvent::SinkFrame { event, payload } = &evt {
-                        on_event_sink.emit(event, payload.clone());
-                    }
-                }
-            },
-        ),
-        Arc::new(move |id: &str| (id == "s1").then(|| sink.clone())),
-    )
-    .with_dead_bound(dead_bound);
-    let wm = Arc::new(wm);
-    let env = StartEnv::from_parts(
-        "s1".to_string(),
-        "/tmp/space".to_string(),
-        StartMode::Fresh,
-        None,
-        models[0].clone(),
-        ModelCatalog {
-            models,
-            default_model: None,
-            compaction: CompactionConfig::default(),
-        },
-        None,
-        true,
-        None,
-        config_dir
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/tmp".to_string()),
-        true,
-        None,
-        // (issue #101) `from_parts`' new trailing arg (parent fixture: no block).
-        None,
-    );
-    wm.attach("s1", &env)
-        .await
-        .expect("the parent attach completes");
-    wm
-}
-
-/// A `SubagentSessionManager` on a `WorkerManager` (the ADR 0025
-/// Task 5 re-plumb — the `InProcessDispatcher`'s manager): the parent
-/// `"s1"` is `attach`ed with the given `models` catalog (the
-/// `dispatch_subagent` flow resolves the child's `model` against it).
-async fn make_subagent_manager(
-    dead_bound: Duration,
-    models: Vec<Model>,
-    config_dir: Option<&std::path::Path>,
-    sink: Arc<dyn EventSink>,
-) -> Arc<SubagentSessionManager> {
-    let wm = make_worker_manager(dead_bound, models, config_dir, sink).await;
-    let manager = Arc::new(SubagentSessionManager::new());
-    manager.set_worker_manager(wm);
-    manager
-}
-
-/// (ADR 0023 thinking-order regression) the `:<level>` suffix of the
-/// resolved model key beats the frontmatter's `thinking` (the
-/// doc-correct order — explicit > suffix > frontmatter; the OLD code
-/// produced the frontmatter's `"low"` here). The ADR 0025 Task 5
-/// re-plumb: the subagent runs in a `fake_worker` process (the
-/// `WorkerManager`'s `dispatch_subagent` flow) — the
-/// `subagent-session-started` frame carries the RESOLVED model +
-/// thinking, and the `subagent` tool result is the child's captured
-/// final text (the `fake_worker`'s canned `"canned answer"`).
-#[tokio::test]
-async fn a_native_subagent_with_a_suffix_model_key_uses_the_suffix_thinking() {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, _calls) = ScriptedProvider::new(vec![
-        Some(vec![
-            ProviderEvent::ToolCall(ToolCall {
-                id: "t1".to_string(),
-                name: "subagent".to_string(),
-                arguments: json!({ "task": "recon the auth code", "agentName": "scout" }),
-            }),
-            ProviderEvent::Done(FinishReason::ToolCalls),
-        ]),
-        Some(vec![
-            ProviderEvent::TextDelta("done".to_string()),
-            ProviderEvent::Done(FinishReason::Stop),
-        ]),
-    ]);
-    // A TWO-model catalog: `fake/m1` (the parent) + `fake/m2` (the
-    // frontmatter target — IN the catalog, so it is NOT stale).
-    let models = vec![fake_model("m1"), fake_model("m2")];
-    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
-        events: sink_events.clone(),
-    });
-    let manager =
-        make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let (_space, mut loop_) = build_loop_with_dispatcher(
-        Box::new(provider),
-        events_tx,
-        Arc::new(StdMutex::new(CancellationToken::new())),
-        watch::channel(0u64).0,
-        RetryPolicy::new_with(5, Duration::from_millis(1)),
-        sink,
-        Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
-        models,
-        None,
-    );
-    // The Agent definition: `model: fake/m2:high` (IN the catalog —
-    // the `:<level>` suffix is stripped for the resolvability check)
-    // + `thinking: low` (the LAST rung — the suffix beats it).
-    let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-    if let Some(parent) = agent_file.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(
-        &agent_file,
-        "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2:high\nthinking: low\n---\nYou are a scout.\n",
-    )
-    .unwrap();
-    loop_.handle_prompt(&text_prompt("go")).await;
-    // The `subagent` tool result: the child's captured final text
-    // (the `fake_worker`'s canned `"canned answer"` — the
-    // `SubagentCapture` over the child's `SinkFrame`
-    // `agent_message_chunk` stream).
-    let end = wait_for_event(
-        &mut events_rx,
-        SPAWN_MS,
-        |e| matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1"),
-    )
-    .await
-    .expect("the `subagent`'s tool_execution_end");
-    let RpcEvent::tool_execution_end {
-        result, is_error, ..
-    } = end
-    else {
-        unreachable!()
-    };
-    assert!(!is_error, "the child completed");
-    assert_eq!(
-        result["content"][0]["text"], "canned answer",
-        "the tool result is the child's captured final text"
-    );
-    // The parent turn settled (bounded — the `ScriptedProvider`
-    // settles it; the child ran to completion inside the dispatch).
-    wait_for_event(&mut events_rx, SPAWN_MS, |e| {
-        matches!(e, RpcEvent::agent_settled)
-    })
-    .await
-    .expect("the parent turn settled");
-    // The `subagent-session-started` frame: the suffix's `high`
-    // beats the frontmatter's `low` (the doc-correct order), and
-    // the model is the suffix-STRIPPED key.
-    let events = sink_events
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let started = events
-        .iter()
-        .find(|(name, _)| name == "subagent-session-started")
-        .expect("the `subagent-session-started` frame was emitted");
-    assert_eq!(
-        started.1["model"], "fake/m2",
-        "the suffix is stripped for the model resolution"
-    );
-    assert_eq!(
-        started.1["thinkingLevel"], "high",
-        "the suffix beats the frontmatter's `thinking` (the order fix)"
-    );
-}
-
-/// (ADR 0023) end-to-end: a settings `subagentModels` override beats
-/// the frontmatter `model` (the child runs the override), and the
-/// frontmatter's `thinking` STILL applies (the override only
-/// replaces the model). The ADR 0025 Task 5 re-plumb: the subagent
-/// runs in a `fake_worker` process — the `subagent-session-started`
-/// frame carries the RESOLVED model + thinking + tools, and the
-/// `subagent` tool result is the child's captured final text (the
-/// `fake_worker`'s canned `"canned answer"`).
-#[tokio::test]
-async fn a_native_subagent_with_a_settings_override_runs_the_override_model() {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, _calls) = ScriptedProvider::new(vec![
-        Some(vec![
-            ProviderEvent::ToolCall(ToolCall {
-                id: "t1".to_string(),
-                name: "subagent".to_string(),
-                arguments: json!({ "task": "recon the auth code", "agentName": "scout" }),
-            }),
-            ProviderEvent::Done(FinishReason::ToolCalls),
-        ]),
-        Some(vec![
-            ProviderEvent::TextDelta("done".to_string()),
-            ProviderEvent::Done(FinishReason::Stop),
-        ]),
-    ]);
-    // A THREE-model catalog: `fake/m1` (the parent) + `fake/m2` (the
-    // frontmatter target) + `fake/m3` (the override target — IN the
-    // catalog, so it is NOT stale).
-    let models = vec![fake_model("m1"), fake_model("m2"), fake_model("m3")];
-    // #96: a TEST-SCOPE guard, declared BEFORE `make_subagent_manager` and
-    // the loop, so it outlives both. Both get `Some(config_dir.path())` — a
-    // borrowed path, never the guard. LIMIT, recorded honestly: the value
-    // does travel to the child via `StartEnv.config_dir`, but this test's
-    // child is `src/bin/fake_worker.rs`, a canned stdin/stdout fixture that
-    // performs NO filesystem I/O, so the "read by a real child process"
-    // premise is false for it. The dir still must outlive the test because
-    // the PARENT-side `AgentLoop` holds the same `config_dir` and re-reads
-    // `settings.json` every turn, and the `WorkerManager` owns the child —
-    // and this placement provides that.
-    let config_dir =
-        crate::test_support::ScratchDir::in_env_temp("harness-agent-def-e2e-cfg-", "override");
-    std::fs::write(
-        config_dir.join("settings.json"),
-        r#"{ "subagentModels": { "scout": "fake/m3" } }"#,
-    )
-    .unwrap();
-    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
-        events: sink_events.clone(),
-    });
-    let manager = make_subagent_manager(
-        Duration::from_secs(30),
-        models.clone(),
-        Some(config_dir.path()),
-        sink.clone(),
-    )
-    .await;
-    let (_space, mut loop_) = build_loop_with_dispatcher(
-        Box::new(provider),
-        events_tx,
-        Arc::new(StdMutex::new(CancellationToken::new())),
-        watch::channel(0u64).0,
-        RetryPolicy::new_with(5, Duration::from_millis(1)),
-        sink,
-        Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
-        models,
-        Some(config_dir.path()),
-    );
-    // The Agent definition: `model: fake/m2` (IN the catalog — NOT
-    // stale) + `thinking: low` (the override replaces ONLY the
-    // model — the thinking still comes from the file).
-    let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-    if let Some(parent) = agent_file.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(
-        &agent_file,
-        "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
-    )
-    .unwrap();
-    loop_.handle_prompt(&text_prompt("go")).await;
-    // The `subagent` tool result: the child's captured final text
-    // (the `fake_worker`'s canned `"canned answer"`).
-    let end = wait_for_event(
-        &mut events_rx,
-        SPAWN_MS,
-        |e| matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1"),
-    )
-    .await
-    .expect("the `subagent`'s tool_execution_end");
-    let RpcEvent::tool_execution_end {
-        result, is_error, ..
-    } = end
-    else {
-        unreachable!()
-    };
-    assert!(!is_error, "the child completed");
-    assert_eq!(
-        result["content"][0]["text"], "canned answer",
-        "the tool result is the child's captured final text"
-    );
-    // The parent turn settled (bounded — the `ScriptedProvider`
-    // settles it; the child ran to completion inside the dispatch).
-    wait_for_event(&mut events_rx, SPAWN_MS, |e| {
-        matches!(e, RpcEvent::agent_settled)
-    })
-    .await
-    .expect("the parent turn settled");
-    // The `subagent-session-started` frame: the override beats the
-    // frontmatter's model, the frontmatter's `thinking` still
-    // applies, and the tools are the frontmatter's allowlist.
-    let events = sink_events
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let started = events
-        .iter()
-        .find(|(name, _)| name == "subagent-session-started")
-        .expect("the `subagent-session-started` frame was emitted");
-    assert_eq!(
-        started.1["model"], "fake/m3",
-        "the settings override beats the frontmatter model"
-    );
-    assert_eq!(
-        started.1["thinkingLevel"], "low",
-        "the frontmatter's `thinking` still applies (the override only replaces the model)"
-    );
-    assert_eq!(
-        started.1["enabledTools"],
-        json!(["read"]),
-        "the child's tools are the frontmatter's allowlist"
-    );
-}
-
-/// (ADR 0020) End-to-end: a native subagent dispatched with an
-/// `agentName` matching a discovered definition runs the FRONTMATTER
-/// config (the `dispatch_subagent` → `resolve_launch` layering — the
-/// child's `subagent-session-started` payload carries the
-/// frontmatter's `model` + `tools`, and the child's `Start` envelope
-/// (the `fake_worker`'s `session_info` echo) carries the frontmatter
-/// body as the `systemPrompt` + exactly the frontmatter's tools).
-/// The ADR 0025 Task 5 re-plumb: the subagent runs in a `fake_worker`
-/// process — the `subagent` tool result is the child's captured
-/// final text (the `fake_worker`'s canned `"canned answer"`).
-///
-/// No `env_lock()` here (intentional): `resolve_launch` reads `HOME`
-/// (via `discover_agents` → `user_roots`), concurrently with the
-/// `HOME`-mutating tests — but the isolation is safe by construction:
-/// (1) the space-level roots are scanned FIRST (first-wins dedupe),
-/// so a user-level `scout` file can never shadow the space-level
-/// `scout` written below; (2) the mutators' scratch homes contain no
-/// agent files. If this test ever asserts on a USER-level definition,
-/// it must take `env_lock()` (and set `HOME`) first.
-#[tokio::test]
-async fn a_native_subagent_with_a_matching_agent_name_runs_the_frontmatter_config() {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, _calls) = ScriptedProvider::new(vec![
-        Some(vec![
-            ProviderEvent::ToolCall(ToolCall {
-                id: "t1".to_string(),
-                name: "subagent".to_string(),
-                arguments: json!({ "task": "recon the auth code", "agentName": "scout" }),
-            }),
-            ProviderEvent::Done(FinishReason::ToolCalls),
-        ]),
-        Some(vec![
-            ProviderEvent::TextDelta("done".to_string()),
-            ProviderEvent::Done(FinishReason::Stop),
-        ]),
-    ]);
-    // A TWO-model catalog: `fake/m1` (the parent) + `fake/m2` (the
-    // frontmatter target — IN the catalog, so it is NOT stale).
-    let models = vec![fake_model("m1"), fake_model("m2")];
-    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
-        events: sink_events.clone(),
-    });
-    let manager =
-        make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let (_space, mut loop_) = build_loop_with_dispatcher(
-        Box::new(provider),
-        events_tx,
-        Arc::new(StdMutex::new(CancellationToken::new())),
-        watch::channel(0u64).0,
-        RetryPolicy::new_with(5, Duration::from_millis(1)),
-        sink,
-        Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
-        models,
-        None,
-    );
-    // The Agent definition (the loop's `space_cwd` is the Space root
-    // — the frontmatter's `model` is IN the catalog, so it is NOT
-    // stale).
-    let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-    if let Some(parent) = agent_file.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(
-        &agent_file,
-        "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
-    )
-    .unwrap();
-    loop_.handle_prompt(&text_prompt("go")).await;
-    // The parent turn settled (bounded — the `ScriptedProvider`
-    // settles it; the child ran to completion inside the dispatch).
-    wait_for_event(&mut events_rx, SPAWN_MS, |e| {
-        matches!(e, RpcEvent::agent_settled)
-    })
-    .await
-    .expect("the parent turn settled");
-    // The `subagent-session-started` frame (the `TestSink` cannot
-    // see it — the `RecordingSink` records EVERY event): the child's
-    // RESOLVED model / tools / thinking carry the frontmatter.
-    let events = sink_events
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let started = events
-        .iter()
-        .find(|(name, _)| name == "subagent-session-started")
-        .expect("the `subagent-session-started` frame was emitted");
-    assert_eq!(
-        started.1["model"], "fake/m2",
-        "the child runs the frontmatter's model (the catalog's `fake/m2`)"
-    );
-    assert_eq!(
-        started.1["enabledTools"],
-        json!(["read"]),
-        "the child's tools are the frontmatter's allowlist"
-    );
-    assert_eq!(
-        started.1["thinkingLevel"], "low",
-        "the child's thinking level is the frontmatter's"
-    );
-    assert_eq!(
-        started.1["nameResolution"], "matched",
-        "a discovered definition reports MATCHED end to end"
-    );
-    // The child's `Start` envelope (the `fake_worker`'s `session_info`
-    // echo — re-emitted on the parent's scope by the `on_event`
-    // router): the frontmatter body is the `systemPrompt` (the
-    // `build_child_system_message` output — the body + the todo
-    // instructions), and the `enabledTools` is exactly the
-    // frontmatter's.
-    let child_info = events
-        .iter()
-        .find(|(name, payload)| {
-            name == "session-update"
-                && payload["update"]["sessionUpdate"] == "session_info"
-                && payload["update"]["systemPrompt"].is_string()
-        })
-        .expect("the child's `session_info` Start echo was re-emitted");
-    assert!(
-        child_info.1["update"]["systemPrompt"]
-            .as_str()
-            .unwrap()
-            .starts_with("You are a scout."),
-        "the frontmatter body is the child's system message (the `build_child_system_message` output)"
-    );
-    assert_eq!(
-        child_info.1["update"]["enabledTools"],
-        json!(["read"]),
-        "the child gets exactly the frontmatter's tool"
-    );
-}
-
-/// (issue #47) The exact scenario: `subagent({ agentName: "reviewr" })` — a
-/// typo in a CORRECTLY-spelled key, so T9's unknown-KEY checker cannot see it.
-///
-/// Two halves, and the first is the one that matters: the miss NEVER blocks.
-/// The `subagent` tool result is still the child's real captured output with
-/// `is_error == false`, and the parent turn settles — ADR 0020's deliberate
-/// config-less dispatch, unchanged, and the same non-blocking doctrine as T9's
-/// warning and ADR 0055's metrics. The second half is what this task adds: the
-/// `subagent-session-started` payload says `unmatched` while still carrying the
-/// name the model asked for, so the UI can stop presenting a confident label
-/// for a child that loaded no persona, no tool allowlist and no model.
-///
-/// Runs the REAL `resolve_launch` → `dispatch_native` → `subagent_flow` path.
-/// NO agent file is written at all, so the name can only miss.
-///
-/// No `env_lock()` (the neighbour's note applies verbatim): the space-level
-/// roots are scanned first and this Space holds no agent file, and the
-/// mutators' scratch homes hold none either — and nothing here asserts on a
-/// USER-level definition.
-#[tokio::test]
-async fn a_subagent_named_after_no_definition_still_runs_and_says_so() {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, _calls) = ScriptedProvider::new(vec![
-        Some(vec![
-            ProviderEvent::ToolCall(ToolCall {
-                id: "t1".to_string(),
-                name: "subagent".to_string(),
-                arguments: json!({ "task": "recon the auth code", "agentName": "reviewr" }),
-            }),
-            ProviderEvent::Done(FinishReason::ToolCalls),
-        ]),
-        Some(vec![
-            ProviderEvent::TextDelta("done".to_string()),
-            ProviderEvent::Done(FinishReason::Stop),
-        ]),
-    ]);
-    let models = vec![fake_model("m1")];
-    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
-        events: sink_events.clone(),
-    });
-    let manager =
-        make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let (_space, mut loop_) = build_loop_with_dispatcher(
-        Box::new(provider),
-        events_tx,
-        Arc::new(StdMutex::new(CancellationToken::new())),
-        watch::channel(0u64).0,
-        RetryPolicy::new_with(5, Duration::from_millis(1)),
-        sink,
-        Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
-        models,
-        None,
-    );
-    // NO agent file: `"reviewr"` can only miss.
-    loop_.handle_prompt(&text_prompt("go")).await;
-    // 1. NON-BLOCKING: the tool result is the child's real output, not an error.
-    let end = wait_for_event(
-        &mut events_rx,
-        SPAWN_MS,
-        |e| matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1"),
-    )
-    .await
-    .expect("the `subagent`'s tool_execution_end");
-    let RpcEvent::tool_execution_end {
-        result, is_error, ..
-    } = end
-    else {
-        unreachable!()
-    };
-    assert!(
-        !is_error,
-        "a resolve miss never fails the dispatch — got {result}"
-    );
-    assert_eq!(
-        result["content"][0]["text"], "canned answer",
-        "the tool result is the child's captured final text (the child RAN)"
-    );
-    // 2. The parent turn settled.
-    wait_for_event(&mut events_rx, SPAWN_MS, |e| {
-        matches!(e, RpcEvent::agent_settled)
-    })
-    .await
-    .expect("the parent turn settled");
-    // 3. The report: `unmatched`, and the name is still there (additive).
-    let events = sink_events
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let started = events
-        .iter()
-        .find(|(name, _)| name == "subagent-session-started")
-        .expect("the `subagent-session-started` frame was emitted");
-    assert_eq!(
-        started.1["nameResolution"], "unmatched",
-        "a name that matched no definition is visible on the payload"
-    );
-    assert_eq!(
-        started.1["agentName"], "reviewr",
-        "the marker never replaces the label — the row keeps the name"
-    );
-}
-
-/// (issue #47 follow-up) A PADDED `agentName` puts the TRIMMED name on the
-/// payload. `resolve_launch` trims before it selects, so `"  scout  "` is a
-/// genuine `Matched` — but the label travelled down a separate path, so the
-/// wire (and therefore the payload) carried the RAW string while the marker
-/// described the trimmed one: the UI printed `"  scout  "` and its row and its
-/// badge were about two different names.
-///
-/// A PAYLOAD-level pin, deliberately not a resolver-level one:
-/// `resolve_launch_a_blank_name_is_no_name_and_a_padded_name_is_a_match`
-/// already proves the padded name MATCHES, and that test stays green with the
-/// label bug in place — nothing below `dispatch_subagent` sees the difference
-/// except this emit. Runs the same real path as the two neighbours above
-/// (`resolve_launch` → `dispatch_native` → `subagent_flow`).
-///
-/// No `env_lock()` (both neighbours' note applies verbatim): the space-level
-/// roots are scanned first, so a user-level `scout` can never shadow the
-/// space-level one written below, and nothing here asserts on a USER-level
-/// definition.
-#[tokio::test]
-async fn a_padded_agent_name_reaches_the_payload_trimmed() {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, _calls) = ScriptedProvider::new(vec![
-        Some(vec![
-            ProviderEvent::ToolCall(ToolCall {
-                id: "t1".to_string(),
-                name: "subagent".to_string(),
-                // The padding is the whole test: a model that emitted the name
-                // with surrounding space (a copy out of a prose list) is the
-                // realistic producer of this input.
-                arguments: json!({ "task": "recon the auth code", "agentName": "  scout  " }),
-            }),
-            ProviderEvent::Done(FinishReason::ToolCalls),
-        ]),
-        Some(vec![
-            ProviderEvent::TextDelta("done".to_string()),
-            ProviderEvent::Done(FinishReason::Stop),
-        ]),
-    ]);
-    let models = vec![fake_model("m1"), fake_model("m2")];
-    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink {
-        events: sink_events.clone(),
-    });
-    let manager =
-        make_subagent_manager(Duration::from_secs(30), models.clone(), None, sink.clone()).await;
-    let (_space, mut loop_) = build_loop_with_dispatcher(
-        Box::new(provider),
-        events_tx,
-        Arc::new(StdMutex::new(CancellationToken::new())),
-        watch::channel(0u64).0,
-        RetryPolicy::new_with(5, Duration::from_millis(1)),
-        sink,
-        Some(Arc::new(InProcessDispatcher::new(manager)) as Arc<dyn SubagentDispatcher>),
-        models,
-        None,
-    );
-    let agent_file = loop_.space_cwd.join(".agents/agents/scout.md");
-    if let Some(parent) = agent_file.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(
-        &agent_file,
-        "---\nname: scout\ndescription: Fast recon.\nmodel: fake/m2\nthinking: low\ntools: [read]\n---\nYou are a scout.\n",
-    )
-    .unwrap();
-    loop_.handle_prompt(&text_prompt("go")).await;
-    wait_for_event(&mut events_rx, SPAWN_MS, |e| {
-        matches!(e, RpcEvent::agent_settled)
-    })
-    .await
-    .expect("the parent turn settled");
-    let events = sink_events
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let started = events
-        .iter()
-        .find(|(name, _)| name == "subagent-session-started")
-        .expect("the `subagent-session-started` frame was emitted");
-    // THE fix: the label the resolver actually selected by.
-    assert_eq!(
-        started.1["agentName"], "scout",
-        "the payload carries the TRIMMED name — the marker and the label must \
-         describe one string, got {:?}",
-        started.1["agentName"]
-    );
-    // And the trim did not COST the dispatch anything: it still matched, and it
-    // still ran the frontmatter (so this is not the `Unmatched` path in a
-    // different costume).
-    assert_eq!(
-        started.1["nameResolution"], "matched",
-        "a padded real name is still MATCHED"
-    );
-    assert_eq!(
-        started.1["model"], "fake/m2",
-        "the padded name still resolved the frontmatter's model"
-    );
-}
+use crate::events::{EventSink, RpcEvent};
+use crate::harness::catalog::Model;
+use crate::harness::dispatch::SubagentDispatcher;
+use crate::harness::provider::{ChatRole, FinishReason, MessageContent, ProviderEvent, ToolCall};
+use crate::harness::retry::RetryPolicy;
+use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
+use crate::tools::ContentBlock;
 
 /// `SubagentWait` mechanics (the `MockDispatcher` seam — a QUEUED
 /// oneshot): a resolving `Completed` outcome completes the `subagent`
@@ -717,15 +37,15 @@ async fn subagent_wait_a_resolving_completed_outcome_completes_the_tool() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+    let dispatcher = crate::harness::dispatch::MockDispatcher::new();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+    dispatcher.queue(rx, crate::subagent::SubagentCancel::none());
     // The test resolves the QUEUED oneshot BEFORE the turn starts (the
     // oneshot's value is buffered — the loop's `select!` sees it
     // resolved immediately when it pops it at `dispatch`).
     tx.send(SubagentOutcome::Completed {
         output: "the answer".to_string(),
-        metrics: crate::agent::subagent::SubagentMetrics {
+        metrics: crate::subagent::SubagentMetrics {
             output: "the answer".to_string(),
             input_tokens: 10,
             output_tokens: 5,
@@ -817,14 +137,14 @@ async fn a_mis_named_subagent_param_is_rejected_and_never_dispatches_a_child() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let dispatcher = Arc::new(crate::agent::harness::dispatch::MockDispatcher::new());
+    let dispatcher = Arc::new(crate::harness::dispatch::MockDispatcher::new());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+    dispatcher.queue(rx, crate::subagent::SubagentCancel::none());
     // A child that was never dispatched never pops this entry — see the doc
     // comment for why it is resolvable rather than left hanging.
     tx.send(SubagentOutcome::Completed {
         output: "the answer".to_string(),
-        metrics: crate::agent::subagent::SubagentMetrics {
+        metrics: crate::subagent::SubagentMetrics {
             output: "the answer".to_string(),
             input_tokens: 10,
             output_tokens: 5,
@@ -971,7 +291,7 @@ impl SubagentDispatcher for ConcurrentCountingDispatcher {
         _sink: &Arc<dyn EventSink>,
     ) -> (
         tokio::sync::oneshot::Receiver<SubagentOutcome>,
-        crate::agent::subagent::SubagentCancel,
+        crate::subagent::SubagentCancel,
     ) {
         let in_flight = self.in_flight.clone();
         let max_in_flight = self.max_in_flight.clone();
@@ -994,7 +314,7 @@ impl SubagentDispatcher for ConcurrentCountingDispatcher {
             tokio::time::sleep(delay).await;
             let _ = tx.send(SubagentOutcome::Completed {
                 output: "done".to_string(),
-                metrics: crate::agent::subagent::SubagentMetrics {
+                metrics: crate::subagent::SubagentMetrics {
                     output: "done".to_string(),
                     input_tokens: 1,
                     output_tokens: 1,
@@ -1004,7 +324,7 @@ impl SubagentDispatcher for ConcurrentCountingDispatcher {
             });
             in_flight.fetch_sub(1, Ordering::SeqCst);
         });
-        (rx, crate::agent::subagent::SubagentCancel::none())
+        (rx, crate::subagent::SubagentCancel::none())
     }
 }
 
@@ -1105,7 +425,7 @@ impl SubagentDispatcher for CancellingDispatcher {
         _sink: &Arc<dyn EventSink>,
     ) -> (
         tokio::sync::oneshot::Receiver<SubagentOutcome>,
-        crate::agent::subagent::SubagentCancel,
+        crate::subagent::SubagentCancel,
     ) {
         let (flag_tx, flag_rx) = watch::channel(false);
         self.cancels.lock().unwrap().push(flag_rx);
@@ -1114,10 +434,7 @@ impl SubagentDispatcher for CancellingDispatcher {
         // until the turn's `select!` `turn.cancelled()` arm fires.
         let (os_tx, os_rx) = tokio::sync::oneshot::channel();
         std::mem::forget(os_tx);
-        (
-            os_rx,
-            crate::agent::subagent::SubagentCancel::new_flag(flag_tx),
-        )
+        (os_rx, crate::subagent::SubagentCancel::new_flag(flag_tx))
     }
 }
 
@@ -1156,7 +473,7 @@ impl SubagentDispatcher for OutOfOrderDispatcher {
         _sink: &Arc<dyn EventSink>,
     ) -> (
         tokio::sync::oneshot::Receiver<SubagentOutcome>,
-        crate::agent::subagent::SubagentCancel,
+        crate::subagent::SubagentCancel,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let delay = if task.contains('a') {
@@ -1170,7 +487,7 @@ impl SubagentDispatcher for OutOfOrderDispatcher {
             completion_order.lock().unwrap().push(task.clone());
             let _ = tx.send(SubagentOutcome::Completed {
                 output: task.clone(),
-                metrics: crate::agent::subagent::SubagentMetrics {
+                metrics: crate::subagent::SubagentMetrics {
                     output: task.clone(),
                     input_tokens: 1,
                     output_tokens: 1,
@@ -1179,7 +496,7 @@ impl SubagentDispatcher for OutOfOrderDispatcher {
                 },
             });
         });
-        (rx, crate::agent::subagent::SubagentCancel::none())
+        (rx, crate::subagent::SubagentCancel::none())
     }
 }
 
@@ -1412,7 +729,7 @@ impl SubagentDispatcher for PartialResolveDispatcher {
         _sink: &Arc<dyn EventSink>,
     ) -> (
         tokio::sync::oneshot::Receiver<SubagentOutcome>,
-        crate::agent::subagent::SubagentCancel,
+        crate::subagent::SubagentCancel,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if task.contains('a') {
@@ -1420,7 +737,7 @@ impl SubagentDispatcher for PartialResolveDispatcher {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 let _ = tx.send(SubagentOutcome::Completed {
                     output: "t1-done".to_string(),
-                    metrics: crate::agent::subagent::SubagentMetrics {
+                    metrics: crate::subagent::SubagentMetrics {
                         output: "t1-done".to_string(),
                         input_tokens: 1,
                         output_tokens: 1,
@@ -1434,7 +751,7 @@ impl SubagentDispatcher for PartialResolveDispatcher {
             // receiver stays PENDING — t2 stays in-flight until cancelled.
             std::mem::forget(tx);
         }
-        (rx, crate::agent::subagent::SubagentCancel::none())
+        (rx, crate::subagent::SubagentCancel::none())
     }
 }
 
@@ -1556,17 +873,17 @@ async fn subagent_wait_a_failed_outcome_is_an_error_result() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+    let dispatcher = crate::harness::dispatch::MockDispatcher::new();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+    dispatcher.queue(rx, crate::subagent::SubagentCancel::none());
     // The test resolves the QUEUED oneshot BEFORE the turn starts
     // (the oneshot's value is buffered — the loop's `select!` sees
     // it resolved immediately when it pops it at `dispatch`).
     tx.send(SubagentOutcome::Failed {
-        reason: crate::agent::subagent::SubagentFailureReason::Other,
+        reason: crate::subagent::SubagentFailureReason::Other,
         error: "boom".to_string(),
         output: String::new(),
-        metrics: crate::agent::subagent::SubagentMetrics::default(),
+        metrics: crate::subagent::SubagentMetrics::default(),
     })
     .unwrap();
     let (_space, mut loop_) = build_loop_with_dispatcher(
@@ -1626,7 +943,7 @@ async fn subagent_wait_a_turn_cancel_cancels_the_dispatch() {
     ])]);
     // The EMPTY queue — the `dispatch` returns a never-resolving
     // oneshot (the outcome arm never fires).
-    let dispatcher = crate::agent::harness::dispatch::MockDispatcher::new();
+    let dispatcher = crate::harness::dispatch::MockDispatcher::new();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
     let turn_cancel_c = turn_cancel.clone();
     let (_space, mut loop_) = build_loop_with_dispatcher(

@@ -17,10 +17,10 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::support::*;
-use crate::agent::events::RpcEvent;
-use crate::agent::harness::dispatch::SubagentDispatcher;
-use crate::agent::harness::provider::{FinishReason, ProviderEvent, ToolCall};
-use crate::agent::harness::retry::RetryPolicy;
+use crate::events::RpcEvent;
+use crate::harness::dispatch::SubagentDispatcher;
+use crate::harness::provider::{FinishReason, ProviderEvent, ToolCall};
+use crate::harness::retry::RetryPolicy;
 
 /// A rejected `write` returns `is_error: true` as its WHOLE result and never
 /// touches the filesystem.
@@ -135,9 +135,9 @@ async fn a_rejected_subagent_call_never_creates_a_child() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let dispatcher = Arc::new(crate::agent::harness::dispatch::MockDispatcher::new());
+    let dispatcher = Arc::new(crate::harness::dispatch::MockDispatcher::new());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    dispatcher.queue(rx, crate::agent::subagent::SubagentCancel::none());
+    dispatcher.queue(rx, crate::subagent::SubagentCancel::none());
     // Keep the SENDER alive: dropping it would resolve the queued receiver
     // and make the pre-fix path look like a `Completed` child instead of a
     // child that was never spawned.
@@ -261,12 +261,6 @@ async fn a_rejected_call_never_reaches_the_permission_gate() {
             ProviderEvent::Done(FinishReason::Stop),
         ]),
     ]);
-    let cfg = Tmp::new("cfg");
-    std::fs::write(
-        cfg.path().join("settings.json"),
-        policy_settings("ask", "ask", "ask"),
-    )
-    .unwrap();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
     let (_space, mut loop_, _db) = build_loop_with_db(
@@ -276,7 +270,31 @@ async fn a_rejected_call_never_reaches_the_permission_gate() {
         watch::channel(0u64).0,
         RetryPolicy::new_with(5, Duration::from_millis(1)),
         vec![fake_model("m1")],
-        Some(cfg.path()),
+        None,
+    );
+    // (Fulcrum T3) The `ask` policy is PACKAGED, not written to a
+    // `settings.json` — the disk read this task removes means that file would
+    // now be ignored, so the fixture feeds the loop the way production does.
+    //
+    // Honest scope: this test's assertion (`no permission-request` + the
+    // rejection wording) is a NEGATIVE one, so it does NOT depend on the `ask`
+    // policy actually being in force — it stays green on the all-`Allow`
+    // default too. The packaging is here to keep the fixture's PREMISE true (a
+    // gate that really would have prompted, per the docblock above), not to
+    // make the assertion non-vacuous; the non-vacuity pins for "the loop reads
+    // no file" live in `launch/tests/mod.rs`
+    // (`resolve_launch_ignores_a_settings_file_holding_a_different_override`)
+    // and in `policy_gate`'s two push-path live-reload tests.
+    let packaged = serde_json::from_str::<crate::config_types::Settings>(&policy_settings(
+        "ask", "ask", "ask",
+    ))
+    .expect("the fixture's settings document parses");
+    loop_.set_desktop_config(
+        Some(packaged.file_policy.clone()),
+        Some(packaged.web.clone()),
+        Some(packaged.agent_overrides.clone()),
+        packaged.providers.clone(),
+        packaged.mcp_servers.clone(),
     );
     // Swap the `TestSink` for a recording one (`loop_.sink` is `pub`) — the
     // `TestSink` cannot see `permission-request`.
@@ -472,10 +490,8 @@ async fn a_cancelled_subagent_call_reports_cancelled_and_not_a_rejection() {
         }),
         // A dispatcher is present so the `subagent` call is a live shape; the
         // cancelled batch gate means it is never consulted (see the doc above).
-        Some(
-            Arc::new(crate::agent::harness::dispatch::MockDispatcher::new())
-                as Arc<dyn SubagentDispatcher>,
-        ),
+        Some(Arc::new(crate::harness::dispatch::MockDispatcher::new())
+            as Arc<dyn SubagentDispatcher>),
         vec![fake_model("m1")],
         None,
     );

@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::manager::McpManager;
 use super::types::{McpState, ToolCallResult};
-use crate::agent::tools::{ContentBlock, ToolResult};
+use crate::tools::{ContentBlock, ToolResult};
 
 /// The `mcp` tool's per-request timeout (a stdio / HTTP request bound).
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -795,15 +795,16 @@ pub async fn mcp_tool(
 mod tests {
     use super::*;
 
-    /// The `fake_mcp_stdio` test-double binary (built by `cargo test` — the
-    /// `CARGO_MANIFEST_DIR`/`target/debug` path).
+    /// The `fake_mcp_stdio` test-double binary (built by `cargo test`).
+    ///
+    /// T5/S3 (Step A-bis): see `mcp/stdio.rs::fake_mcp_bin` — same trap, same
+    /// fix, one resolver (`crate::test_support::target_debug_dir`, TWO levels
+    /// up), pinned by `childproc::target_debug_dir_is_where_cargo_actually_builds`.
     fn fake_bin() -> String {
-        std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_mcp_stdio"
-        ))
-        .display()
-        .to_string()
+        crate::test_support::target_debug_dir()
+            .join("fake_mcp_stdio")
+            .display()
+            .to_string()
     }
 
     /// A temp `McpManager` over a temp config (the servers point at the fake

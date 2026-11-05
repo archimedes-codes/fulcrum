@@ -18,9 +18,9 @@
 //! orchestrated by the `AgentLoop` (it owns the `Provider`); this type
 //! owns the thresholds + the message split.
 
-use crate::agent::harness::catalog::CompactionConfig;
-use crate::agent::harness::provider::{ChatMessage, ChatRole, MessageContent, Usage};
-use crate::agent::tools::ContentBlock;
+use crate::harness::catalog::CompactionConfig;
+use crate::harness::provider::{ChatMessage, ChatRole, MessageContent, Usage};
+use crate::tools::ContentBlock;
 
 /// The context compactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,11 +347,11 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::harness::catalog::Model;
-use crate::agent::harness::provider::{
+use crate::harness::catalog::Model;
+use crate::harness::provider::{
     FinishReason, ModelOptions, ModelRequest, Provider, ProviderError, ProviderEvent,
 };
-use crate::agent::harness::store::{role_str, Store};
+use crate::harness::store::{role_str, Store};
 
 /// The compaction SUMMARY's prefix (moved from `loop.rs` alongside
 /// `run_compaction`, which prepends it to the summarized text): the ONE
@@ -366,7 +366,7 @@ pub(crate) const SUMMARY_PREFIX: &str = "Summary of previous conversation:";
 /// A message is a compaction SUMMARY (a `System` message with the
 /// harness-generated `SUMMARY_PREFIX` text) — conversation state, never
 /// prompt state.
-pub(crate) fn is_compaction_summary(m: &ChatMessage) -> bool {
+pub fn is_compaction_summary(m: &ChatMessage) -> bool {
     matches!(&m.content, MessageContent::Text(t) if t.starts_with(SUMMARY_PREFIX))
 }
 
@@ -689,12 +689,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::agent::harness::catalog::Model;
-    use crate::agent::harness::provider::ChatRole;
-    use crate::agent::harness::provider::{Provider, ProviderError, ProviderEvent};
-    use crate::agent::harness::store::{SessionStore, Store};
-    use crate::agent::SessionInfo;
-    use crate::storage::Db;
+    use crate::harness::catalog::Model;
+    use crate::harness::provider::ChatRole;
+    use crate::harness::provider::{Provider, ProviderError, ProviderEvent};
+    use crate::harness::store::Store;
 
     /// A scripted `Provider` (canned `ProviderEvent`s per `complete` call —
     /// a copy of the `loop.rs` test helper, so the moved compaction tests
@@ -772,7 +770,7 @@ mod tests {
     /// Records the WHOLE summary `ModelRequest` — the input size and the output
     /// cap are what ADR 0047 pins.
     struct RequestRecordingProvider {
-        recorded: Arc<std::sync::Mutex<Vec<crate::agent::harness::provider::ModelRequest>>>,
+        recorded: Arc<std::sync::Mutex<Vec<crate::harness::provider::ModelRequest>>>,
     }
 
     #[async_trait::async_trait]
@@ -911,26 +909,24 @@ mod tests {
         }
     }
 
-    /// The moved tests' harness: a temp-dir `Db` with the `"s1"` session
-    /// row (the `native_messages` FK), a `SessionStore`, and the fake
-    /// model (what `build_loop_with_db` gave the `AgentLoop`).
-    fn temp_store() -> (crate::test_support::ScratchDir, Arc<Db>, Arc<dyn Store>) {
-        let dir = crate::test_support::ScratchDir::in_env_temp("harness-compact-test-", "store");
-        let db = Arc::new(Db::open(&dir.join("t.db")).expect("db should open"));
-        db.record_session(&SessionInfo {
-            session_id: "s1".to_string(),
-            cwd: std::path::PathBuf::from("/tmp"),
-            capabilities: serde_json::json!({}),
-            config_options: None,
-            archived: false,
-            title: None,
-            context_usage: None,
-            cost_usd: None,
-            is_subagent: false,
-        })
-        .expect("record_session");
-        let store: Arc<dyn Store> = Arc::new(SessionStore::new(db.clone()));
-        (dir, db, store)
+    /// The moved tests' harness: the crate's [`MemoryStore`] behind the same
+    /// `Arc<dyn Store>` the loop holds, plus the fake model (what
+    /// `build_loop_with_db` gave the `AgentLoop`).
+    ///
+    /// (T5/S5b) This fixture RE-POINTED rather than relocated. It used to mint a
+    /// temp-dir `Db` + a `SessionStore`, and the crate cannot open one. What
+    /// these tests assert is `replace_messages` → `load_messages` (the compaction
+    /// rewrite read back) — the seq-ordered transcript the seam must give, which
+    /// `MemoryStore` implements for real. What they do NOT assert is the SQLite
+    /// UNIQUE collapse, the transaction's atomicity, or the FK, so nothing here
+    /// rides on the database; the three properties that do are pinned on the
+    /// desktop (`tests/harness_store.rs`, and the four `SessionStore` tests in
+    /// `src-tauri/src/agent/harness/store.rs`). The tuple keeps its three-slot
+    /// shape — the scratch guard is `None` now that no fixture writes a dir, and
+    /// the #96 census row for `harness-compact-test-` retires with it.
+    fn temp_store() -> (Option<crate::test_support::ScratchDir>, (), Arc<dyn Store>) {
+        let store: Arc<dyn Store> = Arc::new(crate::test_support::MemoryStore::new());
+        (None, (), store)
     }
 
     fn text_msg(t: &str) -> ChatMessage {
@@ -1440,7 +1436,7 @@ mod tests {
             role: ChatRole::Assistant,
             content: MessageContent::Text(String::new()),
             tool_call_id: None,
-            tool_calls: Some(vec![crate::agent::harness::provider::ToolCall {
+            tool_calls: Some(vec![crate::harness::provider::ToolCall {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: serde_json::json!({ "command": "ls" }),
@@ -1500,7 +1496,7 @@ mod tests {
             role: ChatRole::Assistant,
             content: MessageContent::Text(String::new()),
             tool_call_id: None,
-            tool_calls: Some(vec![crate::agent::harness::provider::ToolCall {
+            tool_calls: Some(vec![crate::harness::provider::ToolCall {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: serde_json::json!({ "command": "ls" }),
@@ -1533,7 +1529,7 @@ mod tests {
     /// exists to recover (the failure ADR 0047 was written to end).
     #[test]
     fn the_trim_charges_the_tool_call_arguments_the_summary_sends() {
-        use crate::agent::harness::provider::ToolCall;
+        use crate::harness::provider::ToolCall;
         // ~10 000 tokens of argument — a large `write`, the call that drives
         // compaction in the first place.
         let big = "x".repeat(40_000);

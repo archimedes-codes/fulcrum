@@ -113,7 +113,7 @@ const NON_OVERFLOW_FRAGMENTS: &[&str] = &[
 /// Matching is on the LOWERCASED text (every provider capitalizes
 /// differently, and the wire embeds the JSON body verbatim), so every
 /// fragment below is lowercase.
-pub(crate) fn is_context_overflow_text(text: &str) -> bool {
+pub fn is_context_overflow_text(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     if NON_OVERFLOW_FRAGMENTS.iter().any(|f| text.contains(f)) {
         return false;

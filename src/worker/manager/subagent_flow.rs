@@ -5,17 +5,17 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
-use crate::agent::events::RpcEvent;
-use crate::agent::harness::prompt::build_child_system_message;
-use crate::agent::harness::provider::openai::content_is_effectively_empty;
-use crate::agent::harness::r#loop::tool_specs;
-use crate::agent::harness::{ModelKey, ModelRef};
-use crate::agent::is_bookkeeping_message_id;
-use crate::agent::session::resolve_composed_model;
-use crate::agent::subagent::{SubagentFailureReason, SubagentMetrics, SubagentOutcome};
-use crate::agent::types::mint_session_id;
-use crate::agent::worker::client::{WorkerHandle, WorkerInboundEvent};
-use crate::agent::worker::protocol::{Inbound, StartEnv, StartMode, SubagentDispatchWire};
+use crate::catalog::resolve_composed_model;
+use crate::events::RpcEvent;
+use crate::harness::prompt::build_child_system_message;
+use crate::harness::provider::openai::content_is_effectively_empty;
+use crate::harness::r#loop::tool_specs;
+use crate::harness::{ModelKey, ModelRef};
+use crate::normalize::is_bookkeeping_message_id;
+use crate::subagent::{SubagentFailureReason, SubagentMetrics, SubagentOutcome};
+use crate::types::mint_session_id;
+use crate::worker::client::WorkerHandle;
+use crate::worker::protocol::{DesktopConfig, Inbound, StartEnv, StartMode, SubagentDispatchWire};
 
 use super::pump::start_pump;
 use super::registry::{reap_worker, ManagerState};
@@ -105,18 +105,29 @@ pub struct SubagentCapture {
     /// `outputTokens` fields — the MAX across the frames: a turn's
     /// usage is cumulative per message, the last is the largest).
     usage: StdMutex<(u64, u64)>,
-    /// The child's **cost** accumulation (issue #87, T09): the SUM of the
-    /// `costUsd` figures on the child's own `cost_update` interactive-event
-    /// frames. `None` until a priced frame arrives — the distinction between
-    /// "no call reported a cost" and "a call reported zero" is preserved HERE
-    /// and carried through the `SubagentMetrics.cost: Option<f64>` hand-off
-    /// (issue #107) — no `unwrap_or(0.0)`, no named follow-up, not a decision
-    /// to invent money.
+    /// The child's **cost** figure (issue #87, T09; the grain is Fulcrum T2's):
+    /// the LAST `costUsd` seen on the child's own `cost_update` interactive-event
+    /// frames — which since T2 IS the child's CUMULATIVE TOTAL, because the
+    /// child's loop accumulates and emits totals. `None` until a priced frame
+    /// arrives — the distinction between "no call reported a cost" and "a call
+    /// reported zero" is preserved HERE and carried through the
+    /// `SubagentMetrics.cost: Option<f64>` hand-off (issue #107) — no
+    /// `unwrap_or(0.0)`, no named follow-up, not a decision to invent money.
     ///
-    /// A SUM, deliberately NOT a `max` like the token fields next door: a
-    /// turn's token usage is cumulative per message (so the last frame is the
-    /// largest), but money accumulates across calls — copying the `max` rule
-    /// here would report one call's cost for a ten-call child.
+    /// LAST FRAME WINS, deliberately NOT a sum (the shape this field had until
+    /// T2) and NOT the `max` the token fields next door use. The reason is the
+    /// grain of the frame, not a preference: a `cost_update` frame now carries a
+    /// TOTAL, so summing the frames sums the same money twice — a four-call
+    /// child's frames `0.001 / 0.0017 / 0.0024 / 0.0031` would have summed to
+    /// `0.0082` for a child that spent `0.0031`, and the parent's row (a SNAPSHOT
+    /// store now) would have taken that inflated figure as its own. `max` would
+    /// be right for the well-ordered case and wrong for a replay that arrives
+    /// out of order or a provider that re-reports a smaller figure; last-wins is
+    /// what "the newest report of the total" means, and it is the same rule the
+    /// frontend store and the DB write moved to. The token fields keep `max`
+    /// because their frames really are cumulative-per-message snapshots of a
+    /// monotonic counter — money's frames are snapshots of a total the emitter
+    /// owns.
     cost: StdMutex<Option<f64>>,
     /// (issue #122) Did the child announce ANY tool call? Set on the first
     /// `tool_execution_start` the pump feeds.
@@ -161,9 +172,10 @@ impl SubagentCapture {
     ///   and a `message_retracted` frame (ADR 0048) which ERASES the Abandoned
     ///   attempt's text for the `messageId` it names.
     /// - `interactive-event` — the child's own `cost_update` frames (issue #87,
-    ///   T09), whose `payload.costUsd` sums into this capture's cost. Without
-    ///   this branch a child's money reached the parent's Supervisor and was
-    ///   dropped ON THE FLOOR here, which is why `SubagentMetrics.cost` was a
+    ///   T09), whose `payload.costUsd` is the child's CUMULATIVE TOTAL and
+    ///   REPLACES this capture's figure (last-frame-wins since Fulcrum T2).
+    ///   Without this branch a child's money reached the parent's Supervisor and
+    ///   was dropped ON THE FLOOR here, which is why `SubagentMetrics.cost` was a
     ///   hardcoded `0.0` and why the roadmap's "rolls up through the existing
     ///   path" was false.
     pub fn observe_sink_frame(&self, event: &str, payload: &Value) {
@@ -189,7 +201,12 @@ impl SubagentCapture {
                     // can never carry a signed zero onto the wire.
                     let cost = cost + 0.0;
                     let mut held = self.cost.lock().unwrap_or_else(|p| p.into_inner());
-                    *held = Some(held.unwrap_or(0.0) + cost);
+                    // LAST FRAME WINS — the frame carries the child's running
+                    // TOTAL, so it REPLACES the figure (T2; the retired code
+                    // added). A frame that fails the filter above leaves the
+                    // held figure ALONE: a malformed frame is not a report of
+                    // zero and must never erase a real total.
+                    *held = Some(cost);
                 }
             }
             return;
@@ -317,9 +334,10 @@ impl SubagentCapture {
         self.usage().1
     }
 
-    /// The child's summed cost (`None` when NO frame carried a figure — a
+    /// The child's cost TOTAL (`None` when NO frame carried a figure — a
     /// different state from `Some(0.0)`, which means a call reported a real
-    /// zero). Issue #87, T09.
+    /// zero). Issue #87, T09; the figure is the child's CUMULATIVE TOTAL since
+    /// Fulcrum T2 (the field's doc gives the last-frame-wins reason).
     pub fn cost_usd(&self) -> Option<f64> {
         *self.cost.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -721,6 +739,15 @@ pub(crate) fn dispatch_subagent(
         // `clone()` on the `Box` clones the block, which is what we want here).
         wire.launch.permission.as_deref().cloned(),
     );
+    // (Fulcrum T3) The child inherits the PARENT's five packaged desktop-config
+    // fields. THIS line is ADR 0023's live property on the child path: a
+    // `config-update` push refreshes the parent's stored env in the registry,
+    // and because the child's five are read off that live copy right here, the
+    // NEXT dispatch's child runs the edited policy / override layer — the same
+    // "a settings edit applies at the next dispatch, no restart" the per-dispatch
+    // `settings.json` read used to buy. `DesktopConfig::from_env` exists so a
+    // sixth packaged field cannot be silently forgotten in a hand-written copy.
+    let env = env.with_desktop_config(DesktopConfig::from_env(&parent_env));
     // 6. The `subagent-session-started` UI lifecycle event (the
     // current driver's step 9 — the PARENT session's sink: the
     // `model` in the COMPOSED `provider/id` form, the
@@ -1300,71 +1327,42 @@ pub(crate) async fn finish_subagent(
             }
         }
     }
-    // (issue #87, T09) THE SUBAGENT ROLL-UP: the child's summed cost, emitted
-    // as ONE `cost_update` DELTA keyed to the PARENT.
+    // (issue #87, T09 → Fulcrum T2's follow-up) THE PARENT-KEYED ROLL-UP FRAME
+    // IS GONE. This used to emit the child's cost figure as one `cost_update`
+    // frame keyed to the PARENT, routed through `hooks.on_event` so the router
+    // persisted it. That made TWO writers on ONE store key — this frame and the
+    // parent's own `emit_cost_update` frames — and since a `cost_update` frame
+    // is a SNAPSHOT that the store OVERWRITES, last-frame-wins decided the
+    // parent's figure. The parent's accumulator had never seen its child, so
+    // the parent's next frame erased the child's money: parent 0.003 → child
+    // 0.002 → parent 0.006 stored **0.009**, not 0.011. The delta wire ADDED, so
+    // it could not lose a child; the totals wire made the loss structural. This
+    // block diagnosed the symptom ("a parent with two children takes the second
+    // child's figure") without naming the cause, which was the second writer.
     //
-    // Why it must be emitted HERE rather than by the parent's loop: the parent
-    // loop structurally cannot know a child's cost — `dispatch.rs` discards the
-    // metrics (`let _ = (reason, metrics);`) and the parent's only view of a
-    // child is the `ToolResult` text. So a parent-owned total could never
-    // include children; a store-side sum can, provided the figure reaches the
-    // store at all. This is that route.
+    // WHERE THE MONEY WENT INSTEAD — ONE WRITER PER KEY. The child's
+    // `metrics.cost` reaches the parent's loop as a VALUE out of
+    // `harness::dispatch::dispatch_subagent` (it travels in the outcome it
+    // already rides; only the cost is read out of it, and it is never put in
+    // the parent's PROMPT), and `AgentLoop::fold_child_cost` adds it to the
+    // parent's accumulator and emits the parent's new total AT THE OUTCOME. So:
+    // a parent that delegates and then makes no further priced call still
+    // persists its children's money; multiple children accumulate monotonically
+    // instead of overwriting each other; and issue #105's requirement — a
+    // parent's STORED total includes its children — survives, now satisfied by
+    // the only party that can see both sides of the sum. The Supervisor cannot
+    // be that writer: it has no view of the parent's accumulator, so it could
+    // only ever produce a partial total, which is why keeping this roll-up as
+    // the sole parent-keyed writer was rejected rather than merely worse.
     //
-    // Why there is no double count: the child's OWN frames are keyed to the
-    // CHILD id (they feed the child's own card), and this one is keyed to the
-    // PARENT — different store keys, and different `sessions` rows.
-    //
-    // It goes through `hooks.on_event` as a `SinkFrame` — i.e. through
-    // `SessionManager::route_event` — and NOT straight to the parent's Tauri
-    // sink. That is the issue #105 fix: persistence happens ONLY inside
-    // `route_event`'s `apply_interactive_event` call, so a frame emitted
-    // directly via `hooks.sink_for` reached the UI and never the DB, which made
-    // the parent's STORED total disagree with the figure displayed under its
-    // own title. `route_event` persists it and then re-emits the SAME payload
-    // verbatim (the `Value` is moved, not re-serialised), so the frontend
-    // contract is byte-identical to the old direct emission. `is_subagent:
-    // false` is correct: this frame is the PARENT's money, and the router's
-    // gate keys on that flag.
-    //
-    // The gate is the `Option` itself (the `emit_cost_update` mirror — the same
-    // rule the main path uses): `None` → NO frame, `Some(0.0)` → frame. It is
-    // still a FRAME-EXISTENCE gate and never a value filter: a child that
-    // reported nothing contributes nothing, and a child whose calls reported a
-    // REAL zero is a figure and its frame lands, keyed to the PARENT. The old
-    // `> 0.0` test could not express that (it ate the real zero, which is the
-    // filter `emit.rs`'s doc names as the bug), and the `f64` hand-off left it
-    // no `Option` to match on. There is no `!= 0` filter either — the roll-up's
-    // only writer is the capture's `filter(c.is_finite() && *c >= 0.0)`, so a
-    // non-negative figure is all that can ever arrive, and a real zero reaches
-    // the wheel.
-    let rollup_cost = match &outcome {
-        SubagentOutcome::Completed { metrics, .. } => metrics.cost,
-        SubagentOutcome::Failed { metrics, .. } => metrics.cost,
-    };
-    // The gate is an `if let` and NOT a `let … else { return }`: `finish_subagent`
-    // CONTINUES after this block (the reap, the `drives` removal, the
-    // `SubagentResult` delivery), so an early `return` would silently skip the
-    // child's teardown and never answer the parent's wait. The `if let` scopes
-    // the gate to the ONE frame, which is all a frame-existence gate may do.
-    if let Some(rollup_cost) = rollup_cost {
-        state.hooks.on_event(
-            parent_session_id,
-            false,
-            WorkerInboundEvent::SinkFrame {
-                event: "interactive-event".to_string(),
-                payload: json!({
-                    "sessionId": parent_session_id,
-                    "seq": 0,
-                    "event": "cost_update",
-                    // `+ 0.0` is defence in depth, not the load-bearing guard:
-                    // the capture rejects negatives, so no `-0.0` can reach
-                    // here. It keeps the wire's "never a signed zero" invariant
-                    // true at every writer of `costUsd`.
-                    "payload": { "costUsd": rollup_cost + 0.0, "source": "subagent" },
-                }),
-            },
-        );
-    }
+    // WHAT DID NOT MOVE. The child's OWN `cost_update` frames still key to the
+    // CHILD's id and land on the child's own row and its own card — that is the
+    // `router.rs` `cost_update` exception's job and it is untouched. And the
+    // `subagent-closed` hand-off emitted just above still carries
+    // `metrics.cost` verbatim, so the Client's child card and the salvage path
+    // lose nothing. `finish_subagent` therefore now emits NO money frame at all:
+    // the absence is the contract, pinned by
+    // `finish_subagent_emits_no_parent_keyed_cost_frame`.
     // The `reaping` flag is set FIRST (the `Exited` is EXPECTED: NO
     // `on_crash`).
     {
@@ -1525,13 +1523,21 @@ mod tests {
         );
     }
 
-    /// A child's money accumulates ACROSS calls — a SUM, not the `max` the
-    /// neighbouring token fields use. A turn's token usage is cumulative per
-    /// message (so the largest frame wins), but money is spent per call, and
-    /// copying the `max` rule here would report one call's cost for a
-    /// ten-call child. This pin is what discriminates the two rules.
+    /// A child's frames are **last-frame-wins** — the capture holds the child's
+    /// CUMULATIVE TOTAL, not a sum (Fulcrum T2, amending ADR 0082's "deltas not
+    /// totals").
+    ///
+    /// Superseded shape: this pin used to discriminate SUM vs `max` (two frames
+    /// `0.001` / `0.002` had to read `0.003`, and a `max` copy of the neighbouring
+    /// token rule would read `0.002`). The frames moved to totals, so the child's
+    /// LAST frame already IS the total and summing them would report `0.003` for a
+    /// child that spent `0.002` — and the parent's row, now a SNAPSHOT store,
+    /// would take that inflated figure as its own. The rule that survives
+    /// unchanged is the one that made the old pin non-tautological: the two
+    /// numbers differ, so neither "first frame wins" nor "sum" nor "max" is
+    /// satisfiable by accident — `0.002` is the only reading that is last-wins.
     #[test]
-    fn a_child_cost_frame_accumulates_across_calls() {
+    fn a_child_cost_frame_is_the_childs_running_total_last_frame_wins() {
         let capture = SubagentCapture::new();
         capture.observe_sink_frame(
             "interactive-event",
@@ -1543,9 +1549,26 @@ mod tests {
         );
         let cost = capture.cost_usd().expect("two priced frames were observed");
         assert!(
-            (cost - 0.003).abs() < f64::EPSILON,
-            "the child's cost is the SUM of its frames (0.001 + 0.002), got {cost} — \
-             a `max` copy of the token rule would report 0.002"
+            (cost - 0.002).abs() < f64::EPSILON,
+            "the child's figure is the LAST frame (its running total), got {cost} — \
+             0.003 would be the retired SUM and 0.001 a first-frame-wins bug"
+        );
+    }
+
+    /// A replayed child frame changes nothing (the same idempotency the DB write
+    /// gained, at the capture seam): the child's total is a snapshot, so a
+    /// duplicate frame is not a second spend.
+    #[test]
+    fn a_replayed_child_frame_does_not_move_the_captured_total() {
+        let capture = SubagentCapture::new();
+        let frame = child_cost_frame("child-1", json!(0.0000341));
+        capture.observe_sink_frame("interactive-event", &frame);
+        let once = capture.cost_usd().expect("a figure was captured");
+        capture.observe_sink_frame("interactive-event", &frame);
+        let twice = capture.cost_usd().expect("still a figure");
+        assert_eq!(
+            once, twice,
+            "a re-delivered total frame is a no-op at the capture, too"
         );
     }
 
@@ -1598,7 +1621,7 @@ mod tests {
     /// A `-0.0` the child reports is normalised to `+0.0` at the capture's parse
     /// seam, so the roll-up can never carry a signed zero onto the wire (the
     /// emitter-side normalisation covers the loop's own frames; this covers the
-    /// sum). A real zero stays a real figure.
+    /// captured total). A real zero stays a real figure.
     #[test]
     fn a_negative_zero_child_cost_is_normalised_to_positive_zero() {
         let capture = SubagentCapture::new();
@@ -1775,16 +1798,33 @@ mod tests {
     }
 }
 
-/// The roll-up half of issue #87 driven end to end through `finish_subagent`
-/// (the capture pins above cannot see the emission, and the emission is the
-/// other half of the roll-up).
+/// THE ONE-WRITER RULE, pinned where the second writer used to live.
+///
+/// These tests used to drive the parent-keyed ROLL-UP frame end to end through
+/// `finish_subagent` (issue #87's "the child's money reaches the parent"). That
+/// frame is DELETED, and these pins are its replacement: they assert its
+/// ABSENCE, and that everything the frame was NOT — the `subagent-closed`
+/// hand-off, its CHILD keying, its figure — still happens.
+///
+/// Why the frame had to go: a `cost_update` frame is a SNAPSHOT and the store
+/// OVERWRITES, so two writers on one store key make the last one win. This
+/// module's roll-up and the parent's own `emit_cost_update` frames were both
+/// keyed to the parent, and the parent's accumulator had never seen the child —
+/// so the parent's next frame erased the child's money (parent 0.003 → child
+/// 0.002 → parent 0.006 stored 0.009, not 0.011). The child's money is now
+/// folded into the PARENT's own accumulator by `AgentLoop::fold_child_cost`,
+/// fed from the value `harness::dispatch::dispatch_subagent` returns; that fold
+/// is pinned loop-side in `harness/loop/tests/cost.rs`
+/// (`a_delegating_parents_total_keeps_its_childs_money`,
+/// `two_children_accumulate_into_one_parent_total`). What is left for THIS
+/// module to prove is that it no longer competes for the parent's key.
 #[cfg(test)]
 mod rollup_tests {
     use super::*;
-    use crate::agent::events::EventSink;
-    use crate::agent::worker::client::{WorkerError, WorkerErrorKind};
-    use crate::agent::worker::manager::registry::ManagerState;
-    use crate::agent::worker::manager::{ClosureHooks, WorkerFactory};
+    use crate::events::EventSink;
+    use crate::worker::client::{WorkerError, WorkerErrorKind, WorkerInboundEvent};
+    use crate::worker::manager::registry::ManagerState;
+    use crate::worker::manager::{ClosureHooks, WorkerFactory};
 
     /// A sink that records every `(name, payload)` it is given.
     struct RecordingSink {
@@ -1805,7 +1845,7 @@ mod rollup_tests {
     struct NeverSpawns;
 
     impl WorkerFactory for NeverSpawns {
-        fn spawn(&self) -> Result<crate::agent::worker::client::WorkerHandle, WorkerError> {
+        fn spawn(&self) -> Result<crate::worker::client::WorkerHandle, WorkerError> {
             Err(WorkerError {
                 kind: WorkerErrorKind::SpawnFailed,
             })
@@ -1815,18 +1855,20 @@ mod rollup_tests {
     /// The harness's `WorkerHooks`.
     ///
     /// `on_event` FORWARDS a `SinkFrame` into the same `RecordingSink` the
-    /// `sink_for` closure hands out. Production's `on_event` is
-    /// `SessionWorkerHooks::on_event` → `SessionManager::route_event`, whose
-    /// `SinkFrame` arm re-emits the payload verbatim to `self.sink` — so a
-    /// forwarding sink here is the faithful stand-in for that path (and
-    /// `sink_for` stays wired to the same collector, because the other
-    /// emissions in `finish_subagent` — `interactive-request-close` and
-    /// `subagent-closed` — still go straight to the sink).
+    /// `sink_for` closure hands out — which is what makes the absence pin below
+    /// non-vacuous. Production's `on_event` is `SessionWorkerHooks::on_event` →
+    /// `SessionManager::route_event`, whose `SinkFrame` arm persists and then
+    /// re-emits the payload verbatim; a deleted writer that still went through
+    /// `on_event` would therefore be VISIBLE here, and a no-op `on_event` would
+    /// have made "zero roll-up frames" true for the wrong reason.
     ///
-    /// It is deliberately NOT the real router: `ManagerState` has no `db`
-    /// field (`registry.rs`), so nothing in this module can assert a write.
-    /// That half lives in `router.rs`'s
-    /// `a_parent_keyed_cost_frame_from_the_router_writes_the_parents_row`.
+    /// It is deliberately NOT the real router: `ManagerState` has no `db` field
+    /// (`registry.rs`), so nothing in this module can assert a write. That half
+    /// lives in `router.rs`'s
+    /// `a_parent_keyed_cost_frame_from_the_router_writes_the_parents_row`, which
+    /// now pins the SURVIVING producer (the child's own frames, and the parent
+    /// loop's fold, which arrive as ordinary main-session frames) rather than
+    /// the deleted roll-up.
     fn state_with(collector: Arc<RecordingSink>) -> ManagerState {
         let forwarded = collector.clone();
         ManagerState::new(
@@ -1834,10 +1876,6 @@ mod rollup_tests {
             Arc::new(ClosureHooks {
                 on_crash: Box::new(|_, _, _| {}),
                 on_event: Box::new(move |_, _, evt| {
-                    // The roll-up now reaches the UI through the ROUTER (the
-                    // `SinkFrame` re-emission), not through `sink_for`. A
-                    // no-op `on_event` here would silently swallow it and make
-                    // the `frames.len() == 1` assertions vacuous.
                     if let WorkerInboundEvent::SinkFrame { event, payload } = evt {
                         forwarded.emit(&event, payload);
                     }
@@ -1848,21 +1886,24 @@ mod rollup_tests {
         )
     }
 
-    fn wire() -> crate::agent::worker::protocol::SubagentDispatchWire {
-        crate::agent::worker::protocol::SubagentDispatchWire {
+    fn wire() -> crate::worker::protocol::SubagentDispatchWire {
+        crate::worker::protocol::SubagentDispatchWire {
             id: "d1".to_string(),
             parent_session_id: "parent-1".to_string(),
             parent_cwd: "/tmp".to_string(),
             parent_enabled_tools: Vec::new(),
             agent_name: "tester".to_string(),
-            name_resolution: crate::agent::subagent::AgentNameResolution::Matched,
-            launch: crate::agent::subagent::LaunchConfig::default(),
+            name_resolution: crate::subagent::AgentNameResolution::Matched,
+            launch: crate::subagent::LaunchConfig::default(),
             task: "t".to_string(),
             model_key: "fake/m1".to_string(),
         }
     }
 
-    fn rollups(events: &StdMutex<Vec<(String, Value)>>) -> Vec<Value> {
+    /// Every `cost_update` frame the run emitted, on ANY key. The envelope is
+    /// returned whole so a failure message can show which key a stray frame
+    /// carried — the whole point of the absence pins below.
+    fn cost_frames(events: &StdMutex<Vec<(String, Value)>>) -> Vec<Value> {
         events
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1872,16 +1913,19 @@ mod rollup_tests {
             .collect()
     }
 
-    /// The roll-up frame is keyed to the **PARENT**, never to the child — which
-    /// is what makes it additive rather than a double count. The child's OWN
-    /// frames carry the CHILD id (pinned loop-side by
-    /// `a_priced_call_emits_one_cost_update_frame_carrying_that_calls_cost`,
-    /// where the envelope's `sessionId` is the emitting loop's own id), so the
-    /// two land in DIFFERENT store keys and the parent's sum gains the child's
-    /// money exactly once. Also pins the envelope, the `source`, and that the
-    /// `subagent-closed` hand-off still carries the same figure.
+    /// THE ABSENCE PIN: `finish_subagent` emits NO `cost_update` frame for a
+    /// child that spent real money.
+    ///
+    /// This is the one-writer rule measured at the second writer's old address.
+    /// It is NOT vacuous, and the two preconditions below are what make that
+    /// checkable rather than assumed: (1) the child's figure is a REAL
+    /// `Some(0.0000341)` — the exact figure the deleted frame used to carry — so
+    /// the old gate `if let Some(..)` would have fired; and (2) the collector
+    /// demonstrably received THIS run's emissions (the `subagent-closed`
+    /// assertion), so "zero frames" is a statement about the code and not about
+    /// a sink nobody wrote to.
     #[tokio::test]
-    async fn the_rollup_frame_is_keyed_to_the_parent_not_the_child() {
+    async fn finish_subagent_emits_no_parent_keyed_cost_frame() {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let collector = Arc::new(RecordingSink {
             events: events.clone(),
@@ -1898,7 +1942,8 @@ mod rollup_tests {
                     output: "done".to_string(),
                     input_tokens: 10,
                     output_tokens: 2,
-                    // T08's measured band: four priced calls summed.
+                    // T08's measured band — the figure the deleted roll-up
+                    // carried, and the figure the PARENT's fold now carries.
                     cost: Some(0.0000341),
                     duration_ms: 5,
                 },
@@ -1907,71 +1952,38 @@ mod rollup_tests {
         )
         .await;
 
-        let frames = rollups(&events);
-        assert_eq!(frames.len(), 1, "exactly ONE roll-up frame per child");
-        assert_eq!(
-            frames[0]["sessionId"], "parent-1",
-            "the roll-up is keyed to the PARENT — the child's own frames carry \
-             the CHILD id, so the two never share a store key (no double count)"
-        );
-        assert_ne!(
-            frames[0]["sessionId"], "child-1",
-            "the roll-up must NOT re-key the child's money to the child"
-        );
-        assert_eq!(frames[0]["seq"], 0);
-        assert_eq!(frames[0]["event"], "cost_update");
-        assert_eq!(frames[0]["payload"]["source"], "subagent");
-        assert_eq!(
-            frames[0]["payload"]["costUsd"].as_f64().expect("a number"),
-            0.0000341,
-            "the child's summed cost, whole (the sub-cliff figure survives the wire)"
-        );
-
-        // The `subagent-closed` hand-off still fires, still CHILD-keyed, with
-        // the SAME figure — the roll-up is an addition, not a relocation.
+        // Precondition: the collector is LIVE for this run.
         let closed = {
             let held = events.lock().unwrap_or_else(|p| p.into_inner());
             held.iter()
                 .find(|(name, _)| name == "subagent-closed")
                 .map(|(_, p)| p.clone())
         }
-        .expect("the `subagent-closed` still fires");
-        assert_eq!(closed["sessionId"], "child-1", "closed stays CHILD-keyed");
-        assert_eq!(closed["metrics"]["cost"].as_f64(), Some(0.0000341));
-    }
-
-    /// A child that reported NO figure contributes NO frame — the gate is the
-    /// `Option` itself, and the wire spelling of "no figure" on the hand-off is
-    /// `"cost": null` (present-and-null), never a `costUsd: 0` that the summing
-    /// store would turn into a phantom `$0.00`.
-    #[tokio::test]
-    async fn a_child_that_spent_nothing_emits_no_rollup_frame() {
-        let events = Arc::new(StdMutex::new(Vec::new()));
-        let collector = Arc::new(RecordingSink {
-            events: events.clone(),
-        });
-        let state = state_with(collector);
-        finish_subagent(
-            &state,
-            "child-2",
-            "parent-1",
-            &wire(),
-            // `preflight_failed` — the child never started, nothing was spent.
-            preflight_failed("never started".to_string()),
-            &SubagentOutcomeSink::Oneshot(Arc::new(StdMutex::new(None))),
-        )
-        .await;
-
+        .expect("the `subagent-closed` still fires — the sink is being written");
+        // THE pin: not one `cost_update` frame, on ANY key, from this function.
+        let frames = cost_frames(&events);
         assert!(
-            rollups(&events).is_empty(),
-            "a child that spent nothing contributes NO frame at all"
+            frames.is_empty(),
+            "`finish_subagent` must emit NO `cost_update` frame at all: it would              be a SECOND writer on the parent's store key, and since a frame is              a snapshot the parent's next frame would erase the child's money.              The fold in the parent's loop owns that key now. Got: {frames:?}"
+        );
+        // And the figure the deleted frame carried is still handed off — the
+        // removal moved the money's ROUTE, not its existence.
+        assert_eq!(
+            closed["metrics"]["cost"].as_f64(),
+            Some(0.0000341),
+            "the `subagent-closed` hand-off still carries the child's total"
+        );
+        assert_eq!(
+            closed["sessionId"], "child-1",
+            "and it stays CHILD-keyed — the child's own card reads it there"
         );
     }
 
-    /// A FAILED child's money still rolls up: the salvage exists so a child's
-    /// real work is not reported as free, and the same applies to its cost.
+    /// A DEAD child's money also produces no parent-keyed frame (the `Failed`
+    /// arm used to roll up too), and its salvage hand-off still reports the
+    /// figure it really spent.
     #[tokio::test]
-    async fn a_failed_childs_cost_still_rolls_up() {
+    async fn a_failed_child_emits_no_parent_keyed_cost_frame_either() {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let collector = Arc::new(RecordingSink {
             events: events.clone(),
@@ -1988,7 +2000,7 @@ mod rollup_tests {
             }),
         );
         let outcome = failed_with_salvage(
-            crate::agent::subagent::SubagentFailureReason::Unresponsive,
+            crate::subagent::SubagentFailureReason::Unresponsive,
             "unresponsive".to_string(),
             &capture,
             100,
@@ -2003,25 +2015,87 @@ mod rollup_tests {
         )
         .await;
 
-        let frames = rollups(&events);
-        assert_eq!(frames.len(), 1, "a dead child's money is still money spent");
-        assert_eq!(frames[0]["sessionId"], "parent-1");
+        let closed = {
+            let held = events.lock().unwrap_or_else(|p| p.into_inner());
+            held.iter()
+                .find(|(name, _)| name == "subagent-closed")
+                .map(|(_, p)| p.clone())
+        }
+        .expect("the `subagent-closed` still fires for a dead child");
+        assert!(
+            cost_frames(&events).is_empty(),
+            "a dead child's money folds in the parent's loop too — no second              frame from here: {frames:?}",
+            frames = cost_frames(&events)
+        );
         assert_eq!(
-            frames[0]["payload"]["costUsd"].as_f64().expect("a number"),
-            0.00001243
+            closed["metrics"]["cost"].as_f64(),
+            Some(0.00001243),
+            "ADR 0055's rule survives in money form: a reaped child is not free"
         );
     }
 
-    /// A child that NEVER reported a figure contributes NO roll-up frame, and
-    /// its `subagent-closed` hand-off says `"cost": null` — the wire spelling
-    /// of "no figure" (issue #107). Under the old `f64` hand-off this same
-    /// child arrived with `"cost": 0.0`, which is a FIGURE: the card could not
-    /// tell a child that never cost anything from one whose calls reported a
-    /// genuine `$0.00`, and the summing store would have turned a phantom zero
-    /// into a phantom `$0.00`. The frame-EXISTENCE gate is now the `Option`
-    /// itself: `None` → no frame, `Some(0.0)` → frame.
+    /// A REAL-ZERO child still hand-offs the NUMBER `0.0` (issue #107) even
+    /// though it now emits no frame at all.
+    ///
+    /// The deleted frame's gate was `Option`: `None` → no frame, `Some(0.0)` →
+    /// frame. With the frame gone the `Option` no longer decides whether to
+    /// EMIT; it decides what the hand-off SAYS, and the fold on the other side
+    /// of the seam keeps the same rule (`a_never_priced_child_contributes_no_
+    /// fold_frame`). This pin keeps the two states distinguishable at the only
+    /// money hand-off this module still owns.
     #[tokio::test]
-    async fn a_never_priced_child_emits_no_rollup_frame() {
+    async fn a_real_zero_child_still_hand_offs_the_number_and_emits_no_frame() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let collector = Arc::new(RecordingSink {
+            events: events.clone(),
+        });
+        let state = state_with(collector);
+        finish_subagent(
+            &state,
+            "child-5",
+            "parent-1",
+            &wire(),
+            SubagentOutcome::Completed {
+                output: "done".to_string(),
+                metrics: SubagentMetrics {
+                    output: "done".to_string(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost: Some(0.0),
+                    duration_ms: 1,
+                },
+            },
+            &SubagentOutcomeSink::Oneshot(Arc::new(StdMutex::new(None))),
+        )
+        .await;
+
+        let closed = {
+            let held = events.lock().unwrap_or_else(|p| p.into_inner());
+            held.iter()
+                .find(|(name, _)| name == "subagent-closed")
+                .map(|(_, p)| p.clone())
+        }
+        .expect("the `subagent-closed` still fires");
+        assert_eq!(
+            closed["metrics"]["cost"].as_f64(),
+            Some(0.0),
+            "a real zero is a FIGURE and is never spelled `null`"
+        );
+        assert!(
+            !closed["metrics"]["cost"].is_null(),
+            "the two states stay distinguishable: {cost:?}",
+            cost = closed["metrics"]["cost"]
+        );
+        assert!(
+            cost_frames(&events).is_empty(),
+            "and a real zero earns no parent-keyed frame either — the fold on              the parent's side is what turns it into the parent's total"
+        );
+    }
+
+    /// A NEVER-PRICED child hand-offs `"cost": null` and emits nothing (the
+    /// other half of the pair above).
+    #[tokio::test]
+    async fn a_never_priced_child_hand_offs_null_and_emits_no_frame() {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let collector = Arc::new(RecordingSink {
             events: events.clone(),
@@ -2040,9 +2114,8 @@ mod rollup_tests {
         .await;
 
         assert!(
-            rollups(&events).is_empty(),
-            "a child that reported NO figure contributes NO `cost_update` \
-             frame to the parent — absence is spelled by NOT emitting"
+            cost_frames(&events).is_empty(),
+            "a child that reported NO figure contributes NO `cost_update` frame              to the parent — absence is spelled by NOT emitting"
         );
         let closed = {
             let held = events.lock().unwrap_or_else(|p| p.into_inner());

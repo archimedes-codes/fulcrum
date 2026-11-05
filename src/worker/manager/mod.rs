@@ -48,11 +48,11 @@ pub(crate) use subagent_flow::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::debuglog;
-use crate::agent::events::EventSink;
-use crate::agent::subagent::SubagentOutcome;
-use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
-use crate::agent::worker::protocol::{StartEnv, SubagentDispatchWire};
+use crate::debuglog;
+use crate::events::EventSink;
+use crate::subagent::SubagentOutcome;
+use crate::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
+use crate::worker::protocol::{StartEnv, SubagentDispatchWire};
 
 /// The default **Dead bound** (ADR 0055): 30 min of UNEXPLAINED SILENCE **as the
 /// Supervisor OBSERVES it**. It is the most a **Subagent session** may go with no
@@ -72,7 +72,9 @@ pub const DEFAULT_SUBAGENT_DEAD_BOUND: std::time::Duration =
 
 /// The Worker spawn seam (the test injection point): production is
 /// `WorkerHandle::spawn(std::env::current_exe().as_path())`; tests are
-/// the `fake_worker` binary (the manifest-dir path convention).
+/// the `fake_worker` binary (resolved through `test_support::target_debug_dir()`
+/// — the crate's two-levels-up `target/` resolver; since S8.3 this module lives in
+/// `fulcrum-core`, so the manifest-parent convention it used to name is wrong here).
 pub trait WorkerFactory: Send + Sync {
     fn spawn(&self) -> Result<WorkerHandle, WorkerError>;
 }
@@ -403,6 +405,59 @@ impl WorkerManager {
         delivered
     }
 
+    /// (Fulcrum T3) Mirror the three live-reload fields into a session's
+    /// STORED `StartEnv`, after the `config-update` frame was DELIVERED.
+    ///
+    /// This is the half that makes the push reach CHILDREN, and it is the
+    /// reason the registry keeps the env at all: `subagent_flow` builds every
+    /// child's five packaged fields from the PARENT's stored env
+    /// (`DesktopConfig::from_env(&parent_env)`), so refreshing this copy is
+    /// what gives a subagent the edited policy / override layer on the NEXT
+    /// dispatch — ADR 0023's "next dispatch, no restart", which a frame sent
+    /// only to the parent's stdin would not provide.
+    ///
+    /// Callers must send FIRST and mirror ONLY on success (finding 12's rule,
+    /// the `refresh_live_models` discipline): a frame that never arrived means
+    /// the loop never applied it, and mirroring then would make the next child
+    /// inherit a policy its parent is not running.
+    ///
+    /// Only the three fields the frame carries move. `providers` /
+    /// `mcp_servers` stay the construction snapshot — the recorded residual
+    /// hole — so a mid-session provider or MCP edit still needs a restart.
+    pub fn mirror_stored_desktop_config(
+        &self,
+        session_id: &str,
+        file_policy: Option<&crate::policy::FilePolicy>,
+        web: Option<&crate::web::config::WebSettings>,
+        agent_overrides: Option<
+            &std::collections::HashMap<String, crate::config_types::AgentOverrideFields>,
+        >,
+    ) {
+        let mut map = self.state.workers.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = map.get_mut(session_id) else {
+            return;
+        };
+        if let Some(p) = file_policy {
+            entry.env.file_policy = p.clone();
+        }
+        if let Some(w) = web {
+            entry.env.web = w.clone();
+        }
+        if let Some(o) = agent_overrides {
+            entry.env.agent_overrides = o.clone();
+        }
+    }
+
+    /// (test only) The ATTACH-time `StartEnv` the registry holds for a session
+    /// — the copy `subagent_flow` builds each child's five packaged fields from.
+    /// `None` when the session is not attached. Follows the `test_*` naming
+    /// convention of the accessors above; production reads this map only through
+    /// the typed methods, never through a getter.
+    pub fn test_env_for(&self, session_id: &str) -> Option<StartEnv> {
+        let map = self.state.workers.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(session_id).map(|e| e.env.clone())
+    }
+
     /// The session's `WorkerHandle` (a clone) — `None` when the session is not
     /// attached (or was already reaped). The `SessionManager` uses this to relay
     /// frames (prompt / config / abort / responses) to the session's Worker.
@@ -437,5 +492,48 @@ impl WorkerManager {
                 l.open_gates.remove(request_id);
             });
         }
+    }
+}
+
+// ── T5/S4 — the crate's subagent-dispatch seam, implemented (plan Step E.2) ───
+//
+// THE SECOND INSTANTIATION PIN OF S4. `crate::seams::Dispatcher` (the crate's
+// own name for `fulcrum_core::seams::Dispatcher` from inside the package) exists
+// because `SubagentSessionManager` (moving in S5) currently holds an
+// `Arc<WorkerManager>` — edge E2, `subagent.rs:28` — and the crate cannot import
+// `archimedes_lib` to keep holding it. After S5 the manager holds
+// `Arc<dyn Dispatcher>` and this block is what makes that resolve back here.
+//
+// The proof S4 asks for is that this COMPILES, not that it runs: both bodies are a
+// one-line delegation to the inherent method of the same name, so there is no new
+// behaviour to test — the behaviour is `dispatch_subagent_to`'s and
+// `cancel_subagent`'s, already covered by `worker_e2e.rs` and the manager's own
+// tests. `src-tauri/tests/fulcrum_seams.rs` asserts the instantiation and records
+// the deletion that reddens it.
+//
+// Exactly TWO methods, matching the trait: the plain `dispatch_subagent` above is
+// NOT exposed through the seam, because nothing in the crate's set calls it (it is
+// the `Outbound::SubagentDispatch` route that answers a requesting Worker rather
+// than a oneshot) — the S3 RULING's standing instruction is to stop writing seam
+// methods with no caller.
+impl crate::seams::Dispatcher for WorkerManager {
+    fn dispatch_subagent_to(
+        &self,
+        parent_session_id: &str,
+        wire: crate::worker_types::SubagentDispatchWire,
+        child_session_id: String,
+        outcome: tokio::sync::oneshot::Sender<crate::subagent_types::SubagentOutcome>,
+    ) {
+        WorkerManager::dispatch_subagent_to(
+            self,
+            parent_session_id,
+            wire,
+            child_session_id,
+            outcome,
+        );
+    }
+
+    fn cancel_subagent(&self, child_session_id: &str) {
+        WorkerManager::cancel_subagent(self, child_session_id);
     }
 }

@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::events::EventSink;
-use crate::agent::harness::catalog::Model;
-use crate::agent::harness::dispatch::SubagentDispatcher;
-use crate::agent::harness::ModelKey;
-use crate::agent::subagent::{AgentNameResolution, LaunchConfig, SubagentCancel, SubagentOutcome};
-use crate::agent::worker::protocol::Outbound;
+use crate::events::EventSink;
+use crate::harness::catalog::Model;
+use crate::harness::dispatch::SubagentDispatcher;
+use crate::harness::ModelKey;
+use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentCancel, SubagentOutcome};
+use crate::worker::protocol::Outbound;
 
 /// The `IpcDispatcher`'s waiter map (shared with the `WorkerCore` — the
 /// `SubagentResult` handler resolves a waiter by the dispatch `id`).
@@ -110,9 +110,9 @@ impl SubagentDispatcher for IpcDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::events::EventSink;
-    use crate::agent::harness::catalog::Model;
-    use crate::agent::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
+    use crate::events::EventSink;
+    use crate::harness::catalog::Model;
+    use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::mpsc;
@@ -213,10 +213,10 @@ mod tests {
                     .expect("the waiter is registered under the frame id");
                 waiter
                     .send(SubagentOutcome::Failed {
-                        reason: crate::agent::subagent::SubagentFailureReason::Other,
+                        reason: crate::subagent::SubagentFailureReason::Other,
                         error: "boom".to_string(),
                         output: String::new(),
-                        metrics: crate::agent::subagent::SubagentMetrics::default(),
+                        metrics: crate::subagent::SubagentMetrics::default(),
                     })
                     .expect("the waiter is live");
             }
@@ -229,10 +229,10 @@ mod tests {
         assert_eq!(
             outcome,
             SubagentOutcome::Failed {
-                reason: crate::agent::subagent::SubagentFailureReason::Other,
+                reason: crate::subagent::SubagentFailureReason::Other,
                 error: "boom".to_string(),
                 output: String::new(),
-                metrics: crate::agent::subagent::SubagentMetrics::default(),
+                metrics: crate::subagent::SubagentMetrics::default(),
             },
             "resolving the registered waiter resolves the returned oneshot"
         );

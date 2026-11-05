@@ -12,12 +12,27 @@
 
 pub mod anthropic;
 pub mod openai;
-mod overflow;
 pub mod responses;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transport;
-pub mod types;
+
+// ── T5/S4 — `types.rs` and `overflow.rs` moved to `fulcrum-core` ──────────────
+//
+// Both moved because `StartEnv.transcript` is an `Option<Vec<ChatMessage>>` and
+// `StoreFrame`'s sibling wire types embed it, so E1 could not be severed without
+// it; `provider_types.rs` in turn calls `provider_overflow::is_context_overflow_text`
+// in production (`parse_error_chunk`, the ONE classifier of the three wires), so
+// the two moved together. `Provider`/`ModelRequest`/`ProviderError` came as part of
+// the same file — moving half a module is not a thing.
+//
+// ALIASED rather than re-exported by name, deliberately: `transport.rs`,
+// `openai.rs`, `anthropic.rs`, `responses.rs` and `test_util.rs` all STAY desktop
+// through S5 and every one of them imports `super::types::…` (and `transport.rs`
+// imports `super::overflow::…`). The alias keeps all five compiling with ZERO
+// edits — the S1 lesson (re-export the MODULE, not just named symbols: deleting
+// one module-level line there cost 36 errors) applied to a split module.
+pub use crate::{provider_overflow as overflow, provider_types as types};
 
 pub use anthropic::{normalize_anthropic_base_url, normalize_wire_base_url, AnthropicProvider};
 pub use openai::OpenAiCompatibleProvider;
@@ -26,6 +41,11 @@ pub use types::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest, Provider,
     ProviderError, ProviderEvent, ToolCall, ToolCallDelta, ToolSpec, Usage,
 };
+// (T5/S4, Step A.3) The two `pub(crate)` free functions and the two `pub(super)`
+// wire shapes in the moved file are now `pub`, because a package boundary erases
+// both visibilities and the STAYING `openai.rs`/`anthropic.rs`/`responses.rs` name
+// all four. Re-exported through the alias so their import sites did not change.
+pub use types::{cost_usd_from_usage, parse_error_chunk, WireToolCall};
 
 /// Build the `Provider` for a `Model` (the `api` discriminator — ADR
 /// 0024; the `SessionManager`'s default factory + the tests).
@@ -33,11 +53,11 @@ pub use types::{
 /// The `None`-headers shorthand (issue #129): no custom headers on the wire.
 /// [`build_provider_with_headers`] is the header-carrying form the two
 /// production construction sites use.
-pub fn build_provider(m: &crate::agent::harness::catalog::Model) -> Box<dyn Provider> {
-    match crate::agent::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
+pub fn build_provider(m: &crate::harness::catalog::Model) -> Box<dyn Provider> {
+    match crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
         .unwrap_or_default()
     {
-        crate::agent::harness::WireApi::AnthropicMessages => Box::new(AnthropicProvider {
+        crate::harness::WireApi::AnthropicMessages => Box::new(AnthropicProvider {
             // T3b (#131): the Messages wire wants the ROOT — the client appends
             // its own `/v1/messages`, so a `{root}/v1` base (the Settings'
             // convention, and what the LiteLLM discovery rows carry) would
@@ -45,7 +65,7 @@ pub fn build_provider(m: &crate::agent::harness::catalog::Model) -> Box<dyn Prov
             // (`n(n(u)) == n(u)`), so re-running it is a no-op.
             base_url: normalize_wire_base_url(
                 &m.base_url,
-                crate::agent::harness::WireApi::AnthropicMessages,
+                crate::harness::WireApi::AnthropicMessages,
             ),
             api_key: m.api_key.clone(),
             custom_headers: None,
@@ -54,7 +74,7 @@ pub fn build_provider(m: &crate::agent::harness::catalog::Model) -> Box<dyn Prov
         // (byte-identical to today — see the note above
         // `build_provider_with_headers` for why the append rule is not applied
         // here, and `normalize_wire_base_url` for the rule itself).
-        crate::agent::harness::WireApi::OpenAiResponses => Box::new(OpenAiResponsesProvider {
+        crate::harness::WireApi::OpenAiResponses => Box::new(OpenAiResponsesProvider {
             base_url: m.base_url.clone(),
             api_key: m.api_key.clone(),
             custom_headers: None,
@@ -71,56 +91,69 @@ pub fn build_provider(m: &crate::agent::harness::catalog::Model) -> Box<dyn Prov
     }
 }
 
-/// Expand + validate ONE provider's custom headers from `settings.json`
-/// (R1, issue #129 — the completion-wire path). `config_dir` is the Worker's
-/// settings home (`env.config_dir`, ALREADY threaded into `AgentLoop`); the
-/// row is the one whose `id == model.provider`. A missing row / a row with no
-/// `headers` → `None` (no custom headers — the current behaviour byte-for-
-/// byte); an unreadable settings file degrades the same way (`config::
-/// load_settings` never fails — it returns the defaults + its own warning), so
-/// provider CONSTRUCTION never fails because headers were unreadable.
+/// Expand + validate ONE provider's custom headers from the PACKAGED provider
+/// rows (R1, issue #129 — the completion-wire path; Fulcrum T3 repoints it at
+/// the envelope). The rows are `StartEnv.providers` — the desktop's
+/// `providers` vec as the Supervisor packaged it — and the row is the one whose
+/// `id == model.provider`. No row / a row with no `headers` → `None` (no custom
+/// headers — the behaviour byte-for-byte), which is ALSO what an old envelope
+/// (`#[serde(default)]` → the empty vec) produces, so the additive path cannot
+/// change anyone's headers.
+///
+/// This replaced `provider_headers_for(config_dir, model)`, which read
+/// `settings.json` through the loop's `config_dir`. Removing that read is the
+/// point: BOTH header sites (`worker/core.rs`'s loop construction and
+/// `AgentLoop::set_model`) are worker-reachable, so packaging four fields and
+/// leaving this one would still leave the Worker opening `settings.json`.
 ///
 /// The expansion engine is the SAME `provider_auth::headers::expand_map` the
-/// discovery spine (T2a) calls — a header value is expanded once and both
-/// wires see the identical result. The insecure-HTTP gate is NOT re-checked
-/// here: it belongs to the discovery spine (T2a's `validate_base_url`), and
-/// this lookup is synchronous by construction (`AgentLoop::set_model` is a
-/// sync `&mut self` method).
-pub(crate) fn provider_headers_for(
-    config_dir: &std::path::Path,
-    model: &crate::agent::harness::catalog::Model,
+/// discovery spine (T2a) calls — a header value is expanded once and both wires
+/// see the identical result — and it still runs HERE, against the Worker's own
+/// process env (the env the Worker inherited from the Supervisor at spawn, so
+/// the same `$VAR` resolves to the same value as it did when the lookup read
+/// the file in-process). The insecure-HTTP gate is NOT re-checked here: it
+/// belongs to the discovery spine (T2a's `validate_base_url`), and this lookup
+/// is synchronous by construction (`AgentLoop::set_model` is a sync `&mut self`
+/// method).
+// (Step A.3) RAISED from `pub(crate)`: the STAYING desktop `worker/core.rs`
+// calls it (the loop-construction header site), and a package boundary erases
+// `pub(crate)`. T8/S8.2 then moved `worker/core.rs` INTO this crate, so the
+// caller is no longer across the boundary and the raise is no longer strictly
+// required — it is KEPT (widening is not the thing to undo under a move, and
+// S8.5's extraction audit is where a visibility tighten belongs if it is wanted).
+pub fn headers_for_providers(
+    providers: &[crate::config_types::ProviderConfig],
+    model: &crate::harness::catalog::Model,
 ) -> Option<std::collections::BTreeMap<String, String>> {
-    let settings = crate::config::load_settings(config_dir);
-    settings
-        .providers
+    providers
         .iter()
         .find(|p| p.id == model.provider)
         .and_then(|p| p.headers.as_ref())
-        .map(crate::agent::provider_auth::headers::expand_map)
+        .map(crate::provider_headers::expand_map)
 }
 
 /// Build the `Provider` for a `Model` WITH the provider's custom headers
 /// (R1, issue #129): the production construction entry —
-/// `build_provider_with_headers(&model, provider_headers_for(dir, model).as_ref())`.
+/// `build_provider_with_headers(&model, headers_for_providers(&rows, model).as_ref())`.
 /// `custom_headers` is the EXPANDED + VALIDATED map; it rides every completion
 /// request through the ONE seam, [`transport::build_client`]'s
 /// `default_headers`. `None` is byte-identical to [`build_provider`] (which
 /// stays the `None` shorthand for the naming path and the tests).
 pub fn build_provider_with_headers(
-    m: &crate::agent::harness::catalog::Model,
+    m: &crate::harness::catalog::Model,
     custom_headers: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Box<dyn Provider> {
-    match crate::agent::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
+    match crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
         .unwrap_or_default()
     {
-        crate::agent::harness::WireApi::AnthropicMessages => Box::new(AnthropicProvider {
+        crate::harness::WireApi::AnthropicMessages => Box::new(AnthropicProvider {
             // T3b (#131): the SAME root-for-Messages pass as `build_provider`
             // (the idempotent strip; the client re-appends `/v1/messages` at
             // its own adapter boundary, so a `{root}/v1` row and a root row
             // both land on `{root}/v1/messages`).
             base_url: normalize_wire_base_url(
                 &m.base_url,
-                crate::agent::harness::WireApi::AnthropicMessages,
+                crate::harness::WireApi::AnthropicMessages,
             ),
             api_key: m.api_key.clone(),
             custom_headers: custom_headers.cloned(),
@@ -128,7 +161,7 @@ pub fn build_provider_with_headers(
         // Completions / Responses keep the configured base VERBATIM — see the
         // note on `build_provider` (the append half of
         // `normalize_wire_base_url` is deliberately NOT applied here).
-        crate::agent::harness::WireApi::OpenAiResponses => Box::new(OpenAiResponsesProvider {
+        crate::harness::WireApi::OpenAiResponses => Box::new(OpenAiResponsesProvider {
             base_url: m.base_url.clone(),
             api_key: m.api_key.clone(),
             custom_headers: custom_headers.cloned(),
@@ -160,8 +193,8 @@ mod tests {
     /// A `Model` test-literal helper (everything else pinned; `api` is
     /// the parameter — the `catalog.rs` tests' `model` helper pattern,
     /// extended with the `api` parameter).
-    fn model(base_url: &str, api: Option<&str>) -> crate::agent::harness::catalog::Model {
-        crate::agent::harness::catalog::Model {
+    fn model(base_url: &str, api: Option<&str>) -> crate::harness::catalog::Model {
+        crate::harness::catalog::Model {
             id: "m/1".to_string(),
             provider: "p".to_string(),
             base_url: base_url.to_string(),

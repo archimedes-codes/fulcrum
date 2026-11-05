@@ -32,7 +32,8 @@
 //!
 //! `CREATE_NO_WINDOW` is documented as ignored for a child that is not a
 //! console application, so the two sites that spawn **our own exe** — the
-//! `--worker` self-exec (`src/agent/worker/client.rs`) and the updater relaunch
+//! `--worker` self-exec (`worker/client.rs`, in this crate since T8/S8.3) and the
+//! updater relaunch
 //! (`src/commands/update.rs`) — could never pop a window in the shipped build,
 //! where the exe is GUI-subsystem. They still route through here, for two
 //! reasons: in a *debug* build the attribute is off and the exe is
@@ -42,7 +43,7 @@
 //! call away.
 //!
 //! What this module deliberately does NOT own: the environment (that is
-//! [`crate::agent::hostenv`]), stdout/stderr (each site chooses those), and any
+//! [`crate::hostenv`]), stdout/stderr (each site chooses those), and any
 //! `STARTUPINFO`/`SW_HIDE` or `DETACHED_PROCESS` route (the former is
 //! nightly-only on stable Rust; the latter is documented to make
 //! `CREATE_NO_WINDOW` *ignored*, and leaves the child free to `AllocConsole`).
@@ -205,7 +206,7 @@ pub fn append_cmd_c(_cmd: &mut tokio::process::Command, _command: &str) {
 /// that keeps its own inline syscall: a `Drop` is synchronous and cannot reach
 /// an `async fn`; its pid is already latched and the census carves it out by
 /// name.
-pub(crate) async fn kill_process_group(pid: Option<u32>, child: &mut tokio::process::Child) {
+pub async fn kill_process_group(pid: Option<u32>, child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         // A negative pid SIGKILLs the WHOLE process group (the child is the
@@ -366,7 +367,15 @@ mod tests {
     /// rename).
     #[test]
     fn production_process_group_kill_lives_only_in_childproc() {
-        const SUDO_EXEC: &str = "agent/interactive/sudo_exec.rs";
+        // T5/S2 repointed every path here at its OWN package, and T5/S3 had to
+        // do it again: `interactive/` moved into the crate with S3, so both
+        // `interactive` paths below carry the `fulcrum-core/` label now. A stale
+        // prefix is not a wrong-file bug but a MISSING file — `production_region`
+        // panics on an unreadable path, so it fails loudly rather than reading as
+        // "0 sites, all clear". That is the property that makes this census the
+        // instructive contrast to the `fake_mcp_stdio` spawners (the status file's
+        // finding 3): a wrong root here is RED, not silently green.
+        const SUDO_EXEC: &str = "fulcrum-core/interactive/sudo_exec.rs";
         // The needle is the negative-pid SIGKILL itself — the syscall shape,
         // not a name that a wrapper could rename.
         const NEEDLE: &str = "libc::kill(-(pid as i32)";
@@ -376,22 +385,22 @@ mod tests {
         let files = [
             SELF,
             SUDO_EXEC,
-            "agent/tools/exec/bash.rs",
-            "agent/worker/client.rs",
-            "agent/interactive/mod.rs",
+            "fulcrum-core/tools/exec/bash.rs",
+            // T8/S8.3: `worker/client.rs` moved into this crate, so its census
+            // label changed root (`archimedes/` → `fulcrum-core/`). A stale
+            // prefix here is a RED, not a skip — `region_of_labeled` panics when
+            // a labelled path names no file.
+            "fulcrum-core/worker/client.rs",
+            // T5/S3: moved with `interactive`.
+            "fulcrum-core/interactive/mod.rs",
         ];
 
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        assert!(
-            src_root.is_dir(),
-            "the census resolved the wrong root: {} is not a directory",
-            src_root.display()
-        );
+        let roots = source_roots();
 
         let sites: Vec<(String, Vec<usize>)> = files
             .iter()
             .map(|rel| {
-                let region = production_region(&src_root.join(rel));
+                let region = region_of_labeled(&roots, rel);
                 let lines: Vec<usize> = region
                     .iter()
                     .filter(|l| l.text.contains(NEEDLE))
@@ -421,7 +430,11 @@ mod tests {
              `{SUDO_EXEC}` (expected 1 — the `SudoGroupGuard::drop` carve-out). At 0 \
              the needle drifted from the code (or a root resolved wrongly: {}), and \
              the zero-check below would pass having seen nothing.",
-            src_root.display(),
+            source_roots()
+                .iter()
+                .map(|r| r.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" + "),
         );
 
         // ── The invariant: nothing else kills a process group.
@@ -569,7 +582,10 @@ mod tests {
     // policy, in the spirit of `hostenv::configured_env` ("the only honest
     // introspection available" for the same class of reason).
     //
-    // Scanned: `src/**/*.rs` ONLY. `tests/*.rs` is deliberately NOT scanned —
+    // Scanned: BOTH packages' `src/**/*.rs` — `crates/fulcrum-core/src` and
+    // `src-tauri/src` (see `source_roots`; since T5/S2 the policed code spans
+    // two packages and a one-root scan would certify the other half unseen).
+    // `tests/*.rs` is deliberately NOT scanned —
     // those integration fixtures build raw `Command`s ON PURPOSE (they launch
     // the built binary, and a fixture that wanted the policy opts in
     // explicitly), so scanning them would demand a change to code whose job is
@@ -588,10 +604,234 @@ mod tests {
         text: String,
     }
 
-    /// The census's own path, `/`-normalised and relative to `src/` — the one
-    /// file allowed to hold `Command::new(` and `creation_flags`. Normalised so
-    /// the comparison holds on Windows, where `strip_prefix` yields `\`.
-    const SELF: &str = "agent/childproc.rs";
+    /// The workspace root — `CARGO_MANIFEST_DIR` TWO levels up.
+    ///
+    /// T5/S2 (Step A-bis) moved this file from `src-tauri/` to
+    /// `crates/fulcrum-core/`, so `CARGO_MANIFEST_DIR` is no longer the package
+    /// that owns the code the census polices, and its `.parent()` is `crates/`,
+    /// not the repo root. Everything below resolves through HERE so there is one
+    /// definition of "where the workspace is" in the crate.
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/fulcrum-core has a grandparent (the repo root)")
+            .to_path_buf()
+    }
+
+    /// The shared cargo `target/` dir. From `crates/fulcrum-core` that is TWO
+    /// levels up, NOT one — the trap T4 left and Step A-bis exists to close.
+    ///
+    /// T5/S3 MOVED THIS HERE (`test_support::target_debug_dir`) and left a
+    /// one-line alias below. The reason is Step A-bis's own instruction — "fix
+    /// once, not eight times" — and S3 is where it stops being hypothetical: the
+    /// first consumers arrived (`mcp/stdio.rs`, `mcp/tool.rs`, `mcp/manager.rs`,
+    /// four `fake_mcp_stdio` spawners). A second definition of "where cargo
+    /// builds" inside the same crate is exactly the drift this helper exists to
+    /// prevent, so the census keeps its local `workspace_root()` (it needs the
+    /// ROOT, to walk two `src/` trees) and defers the `target/debug` half to the
+    /// shared one.
+    ///
+    /// NO S2 FILE CONSUMES THIS, and that was a measured finding, not an
+    /// oversight: nothing in `{tools, web, boundary, policy, definition_permission,
+    /// childproc, skills, agents, roots}` spawns a built binary (grep for
+    /// `target/debug` / `CARGO_BIN_EXE` / `fake_worker` / `fake_mcp_stdio` across
+    /// the moved set returns only prose in doc comments). It landed in S2 anyway
+    /// because the pin below is what makes the resolution provably right BEFORE a
+    /// consumer depends on it — the alternative is S3 discovering it mid-move.
+    /// `#[cfg(test)]` for that reason: an ungated `pub(crate)` fn with no
+    /// production caller is `dead_code`, which the gate's `-D warnings` rejects.
+    #[cfg(test)]
+    pub(crate) fn target_debug_dir() -> std::path::PathBuf {
+        crate::test_support::target_debug_dir()
+    }
+
+    /// The pin Step A-bis demands: `target_debug_dir()` resolves to the directory
+    /// cargo ACTUALLY builds into, proved against `current_exe()`.
+    ///
+    /// # Why the pin had to live in the crate (and what S8.3 changed)
+    ///
+    /// T4's `fixture_path_resolves_to_the_workspace_root_target` used to live in
+    /// the desktop's `worker/client.rs`, which S5 assumed would stay desktop
+    /// through T8 — so it would keep passing while every moved fixture path was
+    /// broken. **T8/S8.3 moved that file, and the assumption turned out to be the
+    /// wrong half:** the moved helper resolved to `<root>/crates/target/debug/…`
+    /// and its two `starts_with` asserts PASSED on the broken path (measured — the
+    /// RED came only from the `is_file()` witness). `client.rs` now carries an
+    /// equality + `current_exe()` pin of its own, so the drift this pin was written
+    /// to catch has a second witness.
+    ///
+    /// This pin stays because it guards the RESOLVER, not one caller: every crate
+    /// fixture spawner (`mcp/stdio.rs`, `mcp/tool.rs`, `mcp/manager.rs`,
+    /// `worker/client.rs`, `worker/manager/tests`) derives from
+    /// `target_debug_dir()`, and comparing against `current_exe()` is the one
+    /// comparison that cannot go green on a wrong LEVEL count.
+    ///
+    /// # How it compares
+    ///
+    /// The ground truth is `current_exe()`: the test binary IS
+    /// `target/debug/deps/<name>-<hash>`, cargo put it there, so walking up twice
+    /// from it gives the real `target/debug` with NO manifest arithmetic involved.
+    /// If the crate's TWO-level resolution drifts to ONE level
+    /// (`crates/target/debug`), it stops equaling the ground truth and this
+    /// reddens. Since S8.3 the crate CAN call `worker/client.rs::fixture_path()`
+    /// directly (same package, both `#[cfg(test)]`) and does — in that module's
+    /// own equality pin — so this pin is now the resolver-level half of a pair
+    /// rather than the only witness.
+    ///
+    /// # Verified non-vacuous
+    ///
+    /// Collapsing `workspace_root()`'s `.parent().and_then(|p| p.parent())` to a
+    /// single `.parent()` makes this fail: the assertion quotes both sides, so the
+    /// failure names `crates/target/debug` against the real one. That is the T4
+    /// lesson applied — a pin that cannot go red is not a pin.
+    #[test]
+    fn target_debug_dir_is_where_cargo_actually_builds() {
+        let claimed = target_debug_dir();
+        let exe = std::env::current_exe().expect("a test binary has a path");
+        let ground_truth = exe
+            .parent() // target/debug/deps
+            .and_then(|deps| deps.parent()) // target/debug
+            .expect("the test binary lives in target/debug/deps");
+
+        assert_eq!(
+            claimed,
+            ground_truth,
+            "`target_debug_dir()` resolved to {claimed:?}, but cargo built THIS test \
+             binary into {ground_truth:?}/deps — the two disagree, so every fixture \
+             path the crate derives from `target_debug_dir()` would spawn an ENOENT \
+             path (or, at a `let _ =` site, quietly nothing). The crate manifest is \
+             {}; the workspace root must be its GRANDPARENT (T5/S2 Step A-bis).",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+
+        // The existence witness. It used to carry a different job: while
+        // `worker/client.rs` was desktop, this was the crate-side half of a
+        // two-member agreement that both packages land on ONE `target/`. S8.3
+        // moved that file, so the agreement is now intra-crate and this assert is
+        // simply the cheap "a resolution that names a directory no build writes to
+        // is wrong on any host that has run a build" check.
+        assert!(
+            claimed.is_dir(),
+            "the resolved {claimed:?} is a real directory — cargo writes build output \
+             here, so a resolution that names a non-existent dir is wrong on any host \
+             that has run a build",
+        );
+    }
+
+    /// A census-scanned source tree: a label plus its `src/` directory.
+    struct SourceRoot {
+        /// The prefix every relative path from this root carries, so a
+        /// violation report says WHICH package the offender lives in and two
+        /// same-named files in different packages cannot collide in the scan.
+        label: &'static str,
+        path: std::path::PathBuf,
+    }
+
+    /// BOTH packages' `src/` trees.
+    ///
+    /// THE REASON THIS IS TWO ROOTS AND NOT ONE: the census asserts ABSENCES
+    /// ("no `Command::new(` outside `childproc`", "no `.creation_flags(` outside
+    /// `childproc`", "no `.raw_arg(` outside `childproc`"). Before S2 one walk of
+    /// `src-tauri/src` saw every file those invariants police. After S2 the
+    /// policed code sits in TWO packages, and a scan of either one alone reports a
+    /// clean bill of health for the half it never opened — the fail-OPEN shape
+    /// this repo keeps recording (the same class as the 18c census scan roots and
+    /// the five-edge scan). So: walk both, always.
+    ///
+    /// The workspace root itself is deliberately NOT a walk root: it holds
+    /// `target/`, whose `build/` trees carry generated `*.rs` (and tens of GB).
+    /// Walking it would both hang and invent violations in generated code. Two
+    /// named `src/` dirs is the exact scope.
+    fn source_roots() -> Vec<SourceRoot> {
+        let root = workspace_root();
+        let roots = vec![
+            SourceRoot {
+                label: "fulcrum-core/",
+                path: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            },
+            SourceRoot {
+                label: "archimedes/",
+                path: root.join("src-tauri").join("src"),
+            },
+        ];
+        for r in &roots {
+            // Loud, not fail-open: a root that does not resolve would empty its
+            // half of the corpus, and every "zero violations" below would then be
+            // true of nothing. The message names the root, per the guard's own
+            // convention.
+            assert!(
+                r.path.is_dir(),
+                "the census resolved the wrong root: {} is not a directory \
+                 (workspace root resolved to {:?} from CARGO_MANIFEST_DIR={})",
+                r.path.display(),
+                root,
+                env!("CARGO_MANIFEST_DIR"),
+            );
+        }
+        roots
+    }
+
+    /// The census's own path, `/`-normalised and prefixed with its ROOT LABEL —
+    /// the one file allowed to hold `Command::new(` and `creation_flags`.
+    /// Normalised so the comparison holds on Windows, where `strip_prefix`
+    /// yields `\`.
+    ///
+    /// T5/S2 moved this file out of `src-tauri/src/agent/` into the crate, so the
+    /// label changed from `agent/childproc.rs` to `fulcrum-core/childproc.rs`:
+    /// the label IS the root's identity, so a moved file's label moves with it.
+    const SELF: &str = "fulcrum-core/childproc.rs";
+
+    /// Resolve one labelled path (`"<label><rest>"`, as the `files` lists below
+    /// spell them) to an absolute path, WITHOUT reading it. Panics if the label
+    /// names no root — a typo'd label would otherwise read as "file absent".
+    fn resolve_labeled(roots: &[SourceRoot], labeled: &str) -> std::path::PathBuf {
+        for root in roots {
+            if let Some(rest) = labeled.strip_prefix(root.label) {
+                return root.path.join(rest);
+            }
+        }
+        panic!(
+            "census path `{labeled}` names no source root ({:?}) — its half of the \
+             corpus would be silently missing",
+            roots.iter().map(|r| r.label).collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    /// The production region of one labelled path (`"<label><rest>"`, as the
+    /// `files` lists below spell them), resolved against its own root.
+    ///
+    /// Panics if the label names no root — a typo'd label would otherwise read as
+    /// "file absent", and every count-based vacuity guard downstream would then
+    /// fail (the good direction) while any absence-based check would pass blind.
+    fn region_of_labeled(roots: &[SourceRoot], labeled: &str) -> Vec<SourceLine> {
+        production_region(&resolve_labeled(roots, labeled))
+    }
+
+    /// Every `*.rs` under BOTH packages' `src/`, as `(labelled path, production
+    /// region)` pairs sorted by path so a violation report is reproducible.
+    ///
+    /// The label is prefixed BEFORE sorting so `fulcrum-core/…` and `archimedes/…`
+    /// form two contiguous blocks and a file that exists in both packages (both
+    /// have a `web/config.rs` story to tell, and `types.rs` exists on both sides)
+    /// can never be conflated in a report.
+    fn scan_all(roots: &[SourceRoot]) -> Vec<(String, Vec<SourceLine>)> {
+        let mut out: Vec<(String, Vec<SourceLine>)> = Vec::new();
+        for root in roots {
+            let mut paths = Vec::new();
+            rust_files(&root.path, &mut paths);
+            for path in paths {
+                let rel = path
+                    .strip_prefix(&root.path)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((format!("{}{}", root.label, rel), production_region(&path)));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 
     /// Whether a trimmed line is COMMENT text, which the census ignores — for
     /// the `#[cfg(test)]` boundary and for every match. Not cosmetic: three
@@ -699,28 +939,12 @@ mod tests {
     ///   worse bug than the hang this fixes.
     #[test]
     fn production_source_has_exactly_one_child_constructor() {
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        assert!(
-            src_root.is_dir(),
-            "the census resolved the wrong root: {} is not a directory",
-            src_root.display()
-        );
-
-        let mut paths = Vec::new();
-        rust_files(&src_root, &mut paths);
-        // Sorted so a violation report is reproducible run to run.
-        paths.sort();
-
-        let relative = |path: &std::path::Path| {
-            path.strip_prefix(&src_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
-        let regions: Vec<(String, Vec<SourceLine>)> = paths
-            .iter()
-            .map(|path| (relative(path), production_region(path)))
-            .collect();
+        // TWO roots, because after T5/S2 the policed code lives in two packages.
+        // A one-root version of this test would keep passing while seeing only
+        // half the tree — invariants A and B assert ABSENCES, so a missing root
+        // is a silent green, not a red.
+        let roots = source_roots();
+        let regions = scan_all(&roots);
 
         // ── Vacuity guard, FIRST: a scanner that sees nothing must fail loudly,
         // not report a clean bill of health for an empty corpus (the same trick
@@ -816,7 +1040,12 @@ mod tests {
         let mut total_closed = 0usize;
 
         for (rel, region) in &regions {
-            if !rel.starts_with("agent/tools/exec") {
+            // The Tool-executor subtree, labelled with ITS package: `tools/exec`
+            // moved into the crate in T5/S2, so the pre-move `agent/tools/exec`
+            // prefix would match nothing and `total_tool_ctors` would be 0 — the
+            // `== 4` below catches that, but only because the count is asserted;
+            // the prefix is repointed so the invariant reads the real files.
+            if !rel.starts_with("fulcrum-core/tools/exec") {
                 continue;
             }
             if rel.contains("/tests/") || rel.ends_with("/tests.rs") || rel.ends_with("tests.rs") {
@@ -856,11 +1085,16 @@ mod tests {
              stdin instead hangs on it until the 300 s bash timeout; see the module docs.",
         );
 
+        // T5/S3 repointed TWO of these four: `mcp/stdio.rs` and
+        // `interactive/sudo_exec.rs` are in the crate now. The label is not
+        // cosmetic — `region_of` PANICS when a labelled path names no file, so a
+        // stale entry is a red test rather than a file the census skipped.
         for runtime_child in [
-            "agent/mcp/stdio.rs",
-            "agent/worker/client.rs",
-            "agent/interactive/sudo_exec.rs",
-            "commands/update.rs",
+            "fulcrum-core/mcp/stdio.rs",
+            // T8/S8.3: moved into this crate — the label follows the file.
+            "fulcrum-core/worker/client.rs",
+            "fulcrum-core/interactive/sudo_exec.rs",
+            "archimedes/commands/update.rs",
         ] {
             let found = mentions(region_of(runtime_child), "closed_stdin");
             assert_eq!(
@@ -872,9 +1106,9 @@ mod tests {
         }
     }
 
-    /// The crash-log module's path, `/`-normalised and relative to `src/` like
-    /// [`SELF`], so the violation report reads the same on Windows.
-    const CRASHLOG: &str = "agent/crashlog.rs";
+    /// The crash-log module's path, `/`-normalised and LABELLED like [`SELF`] —
+    /// it stayed desktop, so it carries the `archimedes/` root label.
+    const CRASHLOG: &str = "archimedes/agent/crashlog.rs";
 
     /// Invariant D — `agent/crashlog.rs` may not resolve a data dir.
     ///
@@ -922,11 +1156,11 @@ mod tests {
     /// imply the region is exact.
     #[test]
     fn production_crashlog_never_resolves_a_data_dir() {
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let crashlog_path = resolve_labeled(&source_roots(), CRASHLOG);
         // One file is the whole scope of this invariant — no tree walk. The
         // call panics rather than skipping if the file is unreadable, so a
         // wrong root fails loudly here instead of silently emptying the region.
-        let region = production_region(&src_root.join(CRASHLOG));
+        let region = production_region(&crashlog_path);
 
         // ── Vacuity guard FIRST, in the census's own style: it proves the
         // scanner's EYESIGHT by requiring a token it knows is there, not by
@@ -949,7 +1183,7 @@ mod tests {
              was cut short, and the check below would pass having read nothing",
             region.len(),
             region.last().map_or(0, |l| l.line),
-            src_root.join(CRASHLOG).display(),
+            crashlog_path.display(),
         );
 
         let resolvers: Vec<String> = region
@@ -1003,31 +1237,15 @@ mod tests {
     ///   outside view.
     #[test]
     fn production_code_never_appends_a_raw_command_line_itself() {
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        assert!(
-            src_root.is_dir(),
-            "the census resolved the wrong root: {} is not a directory",
-            src_root.display()
-        );
-        let mut paths = Vec::new();
-        rust_files(&src_root, &mut paths);
-        // Sorted so a violation report is reproducible run to run.
-        paths.sort();
-        let relative = |path: &std::path::Path| {
-            path.strip_prefix(&src_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
-        let regions: Vec<(String, Vec<SourceLine>)> = paths
-            .iter()
-            .map(|path| (relative(path), production_region(path)))
-            .collect();
+        // TWO roots (see `source_roots`): invariant E asserts an ABSENCE, so a
+        // scan of one package alone would certify the other half unseen.
+        let roots = source_roots();
+        let regions = scan_all(&roots);
 
         // ── Vacuity guard FIRST, in the census's own style: a scanner that sees
         // nothing must fail loudly, not report a clean bill. Exactly ONE
         // production caller of [`append_cmd_c`] is expected, and it is
-        // `exec/bash.rs` (`crate::agent::childproc::append_cmd_c(` contains the
+        // `exec/bash.rs` (`crate::childproc::append_cmd_c(` contains the
         // needle). This does double duty: it proves the scanner can SEE the API
         // it polices, and it pins that the `bash` child's command line still
         // goes through its owner. `SELF` is excluded and would score 0 anyway —

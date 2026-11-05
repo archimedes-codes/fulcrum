@@ -3,13 +3,13 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGEN
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::agent::web::config::WebConfig;
-use crate::agent::web::net::{safe_fetch, FetchOpts};
-use crate::agent::web::providers::common::{
+use crate::web::config::WebConfig;
+use crate::web::net::{safe_fetch, FetchOpts};
+use crate::web::providers::common::{
     build_browser_headers, collapse_whitespace, format_http_error, format_provider_error,
     truncate_results, validate_query, DEFAULT_USER_AGENT,
 };
-use crate::agent::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
+use crate::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
 const DEFAULT_DDG_URL: &str = "https://html.duckduckgo.com/html/?q=";
 

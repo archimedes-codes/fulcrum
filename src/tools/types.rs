@@ -129,7 +129,7 @@ pub struct ToolCtx {
     /// `$HOME`).
     pub boundary: Vec<PathBuf>,
     /// (ADR 0030) The policy in force for this call.
-    pub file_policy: crate::agent::policy::FilePolicy,
+    pub file_policy: crate::policy::FilePolicy,
     /// (ADR 0030) The write deny-list (`boundary::protected_dirs()`, frozen
     /// at session start; `vec![]` in tests). Since the permissions spec's
     /// round-3 correction this is the write GUARD-MEMBERSHIP list (the four
@@ -139,10 +139,10 @@ pub struct ToolCtx {
     pub protected: Vec<PathBuf>,
     /// (T03) The rule list IN FORCE for this call: the concatenated
     /// `default_rules()` FIRST, then the user rules — the CONCATENATION
-    /// CONTRACT of [`crate::agent::policy::default_rules`], frozen defaults +
+    /// CONTRACT of [`crate::policy::default_rules`], frozen defaults +
     /// the per-turn user half (ADR 0030 Deviation 4). Every consumer — the
     /// gate's twin in the executors — hands this SAME list to
-    /// [`crate::agent::policy::rule_for`], never a partial one, so the gate
+    /// [`crate::policy::rule_for`], never a partial one, so the gate
     /// and the executor cannot decide differently about one access.
     ///
     /// Hermetic in tests: an EMPTY list means no rules at all — exactly the
@@ -151,7 +151,7 @@ pub struct ToolCtx {
     /// `default_rules()` EMPTY (the round-3 correction) an empty list is also
     /// what a real session carries until the user writes a rule, so the test
     /// value and the production default agree.
-    pub rules: Vec<crate::agent::policy::AccessRule>,
+    pub rules: Vec<crate::policy::AccessRule>,
     /// (T03) The home dir `rule_for` expands a leading `~` against — the
     /// crate's `skills::home_dir()` chain, exactly what
     /// `default_rules()`/`protected_dirs()` go through.
@@ -172,9 +172,9 @@ pub struct ToolCtx {
     /// from `settings.json` + the environment — NOT re-read per call, so a
     /// key added mid-turn lands next turn. `WebConfig::default()` in tests
     /// (HERMETIC: never read `$HOME` here — the same rule as `boundary`).
-    pub web: crate::agent::web::config::WebConfig,
+    pub web: crate::web::config::WebConfig,
     /// Render requester for escalated headless webview fetches (Task 7).
-    pub render_requester: Option<std::sync::Arc<dyn crate::agent::web::RenderRequester>>,
+    pub render_requester: Option<std::sync::Arc<dyn crate::web::RenderRequester>>,
     /// (B1) The stream this tool call reports LIVE partial progress to — a
     /// `None` handle (every direct fixture) is a silent no-op. `Arc` so the
     /// derived `Clone` SHARES the sink: the codemode bridge clones the ctx it

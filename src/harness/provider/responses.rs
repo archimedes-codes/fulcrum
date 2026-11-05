@@ -21,7 +21,7 @@ use super::types::{
     cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
     Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
 };
-use crate::agent::tools::ContentBlock;
+use crate::tools::ContentBlock;
 
 /// The accumulated per-item tool-call state for the OpenAI Responses
 /// wire (a `function_call` output item: the `id` + `name` arrive at
@@ -740,7 +740,7 @@ mod tests {
     use super::super::test_util::{chat_message, collect};
     use super::super::types::{ModelOptions, ToolSpec};
     use super::*;
-    use crate::agent::tools::ImageRef;
+    use crate::tools::ImageRef;
 
     // ── the OpenAI Responses wire (`event:`-tagged SSE, ADR 0024) ──────
 

@@ -1,9 +1,9 @@
 use serde_json::json;
 
 use super::support::*;
-use crate::agent::hostenv::EnvPatch;
-use crate::agent::tools::exec::search::{build_fd_command_with, build_rg_command_with};
-use crate::agent::tools::exec::{execute_tool, glob_match};
+use crate::hostenv::EnvPatch;
+use crate::tools::exec::search::{build_fd_command_with, build_rg_command_with};
+use crate::tools::exec::{execute_tool, glob_match};
 
 /// `fd` is available (spawn `fd --version`). Only the gated
 /// POSIX-shape fixture below reads it — hence the same `cfg`, or it is

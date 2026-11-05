@@ -2,7 +2,7 @@ use base64::Engine;
 use serde_json::json;
 
 use super::support::*;
-use crate::agent::tools::exec::execute_tool;
+use crate::tools::exec::execute_tool;
 
 #[tokio::test]
 async fn read_happy_and_offset_limit() {

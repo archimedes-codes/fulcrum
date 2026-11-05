@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 
-use crate::agent::web::providers::types::SearchResultItem;
+use crate::web::providers::types::SearchResultItem;
 
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36";

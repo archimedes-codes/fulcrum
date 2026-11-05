@@ -71,13 +71,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::dispatch::is_tool_enabled;
 use super::AgentLoop;
-use crate::agent::codemode::{race_turn, CodemodeEngine, EngineLimits, ScriptEnd};
-use crate::agent::harness::provider::{ToolCall, ToolSpec};
-use crate::agent::harness::r#loop::tools::cancelled_tool_result;
-use crate::agent::harness::tool_specs::unknown_param_error;
-use crate::agent::mcp::mcp_tool;
-use crate::agent::policy::Decision;
-use crate::agent::tools::{execute_tool, ContentBlock, ToolCtx, ToolResult};
+use crate::codemode::{race_turn, CodemodeEngine, EngineLimits, ScriptEnd};
+use crate::harness::provider::{ToolCall, ToolSpec};
+use crate::harness::r#loop::tools::cancelled_tool_result;
+use crate::harness::tool_specs::unknown_param_error;
+use crate::mcp::mcp_tool;
+use crate::policy::Decision;
+use crate::tools::{execute_tool, ContentBlock, ToolCtx, ToolResult};
 
 /// The script's wall-clock bound (spec §7.1's budget for one `codemode` call).
 const WALL_CLOCK: Duration = Duration::from_secs(300);
@@ -631,7 +631,7 @@ pub(super) async fn exec_codemode(
     }
 
     let limits = EngineLimits {
-        memory_bytes: crate::agent::codemode::engine::CODEMODE_MEMORY_LIMIT,
+        memory_bytes: crate::codemode::engine::CODEMODE_MEMORY_LIMIT,
         stack_bytes: STACK_BYTES,
         wall_clock: WALL_CLOCK,
     };
@@ -1355,7 +1355,7 @@ mod tests {
                     text: "out".to_string(),
                 },
                 ContentBlock::Image {
-                    image: crate::agent::tools::ImageRef {
+                    image: crate::tools::ImageRef {
                         data: "AAA".to_string(),
                         mime_type: "image/png".to_string(),
                     },
@@ -1405,7 +1405,7 @@ mod tests {
     /// advertised tool is present.
     #[test]
     fn the_excluded_tools_are_neither_callable_nor_discoverable() {
-        let callable = callable_specs(&crate::agent::harness::r#loop::tool_specs());
+        let callable = callable_specs(&crate::harness::r#loop::tool_specs());
         let names: Vec<&str> = callable
             .iter()
             .map(|spec| spec["name"].as_str().unwrap_or_default())
@@ -1418,7 +1418,7 @@ mod tests {
         }
         // The interactive/recursive tools ARE advertised to the model — the exclusion
         // is the bridge's, not the census's.
-        let advertised: Vec<String> = crate::agent::harness::r#loop::tool_specs()
+        let advertised: Vec<String> = crate::harness::r#loop::tool_specs()
             .into_iter()
             .map(|spec| spec.name)
             .collect();
@@ -1515,7 +1515,7 @@ mod tests {
     /// bridge re-reads `tool_specs()` rather than carrying its own copy (ADR 0017).
     #[test]
     fn the_callable_specs_carry_the_advertised_description_verbatim() {
-        let spec = crate::agent::harness::r#loop::tool_specs()
+        let spec = crate::harness::r#loop::tool_specs()
             .into_iter()
             .find(|s| s.name == "bash")
             .expect("`bash` is advertised");
@@ -1560,7 +1560,7 @@ mod tests {
     #[test]
     fn the_engine_limits_use_c1s_memory_constant() {
         assert_eq!(
-            crate::agent::codemode::engine::CODEMODE_MEMORY_LIMIT,
+            crate::codemode::engine::CODEMODE_MEMORY_LIMIT,
             256 * 1024 * 1024
         );
         assert_eq!(STACK_BYTES, 256 * 1024);
@@ -1572,7 +1572,7 @@ mod tests {
     fn a_result_with_no_text_blocks_joins_to_the_empty_string() {
         let result = ToolResult {
             content: vec![ContentBlock::Image {
-                image: crate::agent::tools::ImageRef {
+                image: crate::tools::ImageRef {
                     data: "AAA".to_string(),
                     mime_type: "image/png".to_string(),
                 },

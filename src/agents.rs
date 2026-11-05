@@ -16,7 +16,7 @@
 //! Six top-level keys are read (`name`, `description`, `model`,
 //! `thinking`, `tools`, and the NESTED `permission:` block — the format's
 //! first structured value, owned by
-//! [`crate::agent::definition_permission`]); `parse_agent_file` returns
+//! [`crate::definition_permission`]); `parse_agent_file` returns
 //! `(name, description, model, thinking, tools, permission, notes, body)`.
 //!
 //! Unknown top-level keys are announced as per-definition reports
@@ -68,7 +68,7 @@ pub struct AgentDefinition {
     /// dropped). `None` → this file does not speak about permissions (the
     /// strict-of-two merge starts from `None` as "no narrowing"). `Some` →
     /// the rules this file CARRIES; enforcement is the follow-up task's.
-    pub permission: Option<crate::agent::definition_permission::PermissionBlock>,
+    pub permission: Option<crate::definition_permission::PermissionBlock>,
     /// The frontmatter-READ notes (unknown top-level keys, unrecognised
     /// tool keys, unsupported pattern rows — a `bash` command-text pattern
     /// object and a path-taking tool's path-pattern map each announce their own
@@ -81,7 +81,7 @@ pub struct AgentDefinition {
     /// 0065).** NOT the `Shadowed<T>` type: that carries
     /// `{name,path,scope}` twice. NOT widened into `shadowed` (its
     /// `[]`-wire pin stands).
-    pub frontmatter_notes: Vec<crate::agent::definition_permission::FrontmatterNote>,
+    pub frontmatter_notes: Vec<crate::definition_permission::FrontmatterNote>,
     /// The file body (minus the frontmatter), trimmed. `""` when the body is
     /// empty (no system prompt).
     pub system_prompt: String,
@@ -280,7 +280,7 @@ pub fn user_roots() -> Vec<(PathBuf, AgentScope)> {
 ///
 /// Returns `(name, description, model, thinking, tools, permission, notes,
 /// body)` — SIX keys read (`permission` being the format's first NESTED
-/// value, owned by [`crate::agent::definition_permission`]), plus the
+/// value, owned by [`crate::definition_permission`]), plus the
 /// announce notes for every top-level key this reader does not read.
 ///
 /// The notes are a REPORT, never an error: the tuple is still `Some` and the
@@ -296,11 +296,11 @@ fn parse_agent_file(
     Option<String>,
     Option<String>,
     Option<Vec<String>>,
-    Option<crate::agent::definition_permission::PermissionBlock>,
-    Vec<crate::agent::definition_permission::FrontmatterNote>,
+    Option<crate::definition_permission::PermissionBlock>,
+    Vec<crate::definition_permission::FrontmatterNote>,
     String,
 )> {
-    use crate::agent::definition_permission::{parse_permission_block, FrontmatterNote};
+    use crate::definition_permission::{parse_permission_block, FrontmatterNote};
 
     // 1. Normalize `\r\n` and lone `\r` to `\n`.
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
@@ -345,7 +345,7 @@ fn parse_agent_file(
     let mut model: Option<String> = None;
     let mut thinking: Option<String> = None;
     let mut tools: Option<String> = None;
-    let mut permission: Option<crate::agent::definition_permission::PermissionBlock> = None;
+    let mut permission: Option<crate::definition_permission::PermissionBlock> = None;
     let mut notes: Vec<FrontmatterNote> = Vec::new();
     // One `UnknownKey("permission")` per FILE, even if the key repeats: the
     // note reports "this file said something unreadable", and N unreadable
@@ -1261,7 +1261,7 @@ mod tests {
     // and the launch resolver is the follow-up task's scope, so no assertion
     // below reaches for a `LaunchConfig`, a DTO or a verdict.
 
-    use crate::agent::definition_permission::{
+    use crate::definition_permission::{
         Action, FrontmatterNote, PermissionBlock, Rule, Rules, ToolKey, UnsupportedReason,
     };
 

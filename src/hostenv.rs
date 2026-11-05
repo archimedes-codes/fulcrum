@@ -219,7 +219,7 @@ impl EnvPatch {
 /// six call sites). Instrumenting the initializer also means it cannot be
 /// forgotten at a call site and cannot fire twice.
 ///
-/// It is `eprintln!` and NOT [`crate::agent::debuglog::log`] for the same class
+/// It is `eprintln!` and NOT [`crate::debuglog::log`] for the same class
 /// of reason this task exists to kill: the tools run in the WORKER, and
 /// `debuglog::init_from_env()` is only ever called from `lib.rs::run()` (the
 /// Supervisor), so a `debuglog::log` from here would be a SILENT NO-OP in
@@ -1223,11 +1223,11 @@ mod tests {
 /// instead, so a test can ask a spawn site "what does the patch do to this
 /// `Command`?" with a patch that is genuinely non-empty:
 ///
-/// * [`MOUNT`] is `appdir`-shaped the way the AppImage runtime names a mount
+/// * [`fixtures::MOUNT`] is `appdir`-shaped the way the AppImage runtime names a mount
 ///   point (`build_mount_point` in `runtime.c`), which is the structural
 ///   corroboration [`scrub`]'s gate accepts — so NO tree has to exist on disk
 ///   and the fabrications stay deterministic on every Linux runner.
-/// * [`tainted_inherited`] is the taint `AppRun.c` and the GTK hook actually
+/// * [`fixtures::tainted_inherited`] is the taint `AppRun.c` and the GTK hook actually
 ///   write, with one non-mount entry in it: without a survivor the patch would
 ///   `remove` every variable and a call site that dropped the user's own paths
 ///   could not be told from a correct one.
@@ -1239,26 +1239,47 @@ mod tests {
 /// Linux-only: off Linux [`scrub`] is DEFINED to return the empty patch, so
 /// nothing there consumes this module, and `clippy --all-targets -D warnings`
 /// would report it as `dead_code` on the Windows/macOS CI rows.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) mod fixtures {
+///
+/// THE `cfg(test)` HALF OF THE ORIGINAL GATE IS GONE, and it is not an oversight.
+/// This module was `#[cfg(all(test, target_os = "linux"))] pub(crate) mod` while
+/// it lived in `src-tauri/src/`, because its four consumers were unit tests in
+/// the SAME crate (`commands/update.rs`, `mcp/stdio.rs`, `worker/client.rs`,
+/// `interactive/sudo_exec.rs`). Those consumers STAY desktop (T8 moves `worker`,
+/// S2/S3 move `mcp`/`interactive`, `commands/` never moves), so they now link
+/// this crate as an rlib — and `#[cfg(test)]` code is NOT compiled into an rlib.
+/// Raising the visibility alone does not reach them (measured: `pub mod fixtures`
+/// behind `cfg(test)` still fails all four with E0432), because the gate, not the
+/// visibility, is what hides it. `pub` + `target_os = "linux"` is the shape the
+/// desktop's own `test_support.rs` already chose for the same reason — its module
+/// docs record that an ungated `ScratchDir` is deliberate, "compiled into release
+/// builds and into the rlib `tests/*.rs` links against". The payload here is
+/// inert: constants and pure functions over them (no I/O, no spawn), so the
+/// shipping Linux binary carries fabricated path STRINGS and nothing else.
+///
+/// This is the S1 instance of a general Step-A gap: `#[cfg(test)] pub(crate)`
+/// items in a MOVING file that a STAYING file consumes cannot survive the package
+/// boundary verbatim. See the crate's `test_support` for the same correction on
+/// the desktop's test helpers.
+#[cfg(target_os = "linux")]
+pub mod fixtures {
     use super::*;
 
     /// The fabricated mount root.
-    pub(crate) const MOUNT: &str = "/tmp/.mount_archimTEST";
+    pub const MOUNT: &str = "/tmp/.mount_archimTEST";
     /// The `current_exe()` of a process running FROM [`MOUNT`] (in a real
     /// AppImage it resolves through the mount via `/proc/self/exe`).
-    pub(crate) const EXE_INSIDE_MOUNT: &str = "/tmp/.mount_archimTEST/usr/bin/archimedes";
+    pub const EXE_INSIDE_MOUNT: &str = "/tmp/.mount_archimTEST/usr/bin/archimedes";
     /// The entry that is NOT the bundle's and must survive every scrub, so
     /// "stripped everything" is never mistaken for "stripped the mount".
-    pub(crate) const USER_BIN: &str = "/opt/test-unique/bin";
+    pub const USER_BIN: &str = "/opt/test-unique/bin";
     /// The value the scrub leaves for `LD_LIBRARY_PATH` (the surviving entry).
-    pub(crate) const SCRUBBED_LD_LIBRARY_PATH: &str = "/usr/lib";
+    pub const SCRUBBED_LD_LIBRARY_PATH: &str = "/usr/lib";
 
     /// The taint, in the shapes `AppRun.c` emits: the mount dir at position 0,
     /// a TRAILING SLASH + colon on `LD_LIBRARY_PATH`, and `PYTHONHOME` as a
     /// SINGLE path inside the mount (so the patch must REMOVE it — an empty
     /// value is not an absent one).
-    pub(crate) fn tainted_inherited() -> Vec<(OsString, OsString)> {
+    pub fn tainted_inherited() -> Vec<(OsString, OsString)> {
         vec![
             (
                 OsString::from("LD_LIBRARY_PATH"),
@@ -1277,7 +1298,7 @@ pub(crate) mod fixtures {
 
     /// The patch [`tainted_inherited`] produces, asserted non-empty: a test
     /// whose patch is empty cannot fail, so it must not be run at all.
-    pub(crate) fn tainted_patch() -> EnvPatch {
+    pub fn tainted_patch() -> EnvPatch {
         let patch = scrub(
             tainted_inherited(),
             Some(Path::new(MOUNT)),
@@ -1296,7 +1317,7 @@ pub(crate) mod fixtures {
     /// `get_envs` (hence `as_std()`), and because `get_envs` reports an
     /// `env_remove` as a `None`-valued entry (it lists the configured changes,
     /// not the inherited env).
-    pub(crate) fn configured_env(
+    pub fn configured_env(
         cmd: &tokio::process::Command,
     ) -> std::collections::BTreeMap<OsString, Option<OsString>> {
         cmd.as_std()
@@ -1315,7 +1336,7 @@ pub(crate) mod fixtures {
     /// would hide exactly the half of the patch the ordering test is about. A
     /// bare `Command` reports every configured change — and `get_envs` never
     /// lists the INHERITED env, so there is nothing else to clear away.
-    pub(crate) fn reference_env(
+    pub fn reference_env(
         patch: &EnvPatch,
     ) -> std::collections::BTreeMap<OsString, Option<OsString>> {
         let mut cmd = tokio::process::Command::new("true");
@@ -1326,7 +1347,7 @@ pub(crate) mod fixtures {
     /// Whether a colon list names a mount path ANYWHERE in it (an independent
     /// restatement of the shape rule, so a call site that scrubbed via a bug in
     /// this module's own matcher is still caught).
-    pub(crate) fn lists_a_mount_path(value: &OsStr) -> bool {
+    pub fn lists_a_mount_path(value: &OsStr) -> bool {
         use std::os::unix::ffi::OsStrExt;
         std::env::split_paths(value).any(|component| {
             Path::new(&component).ancestors().any(|ancestor| {

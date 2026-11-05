@@ -15,10 +15,25 @@
 
 use tokio::sync::mpsc;
 
-use crate::agent::harness::provider::ChatMessage;
-use crate::agent::harness::store::{DisplayRow, Store};
-use crate::agent::worker::protocol::Outbound;
-use crate::storage::DbError;
+use crate::harness::provider::ChatMessage;
+use crate::harness::store::{DisplayRow, Store};
+use crate::seams::StoreError;
+use crate::worker::protocol::Outbound;
+// (T5/S5b + T8/S8.1) The `Store` trait moved to this crate with its error type
+// re-typed to the crate's `StoreError`, so this impl follows it — and now the
+// FILE has moved too, so the error is named crate-internally rather than through
+// the package path: `use fulcrum_core::StoreError` from inside `fulcrum-core` is
+// a cycle (a crate cannot import itself by name), which is exactly what the
+// compiler reported at the RED step. `crate::seams::StoreError` is the same type.
+// The mapping is free HERE and worth stating: `IpcStore` never touches SQLite —
+// its one error is the hand-built write-only `Io` below — so it constructs
+// `StoreError::Io` directly and no `DbError` ever needs converting on this path.
+// (The desktop's `From<DbError> for StoreError` is what `SessionStore` maps
+// through; this impl does not need it, which is the seam doing its job rather
+// than a second one. The pre-accepted `"io error: sqlite error: …"` deviation
+// therefore does NOT widen here: `load_messages_is_the_defensive_write_only_error`
+// pins the one error this impl builds, and its `Display` is `"io error: …"` on
+// both sides of the move.)
 
 /// The Worker's `Store` seam (ADR 0025 Task 2): frames every `Store`
 /// call over the protocol (the Supervisor's `TranscriptPersister` —
@@ -43,7 +58,7 @@ impl Store for IpcStore {
         seq: u64,
         role: &str,
         content_json: &str,
-    ) -> Result<(), DbError> {
+    ) -> Result<(), StoreError> {
         // Unbounded — send never fails (nothing is dropped).
         let _ = self.outbound.send(Outbound::TranscriptInsert {
             session_id: session_id.to_string(),
@@ -58,15 +73,15 @@ impl Store for IpcStore {
     /// loop never calls it: the Supervisor rehydrates and sends the
     /// transcript in `Start`; if it IS called, the error is explicit,
     /// not a silent empty).
-    fn load_messages(&self, _session_id: &str) -> Result<Vec<ChatMessage>, DbError> {
-        Err(DbError::Io(std::io::Error::other(
+    fn load_messages(&self, _session_id: &str) -> Result<Vec<ChatMessage>, StoreError> {
+        Err(StoreError::Io(std::io::Error::other(
             "worker store is write-only — resume is rehydrated via the start envelope",
         )))
     }
 
     /// `clear_messages` → a no-op (the native resume path's `clear` is
     /// external-era; nothing in the Worker world calls it).
-    fn clear_messages(&self, _session_id: &str) -> Result<(), DbError> {
+    fn clear_messages(&self, _session_id: &str) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -75,7 +90,7 @@ impl Store for IpcStore {
         &self,
         session_id: &str,
         rows: &[(u64, String, String)],
-    ) -> Result<(), DbError> {
+    ) -> Result<(), StoreError> {
         let _ = self.outbound.send(Outbound::TranscriptReplace {
             session_id: session_id.to_string(),
             rows: rows.to_vec(),
@@ -85,7 +100,7 @@ impl Store for IpcStore {
 
     /// `persist_display` → `DisplayUpsert` (the display `messages` rows
     /// verbatim).
-    fn persist_display(&self, session_id: &str, rows: &[DisplayRow]) -> Result<(), DbError> {
+    fn persist_display(&self, session_id: &str, rows: &[DisplayRow]) -> Result<(), StoreError> {
         let _ = self.outbound.send(Outbound::DisplayUpsert {
             session_id: session_id.to_string(),
             rows: rows.to_vec(),
@@ -100,7 +115,7 @@ impl Store for IpcStore {
         session_id: &str,
         used: u64,
         window: u64,
-    ) -> Result<(), DbError> {
+    ) -> Result<(), StoreError> {
         let _ = self.outbound.send(Outbound::ContextUsage {
             session_id: session_id.to_string(),
             used,
@@ -113,8 +128,7 @@ impl Store for IpcStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::harness::store::DisplayRow;
-    use crate::storage::DbError;
+    use crate::harness::store::DisplayRow;
     use tokio::sync::mpsc;
 
     /// A test-observed outbound channel + the `IpcStore`.
@@ -227,8 +241,14 @@ mod tests {
         }
     }
 
-    /// `load_messages` — the defensive write-only error (a `DbError::Io`
+    /// `load_messages` — the defensive write-only error (a `StoreError::Io`
     /// variant — explicit, NOT a silent empty transcript).
+    ///
+    /// (T5/S5b) The variant name is the crate's, not the desktop's — the trait's
+    /// error type moved with the trait. The ASSERTION is unchanged in meaning:
+    /// an explicit error, never a silent empty. The string the Worker's caller
+    /// renders is unchanged too (`"io error: …"` on both sides), so unlike the
+    /// `Sqlite → Io` arm this re-point costs nothing.
     #[tokio::test]
     async fn load_messages_is_the_defensive_write_only_error() {
         let (store, _rx) = store();
@@ -236,8 +256,8 @@ mod tests {
             .load_messages("s1")
             .expect_err("the worker store is write-only");
         assert!(
-            matches!(err, DbError::Io(_)),
-            "the error is the explicit `DbError::Io` variant, got {err:?}"
+            matches!(err, StoreError::Io(_)),
+            "the error is the explicit `StoreError::Io` variant, got {err:?}"
         );
     }
 

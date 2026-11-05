@@ -13,8 +13,8 @@
 //! **This module NEVER spawns its own interval loop.** The budget tick is
 //! driven by `refresh.rs`'s `SupervisorRefresher` (T1) — the same
 //! `tokio::spawn` sleep-loop, the same `select!` sleep-vs-cancel, the same
-//! backoff, the same `JoinHandle` + `Drop` + [`super::SupervisorRefresher::stop`]
-//! lifecycle, and the same single start point
+//! backoff, the same `JoinHandle` + `Drop` + `SupervisorRefresher::stop` (the
+//! desktop's `refresh.rs`) lifecycle, and the same single start point
 //! (`lib.rs::setup_dirs_with_factory_refresher`). A second `tokio::time::interval`
 //! in this crate would be an architecture fork: two loop flavours, two stop
 //! paths, two census-leak shapes (ADR 0078). [`run_budget_tick`] is therefore a
@@ -37,15 +37,14 @@
 //! nothing here re-twists or strips `/v1`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 
 use super::resolve_bearer_at;
 use super::store;
-use crate::agent::debuglog;
-use crate::config::load_settings;
+use crate::debuglog;
 
 /// The default budget poll interval (15 s). Long enough that a forbidden
 /// endpoint costs one request per interval (the denial-memory bound), short
@@ -574,6 +573,51 @@ pub async fn poll_all(
 
 // ── the shared ledger (the loop's add-on writes it, the command reads it) ───
 
+/// The `ProviderSource` seam (T7/S7.2, ADR 0091 "seams over moves").
+///
+/// # Why this exists at all
+///
+/// `BudgetPoller` re-reads the provider rows on EVERY arm (`arm_tick` →
+/// [`BudgetPoller::reload_providers`], once per 15 s tick and again on the
+/// command's on-demand path). Before the move that read was
+/// `crate::config::load_settings(&self.config_dir)` — two crossing edges, the
+/// import and the call — and `load_settings` IS the desktop's disk boundary: it
+/// owns `settings.json`. The crate may hold the SHAPE (`ProviderConfig` moved as
+/// a DTO in S5b) but never the FILE, so the read becomes this trait and the
+/// desktop keeps the implementation
+/// (`src-tauri/src/agent/provider_auth/mod.rs::SettingsProviderSource`).
+///
+/// # Who owns the LiteLLM filter — the crate, NOT the source
+///
+/// The source returns EVERY configured row. The `p.api == "litellm"` filter
+/// stays crate-side in [`BudgetPoller::reload_providers`], because "only LiteLLM
+/// rows are polled" is the crate's rule about the three LiteLLM management
+/// routes, not a fact about where rows come from. A desktop impl that filtered
+/// as well would be harmless (filter∘filter = filter); a crate that DROPPED the
+/// filter would probe `/key/info` on non-LiteLLM rows — a request to an unrelated
+/// endpoint whose 404 then sits in the denial scoreboard.
+///
+/// # Why a trait and not the existing `DesktopConfig` push
+///
+/// T3's push channel targets the Worker's loop; the poller is Supervisor-side and
+/// constructed at the desktop's `lib.rs`, outside that push's sight. One consumer
+/// gets one narrow method rather than a second plumbing path.
+pub trait ProviderSource: Send + Sync {
+    /// EVERY configured provider row, unfiltered (the LiteLLM filter is the
+    /// poller's — see the doc above).
+    fn providers(&self) -> Vec<crate::config_types::ProviderConfig>;
+}
+
+/// The source that has no rows (and no disk): [`BudgetPoller::default`]'s shape,
+/// so a poller can exist in a process that never reads settings.
+struct EmptyProviderSource;
+
+impl ProviderSource for EmptyProviderSource {
+    fn providers(&self) -> Vec<crate::config_types::ProviderConfig> {
+        Vec::new()
+    }
+}
+
 /// The per-provider budget ledger: ONE shared view of the latest facts and ONE
 /// denial memory, owned as `Arc<Mutex<BudgetPoller>>` managed state so the
 /// refresher loop's add-on and the `get_provider_budget` command cannot drift
@@ -584,8 +628,11 @@ pub async fn poll_all(
 /// `provider-auth.json` store (no third `ProviderCredential` variant — that
 /// enum is the credential surface, not a facts cache).
 pub struct BudgetPoller {
-    /// The settings home the provider rows are re-read from at each arm.
-    config_dir: PathBuf,
+    /// Who hands us the provider rows at each arm (the [`ProviderSource`]
+    /// seam). This REPLACED the poller's `config_dir: PathBuf` at T7/S7.2 —
+    /// the crate holds NO settings-directory path, because it holds no
+    /// settings read.
+    source: Arc<dyn ProviderSource>,
     /// The credential-store path T1's resolver reads (ruling R3: the DATA dir)
     /// — carried so the tick resolves through `resolve_bearer_at` and never
     /// invents a path of its own.
@@ -594,7 +641,7 @@ pub struct BudgetPoller {
     interval_millis: u64,
     /// The provider rows to poll, refreshed at every arm (a provider added on
     /// the Settings page appears within one interval).
-    providers: Vec<crate::config::ProviderConfig>,
+    providers: Vec<crate::config_types::ProviderConfig>,
     /// The latest facts by provider id (the DTO command's source).
     facts: BTreeMap<String, BudgetFacts>,
     /// The denial scoreboard (shared with the command's on-demand path).
@@ -610,7 +657,7 @@ impl std::fmt::Debug for BudgetPoller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The bearer map is deliberately NOT printed (it holds tokens).
         f.debug_struct("BudgetPoller")
-            .field("config_dir", &self.config_dir)
+            .field("source", &"dyn ProviderSource")
             .field("interval_millis", &self.interval_millis)
             .field("providers", &self.providers.len())
             .field("facts", &self.facts.len())
@@ -621,8 +668,8 @@ impl std::fmt::Debug for BudgetPoller {
 
 impl Default for BudgetPoller {
     fn default() -> Self {
-        Self::new(
-            PathBuf::from("."),
+        Self::new_with_source(
+            Arc::new(EmptyProviderSource),
             PathBuf::from("provider-auth.json"),
             BUDGET_POLL_INTERVAL_MILLIS,
         )
@@ -630,12 +677,21 @@ impl Default for BudgetPoller {
 }
 
 impl BudgetPoller {
-    /// The production constructor: the settings home + the credential-store
-    /// path (both injected — never resolved from inside, so no test can reach
-    /// the real data dir) + the default cadence.
-    pub fn new(config_dir: PathBuf, auth_file: PathBuf, interval_millis: u64) -> Self {
+    /// The seam's constructor: WHO supplies the provider rows (the
+    /// [`ProviderSource`]) + the credential-store path + the cadence. All three
+    /// are injected — the poller resolves nothing itself, so no test can reach a
+    /// real dir and the crate never holds a settings path.
+    ///
+    /// The desktop's production call site goes through
+    /// `crate::agent::provider_auth::budget_poller_for`, which wraps
+    /// `load_settings` in the crate's `ProviderSource` impl and calls this.
+    pub fn new_with_source(
+        source: Arc<dyn ProviderSource>,
+        auth_file: PathBuf,
+        interval_millis: u64,
+    ) -> Self {
         Self {
-            config_dir,
+            source,
             auth_file,
             interval_millis,
             providers: Vec::new(),
@@ -649,7 +705,7 @@ impl BudgetPoller {
     }
 
     /// The provider rows this poller polls (the arm-time snapshot).
-    pub fn providers(&self) -> &[crate::config::ProviderConfig] {
+    pub fn providers(&self) -> &[crate::config_types::ProviderConfig] {
         &self.providers
     }
 
@@ -681,11 +737,6 @@ impl BudgetPoller {
     /// The credential-store path the tick resolves bearers against.
     pub fn auth_file(&self) -> &PathBuf {
         &self.auth_file
-    }
-
-    /// The settings home the rows are re-read from.
-    pub fn config_dir(&self) -> &PathBuf {
-        &self.config_dir
     }
 
     /// The configured cadence.
@@ -725,17 +776,24 @@ impl BudgetPoller {
         due
     }
 
-    /// Re-read the provider rows from `settings.json` (the staleness rule: a
-    /// provider added on the Settings page appears within one interval, and an
-    /// on-demand refresh sees it immediately).
+    /// Re-read the provider rows from the [`ProviderSource`] (the staleness
+    /// rule: a provider added on the Settings page appears within one interval,
+    /// and an on-demand refresh sees it immediately).
+    ///
+    /// THE SEAM'S OWN LINE: this WAS `load_settings(&self.config_dir)` — the
+    /// desktop's `settings.json` read, and the only reason `budget.rs` stayed
+    /// desktop through S3. The source supplies EVERY row; the LiteLLM filter
+    /// below is the crate's rule and stays crate-side (see [`ProviderSource`]'s
+    /// doc — dropping it would probe `/key/info` on non-LiteLLM rows and park a
+    /// foreign 404 in the denial scoreboard).
     pub fn reload_providers(&mut self) {
-        let settings = load_settings(&self.config_dir);
         // Only LiteLLM rows are polled: `/key/info`, `/v2/user/info` and
         // `/team/info` are LITELLM management routes. Probing them on
         // `api.openai.com` would be a request to an unrelated endpoint (and the
         // 404 it returns would then sit in the denial scoreboard for nothing).
-        self.providers = settings
-            .providers
+        self.providers = self
+            .source
+            .providers()
             .into_iter()
             .filter(|p| p.api == "litellm")
             .collect();
@@ -782,7 +840,7 @@ pub async fn run_budget_tick(
     execute_helpers: bool,
 ) {
     let now = store::now_epoch_millis();
-    let (providers, config_dir, auth_file, mut memory) = {
+    let (providers, auth_file, mut memory) = {
         let Ok(mut guard) = poller.lock() else {
             return;
         };
@@ -811,7 +869,6 @@ pub async fn run_budget_tick(
         }
         (
             guard.providers().to_vec(),
-            guard.config_dir().clone(),
             guard.auth_file().clone(),
             guard.denial_memory().clone(),
         )
@@ -832,13 +889,28 @@ pub async fn run_budget_tick(
         // seam) and the SAME body the production `resolve_bearer` alias calls —
         // the poller supplies the store path it was CONSTRUCTED with, so a test
         // poller can never read the real DATA-dir store.
-        let bearer =
-            match resolve_bearer_at(&provider, &auth_file, &config_dir, client, execute_helpers)
-                .await
-            {
-                Some(token) => token,
-                None => provider.api_key.clone(),
-            };
+        //
+        // T7/S7.2: the `config_dir` argument this call used to pass is the
+        // poller's former settings home, and the poller no longer has one (the
+        // [`ProviderSource`] replaced it). The SIGNATURE is untouched — it is
+        // `pub` and many test callers pass a real dir — so the crate passes an
+        // empty path, and here is why that is safe rather than hopeful: the only
+        // consumer of that parameter is `gcloud::token(config_dir, client)`, and
+        // `gcloud.rs:376` is literally `let _ = config_dir;` — the value is
+        // discarded at the top of the function. `resolve_bearer_at`'s signature
+        // is the thing that carries it, not this call site.
+        let bearer = match resolve_bearer_at(
+            &provider,
+            &auth_file,
+            Path::new(""),
+            client,
+            execute_helpers,
+        )
+        .await
+        {
+            Some(token) => token,
+            None => provider.api_key.clone(),
+        };
         if bearer.is_empty() {
             debuglog::log(&format!(
                 "budget: provider `{}` has no bearer — skipping the budget poll",
@@ -881,6 +953,104 @@ pub async fn run_budget_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the `ProviderSource` seam ───────────────────────────────────────────
+
+    /// A source whose rows CAN change between calls — the shape the desktop's
+    /// `SettingsProviderSource` has (rows change whenever Settings saves). The
+    /// seam's crate-side tests drive this directly, so the poller's row supply
+    /// is exercised by a real impl rather than by a mock nobody instantiates.
+    struct MutableTestSource(Mutex<Vec<crate::config_types::ProviderConfig>>);
+
+    impl MutableTestSource {
+        fn new(rows: Vec<crate::config_types::ProviderConfig>) -> Self {
+            Self(Mutex::new(rows))
+        }
+        fn push(&self, row: crate::config_types::ProviderConfig) {
+            self.0.lock().unwrap().push(row);
+        }
+    }
+
+    impl ProviderSource for MutableTestSource {
+        fn providers(&self) -> Vec<crate::config_types::ProviderConfig> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A row with just the fields the poller reads (`id`, `base_url`, `api`,
+    /// `api_key`); the rest are the same defaults `ProviderConfig`'s serde
+    /// defaults would give. `ProviderConfig` has no `Default` impl (the desktop
+    /// builds it from a settings document), so every field is spelled.
+    fn row(id: &str, api: &str) -> crate::config_types::ProviderConfig {
+        crate::config_types::ProviderConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            base_url: format!("https://{id}.example/v1"),
+            api_key: "sk-test".to_string(),
+            api: api.to_string(),
+            key_url: None,
+            auth_mode: "api_key".to_string(),
+            headers: None,
+            allow_insecure_http: false,
+            use_gcloud_token_auth: false,
+            oidc: None,
+        }
+    }
+
+    #[test]
+    fn reload_providers_rereads_the_source_and_keeps_only_litellm_rows() {
+        // TWO pins in one test, both about the seam:
+        //  (1) THE FILTER IS CRATE-SIDE. The source hands over EVERY row (that
+        //      is the desktop impl's contract — `settings.providers`,
+        //      unfiltered) and `reload_providers` drops the non-LiteLLM ones.
+        //      Drop that filter and the poller probes `/key/info` on
+        //      `api.openai.com`-shaped rows: a request to an unrelated endpoint
+        //      whose 404 then sits in the denial scoreboard.
+        //  (2) THE SOURCE IS RE-READ EVERY CALL (the staleness rule the
+        //      `settings.json` read used to buy): a row that appears later shows
+        //      up on the next reload, without rebuilding the poller.
+        let source = std::sync::Arc::new(MutableTestSource::new(vec![
+            row("gw", "litellm"),
+            row("openai", "openai-completions"),
+        ]));
+        let mut poller = BudgetPoller::new_with_source(
+            source.clone(),
+            PathBuf::from("provider-auth.json"),
+            BUDGET_POLL_INTERVAL_MILLIS,
+        );
+
+        poller.reload_providers();
+        assert_eq!(
+            poller.provider_ids(),
+            vec!["gw".to_string()],
+            "only the LiteLLM row survives the crate-side filter"
+        );
+
+        source.push(row("gw2", "litellm"));
+        source.push(row("anthropic", "anthropic-messages"));
+        poller.reload_providers();
+        assert_eq!(
+            poller.provider_ids(),
+            vec!["gw".to_string(), "gw2".to_string()],
+            "a row saved after construction is polled on the next reload"
+        );
+    }
+
+    #[test]
+    fn a_poller_without_a_source_has_no_rows_and_never_arms() {
+        // `Default` is the no-disk shape: `EmptyProviderSource` (the crate must
+        // be able to CONSTRUCT a poller with no settings anywhere — that is the
+        // point of the seam). No rows ⇒ `millis_until_next_arm` is `None`, so
+        // the refresher's 60 s cap is never shortened by budget work.
+        let mut poller = BudgetPoller::default();
+        poller.reload_providers();
+        assert!(poller.providers().is_empty());
+        assert!(poller.millis_until_next_arm(0).is_none());
+        assert!(
+            !poller.arm_tick(0),
+            "an empty poller must not wake the loop every interval"
+        );
+    }
 
     // ── the classification pin ──────────────────────────────────────────────
 
@@ -987,9 +1157,15 @@ mod tests {
         // And the poller's side: the FIRST bearer seen is not a change (nothing
         // to forget), an identical re-read is not a change, a different token
         // IS — and it clears exactly the rotated provider's entries.
+        //
+        // The scratch dir still mints (`provider-budget-`) and still supplies the
+        // auth-file path, so the poller stays hermetic by construction; the rows
+        // now come from the injected [`ProviderSource`] instead of a
+        // `settings.json` inside that dir (S7.2 — the crate reads no settings
+        // file, so a test poller has NO settings dir to read).
         let dir = crate::test_support::ScratchDir::in_env_temp("provider-budget-", "bearer");
-        let mut poller = BudgetPoller::new(
-            dir.path().to_path_buf(),
+        let mut poller = BudgetPoller::new_with_source(
+            Arc::new(MutableTestSource::new(Vec::new())),
             dir.path().join("provider-auth.json"),
             BUDGET_POLL_INTERVAL_MILLIS,
         );

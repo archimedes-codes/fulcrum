@@ -10,17 +10,15 @@ use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 use tokio_util::sync::CancellationToken;
 
 use super::super::*;
-use crate::agent::events::{EventSink, RpcEvent};
-use crate::agent::harness::catalog::{CompactionConfig, Model, ModelCatalog};
-use crate::agent::harness::dispatch::SubagentDispatcher;
-use crate::agent::harness::provider::{
+use crate::events::{EventSink, RpcEvent};
+use crate::harness::catalog::{CompactionConfig, Model, ModelCatalog};
+use crate::harness::dispatch::SubagentDispatcher;
+use crate::harness::provider::{
     FinishReason, ModelRequest, Provider, ProviderError, ProviderEvent,
 };
-use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::harness::store::SessionStore;
-use crate::agent::interactive::SudoRunner;
-use crate::storage::Db;
-use crate::test_support::ScratchDir;
+use crate::harness::retry::RetryPolicy;
+use crate::interactive::SudoRunner;
+use crate::test_support::{MemoryStore, ScratchDir};
 
 /// Dev machines see this whole suite in ~10 s on 8 cores, so the bare 5 s
 /// bounds these waits used were tuned against margins they never came
@@ -69,7 +67,7 @@ impl SudoRunner for RecordingSudoRunner {
         _password: String,
         _timeout: Duration,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = crate::agent::interactive::SudoRun> + Send + 'static>,
+        Box<dyn std::future::Future<Output = crate::interactive::SudoRun> + Send + 'static>,
     > {
         self.ran.store(true, Ordering::SeqCst);
         Box::pin(async { unreachable!("the recording runner never completes a run") })
@@ -287,7 +285,7 @@ pub(super) fn build_loop_with_db(
     retry: RetryPolicy,
     models: Vec<Model>,
     config_dir: Option<&std::path::Path>,
-) -> (ScratchDir, AgentLoop, Arc<Db>) {
+) -> (ScratchDir, AgentLoop, Arc<MemoryStore>) {
     let sink = Arc::new(TestSink {
         updates: Arc::new(StdMutex::new(Vec::new())),
     });
@@ -318,24 +316,20 @@ pub(super) fn build_loop_with_sink(
     models: Vec<Model>,
     config_dir: Option<&std::path::Path>,
     sink: Arc<dyn EventSink>,
-) -> (ScratchDir, AgentLoop, Arc<Db>) {
+) -> (ScratchDir, AgentLoop, Arc<MemoryStore>) {
     let space = crate::test_support::ScratchDir::in_env_temp("harness-loop-test-", "space");
-    let db = Arc::new(Db::open(&space.join("t.db")).expect("db should open"));
-    // The `native_messages` rows FK to `sessions`: record the test
-    // session so transcript writes (e.g. the `run_compaction`
-    // rewrite) are valid.
-    db.record_session(&crate::agent::SessionInfo {
-        session_id: "s1".to_string(),
-        cwd: std::path::PathBuf::from("/tmp"),
-        capabilities: serde_json::json!({}),
-        config_options: None,
-        archived: false,
-        title: None,
-        context_usage: None,
-        cost_usd: None,
-        is_subagent: false,
-    })
-    .expect("record_session");
+    // (T5/S5b) The fixture's store RE-POINTED from a temp-dir `Db` +
+    // `SessionStore` to the crate's `MemoryStore` (the crate cannot open a
+    // `Db` — no `rusqlite` in its graph). The `record_session` call that
+    // followed the `Db::open` is GONE WITH THE `Db`: its whole job was to
+    // satisfy the SQLite FK from `native_messages` to `sessions`, and a double
+    // has no FK. That is not coverage lost — the FK, the UPSERT collapse and
+    // the transaction are pinned on the DESKTOP side (`tests/harness_store.rs`,
+    // `tests/harness_loop.rs`, the four `SessionStore` tests in
+    // `src-tauri/src/agent/harness/store.rs`). What these ~190 loop tests assert
+    // through `loop_.store` is which rows the loop handed the seam, and that is
+    // exactly what `MemoryStore` answers.
+    let db = Arc::new(MemoryStore::new());
     let model = models.first().cloned().expect("at least one model");
     let catalog = ModelCatalog {
         models,
@@ -351,7 +345,7 @@ pub(super) fn build_loop_with_sink(
         model,
         provider,
         catalog,
-        Arc::new(SessionStore::new(db.clone())),
+        db.clone(),
         events,
         CancellationToken::new(),
         turn_cancel,
@@ -362,31 +356,43 @@ pub(super) fn build_loop_with_sink(
         Arc::new(TokioMutex::new(HashMap::new())),
         None,
         sink,
-        Arc::new(crate::agent::todo::TodoStore::new()),
+        Arc::new(crate::todo::TodoStore::new()),
         None,
         SudoDeps::default(),
         retry,
         config_dir.map(|p| p.to_path_buf()),
         "t".to_string(),
+        // (T5/S5a, SEAM 2) The opener is now a REQUIRED argument (the loop
+        // takes it instead of calling `crate::open` itself, which it cannot do
+        // once `harness` moves). A fixture injects the NO-OP opener: a unit
+        // test must never launch a real browser, and none of these tests drives
+        // the MCP `auth` action — the seam's own consumption is pinned inside
+        // the crate (`mcp::manager::tests::
+        // the_auth_action_opens_the_browser_through_the_seam`) and the
+        // desktop's wiring is pinned by `open.rs`'s two source lints.
+        Arc::new(crate::mcp::NoOpenRequester),
     );
     (space, loop_, db)
 }
 
-/// `build_loop_with_db` with a REAL settings home carrying the provider's
+/// `build_loop_with_db` with PACKAGED provider rows carrying the provider's
 /// custom headers (issue #129, R1 — the mid-session-switch fixture).
 ///
-/// The header-less builders cannot pin R1: `build_loop_with_db` threads a
-/// bare `None` as the loop's `config_dir`, so `set_model`'s re-lookup would
-/// have nothing to read and a switch test built on it could never fire the
-/// header assert. This builder therefore
-/// 1. writes a scratch `settings.json` whose provider row (`id ==
-///    provider_id`) carries `headers` (the RAW template map — expanded here
-///    through the SAME `provider_auth::headers::expand_map` the production
-///    spine calls, so the test asserts the EXPANDED value on the wire),
-/// 2. hands that dir to `build_loop_with_sink` as `config_dir` (so
-///    `AgentLoop::set_model` re-resolves from it), and
-/// 3. returns the settings-home guard FIRST — the #96 rule: never
-///    `.0`-project a builder result to discard a guard; bind it.
+/// The header-less builders cannot pin R1: they leave the loop's packaged
+/// `providers` empty, so `set_model`'s re-lookup would find no row and a switch
+/// test built on one could never fire the header assert. This builder therefore
+/// 1. builds the provider row (`id == provider_id`) carrying `headers` — the
+///    RAW template map, so the loop's own expansion through the SAME
+///    `provider_auth::headers::expand_map` the production spine calls produces
+///    the value the test asserts on the wire, and
+/// 2. packages it through [`AgentLoop::set_desktop_config`], so
+///    `AgentLoop::set_model` re-resolves from the packaged slice.
+///
+/// (Fulcrum T3) It used to write a scratch `settings.json` and hand the dir to
+/// `build_loop_with_sink` as `config_dir`. That is exactly the disk read this
+/// task removes, so the row now rides the same seam production uses
+/// (`StartEnv.providers` → `set_desktop_config`); there is no settings home to
+/// own any more, which is why the tuple lost its guard.
 ///
 /// The caller builds the INITIAL provider itself (through
 /// `build_provider_with_headers`) so a test can distinguish the initial
@@ -402,47 +408,43 @@ pub(super) fn build_loop_with_headers_and_db(
     provider_id: &str,
     headers: HashMap<String, String>,
     sink: Arc<dyn EventSink>,
-) -> (ScratchDir, ScratchDir, AgentLoop, Arc<Db>) {
-    // The settings home (a scratch dir holding `settings.json`).
-    let config_home = crate::test_support::ScratchDir::in_env_temp("provider-headers-", "settings");
-    let settings = crate::config::Settings {
-        providers: vec![crate::config::ProviderConfig {
-            id: provider_id.to_string(),
-            name: provider_id.to_string(),
-            // The row's base URL is IRRELEVANT here — the `Model` carries the
-            // wire's base URL; this row exists so the header re-lookup in
-            // `set_model` finds a row whose `id == model.provider`.
-            base_url: "https://example.invalid/v1".to_string(),
-            api_key: String::new(),
-            api: "openai-completions".to_string(),
-            key_url: None,
-            auth_mode: "api_key".to_string(),
-            // The RAW template map (the shape `settings.json` holds — the
-            // expansion happens in `provider_headers_for`, exactly as in
-            // production).
-            headers: Some(headers),
-            allow_insecure_http: false,
-            // (issue #128) The mechanical additive grow: `ProviderConfig`
-            // gained T4's `use_gcloud_token_auth`; this fixture does not use
-            // the ADC flow.
-            use_gcloud_token_auth: false,
-            // (issue #127) The mechanical additive grow: no OIDC login on this fixture.
-            oidc: None,
-        }],
-        ..crate::config::Settings::default()
-    };
-    crate::config::write_settings(&config_home, &settings).expect("settings.json writes");
-    let (space, loop_, db) = build_loop_with_sink(
+) -> (ScratchDir, AgentLoop, Arc<MemoryStore>) {
+    let (space, mut loop_, db) = build_loop_with_sink(
         provider,
         events,
         turn_cancel,
         settle_tx,
         retry,
         models,
-        Some(&config_home),
+        // No settings dir — the row arrives packaged below.
+        None,
         sink,
     );
-    (config_home, space, loop_, db)
+    let row = crate::config_types::ProviderConfig {
+        id: provider_id.to_string(),
+        name: provider_id.to_string(),
+        // The row's base URL is IRRELEVANT here — the `Model` carries the
+        // wire's base URL; this row exists so the header re-lookup in
+        // `set_model` finds a row whose `id == model.provider`.
+        base_url: "https://example.invalid/v1".to_string(),
+        api_key: String::new(),
+        api: "openai-completions".to_string(),
+        key_url: None,
+        auth_mode: "api_key".to_string(),
+        // The RAW template map (the shape the settings document holds — the
+        // expansion happens in `headers_for_providers`, exactly as in
+        // production).
+        headers: Some(headers),
+        allow_insecure_http: false,
+        // (issue #128) The mechanical additive grow: `ProviderConfig`
+        // gained T4's `use_gcloud_token_auth`; this fixture does not use
+        // the ADC flow.
+        use_gcloud_token_auth: false,
+        // (issue #127) The mechanical additive grow: no OIDC login on this fixture.
+        oidc: None,
+    };
+    loop_.set_desktop_config(None, None, None, vec![row], HashMap::new());
+    (space, loop_, db)
 }
 
 /// Build an `AgentLoop` (drops the `Db` — the tests that need the
@@ -603,24 +605,29 @@ pub(super) fn build_loop_with_dispatcher(
     sink: Arc<dyn EventSink>,
     subagent: Option<Arc<dyn SubagentDispatcher>>,
     models: Vec<Model>,
-    config_dir: Option<&std::path::Path>,
+    agent_overrides: Option<
+        &std::collections::HashMap<String, crate::config_types::AgentOverrideFields>,
+    >,
 ) -> (ScratchDir, AgentLoop) {
     let space = crate::test_support::ScratchDir::in_env_temp("harness-loop-test-", "dispatch");
-    let db = Arc::new(Db::open(&space.join("t.db")).expect("db should open"));
+    // (T5/S5b) `MemoryStore`, as in `build_loop_with_sink` — see that
+    // fixture's comment for what the swap costs and where the lost properties
+    // are pinned instead. This builder used to mint a `t.db` it never returned.
+    let db = Arc::new(MemoryStore::new());
     let catalog = ModelCatalog {
         models: models.clone(),
         default_model: None,
         compaction: CompactionConfig::default(),
     };
     let (prompt_tx, prompt_rx) = mpsc::channel(8);
-    let loop_ = AgentLoop::new(
+    let mut loop_ = AgentLoop::new(
         "s1".to_string(),
         // A copy of the path — the guard below owns the dir (#96).
         space.to_path_buf(),
         models[0].clone(),
         provider,
         catalog,
-        Arc::new(SessionStore::new(db)),
+        db,
         events,
         CancellationToken::new(),
         turn_cancel,
@@ -631,13 +638,26 @@ pub(super) fn build_loop_with_dispatcher(
         Arc::new(TokioMutex::new(HashMap::new())),
         None,
         sink,
-        Arc::new(crate::agent::todo::TodoStore::new()),
+        Arc::new(crate::todo::TodoStore::new()),
         subagent,
         SudoDeps::default(),
         retry,
-        config_dir.map(|p| p.to_path_buf()),
+        // (Fulcrum T3) No settings dir: the override layer arrives packaged.
+        None,
         "t".to_string(),
+        // (T5/S5a, SEAM 2) The no-op opener — see the note in
+        // `build_loop_with_sink` for why a fixture injects `NoOpenRequester`.
+        Arc::new(crate::mcp::NoOpenRequester),
     );
+    // The PACKAGED ADR 0066 layer the parent loop hands to `resolve_launch` on
+    // every dispatch (`loop/tools.rs` reads
+    // `self.packaged_agent_overrides`). `None` = the layer that cannot speak,
+    // which is what every other test in this file wants; `Some(map)` is the
+    // override case. Only the overrides half is set — the policy/web/providers
+    // halves stay inert so a dispatch test gates on the default posture.
+    if let Some(map) = agent_overrides {
+        loop_.set_desktop_config(None, None, Some(map.clone()), Vec::new(), HashMap::new());
+    }
     (space, loop_)
 }
 

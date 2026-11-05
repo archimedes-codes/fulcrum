@@ -8,7 +8,7 @@
 
 /// Mint a fresh unique session ID with the `arch_` prefix.
 pub fn mint_session_id() -> String {
-    crate::agent::ids::SessionId::mint().into_string()
+    crate::ids::SessionId::mint().into_string()
 }
 
 /// Mint the id stamp for ONE Worker's life within a Session (a **Session

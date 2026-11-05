@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::debuglog;
-use crate::agent::events::RpcEvent;
-use crate::agent::worker::client::{WorkerHandle, WorkerInboundEvent};
+use crate::debuglog;
+use crate::events::RpcEvent;
+use crate::worker::client::{WorkerHandle, WorkerInboundEvent};
 
 use super::registry::{unexpected_exit, ManagerState};
 use super::subagent_flow::{
@@ -60,7 +60,7 @@ pub(crate) async fn run_pump_loop(
             // process is reaped — the loop ends).
             match result {
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    crate::agent::debuglog::log(&format!(
+                    crate::debuglog::log(&format!(
                         "worker pump lagged {n} frames for session {session_id}"
                     ));
                     continue;

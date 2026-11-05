@@ -13,9 +13,9 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::events::EventSink;
-use crate::agent::interactive::{interactive_key, PendingInteractive};
-use crate::agent::tools::{ContentBlock, ToolResult};
+use crate::events::EventSink;
+use crate::interactive::{interactive_key, PendingInteractive};
+use crate::tools::{ContentBlock, ToolResult};
 
 /// The in-process `ask` flow (the `ask` interactive method's flow — a
 /// `pending_bridge` oneshot + `interactive-request` event): the user's
@@ -448,7 +448,7 @@ fn question_context(r: &AskQuestionResult, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::harness::r#loop::result_text;
+    use crate::harness::r#loop::result_text;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
@@ -1119,7 +1119,7 @@ mod tests {
     /// shape the app has learned to accept.
     #[test]
     fn the_ask_schema_does_not_forbid_the_bare_string_option_form() {
-        let spec = crate::agent::harness::r#loop::tool_specs()
+        let spec = crate::harness::r#loop::tool_specs()
             .into_iter()
             .find(|t| t.name == "ask")
             .expect("the `ask` tool is advertised");

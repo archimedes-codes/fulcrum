@@ -1,6 +1,6 @@
 // ── hostenv: the AppImage child-env scrub, at the CALL SITES ────────
 //
-// `crate::agent::hostenv` pins the RULE (what a scrubbed child env looks
+// `crate::hostenv` pins the RULE (what a scrubbed child env looks
 // like). This section pins the three call sites that were leaking it:
 // `exec_bash`, and the `fd` / `rg` fast paths of `exec_find` /
 // `exec_grep`. Evidence for the defect: the research doc,
@@ -25,7 +25,7 @@ use serde_json::json;
 #[cfg(target_os = "linux")]
 use super::support::*;
 #[cfg(target_os = "linux")]
-use crate::agent::tools::exec::execute_tool;
+use crate::tools::exec::execute_tool;
 
 /// How many hostenv tests SKIPPED because the scrub was unobservable on
 /// this host. Counted, not merely printed —
@@ -177,7 +177,7 @@ fn record_skip(reason: &str) {
 ///
 /// Claim: a `sh` child started the way `exec_bash` starts one (a
 /// `tokio::process::Command` on `sh` with
-/// [`EnvPatch::apply`](crate::agent::hostenv::EnvPatch::apply) on it) sees
+/// [`EnvPatch::apply`](crate::hostenv::EnvPatch::apply) on it) sees
 /// no mount component in `LD_LIBRARY_PATH` and keeps its own `PATH`
 /// entries.
 ///
@@ -203,7 +203,7 @@ async fn a_scrubbed_sh_child_sees_no_mount_path_but_keeps_the_user_path() {
             OsString::from(format!("{MOUNT}/bin:/opt/test-unique/bin")),
         ),
     ];
-    let patch = crate::agent::hostenv::scrub(
+    let patch = crate::hostenv::scrub(
         inherited,
         Some(Path::new(MOUNT)),
         Path::new(EXE_INSIDE_MOUNT),
@@ -284,7 +284,7 @@ async fn the_bash_tool_keeps_the_users_path_entries() {
         OsString::from("PATH"),
         OsString::from(format!("{MOUNT}/bin/:{}", user_bin.display())),
     )];
-    let patch = crate::agent::hostenv::scrub(
+    let patch = crate::hostenv::scrub(
         inherited,
         Some(Path::new(MOUNT)),
         Path::new(EXE_INSIDE_MOUNT),
@@ -411,9 +411,16 @@ async fn a_bash_child_under_a_fabricated_appimage_mount_sees_a_scrubbed_env() {
 
     let mut cmd = tokio::process::Command::new(appdir.join("usr/bin/archimedes"));
     cmd.args([
-        "agent::tools::exec::tests::bash_hostenv::a_bash_child_on_an_appimage_host_sees_no_mount_paths",
-        "agent::tools::exec::tests::bash_hostenv::a_bash_child_under_a_fabricated_appimage_mount_sees_a_scrubbed_env",
-        "agent::tools::exec::tests::bash_hostenv::the_skip_is_a_failure_on_a_capable_host",
+        // The module path is the CRATE's, not the desktop's: these filters are
+        // substrings libtest matches against the test's full path, and T5/S2
+        // moved this file from `agent::tools::exec::tests::…` to
+        // `tools::exec::tests::…`. A stale `agent::` prefix matches NOTHING, and
+        // libtest exits 0 on a filter that selected no test — the parent's
+        // `CHILD_RAN` marker assertion below is what turns that into a loud
+        // failure rather than a green no-op (the reason it is asserted).
+        "tools::exec::tests::bash_hostenv::a_bash_child_on_an_appimage_host_sees_no_mount_paths",
+        "tools::exec::tests::bash_hostenv::a_bash_child_under_a_fabricated_appimage_mount_sees_a_scrubbed_env",
+        "tools::exec::tests::bash_hostenv::the_skip_is_a_failure_on_a_capable_host",
         "--test-threads=1",
         "--nocapture",
     ]);

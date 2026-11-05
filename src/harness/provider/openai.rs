@@ -23,7 +23,7 @@ use super::types::{
     cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
     Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage, WireToolCall,
 };
-use crate::agent::tools::ContentBlock;
+use crate::tools::ContentBlock;
 
 // ── (issue #122) the shared sanitisation-placeholder vocabulary ───────────
 //
@@ -45,7 +45,7 @@ use crate::agent::tools::ContentBlock;
 /// it, and grep across `src/` and `src-tauri/src/` finds zero producers — so
 /// both the inbound stream filter and the outbound `request_body` guard key on
 /// this ONE definition.
-pub(crate) const EMPTY_CONTENT_SANITISE_PLACEHOLDER: &str =
+pub const EMPTY_CONTENT_SANITISE_PLACEHOLDER: &str =
     "[System: Empty message content sanitised to satisfy protocol]";
 
 /// True when `text` IS the upstream sanitisation placeholder and nothing else —
@@ -80,7 +80,7 @@ pub(crate) fn content_is_the_sanitise_placeholder(text: &str) -> bool {
 /// where an effectively-empty text must become `TOOL_EMPTY_OUTPUT_PLACEHOLDER`.
 /// NOT for the streaming drop sites — see
 /// [`content_is_the_sanitise_placeholder`].
-pub(crate) fn content_is_effectively_empty(text: &str) -> bool {
+pub fn content_is_effectively_empty(text: &str) -> bool {
     text.trim().is_empty() || content_is_the_sanitise_placeholder(text)
 }
 
@@ -1016,7 +1016,7 @@ mod tests {
     use super::super::test_util::{chat_message, collect};
     use super::super::types::{ChatMessage, ChatRole, MessageContent, ModelOptions, ToolSpec};
     use super::*;
-    use crate::agent::tools::{ContentBlock, ImageRef};
+    use crate::tools::{ContentBlock, ImageRef};
     // Test-only (the raw-server request counter): importing it at the module
     // head would be an unused import in the non-test build.
     use std::sync::atomic::AtomicU32;

@@ -262,7 +262,7 @@ pub fn user_roots() -> Vec<(PathBuf, SkillScope)> {
     ]
 }
 
-pub(crate) fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
@@ -613,7 +613,7 @@ pub(crate) fn is_tag_safe_name(name: &str) -> bool {
 /// other moves with it, and both sides carry tests for the same name set
 /// (`scout` / `fast-recon` / mixed case in; `has space`, `a_b`, `a.b`,
 /// `café`, `a--b`, `-lead`, `trail-` out).
-pub(crate) fn is_mentionable_name(name: &str) -> bool {
+pub fn is_mentionable_name(name: &str) -> bool {
     let mut expect_segment = true; // a segment is due (start, or after a `-`)
     for c in name.chars() {
         if c == '-' {

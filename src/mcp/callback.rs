@@ -184,7 +184,7 @@ impl CallbackServer {
 /// `oidc.rs` IMPORTS THIS instead of writing a second compare — `provider_auth`
 /// already depends on `mcp::callback` via T5's `bind_with`, so a duplicate
 /// security primitive buys nothing. T6 (and T6 only) may
-/// `use crate::agent::mcp::callback::constant_time_eq`; nothing else copies
+/// `use crate::mcp::callback::constant_time_eq`; nothing else copies
 /// this primitive.
 ///
 /// Honest note on what pins this: `cargo test` cannot OBSERVE timing, so the
@@ -193,7 +193,15 @@ impl CallbackServer {
 /// `tests/provider_oauth_flow.rs` that reddens if this region reverts to a
 /// `String !=` comparison, and MCP's own callback tests staying green (the
 /// behavior pin). No test claims to measure timing.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// (T5/S3 A.3) `pub(crate)` → `pub`, and the ONLY reason is the package
+/// boundary: `provider_auth/oidc.rs` stays desktop (the S3 RULING keeps the
+/// whole rest of `provider_auth` there) and imports this, so `pub(crate)` would
+/// read as an E0603 for it. Ruling R4's substance — ONE definition, imported,
+/// never copy-pasted — is untouched by the visibility; the two structural lints
+/// that pin it (`tests/provider_oidc.rs`, `tests/provider_oauth_flow.rs`) were
+/// repointed at this file's NEW path and the NEW spelling, not weakened.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // The length difference is public (both lengths are visible to the
     // attacker — the state travels in the URL), so it may short-circuit; the
     // byte COMPARE over the shared length never does.

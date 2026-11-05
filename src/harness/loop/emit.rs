@@ -6,12 +6,12 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::{AgentLoop, PermissionContext};
-use crate::agent::events::{EventSink, RpcEvent};
-use crate::agent::harness::provider::{ChatRole, FinishReason, ToolCall, Usage};
-use crate::agent::harness::store::role_str;
-use crate::agent::harness::store::Store;
-use crate::agent::normalize::{compute_display_rows, normalize, ThoughtState, TurnState};
-use crate::agent::tools::ToolEventSink;
+use crate::events::{EventSink, RpcEvent};
+use crate::harness::provider::{ChatRole, FinishReason, ToolCall, Usage};
+use crate::harness::store::role_str;
+use crate::harness::store::Store;
+use crate::normalize::{compute_display_rows, normalize, ThoughtState, TurnState};
+use crate::tools::ToolEventSink;
 
 /// The borrowed view of ONE emit pipeline's state (B1).
 ///
@@ -177,8 +177,8 @@ impl AgentLoop {
         );
     }
 
-    /// Emit one `cost_update` frame (issue #87, T09): the provider's cost for
-    /// the model call whose `Usage` event is being handled.
+    /// Emit one `cost_update` frame (issue #87, T09; the VALUE's meaning is
+    /// Fulcrum T2's): the session's CUMULATIVE cost in USD after this call.
     ///
     /// DIRECT on the sink, like `emit_context_usage` — this is an
     /// **interactive-event**, NOT an `RpcEvent` (D5 + the grounding's §8.5): the
@@ -188,31 +188,77 @@ impl AgentLoop {
     /// phantom event. The envelope is the `todos_update` shape.
     ///
     /// THE CONTRACT (shared with the frontend task, pinned in both plans):
-    /// - **A `None` cost emits NOTHING at all.** Absence is the wire spelling of
-    ///   "no figure"; the phantom `$0.00` is created by *emitting a zero*, so the
-    ///   only defence is not to emit. Rust never puts `null` on this bus.
-    /// - **The value is ONE call's DELTA, never a running total.** The frontend
-    ///   store sums the frames, so re-emitting a total would double-count — and
-    ///   a Worker re-incarnation / `Resume` (which rebuilds this loop with no
-    ///   memory of the old figure) would make that unrecoverable. Hence there is
-    ///   deliberately no accumulator on `AgentLoop`.
+    /// - **A `None` cost emits NOTHING at all, and adds nothing.** Absence is
+    ///   the wire spelling of "no figure"; the phantom `$0.00` is created by
+    ///   *emitting a zero*, so the only defence is not to emit. Rust never puts
+    ///   `null` on this bus. The accumulator is left untouched in that case, so
+    ///   an unpriced call cannot dilute the total the next frame carries.
+    /// - **The value is the session's RUNNING TOTAL** (Fulcrum T2, reversing
+    ///   ADR 0082's "deltas, not totals"). This method owns the accumulator: it
+    ///   adds `cost` to `self.cost_acc` and emits the NEW total. Every consumer
+    ///   — the frontend store (`combineSessionCost`, now last-frame-wins) and the
+    ///   Supervisor's `Db::record_session_cost` (now an overwrite) — replaces
+    ///   rather than sums, so a re-delivered frame cannot double the figure.
+    ///   That is what closes ADR 0082's **limit 7**, whose stated blocker was
+    ///   "a frame carries no identity to dedupe on": a snapshot needs no
+    ///   identity. The `Resume` objection that ADR 0082 used to reject a loop-side
+    ///   total is answered by [`AgentLoop::seed_cost`], which reloads the stored
+    ///   figure into `cost_acc` when the loop is rebuilt.
     /// - **`-0.0` is normalised here.** `c + 0.0` maps `-0.0 -> +0.0` and leaves
     ///   a real `0.0` untouched, so the bus never carries a signed zero (which
     ///   the frontend would render as `$0.00`, since JS treats `-0 === 0`). This
     ///   is NOT the `!= 0.0` filter that would eat a legitimate `Some(0.0)` — a
-    ///   real zero is still a figure and still gets its frame.
-    pub(super) fn emit_cost_update(&self, cost: Option<f64>) {
+    ///   real zero is still a figure and still gets its frame. The normalisation
+    ///   is applied to the TOTAL, so a `-0.0` figure cannot leak a signed zero
+    ///   through the accumulator either, and a session whose first figure is
+    ///   `-0.0` still gets its `+0.0` frame.
+    pub(super) fn emit_cost_update(&mut self, cost: Option<f64>) {
+        // The frame-existence gate and the accumulator's `None` arm are the
+        // SAME decision: no figure reported, nothing to add, no frame.
         let Some(cost) = cost else { return };
-        let cost = cost + 0.0;
+        self.cost_acc += cost;
+        let total = self.cost_acc + 0.0;
         self.sink.emit(
             "interactive-event",
             json!({
                 "sessionId": self.session_id,
                 "seq": 0,
                 "event": "cost_update",
-                "payload": { "costUsd": cost, "source": "main" },
+                "payload": { "costUsd": total, "source": "main" },
             }),
         );
+    }
+
+    /// Fold a CHILD's reported cost into THIS loop's total and emit the new
+    /// total (Fulcrum T2's one-writer fix; the money-loss defect's cure).
+    ///
+    /// WHY THE PARENT'S LOOP IS THE ONLY LEGAL WRITER OF ITS OWN KEY. Issue
+    /// #105 requires a parent's STORED total to include its children. Since the
+    /// frame became a snapshot, two writers on one key cannot both satisfy
+    /// that: the Supervisor's roll-up (`subagent_flow.rs`) and this loop's own
+    /// frames are both keyed to the parent, and the store OVERWRITES, so the
+    /// last frame won — and this loop's accumulator had never seen the child,
+    /// so its next frame erased the child's money (parent 0.003 → child 0.002 →
+    /// parent 0.006 stored `0.009`, not `0.011`). The delta wire ADDED, so it
+    /// hid this; the snapshot wire made it structural. One writer per key is
+    /// the only shape that is correct AND idempotent, and only the parent's
+    /// loop can be that writer: it is the only party that sees both its own
+    /// calls and its children's outcomes.
+    ///
+    /// WHY IT EMITS AND DOES NOT MERELY ADD: a parent whose last act is a
+    /// delegation makes no further priced call, so an add-only fold would keep
+    /// the child's money in memory and out of the row — #105's requirement
+    /// would hold only for parents that happen to spend again afterwards.
+    ///
+    /// The gate is the emitter's own: `None` (a child that never reported a
+    /// figure, or a dispatch that was cancelled before any outcome arrived)
+    /// adds nothing and emits nothing — never a phantom `$0.00` (D5). A child's
+    /// `Some(0.0)` IS a figure and still folds. The `source` stays `"main"`
+    /// because the frame states the PARENT's total, and the label is inert
+    /// anyway (ADR 0041) — a second label on this key would just be a second
+    /// writer wearing a different hat.
+    pub(super) fn fold_child_cost(&mut self, child_cost: Option<f64>) {
+        self.emit_cost_update(child_cost);
     }
 
     /// Re-estimate the context size (the prompt-time / post-tool-batch
@@ -326,7 +372,7 @@ impl AgentLoop {
         ToolCall {
             id: tc.id.clone(),
             name: tc.name.clone(),
-            arguments: crate::agent::harness::ask::normalize_ask_params(&tc.arguments),
+            arguments: crate::harness::ask::normalize_ask_params(&tc.arguments),
         }
     }
 
@@ -416,8 +462,8 @@ impl TurnAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::events::EventSink;
-    use crate::agent::harness::store::NoopStore;
+    use crate::events::EventSink;
+    use crate::harness::store::NoopStore;
     use crate::test_support::env_lock;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_util::sync::CancellationToken;

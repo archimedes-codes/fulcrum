@@ -14,9 +14,9 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::agent::events::EventSink;
-use crate::agent::hostenv::EnvPatch;
-use crate::agent::interactive::{PendingSudo, SudoRun};
+use crate::events::EventSink;
+use crate::hostenv::EnvPatch;
+use crate::interactive::{PendingSudo, SudoRun};
 
 /// The `sudo_exec` execution seam (mirrors the suite's `SudoSpawner` seam,
 /// `packages/sudo/src/tool.ts` `createSudoExecTool({spawner})`): the desktop
@@ -28,7 +28,8 @@ use crate::agent::interactive::{PendingSudo, SudoRun};
 /// trait is NOT dyn-compatible, hence the boxed-future return (the
 /// boxed-future pattern).
 pub trait SudoRunner: Send + Sync {
-    /// Run `sudo -S <argv>` (the full argv from [`build_sudo_argv`] — no
+    /// Run `sudo -S <argv>` (the full argv from
+    /// [`build_sudo_argv`](crate::interactive::sudo_argv::build_sudo_argv) — no
     /// `-p`), writing `password` to stdin (never argv/env), bounded by
     /// `timeout` (on timeout the WHOLE process group is SIGKILLed — the
     /// suite's `killProcessTree`).
@@ -68,19 +69,19 @@ impl SudoRunner for RealSudoRunner {
 /// `argv.split_first()` pair the caller already computed — the seam takes the
 /// same inputs the old two lines did, nothing more.
 fn build_command(cmd0: &str, rest: &[String]) -> tokio::process::Command {
-    build_command_with(cmd0, rest, crate::agent::hostenv::for_child())
+    build_command_with(cmd0, rest, crate::hostenv::for_child())
 }
 
 /// [`build_command`] with the patch as an argument (production passes exactly
-/// [`for_child`](crate::agent::hostenv::for_child); the parameter exists
+/// [`for_child`](crate::hostenv::for_child); the parameter exists
 /// because that cached patch is EMPTY under `cargo test` — its gate needs this
 /// exe under `$APPDIR`, and under cargo it is `target/debug/deps/<hash>`).
 ///
-/// The constructor is `crate::agent::childproc`'s — it owns the child's Windows
+/// The constructor is `crate::childproc`'s — it owns the child's Windows
 /// console window policy (`CREATE_NO_WINDOW`); the password stdin is a Runtime
 /// pipe and stays untouched.
 fn build_command_with(cmd0: &str, rest: &[String], patch: &EnvPatch) -> tokio::process::Command {
-    let mut cmd = crate::agent::childproc::command(cmd0);
+    let mut cmd = crate::childproc::command(cmd0);
     cmd.args(rest);
     // THE HIGHEST-SEVERITY SITE of the four (`docs/research/
     // appimage-child-process-env-leak.md`): an attacker-influenced loader path
@@ -388,7 +389,7 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
     // unbounded wait for EOF (a grandchild that escaped the group could hold
     // the pipes forever). Only meaningful while a pipe is open.
     if stdout_open || stderr_open {
-        let grace = tokio::time::Instant::now() + crate::agent::tools::exec::bash::DRAIN_GRACE;
+        let grace = tokio::time::Instant::now() + crate::tools::exec::bash::DRAIN_GRACE;
         loop {
             tokio::select! {
                 r = stdout_pipe.read(&mut out_chunk), if stdout_open => {
@@ -420,7 +421,7 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
     // status at all. Without it, a hang is reported "exit status unknown".
     if status.is_none() {
         if let Ok(Ok(s)) =
-            tokio::time::timeout(crate::agent::tools::exec::bash::DRAIN_GRACE, child.wait()).await
+            tokio::time::timeout(crate::tools::exec::bash::DRAIN_GRACE, child.wait()).await
         {
             status = Some(s);
         }
@@ -435,7 +436,7 @@ async fn run_sudo_real(argv: Vec<String>, password: String, timeout: Duration) -
     // the sudo run has no cancel arm; the fourth fact is the LATCHED
     // `pipes_held`, never the live pair the kill and drain just cleared.
     let (exit_code, is_error, note) =
-        crate::agent::tools::exec::bash::bash_exit_report(false, timed_out, status, pipes_held);
+        crate::tools::exec::bash::bash_exit_report(false, timed_out, status, pipes_held);
     // The run is settled (the child was reaped by the loop, by the kill + reap,
     // or by the bounded reap above) — disarm the guard: a backgrounded
     // grandchild the user wanted to keep running survives a normal completion,
@@ -478,13 +479,13 @@ fn is_swallowed_pipe_error(e: &std::io::Error) -> bool {
 /// `Child::id()` — the live read is `None` by the time a timed-out child has
 /// been reaped, and a `None` there skips the group kill and leaves the
 /// elevated grandchildren of a root command alive. The kill is delegated to
-/// `crate::agent::childproc::kill_process_group` (its single owner); this
+/// `crate::childproc::kill_process_group` (its single owner); this
 /// wrapper adds only the reap.
 async fn kill_process_group_and_reap(pid: Option<u32>, child: &mut tokio::process::Child) {
     // The group kill itself lives in `childproc` (one owner — ADR 0080's
     // amendment); the REAP is this caller's decision (the elevated path wants
     // no zombie, the bash and Worker paths must not reap).
-    crate::agent::childproc::kill_process_group(pid, child).await;
+    crate::childproc::kill_process_group(pid, child).await;
     let _ = child.wait().await;
 }
 
@@ -1115,15 +1116,15 @@ mod tests {
     /// byte-identical to the caller's (scrubbing must never change WHAT runs).
     ///
     /// The patch is injected through the seam rather than read from
-    /// [`for_child`](crate::agent::hostenv::for_child), which is EMPTY under
+    /// [`for_child`](crate::hostenv::for_child), which is EMPTY under
     /// `cargo test` (`current_exe()` is `target/debug/deps/<hash>`, so the
     /// production gate is closed) — such a test could not fail. The fabricated
-    /// host in [`fixtures`](crate::agent::hostenv::fixtures) supplies a patch
+    /// host in [`fixtures`](crate::hostenv::fixtures) supplies a patch
     /// that is genuinely non-empty.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_sudo_runner_scrubs_before_elevating() {
-        use crate::agent::hostenv::fixtures;
+        use crate::hostenv::fixtures;
         use std::ffi::{OsStr, OsString};
 
         let patch = fixtures::tainted_patch();

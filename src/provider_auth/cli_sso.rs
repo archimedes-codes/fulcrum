@@ -423,7 +423,7 @@ pub async fn store_pasted(
             Err(e) => {
                 // The degradation is LOUD in the log but silent on the wire —
                 // the paste succeeds with the token the user handed us.
-                crate::agent::debuglog::log(&format!(
+                crate::debuglog::log(&format!(
                     "provider-auth: the virtual-key mint failed ({e}) — storing the pasted token \
                      directly"
                 ));

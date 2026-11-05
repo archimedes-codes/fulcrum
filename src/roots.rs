@@ -36,7 +36,7 @@
 //! * **No root-level dedupe, no sort of the roots, no canonicalization.**
 //!   The level list is produced once, innermost-first, and handed to the
 //!   caller as-is. Both pins fix that exact sequence, and
-//!   [`crate::agent::boundary::read_roots`] depends on the RAW spellings
+//!   [`crate::boundary::read_roots`] depends on the RAW spellings
 //!   surviving until its own `push_roots` canonicalizes them — so
 //!   `fs::canonicalize` appears nowhere in the walk, and the input is walked
 //!   as the caller passed it (the "Do NOT canonicalize the input before

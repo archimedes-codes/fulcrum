@@ -1,6 +1,6 @@
 //! The subagent session manager (ADR 0025 Task 5 — the re-plumb): a
 //! subagent dispatch runs the child in a WORKER process (the
-//! `WorkerManager`'s `dispatch_subagent` flow — a subagent Worker per
+//! dispatcher's `dispatch_subagent` flow — a subagent Worker per
 //! dispatch). The in-process child `AgentLoop` + the throwaway-`Db`
 //! machinery are GONE (the subagent's transcript now persists as a
 //! hidden ephemeral row — the Supervisor's `TranscriptPersister` applies
@@ -9,126 +9,90 @@
 //! The manager is the SUPERVISOR-side dispatcher: the
 //! `InProcessDispatcher` (the `AgentLoop`'s `subagent` seam — the test
 //! path) wraps `dispatch_native`, which delegates to the
-//! `WorkerManager`'s `dispatch_subagent` flow (the production path is a
+//! dispatcher's `dispatch_subagent` flow (the production path is a
 //! main-session Worker's `IpcDispatcher` → `Outbound::SubagentDispatch`
-//! → the `WorkerManager`'s flow directly). Subagents cannot dispatch
+//! → the dispatcher's flow directly). Subagents cannot dispatch
 //! subagents (the child Worker's `enabled_tools` exclude `subagent` /
-//! `list_agents` — the recursion guard, the `WorkerManager`'s flow).
+//! `list_agents` — the recursion guard, the dispatcher's flow).
 
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
 
-use crate::agent::events::EventSink;
-use crate::agent::harness::Model;
-use crate::agent::harness::ModelKey;
-use crate::agent::types::mint_session_id;
-use crate::agent::worker::manager::WorkerManager;
-use crate::agent::worker::protocol::SubagentDispatchWire;
+use crate::events::EventSink;
+use crate::harness::Model;
+use crate::harness::ModelKey;
+use crate::seams::Dispatcher;
+use crate::types::mint_session_id;
+use crate::worker_types::SubagentDispatchWire;
 
-/// Per-dispatch pi configuration for a subagent session (moved verbatim
-/// from `launch_wrapper.rs` — the wrapper script is deleted in this task;
-/// the flags are now passed directly to the `pi` spawn).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct LaunchConfig {
-    /// The agent file body (named agents); `None` for config-less dispatch.
-    pub system_prompt: Option<String>,
-    /// Resolved model ("provider/id" or "provider/id:<thinking>"); `None` = pi default.
-    pub model: Option<String>,
-    /// The thinking level from the OVERRIDE layer or the explicit tool-call
-    /// param — NEVER the frontmatter's own value, and never the model key's
-    /// `:<level>` suffix.
-    ///
-    /// This field is the TOP rung of the dispatch's thinking chain
-    /// (`subagent_flow.rs`: this > the model key's suffix >
-    /// `frontmatter_thinking`), so whatever lands in it outranks the suffix.
-    /// ADR 0066 put the `agentOverrides` thinking level here — the only layer
-    /// below the explicit param allowed to — and `resolve_agent_launch` writes
-    /// it only when the model that just resolved advertises the level, so a
-    /// demoted override never reaches a child (nor gets reported as effective,
-    /// ADR 0068). The frontmatter's `thinking` stays in
-    /// `frontmatter_thinking`, the LAST rung.
-    pub thinking: Option<String>,
-    /// The frontmatter's `thinking` (the dispatch resolves the thinking in
-    /// the doc-correct order: explicit > model-key `:<level>` suffix >
-    /// this — the frontmatter's `thinking` is the LAST rung). `None` for
-    /// a config-less dispatch.
-    pub frontmatter_thinking: Option<String>,
-    /// Tool allowlist (named agents with `tools`); `None` → `--exclude-tools subagent`.
-    pub tools: Option<Vec<String>>,
-    /// Frontmatter `permission` (issue #101's ruleset) as the definition
-    /// DECLARES it — a NARROWING layer only: the gate's strict-of-two merge
-    /// consumes it (task05b), so it can make a call MORE restricted than the
-    /// user's `filePolicy` would, never less. `None` → the file does not
-    /// speak about permissions (no narrowing). Crosses the wire inside
-    /// `SubagentDispatchWire.launch`; a config-less dispatch stays `None`.
-    ///
-    /// BOXED, and the box is load-bearing: an inline `Option<PermissionBlock>`
-    /// puts `LaunchConfig` at 144 bytes, which pushes the two wire enums that
-    /// carry it (`Outbound::SubagentDispatch` / `WorkerInboundEvent::
-    /// SubagentDispatch`, both in worker-owned files) over clippy's
-    /// `large_enum_variant` threshold — CI's `-D warnings` would fail on files
-    /// this task may not edit. `Box` is TRANSPARENT to serde, so the wire JSON
-    /// is byte-identical to the unboxed field the plan specifies; only Rust's
-    /// in-memory shape differs (task05b reads it through `Option::as_deref()`).
-    pub permission: Option<Box<crate::agent::definition_permission::PermissionBlock>>,
-}
+// T5/S3: `LaunchConfig` moved to `fulcrum_core::launch_config` — it is pure
+// data (six `Option` fields, its only non-`std` reference is
+// `definition_permission::PermissionBlock`, which moved in S2) while THIS file
+// could not move until S5b because of the `WorkerManager` edge below it.
+// `interactive`
+// (S3) imports it, so the type had to move ahead of its neighbours; the E.1
+// wire-type pattern, not a seam. Re-exported HERE so every existing
+// `subagent::LaunchConfig` path — `bin/fake_worker.rs`, `commands/agents.rs`,
+// `harness/launch.rs`, `harness/dispatch.rs`, `worker/protocol.rs`,
+// `worker/dispatch.rs`, `worker/manager/tests/mod.rs`,
+// `tests/harness_dispatch_native.rs` — keeps resolving with zero edits. See the
+// crate module's docs for the full rationale.
+pub use crate::launch_config::LaunchConfig;
 
-/// (issue #47) Whether a `subagent` call's `agentName` resolved against the
-/// discovered Agent definitions — the REPORT that `resolve_launch`'s
-/// never-an-error contract left unsaid.
-///
-/// The three states are NOT two. `resolve_launch` returns the SAME verbatim
-/// `LaunchConfig` for `NoName` and `Unmatched` (ADR 0020: "an UNKNOWN or
-/// omitted `agentName` is still a no-op for behavior — label-only, config-less,
-/// never an error"), and the child's config is identical in both, so the
-/// distinction is invisible downstream unless the resolver says it. It matters
-/// because the two cases are opposite stories for whoever is debugging:
-/// `NoName` is the designed config-less dispatch, `Unmatched` is a typo in a
-/// correctly-spelled key that leaves a child running the PARENT's model, the
-/// PARENT's tools and no persona while the UI prints a confident agent label.
-/// A `bool` would collapse them and force the UI to flag the deliberate case.
-///
-/// The wire spelling is the contract (`#[serde(rename_all = "snake_case")]` →
-/// `no_name` / `matched` / `unmatched`), pinned by
-/// `protocol::tests::the_agent_name_resolution_serialises_in_snake_case`; the
-/// frontend mirrors it as `AgentNameResolution` in `src/lib/tauri/types.ts`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentNameResolution {
-    /// No `agentName` was passed (or it was blank after `trim()`) — the
-    /// config-less dispatch ADR 0020 intends. NOT a miss; the UI stays silent.
-    NoName,
-    /// A definition matched (`discover_agents` + `eq_ignore_ascii_case`, so a
-    /// different case is a MATCH, not a miss).
-    Matched,
-    /// A name was given and matched NO discovered definition. The launch is
-    /// still returned verbatim and the child still runs — but with no persona,
-    /// no tool allowlist and no model from the name it was given.
-    Unmatched,
-}
+// T5/S4 (plan Step E.2/E.3): the subagent dispatch VOCABULARY moved to
+// `fulcrum_core::subagent_types` with `LaunchConfig`'s siblings. The reason is the
+// same ordering constraint S3 hit and for the same remedy — `SubagentDispatchWire`
+// (E3) names `AgentNameResolution` in a field, and the crate's `Dispatcher` trait
+// (E2) takes a `oneshot::Sender<SubagentOutcome>`, so neither the wire type nor the
+// trait can be DECLARED while those two still live here; and THIS file cannot move
+// until S5b because of that edge. Pure data moves ahead of the
+// behaviour that owns it, re-exported so every existing path resolves.
+//
+// Re-exported HERE (and through `agent/mod.rs`) for all four, so
+// `subagent::AgentNameResolution`, `agent::SubagentOutcome` and
+// `archimedes_lib::agent::subagent::SubagentMetrics` keep compiling at their ~40
+// sites, including `bin/fake_worker.rs`, `harness/launch.rs`, `harness/dispatch.rs`
+// and the two-sided `worker_e2e` fixtures.
+//
+// `SubagentCancel` lives below, in this crate: its dispatch variant used to
+// hold `Arc<WorkerManager>` — the edge E2 re-appearing through the back door —
+// and S5b replaced it with `Arc<dyn Dispatcher>`, exactly the re-plumb the trait's
+// own docs promised. The `Flag` and `None` arms are unchanged.
+pub use crate::subagent_types::{
+    AgentNameResolution, SubagentFailureReason, SubagentMetrics, SubagentOutcome,
+};
 
 /// Manages the subagent dispatchs (ADR 0025 Task 5 — the re-plumb):
-/// `dispatch_native` delegates to the `WorkerManager` (the
+/// `dispatch_native` delegates to the [`Dispatcher`] (the
 /// `dispatch_subagent` flow — a subagent Worker per dispatch; the
 /// model / `thinking` resolution is SUPERVISOR-side, the three-way
 /// `enabled_tools` rule + the `system_prompt` envelope field + the
 /// `SubagentCapture` + the **Dead bound** + the
 /// `subagent-session-started` / `subagent-closed` UI lifecycle events
-/// live in the flow). The `WorkerManager` is set ONCE at the
-/// `SessionManager` wiring time (`set_worker_manager` — the
+/// live in the flow). The dispatcher is set ONCE at the
+/// `SessionManager` wiring time (`set_dispatcher` — the
 /// `SessionManager`'s `attach_worker_manager` / `set_subagent_manager`
 /// late-wire forwards it). The subagent's `sessions` row is recorded by
 /// the Supervisor's `TranscriptPersister` (the `is_subagent` flag) — the
 /// manager no longer records it.
 pub struct SubagentSessionManager {
-    /// The `WorkerManager` (the `dispatch_native` delegate — the subagent
+    /// The dispatch seam (the `dispatch_native` delegate — the subagent
     /// runs in a Worker process; `None` = a manager never wired into a
     /// `SessionManager` → `dispatch_native` is an already-resolved
     /// `Failed`).
-    worker_manager: std::sync::OnceLock<Arc<WorkerManager>>,
+    ///
+    /// T5/S5b (edge E2): the concrete `Arc<WorkerManager>` this held is the
+    /// edge itself, and it is now the crate's [`Dispatcher`] trait. The
+    /// desktop's `WorkerManager` implements it in `worker/manager/mod.rs`, one
+    /// line per method, and the S4 instantiation pin
+    /// (`tests/fulcrum_seams.rs`) is what proves the impl is real. Renamed
+    /// beside the type: the field is PRIVATE, so nothing outside this file
+    /// named it (measured: the only readers were `set_worker_manager` /
+    /// `worker_manager`, both `pub` and both renamed here — A.3's rule that the
+    /// STAYING desktop's names decide visibility applies to the name too).
+    dispatcher: std::sync::OnceLock<Arc<dyn Dispatcher>>,
 }
 
 impl Default for SubagentSessionManager {
@@ -138,25 +102,25 @@ impl Default for SubagentSessionManager {
 }
 
 impl SubagentSessionManager {
-    /// Create a manager (the `WorkerManager` is threaded at the
-    /// `SessionManager` wiring time — `set_worker_manager`).
+    /// Create a manager (the dispatcher is threaded at the
+    /// `SessionManager` wiring time — `set_dispatcher`).
     pub fn new() -> Self {
         Self {
-            worker_manager: std::sync::OnceLock::new(),
+            dispatcher: std::sync::OnceLock::new(),
         }
     }
 
-    /// Store the `WorkerManager` (set-once — a second call is a NO-OP;
+    /// Store the dispatcher (set-once — a second call is a NO-OP;
     /// the `OnceLock` is set at the `SessionManager` wiring time, so
     /// the setter takes `&self` and is callable through the `Arc`).
-    pub fn set_worker_manager(&self, wm: Arc<WorkerManager>) {
-        let _ = self.worker_manager.set(wm);
+    pub fn set_dispatcher(&self, dispatcher: Arc<dyn Dispatcher>) {
+        let _ = self.dispatcher.set(dispatcher);
     }
 
-    /// The `WorkerManager` (`None` until `set_worker_manager` — a
+    /// The dispatcher (`None` until `set_dispatcher` — a
     /// manager that was never wired into a `SessionManager`).
-    pub fn worker_manager(&self) -> Option<Arc<WorkerManager>> {
-        self.worker_manager.get().cloned()
+    pub fn dispatcher(&self) -> Option<Arc<dyn Dispatcher>> {
+        self.dispatcher.get().cloned()
     }
 
     /// Spawn a WORKER for a subagent dispatch (the ADR 0025 Task 5
@@ -176,7 +140,7 @@ impl SubagentSessionManager {
     /// — uses to abort the dispatch maps to the flow's `cancel_subagent`
     /// — the pre-minted child session id is the `drives` map key).
     ///
-    /// `None` `WorkerManager` (a manager never wired into a
+    /// `None` dispatcher (a manager never wired into a
     /// `SessionManager`) → an already-resolved `Failed` (NO fallback —
     /// a native parent always has an attached `WorkerManager` in
     /// production; the "no manager" case is handled by
@@ -200,9 +164,9 @@ impl SubagentSessionManager {
         task: String,
         _sink: &Arc<dyn EventSink>,
     ) -> (oneshot::Receiver<SubagentOutcome>, SubagentCancel) {
-        // The `WorkerManager` (the `dispatch_subagent` flow's home — a
+        // The dispatcher (the `dispatch_subagent` flow's home — a
         // `None` manager is an already-resolved `Failed`).
-        let Some(wm) = self.worker_manager.get().cloned() else {
+        let Some(dispatcher) = self.dispatcher.get().cloned() else {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(SubagentOutcome::Failed {
                 // A preflight failure — the child NEVER started, so the empty
@@ -234,8 +198,8 @@ impl SubagentSessionManager {
             // catalog; a `launch.model` override wins over it).
             model_key: ModelKey::from(parent_model).to_string(),
         };
-        wm.dispatch_subagent_to(parent_session_id.as_ref(), wire, child_id.clone(), tx);
-        (rx, SubagentCancel::new_worker(wm, child_id))
+        dispatcher.dispatch_subagent_to(parent_session_id.as_ref(), wire, child_id.clone(), tx);
+        (rx, SubagentCancel::new_dispatcher(dispatcher, child_id))
     }
 }
 
@@ -249,8 +213,8 @@ pub enum SubagentCancel {
     /// A Worker-backed dispatch: `cancel()` asks the `WorkerManager` to
     /// abort the child Worker (the `send_abort` + the drive's
     /// `Cancelled` outcome + the reap).
-    Worker {
-        wm: Arc<WorkerManager>,
+    Dispatcher {
+        dispatcher: Arc<dyn Dispatcher>,
         child_session_id: String,
     },
     /// The flag (the `IpcDispatcher` — a watcher task turns the flip
@@ -276,24 +240,24 @@ impl SubagentCancel {
     }
 
     /// A Worker-backed cancel (the `dispatch_native` re-plumb — the
-    /// `WorkerManager`'s `cancel_subagent` targets the pre-minted child
+    /// dispatcher's `cancel_subagent` targets the pre-minted child
     /// session id).
-    pub fn new_worker(wm: Arc<WorkerManager>, child_session_id: String) -> Self {
-        SubagentCancel::Worker {
-            wm,
+    pub fn new_dispatcher(dispatcher: Arc<dyn Dispatcher>, child_session_id: String) -> Self {
+        SubagentCancel::Dispatcher {
+            dispatcher,
             child_session_id,
         }
     }
 
     /// Cancel the dispatch. Idempotent (a second `cancel` is a no-op —
-    /// the `WorkerManager`'s `cancel_subagent` is a no-op for a gone
+    /// the dispatcher's `cancel_subagent` is a no-op for a gone
     /// drive; the flag `send` is a no-op for a gone receiver).
     pub fn cancel(&self) {
         match self {
-            SubagentCancel::Worker {
-                wm,
+            SubagentCancel::Dispatcher {
+                dispatcher,
                 child_session_id,
-            } => wm.cancel_subagent(child_session_id),
+            } => dispatcher.cancel_subagent(child_session_id),
             SubagentCancel::Flag(tx) => {
                 let _ = tx.send(true);
             }
@@ -302,641 +266,133 @@ impl SubagentCancel {
     }
 }
 
-/// The metrics captured for a subagent session (the child's reported cost +
-/// its token usage + the wall-clock duration).
-///
-/// The cost mechanism is REAL as of issue #87, and it is **per model CALL, not
-/// per turn**: the child's own loop emits one `cost_update` frame for every
-/// provider call that reported a cost, the Supervisor's `SubagentCapture` sums
-/// those frames (see `worker/manager/subagent_flow.rs`), and this field carries
-/// that sum. The earlier text here claimed the suite "self-emits a per-turn
-/// `cost_update`" derived from a model `turn_end` usage; no such mechanism ever
-/// existed, and the grain was wrong besides — a turn spans several model calls.
-///
-/// **What `cost` says here:** it is an `Option<f64>`, so the field CAN tell the
-/// two states apart. `None` means **no call reported a cost** (a preflight
-/// failure — a child that never started — or a child whose every call came back
-/// unpriced); `Some(0.0)` means **a call reported a real zero**, which is a
-/// figure. The wire spells the first `"cost": null` (present-and-null, exactly
-/// the `SessionInfo.cost_usd` rule) and the second `0.0`, and the two are never
-/// collapsed — a renderer prints nothing for the first and `$0.00` for the
-/// second (ADR 0082 / D5). The old `f64` field collapsed both into `0.0` at
-/// `unwrap_or(0.0)`; that collapse is what issue #107 removed, and the capture's
-/// `Option` now reaches the hand-off untouched.
-///
-/// `duration_ms` is always the wall clock (see the wire contract's metrics note).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct SubagentMetrics {
-    /// The last message's accumulated text ("" when the turn produced no
-    /// assistant text — the stale-carry-over test's EMPTY sentinel).
-    pub output: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    /// The child's summed per-call cost in USD (see the struct's doc). `None` =
-    /// "no call reported a cost" — NOT zero; `Some(0.0)` = a call reported a
-    /// real zero, which IS a figure. Serde has no `skip_serializing_if` here, so
-    /// `None` crosses as `"cost": null` (present-and-null) on both wires.
-    pub cost: Option<f64>,
-    pub duration_ms: u64,
-}
-
-/// Why a **Subagent session** ended without settling (ADR 0055). DATA, not
-/// prose — the `subagent-closed` payload's `reason` field and the card's short
-/// line read this; NOTHING may string-match `error` to find out what happened.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubagentFailureReason {
-    /// The **Dead bound** won — silent with nothing in flight.
-    Unresponsive,
-    /// The **Worker process** exited unexpectedly.
-    Crashed,
-    /// A Stop on the parent (or an app-exit teardown).
-    Cancelled,
-    /// Anything else (a preflight failure — the child never started).
-    #[default]
-    Other,
-}
-
-/// The outcome of a subagent dispatch. `Serialize` / `Deserialize` /
-/// `Clone` (ADR 0025 Task 2): the `SubagentResult` wire frame carries it
-/// verbatim (the Supervisor → Worker resolution), and the client-side
-/// enum needs both.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum SubagentOutcome {
-    /// The task completed; `output` is the last message's accumulated text,
-    /// `metrics` is the accumulated `cost_update` usage + duration.
-    Completed {
-        output: String,
-        metrics: SubagentMetrics,
-    },
-    /// The task failed (or was cancelled — `error` includes `"cancelled"`).
-    /// A **Dead Subagent** is NEVER `Completed`: it never decided it was
-    /// finished. The status stays `failed`; the SALVAGE rides alongside.
-    Failed {
-        /// Why it ended (the machine-readable answer — never parsed out of
-        /// `error`). `#[serde(default)]` so a stale Worker's payload decodes.
-        #[serde(default)]
-        reason: SubagentFailureReason,
-        error: String,
-        /// Whatever the child had produced (the `SubagentCapture`'s text) — `""`
-        /// when there was nothing. Never a substitute for `Completed`.
-        #[serde(default)]
-        output: String,
-        /// REAL accumulated usage + wall clock (the failed path used to report
-        /// `SubagentMetrics::default()` — 0 tokens for work that really cost money).
-        #[serde(default)]
-        metrics: SubagentMetrics,
-    },
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex as StdMutex};
-    use std::time::Duration;
 
     use tokio::sync::oneshot;
 
-    use crate::agent::events::EventSink;
-    use crate::agent::harness::catalog::{Model, ModelCatalog};
-    use crate::agent::subagent::{
-        AgentNameResolution, LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentOutcome,
-        SubagentSessionManager,
-    };
-    use crate::agent::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
-    use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
-    use crate::agent::worker::protocol::{StartEnv, StartMode};
+    use crate::seams::Dispatcher;
+    use crate::subagent::{SubagentCancel, SubagentOutcome, SubagentSessionManager};
 
-    type SinkEvents = Arc<StdMutex<Vec<(String, serde_json::Value)>>>;
-    type EventLog = Arc<StdMutex<Vec<(String, bool, WorkerInboundEvent)>>>;
-    type SinkMap = Arc<StdMutex<HashMap<String, Arc<CollectorSink>>>>;
-
-    /// The `fake_worker` fixture (the `fake_mcp_stdio` convention — the
-    /// `CARGO_MANIFEST_DIR`/`target/debug` path; `cargo test` builds the
-    /// bin targets).
-    fn fixture_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_worker"
-        ))
+    /// A crate-side [`Dispatcher`] double (T5/S5b). The two pins below are the
+    /// only survivors of the `WorkerManager`-backed cluster in this module, and
+    /// they need a dispatcher to hold — so they get the crate's own trait object
+    /// rather than a `WorkerManager`. WHEN THIS WAS WRITTEN THAT WAS A BOUNDARY
+    /// RULE (`worker/` was desktop through T8 and this crate could not name it);
+    /// T8/S8.3 moved `worker/manager/` in, so `crate::worker::manager::
+    /// WorkerManager` is nameable here now. The double is still the right choice,
+    /// for the reason stated below rather than the boundary rule: a real manager
+    /// spawns a child process, and neither claim below is about the manager.
+    ///
+    /// WHY A DOUBLE IS HONEST HERE AND WAS NOT HONEST FOR THE OTHER EIGHT
+    ///
+    /// These two tests' claims are about THIS file: the `OnceLock`'s set-once
+    /// rule, and `SubagentCancel::cancel()` routing to the right arm. The
+    /// dispatcher is not the thing under test — it is the collaborator the thing
+    /// under test is handed — so implementing it here asserts nothing circular.
+    /// The eight tests that RELOCATED to `src-tauri/tests/harness_subagent_worker.rs`
+    /// each asserted something the DESKTOP's `dispatch_subagent` flow computes
+    /// (the capture text, the exit code, the Dead bound, the recursion guard, the
+    /// `trusted` inheritance), and a double would have made all of those
+    /// tautological. That is the line this split is drawn on, and it is drawn per
+    /// claim rather than per file.
+    struct RecordingDispatcher {
+        cancels: StdMutex<Vec<String>>,
     }
 
-    /// The test factory (the `WorkerFactory` seam — the `fake_worker`
-    /// binary; production is `WorkerHandle::spawn(std::env::
-    /// current_exe().as_path())`).
-    struct FakeWorkerFactory;
-
-    impl WorkerFactory for FakeWorkerFactory {
-        fn spawn(&self) -> Result<WorkerHandle, WorkerError> {
-            WorkerHandle::spawn(&fixture_path())
+    impl RecordingDispatcher {
+        fn new() -> Self {
+            Self {
+                cancels: StdMutex::new(Vec::new()),
+            }
         }
-    }
 
-    /// A UI sink collector (the parent-scope `TauriSink` test double).
-    #[derive(Clone)]
-    struct CollectorSink {
-        events: SinkEvents,
-    }
-
-    impl CollectorSink {
-        fn new() -> (Self, SinkEvents) {
-            let events = Arc::new(StdMutex::new(Vec::new()));
-            (
-                Self {
-                    events: events.clone(),
-                },
-                events,
-            )
-        }
-    }
-
-    impl EventSink for CollectorSink {
-        fn emit(&self, event: &str, payload: serde_json::Value) {
-            self.events
+        fn cancels(&self) -> Vec<String> {
+            self.cancels
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .push((event.to_string(), payload));
+                .clone()
         }
     }
 
-    /// A test `Model` (a fake provider — the `fake_worker`'s
-    /// `model_key` `fake/m1` resolves against the parent's catalog).
-    fn test_model(id: &str, thinking_levels: Vec<String>) -> Model {
-        Model {
-            id: id.to_string(),
-            provider: "fake".to_string(),
-            base_url: "http://fake/v1".to_string(),
-            api_key: "k".to_string(),
-            context_window: 100_000,
-            cost_per_mtok_in: 0.0,
-            cost_per_mtok_out: 0.0,
-            supports_tools: true,
-            supports_thinking: !thinking_levels.is_empty(),
-            thinking_levels,
-            api: Some("openai-completions".to_string()),
+    impl Dispatcher for RecordingDispatcher {
+        fn dispatch_subagent_to(
+            &self,
+            _parent_session_id: &str,
+            _wire: crate::worker_types::SubagentDispatchWire,
+            _child_session_id: String,
+            _outcome: oneshot::Sender<SubagentOutcome>,
+        ) {
         }
-    }
 
-    /// A parent `StartEnv` (the `dispatch_subagent` flow reads the
-    /// effective `catalog` / `config_dir` / `trusted` from it — the
-    /// Supervisor owns them).
-    fn test_env(
-        session_id: &str,
-        models: Vec<Model>,
-        enabled_tools: Option<Vec<String>>,
-        trusted: bool,
-    ) -> StartEnv {
-        StartEnv::from_parts(
-            session_id.to_string(),
-            "/tmp/space".to_string(),
-            StartMode::Fresh,
-            None,
-            models
-                .first()
-                .cloned()
-                .unwrap_or_else(|| test_model("m1", Vec::new())),
-            ModelCatalog {
-                models,
-                ..Default::default()
-            },
-            None,
-            trusted,
-            enabled_tools,
-            "/tmp/config".to_string(),
-            true,
-            None,
-            // (issue #101) A parent/worker-side start (no definition involved) —
-            // `None` = no per-agent narrowing.
-            None,
-        )
-    }
-
-    /// A `SubagentSessionManager` on a `WorkerManager` (the
-    /// `dispatch_native` re-plumb — the subagent runs in a
-    /// `fake_worker` process): the parent `p1` is `attach`ed with the
-    /// given `StartEnv` (the flow's `catalog` / `trusted` source) + the
-    /// parent-scope sink is registered (the
-    /// `subagent-session-started` / `subagent-closed` lifecycle events).
-    async fn make_manager(
-        dead_bound: Option<Duration>,
-        parent_env: StartEnv,
-    ) -> (
-        Arc<SubagentSessionManager>,
-        Arc<WorkerManager>,
-        SinkEvents,
-        EventLog,
-    ) {
-        let (sink, sink_events) = CollectorSink::new();
-        let events: EventLog = Arc::new(StdMutex::new(Vec::new()));
-        let sinks: SinkMap = Arc::new(StdMutex::new(HashMap::new()));
-        {
-            let mut m = sinks.lock().unwrap_or_else(|p| p.into_inner());
-            m.insert("p1".to_string(), Arc::new(sink));
-        }
-        let factory: Arc<dyn WorkerFactory> = Arc::new(FakeWorkerFactory);
-        let events_c = events.clone();
-        let manager = WorkerManager::new(
-            factory,
-            Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
-            Arc::new(
-                move |id: String, is_subagent: bool, evt: WorkerInboundEvent| {
-                    events_c
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .push((id, is_subagent, evt));
-                },
-            ),
-            Arc::new(move |id: &str| {
-                sinks
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get(id)
-                    .cloned()
-                    .map(|s| s as Arc<dyn EventSink>)
-            }),
-        );
-        let manager = match dead_bound {
-            Some(t) => manager.with_dead_bound(t),
-            None => manager,
-        };
-        let wm = Arc::new(manager);
-        wm.attach("p1", &parent_env)
-            .await
-            .expect("the parent attach completes");
-        let manager = Arc::new(SubagentSessionManager::new());
-        manager.set_worker_manager(wm.clone());
-        (manager, wm, sink_events, events)
-    }
-
-    /// A `dispatch_native` call (the `SubagentSessionManager` → the
-    /// `WorkerManager` flow — the subagent runs in a `fake_worker`
-    /// process). The `sink` parameter is the re-plumb's no-op (the
-    /// lifecycle events ride the `sink_for` lookup — the `CollectorSink`
-    /// registered in `make_manager`).
-    fn dispatch(
-        manager: &SubagentSessionManager,
-        launch: LaunchConfig,
-        task: &str,
-        parent_enabled_tools: Vec<String>,
-        parent_model: &Model,
-    ) -> (oneshot::Receiver<SubagentOutcome>, SubagentCancel) {
-        let sink: Arc<dyn EventSink> = Arc::new(CollectorSink::new().0);
-        manager.dispatch_native(
-            "p1",
-            std::path::Path::new("/tmp/space"),
-            parent_model,
-            parent_enabled_tools,
-            "tester".to_string(),
-            // The fixture names an Agent; nothing here asserts on the
-            // resolution (the tri-state's own pins live in
-            // `harness::launch` and the `subagent_flow` tests).
-            AgentNameResolution::Matched,
-            launch,
-            task.to_string(),
-            &sink,
-        )
-    }
-
-    /// Bounded-await the dispatch outcome (a missing resolution is a test
-    /// failure, not a hang).
-    async fn outcome(rx: oneshot::Receiver<SubagentOutcome>, timeout: Duration) -> SubagentOutcome {
-        tokio::time::timeout(timeout, rx)
-            .await
-            .expect("the dispatch must resolve (the teardown cannot hang)")
-            .expect("the oneshot must not be dropped")
-    }
-
-    /// Bounded-wait until the `on_event` deliveries for `session_id`
-    /// contain a frame matching `pred` (a deadline, so a missing frame
-    /// is a test failure, not a hang).
-    async fn wait_for_event(
-        events: &EventLog,
-        session_id: &str,
-        pred: impl Fn(&WorkerInboundEvent) -> bool,
-    ) -> Vec<(bool, WorkerInboundEvent)> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let got = events
+        fn cancel_subagent(&self, child_session_id: &str) {
+            self.cancels
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .filter(|(id, _, _)| id == session_id)
-                .map(|(_, is_sub, evt)| (*is_sub, evt.clone()))
-                .collect::<Vec<_>>();
-            if got.iter().any(|(_, e)| pred(e)) || tokio::time::Instant::now() >= deadline {
-                return got;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+                .push(child_session_id.to_string());
         }
     }
 
-    /// (1) **the core (the re-plumb)**: `dispatch_native` (the
-    /// `WorkerManager` flow) spawns a subagent WORKER (a
-    /// `fake_worker` process — NOT an in-process `AgentLoop`), runs the
-    /// task, and resolves `Completed` with the `SubagentCapture`'s final
-    /// text (the `SinkFrame` `agent_message_chunk` source — the
-    /// `last_message_id`'s accumulated text). The `subagent-closed`
-    /// lifecycle event fires on the parent's sink.
-    #[tokio::test]
-    async fn dispatch_native_resolves_completed_with_the_captured_final_text() {
-        let (manager, wm, sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![test_model("m1", Vec::new())], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "do the thing",
-            Vec::new(),
-            &test_model("m1", Vec::new()),
-        );
-        let outcome = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        match outcome {
-            SubagentOutcome::Completed { output, metrics } => {
-                assert_eq!(
-                    output, "canned answer",
-                    "the `SubagentCapture`'s final text (the `SinkFrame` `agent_message_chunk` source)"
-                );
-                assert!(metrics.duration_ms >= 1, "the wall clock (ms)");
-            }
-            other => panic!("expected `Completed`, got {other:?}"),
-        }
-        // The `subagent-closed` lifecycle event fired on the PARENT's
-        // sink (the `subagent-session-started` / `subagent-closed` UI
-        // contract — the `SubagentCapture`'s metrics ride verbatim).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let got: Vec<(String, serde_json::Value)> = loop {
-            let got = sink_events
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            if got.iter().any(|(e, _)| e == "subagent-closed")
-                || tokio::time::Instant::now() >= deadline
-            {
-                break got;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        let started = got
-            .iter()
-            .find(|(e, _)| e == "subagent-session-started")
-            .map(|(_, p)| p.clone())
-            .expect("the `subagent-session-started` fired on the parent's sink");
-        assert_eq!(started["parentSessionId"], "p1");
-        assert_eq!(
-            started["model"], "fake/m1",
-            "the parent's model (the `model_key`)"
-        );
-        let closed = got
-            .iter()
-            .find(|(e, _)| e == "subagent-closed")
-            .map(|(_, p)| p.clone())
-            .expect("the `subagent-closed` fired on the parent's sink");
-        assert_eq!(closed["status"], "completed");
-        assert_eq!(closed["sessionId"], started["sessionId"], "the same child");
-        // The subagent Worker ran (a fresh ephemeral session — its
-        // frames reached the router with `is_subagent: true`).
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        assert!(
-            got.iter().any(|(is_sub, _)| *is_sub),
-            "a subagent Worker's frames reached the router with the flag: {got:?}"
-        );
-        wm.detach("p1");
-    }
-
-    /// (2) **crash**: a subagent WORKER that crashes (a `__crash__` task
-    /// — the `fake_worker` exits 137) is a `Failed` with the EXIT CODE in
-    /// the error (NOT `Completed` — the process exit is the crash signal),
-    /// + `subagent-closed { status: "failed" }`.
-    #[tokio::test]
-    async fn dispatch_native_a_crashed_child_is_failed_with_the_exit_code() {
-        let (manager, wm, sink_events, _events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![test_model("m1", Vec::new())], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "__crash__",
-            Vec::new(),
-            &test_model("m1", Vec::new()),
-        );
-        let outcome = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        match outcome {
-            SubagentOutcome::Failed { error, .. } => {
-                assert_eq!(
-                    error, "subagent worker exited unexpectedly (code 137)",
-                    "the crash carries the EXIT CODE in the error"
-                );
-            }
-            other => panic!("expected `Failed` (crash), got {other:?}"),
-        }
-        // The `subagent-closed` lifecycle event fired (EVERY exit path —
-        // the crash included) with the failure.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let got: Vec<(String, serde_json::Value)> = loop {
-            let got = sink_events
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            if got.iter().any(|(e, _)| e == "subagent-closed")
-                || tokio::time::Instant::now() >= deadline
-            {
-                break got;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        let closed = got
-            .iter()
-            .find(|(e, _)| e == "subagent-closed")
-            .map(|(_, p)| p.clone())
-            .expect("the `subagent-closed` fired (every exit path)");
-        assert_eq!(closed["status"], "failed");
-        assert_eq!(
-            closed["error"],
-            "subagent worker exited unexpectedly (code 137)"
-        );
-        wm.detach("p1");
-    }
-
-    /// (3) **`dead_bound`**: a subagent WORKER whose turn HANGS (a
-    /// `__slow__` task — the `fake_worker` sleeps 10 s before settling) is
-    /// SILENT with NOTHING in flight, so the flow's **Dead bound** reaps it
-    /// (the bound is SHORTER than the 10 s sleep):
-    /// `Failed { reason: Unresponsive, error: "unresponsive" }` +
-    /// `subagent-closed { status: "failed" }`, WITHIN THE BOUND.
-    #[tokio::test]
-    async fn dispatch_native_a_slow_child_hits_the_dead_bound() {
-        let (manager, wm, _sink_events, _events) = make_manager(
-            Some(Duration::from_secs(1)),
-            test_env("p1", vec![test_model("m1", Vec::new())], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "__slow__",
-            Vec::new(),
-            &test_model("m1", Vec::new()),
-        );
-        let outcome = outcome(dispatch_rx, Duration::from_secs(10)).await;
-        assert!(
-            matches!(
-                outcome,
-                SubagentOutcome::Failed {
-                    reason: SubagentFailureReason::Unresponsive,
-                    ref error,
-                    ..
-                } if error == "unresponsive"
-            ),
-            "a silent child is reaped as `Failed` (unresponsive) — got {outcome:?}"
-        );
-        wm.detach("p1");
-    }
-
-    /// (4) **`SubagentCancel`**: a parent-turn cancel (the
-    /// `SubagentCancel` handle's `cancel()` — the loop's
-    /// `dispatch_subagent` `turn.cancelled()` arm calls it) aborts the
-    /// in-flight dispatch (the `WorkerManager`'s `cancel_subagent` — the
-    /// `send_abort` + the drive's `Cancelled` outcome + the reap):
-    /// `Failed { "cancelled" }` + `subagent-closed { error: "cancelled"
-    /// }`, WITHIN THE BOUND (a `__slow__` child would otherwise run out
-    /// the `dead_bound` — the 30 s bound proves the CANCEL arm, not
-    /// the **Dead bound**, wins).
-    #[tokio::test]
-    async fn dispatch_native_cancel_aborts_the_dispatch() {
-        let (manager, wm, _sink_events, _events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![test_model("m1", Vec::new())], None, true),
-        )
-        .await;
-        let (dispatch_rx, cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "__slow__",
-            Vec::new(),
-            &test_model("m1", Vec::new()),
-        );
-        // Let the child start (the `fake_worker`'s 10 s sleep is in
-        // flight), then CANCEL (the `WorkerManager`'s `cancel_subagent`
-        // — the `send_abort` + the drive's `cancel` flag).
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        cancel.cancel();
-        let outcome = outcome(dispatch_rx, Duration::from_secs(10)).await;
-        assert!(
-            matches!(
-                outcome,
-                SubagentOutcome::Failed { ref error, .. } if error == "cancelled"
-            ),
-            "a cancel settles `Failed` (cancelled) — got {outcome:?}"
-        );
-        wm.detach("p1");
-    }
-
-    /// (5) **not configured**: a manager that never got
-    /// `set_worker_manager` resolves an ALREADY-RESOLVED oneshot with
-    /// `Failed { "native subagent dispatch is not configured" }` (NO
-    /// fallback — a native parent always has an attached `WorkerManager`
-    /// in production; the "no manager" case is handled by
-    /// `dispatch_subagent`'s existing `subagent: None` check).
-    #[test]
-    fn dispatch_native_without_a_worker_manager_fails_immediately() {
-        let manager = SubagentSessionManager::new();
-        let sink: Arc<dyn EventSink> = Arc::new(CollectorSink::new().0);
-        let (mut dispatch_rx, cancel) = manager.dispatch_native(
-            "parent-1",
-            std::path::Path::new("/tmp/space"),
-            &test_model("m1", Vec::new()),
-            Vec::new(),
-            "tester".to_string(),
-            AgentNameResolution::Matched,
-            LaunchConfig::default(),
-            "do the thing".to_string(),
-            &sink,
-        );
-        // The oneshot is ALREADY resolved (a `recv` on a resolved oneshot
-        // is immediate — no `tokio` runtime needed).
-        let outcome = dispatch_rx
-            .try_recv()
-            .expect("the oneshot is already resolved (not configured)");
-        assert!(
-            matches!(
-                outcome,
-                SubagentOutcome::Failed { ref error, .. }
-                    if error == "native subagent dispatch is not configured"
-            ),
-            "a `None` `WorkerManager` is an already-resolved `Failed` — got {outcome:?}"
-        );
-        // The `SubagentCancel` handle is returned + idempotent (a no-op
-        // for a never-started dispatch).
-        cancel.cancel();
-        cancel.cancel();
-    }
-
-    /// (6) `set_worker_manager` (`&self`, `OnceLock`): unset in `new`;
-    /// the first `set_worker_manager` stores the manager (readable via
-    /// `worker_manager()`); a second `set_worker_manager` is a NO-OP
-    /// (the first set wins — the `OnceLock` is set-once at wiring time).
+    /// (6) `set_dispatcher` (`&self`, `OnceLock`): unset in `new`; the first
+    /// `set_dispatcher` stores the dispatcher (readable via `dispatcher()`); a
+    /// second `set_dispatcher` is a NO-OP (the first set wins — the `OnceLock` is
+    /// set-once at wiring time).
+    ///
+    /// (T5/S5b) Re-pointed, not relocated: the claim is about THIS file's
+    /// `OnceLock`, and the S5b edge-E2 re-plumb renamed both the field and its
+    /// accessors with the type they hold (`Arc<WorkerManager>` →
+    /// `Arc<dyn Dispatcher>`, `set_worker_manager`/`worker_manager` →
+    /// `set_dispatcher`/`dispatcher`), so the fixture names the trait object the
+    /// setter now takes. See `RecordingDispatcher` for why a double is honest for
+    /// this pin and was not for the eight that relocated.
     #[test]
     fn set_worker_manager_is_set_once_on_the_manager() {
         let manager = SubagentSessionManager::new();
-        // Unset in `new` (the `WorkerManager` is threaded at the
-        // `SessionManager` wiring time).
-        assert!(manager.worker_manager().is_none());
-        let first = Arc::new(
-            WorkerManager::new(
-                Arc::new(FakeWorkerFactory),
-                Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
-                Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
-                Arc::new(|_id: &str| None),
-            )
-            .with_dead_bound(Duration::from_secs(30 * 60)),
-        );
-        manager.set_worker_manager(first.clone());
-        // The first `set_worker_manager` stored the manager (readable
-        // through the `OnceLock`).
+        // Unset in `new` (the dispatcher is threaded at the `SessionManager`
+        // wiring time).
+        assert!(manager.dispatcher().is_none());
+        let first: Arc<dyn Dispatcher> = Arc::new(RecordingDispatcher::new());
+        manager.set_dispatcher(first.clone());
+        // The first `set_dispatcher` stored the dispatcher (readable through the
+        // `OnceLock`).
+        assert!(manager.dispatcher().is_some(), "the first set is stored");
+        // A second `set_dispatcher` is a NO-OP (the first set wins).
+        let second: Arc<dyn Dispatcher> = Arc::new(RecordingDispatcher::new());
+        manager.set_dispatcher(second.clone());
         assert!(
-            manager.worker_manager().is_some(),
-            "the first set is stored"
-        );
-        // A second `set_worker_manager` is a NO-OP (the first set wins).
-        let second = Arc::new(
-            WorkerManager::new(
-                Arc::new(FakeWorkerFactory),
-                Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
-                Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
-                Arc::new(|_id: &str| None),
-            )
-            .with_dead_bound(Duration::from_secs(1)),
-        );
-        manager.set_worker_manager(second);
-        assert!(
-            Arc::ptr_eq(&manager.worker_manager().unwrap(), &first),
+            Arc::ptr_eq(&manager.dispatcher().unwrap(), &first),
             "a second set is a NO-OP (the first set wins)"
+        );
+        // The double was NOT the one stored — the pin would fail if `set_once`
+        // became set-last, because then `second` would be the stored one.
+        assert!(
+            !Arc::ptr_eq(&manager.dispatcher().unwrap(), &second),
+            "the rejected dispatcher is never reachable through the getter"
         );
     }
 
-    /// (7) `SubagentCancel` variants: `None` is a NO-OP (idempotent,
-    /// never panics); `Flag` flips the watch flag (the `IpcDispatcher`'s
-    /// watcher task turns the flip into the `SubagentCancel` frame — a
-    /// second `cancel` is a no-op); `Worker` (a GONE session id) is a
-    /// no-op (the `cancel_subagent` lookup misses).
+    /// (7) `SubagentCancel` variants: `None` is a NO-OP (idempotent, never
+    /// panics); `Flag` flips the watch flag (the `IpcDispatcher`'s watcher task
+    /// turns the flip into the `SubagentCancel` frame — a second `cancel` is a
+    /// no-op); `Dispatcher` routes `cancel()` to the dispatcher's
+    /// `cancel_subagent` with the CHILD's session id, and is idempotent.
+    ///
+    /// (T5/S5b) The variant this pin used to name held `Arc<WorkerManager>` —
+    /// edge E2 arriving through the back door — and S5b replaced it with
+    /// `Arc<dyn Dispatcher>`. The routing assertion got STRONGER with the swap:
+    /// against the desktop's `WorkerManager` a gone session id made `cancel()` an
+    /// unobservable no-op, so the pin could only prove "does not panic". Against
+    /// this double it proves the CHILD ID IS PASSED, which is the behaviour a
+    /// mis-threaded `child_session_id` would break (a parent's cancel reaching the
+    /// wrong drive, or no drive).
     #[test]
     fn subagent_cancel_variants_are_well_behaved() {
         // `None` — a no-op (idempotent).
         SubagentCancel::none().cancel();
         SubagentCancel::none().cancel();
-        // `Flag` — flips the watch flag (the `IpcDispatcher`'s watcher
-        // task observes it); a second `cancel` is a no-op.
+        // `Flag` — flips the watch flag (the `IpcDispatcher`'s watcher task
+        // observes it); a second `cancel` is a no-op.
         let (tx, rx) = tokio::sync::watch::channel(false);
         let cancel = SubagentCancel::new_flag(tx);
         assert!(!*rx.borrow());
@@ -944,380 +400,24 @@ mod tests {
         assert!(*rx.borrow(), "the flag flipped");
         cancel.cancel();
         assert!(*rx.borrow(), "the flag stays flipped (idempotent)");
-        // `Worker` — a GONE session id (the `cancel_subagent` lookup
-        // misses — a no-op, never panics).
-        let wm = Arc::new(WorkerManager::new(
-            Arc::new(FakeWorkerFactory),
-            Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
-            Arc::new(|_id: String, _is_subagent: bool, _evt: WorkerInboundEvent| {}),
-            Arc::new(|_id: &str| None),
-        ));
-        let cancel = SubagentCancel::new_worker(wm, "gone-session".to_string());
+        // `Dispatcher` — `cancel()` reaches the dispatcher's `cancel_subagent`
+        // with the child's id, every time (idempotent by repetition, not by
+        // suppression — the desktop's own `cancel_subagent` is a no-op for a gone
+        // drive, which is what makes calling it twice safe).
+        let dispatcher = Arc::new(RecordingDispatcher::new());
+        let cancel = SubagentCancel::new_dispatcher(dispatcher.clone(), "child-7".to_string());
         cancel.cancel();
+        assert_eq!(
+            dispatcher.cancels(),
+            vec!["child-7".to_string()],
+            "`cancel()` routes to `cancel_subagent` with the CHILD's id"
+        );
         cancel.cancel();
-    }
-
-    /// (8) **the recursion guard (the re-plumb)**: a child's
-    /// `enabledTools` (the `Start` envelope — the `fake_worker`'s
-    /// `session-update` `enabledTools` echo) NEVER contains `subagent`
-    /// (the recursion guard) nor `list_agents` (a child cannot dispatch,
-    /// so listing dispatch targets is pointless token burn) — even when
-    /// the PARENT's enabled tools carry `list_agents` (the three-way
-    /// rule's inherited-parent branch — the `WorkerManager`'s flow).
-    #[tokio::test]
-    async fn a_child_excludes_subagent_and_list_agents_tools() {
-        let (manager, wm, _sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![test_model("m1", Vec::new())], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "do the thing",
-            vec!["read".to_string(), "list_agents".to_string()],
-            &test_model("m1", Vec::new()),
-        );
-        // AWAIT the outcome BEFORE asserting (the child's `Start` frame
-        // — the advertised `enabledTools` — is emitted before the
-        // settle; the `await` guarantees it is present).
-        let _ = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        // The child's advertised tool set (the `Start` → the
-        // `fake_worker`'s `session-update` `enabledTools` frame — the
-        // `is_subagent` events).
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        let child_enabled = got
-            .iter()
-            .find_map(|(is_sub, e)| {
-                if !is_sub {
-                    return None;
-                }
-                match e {
-                    WorkerInboundEvent::SinkFrame { payload, .. } => payload
-                        .get("update")
-                        .and_then(|u| u.get("enabledTools"))
-                        .cloned(),
-                    _ => None,
-                }
-            })
-            .expect("the child advertised its tool set");
         assert_eq!(
-            child_enabled,
-            serde_json::json!(["read"]),
-            "the child's `enabledTools` never contains `subagent` or `list_agents` (the three-way rule's inherited-parent branch)"
+            dispatcher.cancels(),
+            vec!["child-7".to_string(), "child-7".to_string()],
+            "a second `cancel()` is safe (the same id again — never a panic, \
+             never a different id)"
         );
-        wm.detach("p1");
-    }
-
-    /// (9) **the child's system message (the re-plumb — the `system_prompt`
-    /// ENVELOPE field)**: the `build_child_system_message` computation
-    /// (the `launch.system_prompt` + the todo guidance line — the
-    /// `has_todo_tool` derivation from the resolved child tool list) rides
-    /// the `Start` envelope (the `fake_worker`'s `systemPrompt` echo —
-    /// the child's seq-0 transcript row is the Supervisor's
-    /// `TranscriptPersister`'s `is_subagent` row): `Some` prompt + the
-    /// todo tool → the prompt + the todo line; `Some` prompt + NO todo
-    /// tool → the prompt VERBATIM; `None` + the todo tool → the todo line
-    /// ALONE; `None` + NO todo tool → `None` (no system message).
-    #[tokio::test]
-    async fn the_child_system_prompt_rides_the_start_envelope() {
-        let m1 = test_model("m1", Vec::new());
-        // Case 1: `Some` prompt + `launch.tools: None` + the FULL parent
-        // tool set (the child HAS `manage_todo_list`) → the prompt + the
-        // todo line.
-        let (manager, wm, _sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![m1.clone()], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig {
-                system_prompt: Some("You are a careful reviewer.".to_string()),
-                ..Default::default()
-            },
-            "do the thing",
-            Vec::new(),
-            &m1,
-        );
-        let _ = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        let system_prompt = got
-            .iter()
-            .find_map(|(is_sub, e)| {
-                if !is_sub {
-                    return None;
-                }
-                match e {
-                    WorkerInboundEvent::SinkFrame { payload, .. } => payload
-                        .get("update")
-                        .and_then(|u| u.get("systemPrompt"))
-                        .cloned(),
-                    _ => None,
-                }
-            })
-            .expect("the child's `systemPrompt` rides the `Start` envelope");
-        assert_eq!(
-            system_prompt,
-            serde_json::json!("You are a careful reviewer.\nUse manage_todo_list to track multi-step work — write the plan before starting, mark items completed as you go"),
-            "`Some` prompt + the todo tool → the prompt + the todo line"
-        );
-        wm.detach("p1");
-
-        // Case 2: `Some` prompt + NO `manage_todo_list` (the child's
-        // tools = the parent's minus `subagent`) → the prompt VERBATIM.
-        let (manager, wm, _sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![m1.clone()], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig {
-                system_prompt: Some("You are a careful reviewer.".to_string()),
-                ..Default::default()
-            },
-            "do the thing",
-            vec!["read".to_string(), "bash".to_string()],
-            &m1,
-        );
-        let _ = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        let system_prompt = got
-            .iter()
-            .find_map(|(is_sub, e)| {
-                if !is_sub {
-                    return None;
-                }
-                match e {
-                    WorkerInboundEvent::SinkFrame { payload, .. } => payload
-                        .get("update")
-                        .and_then(|u| u.get("systemPrompt"))
-                        .cloned(),
-                    _ => None,
-                }
-            })
-            .expect("the child's `systemPrompt` rides the `Start` envelope");
-        assert_eq!(
-            system_prompt,
-            serde_json::json!("You are a careful reviewer."),
-            "`Some` prompt + NO todo tool → the prompt VERBATIM"
-        );
-        wm.detach("p1");
-
-        // Case 3: `None` prompt + the todo tool → the todo line ALONE.
-        let (manager, wm, _sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![m1.clone()], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "do the thing",
-            Vec::new(),
-            &m1,
-        );
-        let _ = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        let system_prompt = got
-            .iter()
-            .find_map(|(is_sub, e)| {
-                if !is_sub {
-                    return None;
-                }
-                match e {
-                    WorkerInboundEvent::SinkFrame { payload, .. } => payload
-                        .get("update")
-                        .and_then(|u| u.get("systemPrompt"))
-                        .cloned(),
-                    _ => None,
-                }
-            })
-            .expect("the child's `systemPrompt` rides the `Start` envelope");
-        assert_eq!(
-            system_prompt,
-            serde_json::json!("Use manage_todo_list to track multi-step work — write the plan before starting, mark items completed as you go"),
-            "`None` prompt + the todo tool → the todo line ALONE"
-        );
-        wm.detach("p1");
-
-        // Case 4: `None` prompt + NO todo tool → `None` (NO system
-        // message — the child's seq-0 row is absent, and now PROVABLY so:
-        // the envelope's `mode` is `FreshChild`, so the worker's
-        // `(StartMode::FreshChild, None)` arm prepends NOTHING instead of
-        // falling through to the main-prompt arm — issue #9).
-        let (manager, wm, _sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![m1.clone()], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "do the thing",
-            vec!["read".to_string(), "bash".to_string()],
-            &m1,
-        );
-        let _ = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        let system_prompt = got
-            .iter()
-            .find_map(|(is_sub, e)| {
-                if !is_sub {
-                    return None;
-                }
-                match e {
-                    WorkerInboundEvent::SinkFrame { payload, .. } => payload
-                        .get("update")
-                        .and_then(|u| u.get("systemPrompt"))
-                        .cloned(),
-                    _ => None,
-                }
-            })
-            .expect(
-                "the `Start` envelope's `systemPrompt` field is present (the `fake_worker`'s echo)",
-            );
-        assert!(
-            system_prompt.is_null(),
-            "`None` prompt + NO todo tool → `None` (no system message): {system_prompt:?}"
-        );
-        wm.detach("p1");
-    }
-
-    /// (10) **trust inheritance (the re-plumb — the ADR 0010
-    /// `trusted` ENVELOPE field)**: a child's `Start` envelope carries
-    /// the PARENT Space's trust flag (the `WorkerManager`'s flow threads
-    /// `parent_env.trusted` verbatim — the Supervisor owns the `spaces`
-    /// table): a TRUSTED parent Space → `trusted: true` (the child's
-    /// permission gate auto-approves mutating tools); a NON-trusted
-    /// parent → `trusted: false` (fail-closed — the gate prompts).
-    #[tokio::test]
-    async fn a_trusted_parent_space_inherits_onto_the_child_env() {
-        let m1 = test_model("m1", Vec::new());
-        // A TRUSTED parent Space → the child's `Start` envelope carries
-        // `trusted: true` (the child's permission gate auto-approves
-        // mutating tools).
-        let (manager, wm, _sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![m1.clone()], None, true),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "do the thing",
-            Vec::new(),
-            &m1,
-        );
-        let _ = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        let trusted = got
-            .iter()
-            .find_map(|(is_sub, e)| {
-                if !is_sub {
-                    return None;
-                }
-                match e {
-                    WorkerInboundEvent::SinkFrame { payload, .. } => payload
-                        .get("update")
-                        .and_then(|u| u.get("trusted"))
-                        .cloned(),
-                    _ => None,
-                }
-            })
-            .expect("the child's `trusted` flag rides the `Start` envelope");
-        assert_eq!(
-            trusted,
-            serde_json::json!(true),
-            "a TRUSTED parent Space → the child's `Start` envelope carries `trusted: true`"
-        );
-        wm.detach("p1");
-
-        // A NON-trusted parent Space → `trusted: false` (fail-closed).
-        let (manager, wm, _sink_events, events) = make_manager(
-            Some(Duration::from_secs(30)),
-            test_env("p1", vec![m1.clone()], None, false),
-        )
-        .await;
-        let (dispatch_rx, _cancel) = dispatch(
-            &manager,
-            LaunchConfig::default(),
-            "do the thing",
-            Vec::new(),
-            &m1,
-        );
-        let _ = outcome(dispatch_rx, Duration::from_secs(30)).await;
-        let got = wait_for_event(&events, "p1", |e| {
-            matches!(
-                e,
-                WorkerInboundEvent::SinkFrame { event, .. }
-                    if event == "session-update"
-            )
-        })
-        .await;
-        let trusted = got
-            .iter()
-            .find_map(|(is_sub, e)| {
-                if !is_sub {
-                    return None;
-                }
-                match e {
-                    WorkerInboundEvent::SinkFrame { payload, .. } => payload
-                        .get("update")
-                        .and_then(|u| u.get("trusted"))
-                        .cloned(),
-                    _ => None,
-                }
-            })
-            .expect("the child's `trusted` flag rides the `Start` envelope");
-        assert_eq!(
-            trusted,
-            serde_json::json!(false),
-            "a NON-trusted parent Space → the child's `Start` envelope carries `trusted: false` (fail-closed)"
-        );
-        wm.detach("p1");
     }
 }

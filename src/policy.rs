@@ -246,7 +246,7 @@ fn expand_rule_path(path: &Path, home: Option<&Path>) -> PathBuf {
 ///    directory" append beats the default deny it ties with.
 ///
 /// Both sides go through the ONE canonicalizer,
-/// [`crate::agent::fs_backend::canonicalize_lenient`] — the rule path (after
+/// [`crate::fs_backend::canonicalize_lenient`] — the rule path (after
 /// `~` expansion) and the call path — so a rule naming a directory that does
 /// not exist YET still matches (ADR 0081's leniency is load-bearing here: a
 /// strict `canonicalize()` fails on such a rule path and the rule would match
@@ -266,7 +266,7 @@ pub fn rule_for<'a>(
 ) -> Option<&'a AccessRule> {
     // The call path, canonicalized once (leniently — the target of a write
     // into a not-yet-created dir does not exist yet either).
-    let target = crate::agent::fs_backend::canonicalize_lenient(path);
+    let target = crate::fs_backend::canonicalize_lenient(path);
 
     rules
         .iter()
@@ -276,7 +276,7 @@ pub fn rule_for<'a>(
         .filter(|(_, rule)| rule.direction.covers(direction))
         .map(|(index, rule)| {
             let expanded = expand_rule_path(Path::new(rule.path.as_str()), home);
-            let canon = crate::agent::fs_backend::canonicalize_lenient(&expanded);
+            let canon = crate::fs_backend::canonicalize_lenient(&expanded);
             (index, rule, canon)
         })
         // STEP 1 — the FILTER: a genuine component prefix, never a string
@@ -307,7 +307,7 @@ pub fn rule_for<'a>(
 /// `A AND NOT A` and is unreachable at every dir and every nesting depth.
 ///
 /// So the four dirs are a GUARD-MEMBERSHIP set, not a rule set: they live on
-/// [`crate::agent::boundary::protected_dirs`], which is its own plain
+/// [`crate::boundary::protected_dirs`], which is its own plain
 /// four-path list (never rule-derived, so a settings change can never silently
 /// widen the Landlock subtraction that consumes it). A write into one of them
 /// with no user rule matching is therefore the ROW-3 ASK — the guard prompt —

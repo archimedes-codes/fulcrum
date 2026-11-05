@@ -39,10 +39,10 @@ use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::events::EventSink;
-use crate::agent::subagent::LaunchConfig;
-use crate::agent::todo::{TodoItem, TodoStatus, TodoStore};
-use crate::agent::tools::exec::{ContentBlock, ToolResult};
+use crate::events::EventSink;
+use crate::launch_config::LaunchConfig;
+use crate::todo::{TodoItem, TodoStatus, TodoStore};
+use crate::tools::exec::{ContentBlock, ToolResult};
 
 use sudo_argv::{build_sudo_argv, is_sudo_auth_failure, scrub_secret};
 use sudo_exec::SudoPromptCleanup;
@@ -107,7 +107,7 @@ pub const TOOL_EXEC_FAST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const TOOL_EXEC_BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The `SudoRunner`'s outcome. The three verdict fields are the SHARED exit
-/// classifier's (`crate::agent::tools::exec::bash::bash_exit_report`, ADR
+/// classifier's (`crate::tools::exec::bash::bash_exit_report`, ADR
 /// 0080 + its amendment), so the elevated path reports the same shape a `bash`
 /// run does:
 ///
@@ -140,9 +140,25 @@ pub struct SudoRun {
 
 /// Parse + validate the `dispatch_subagent` params: `task` (required,
 /// non-empty) + the optional `launch` config (`model` / `systemPrompt` /
-/// `tools` — `tools: []` is treated as `None`). `pub(crate)` so the native
+/// `tools` — `tools: []` is treated as `None`). `pub` so the native
 /// `AgentLoop`'s `ToolRegistry` (Task 6) reuses the SAME validation.
-pub(crate) fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> {
+///
+/// (T5/S3 A.3) This was `pub(crate)`. A package boundary erases `pub(crate)`:
+/// the caller (`harness/dispatch.rs`) was desktop then while this file was
+/// already in another package, so `pub(crate)` read as an E0603 for it.
+/// Widening is the only option that keeps the ONE shared validator — the
+/// alternative is a second implementation of the same param parsing.
+///
+/// T5/S5b then moved `harness` into this crate too, so the caller is a
+/// crate-internal neighbour again: the ONLY production consumer today is
+/// `harness/dispatch.rs:298` (grep-verified at T8/S8.5 — zero references under
+/// `src-tauri/`), so `pub(crate)` would compile. The `pub` is KEPT anyway:
+/// tightening is a code change and this audit is doc-only, and a visibility
+/// tighten belongs with a deliberate audit of the crate's public surface
+/// (T8/S8.5 records it as a candidate, alongside `provider_types::WireToolCall`
+/// and `harness::provider::headers_for_providers`, which are in the same
+/// situation).
+pub fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> {
     let task = params
         .get("task")
         .and_then(Value::as_str)
@@ -190,7 +206,9 @@ pub(crate) fn dispatch_params(params: &Value) -> Option<(String, LaunchConfig)> 
 /// token is the session's teardown token (the native `AgentLoop` passes
 /// its `cancel`; a session close cancels the in-flight core).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn todo_apply(
+// (T5/S3 A.3) `pub(crate)` → `pub`: the caller `harness/loop/tools.rs` stays
+// desktop until S5, and a package boundary erases `pub(crate)`.
+pub async fn todo_apply(
     store: &TodoStore,
     sid: &str,
     source: &str,
@@ -365,7 +383,9 @@ pub(crate) async fn todo_apply(
 /// token); the `SudoPromptCleanup` guard emits the terminal
 /// `interactive-request-close` on a DROPPED (unanswered) prompt.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn sudo_run_flow(
+// (T5/S3 A.3) `pub(crate)` → `pub`: the caller `harness/loop/tools.rs` stays
+// desktop until S5, and a package boundary erases `pub(crate)`.
+pub async fn sudo_run_flow(
     sid: &str,
     request_id: &str,
     source: &str,
@@ -783,7 +803,7 @@ mod tests {
     use std::future::Future;
     use std::time::Instant;
 
-    use crate::agent::todo::{TodoItem, TodoStatus, TodoStore};
+    use crate::todo::{TodoItem, TodoStatus, TodoStore};
 
     /// A `SudoRunner` for tests: records the call and returns the preset
     /// result (no real `sudo` in `cargo test`).

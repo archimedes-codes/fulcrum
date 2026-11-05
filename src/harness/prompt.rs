@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::agent::harness::provider::ToolSpec;
+use crate::harness::provider::ToolSpec;
 use crate::skills::SkillInfo;
 
 const PREAMBLE: &str = "You are an expert coding assistant operating inside Archimedes Desktop, a desktop app that connects to coding agents. You help users by reading files, executing commands, editing code, and writing new files.";

@@ -15,25 +15,50 @@
 //! message_key)` for `messages`), so a replayed frame never duplicates
 //! a row.
 //!
-//! THE ONE EXCEPTION: `cost_update`. That arm is not an upsert but an
-//! INCREMENT (`Db::record_session_cost` ADDS the frame's delta to the
-//! stored figure), because cost is a per-call DELTA and every other
-//! persisted field here is a whole-state snapshot that can be
-//! overwritten. So the promise above is FALSE for it: re-delivering one
-//! `cost_update` DOUBLES the stored figure. The wire gives frames no
-//! identity to dedupe on — `emit_cost_update` hardcodes `"seq": 0` — so
-//! there is nothing to key an idempotent write on. That is accepted, not
-//! overlooked: the doubling is PINNED rather than prevented, by
-//! `a_replayed_cost_frame_doubles_the_stored_figure` (`db.rs`), which
-//! must be DELETED rather than adjusted if a future change ever makes
-//! the write idempotent. The exposure is bounded by `emit_cost_update`'s
-//! production call sites — today `turn.rs`'s `Usage` arm and `loop.rs`'s
-//! `run_compaction` (the compaction summary's own call), neither of which
-//! is a Resume-replay path — so a `Resume` cannot re-emit history.
-//! Deliberately not stated as a count: the `CONTEXT.md` Cost channel
-//! entry's rule is that a count here goes stale the moment a third emitter
-//! lands (the stale claim is issue #110's defect class); the bound that
-//! matters is that no call site replays history, which neither site does.
+//! `cost_update` USED to be the one exception to that promise and no longer
+//! is (Fulcrum T2, amending ADR 0082's limit 7). It was an INCREMENT
+//! (`Db::record_session_cost` ADDED the frame's delta), so re-delivering one
+//! frame DOUBLED the stored figure — accepted, not overlooked, and PINNED by
+//! `a_replayed_cost_frame_doubles_the_stored_figure` (`db.rs`), whose own
+//! docblock said it must be DELETED rather than adjusted the day the write
+//! became idempotent. That day is this commit: the frame now carries the
+//! session's CUMULATIVE TOTAL, `record_session_cost` OVERWRITES with it, and
+//! the promise above is true for this arm too. Nothing was deduped — the wire
+//! still hardcodes `"seq": 0` and a frame still carries no identity; a snapshot
+//! simply does not need one. The pin's replacement is
+//! `a_replayed_cost_frame_overwrites_to_the_same_figure`.
+//!
+//! What moved instead of being fixed is the ACCUMULATOR, and it moved to each
+//! producer: `AgentLoop::cost_acc` (seeded from the stored row on `Resume`),
+//! the subagent capture, and the parent roll-up — all three in this one commit,
+//! because a snapshot store cannot tolerate a producer that still sends deltas.
+//! The bound the old text leaned on ("no production call site replays history")
+//! is now moot rather than load-bearing: replaying history is survivable, since
+//! every frame restates the total.
+//!
+//! ONE PRODUCER OF THAT THREE NO LONGER EXISTS. The parent-keyed roll-up frame
+//! in `finish_subagent` was deleted in the follow-up commit: with the frame a
+//! snapshot and the write an overwrite, TWO writers on the parent's store key
+//! make the last frame win, and the parent's accumulator had never seen its
+//! child — so the parent's next frame erased the child's money. A child's cost
+//! now folds into the PARENT's own `cost_acc` (`AgentLoop::fold_child_cost`,
+//! fed by `harness::dispatch::dispatch_subagent`), so the parent's loop is the
+//! single writer of the parent's key and #105's "a parent's stored total
+//! includes its children" holds. What persists through THIS arm is unchanged:
+//! one frame, one overwrite, keyed to whatever session the frame names.
+//!
+//! # Where this file's tests are (T5/S5b)
+//!
+//! All eight moved to `src-tauri/tests/persist_frames_db.rs`. They RELOCATED
+//! rather than re-pointed at the crate's `MemoryStore` double because every one
+//! of them asserts a DATABASE property — the `(session_id, seq)` and
+//! `(session_id, kind, message_key)` UNIQUE collapses, the FK from
+//! `native_messages` to `sessions` that `ensure_session_row` exists to satisfy,
+//! and the `sessions` column reads (`session` / `session_cost` /
+//! `session_todos`) — and a double that mimics a constraint proves nothing about
+//! it. `#[cfg(test)]` does not survive into an rlib and the crate cannot name
+//! `storage::Db`, so this is the only honest home for them. The persister under
+//! test is still THIS code, driven through `impl FulcrumPersistence for Db`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,16 +66,23 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
 
-use crate::agent::worker::protocol::StoreFrame;
-use crate::agent::SessionInfo;
-use crate::storage::Db;
+use crate::seams::FulcrumPersistence;
+use crate::store_rows::SessionInfo;
+use crate::worker_types::StoreFrame;
 
 /// The Supervisor's sole-writer transcript persister (ADR 0025). Applies
 /// the Worker's store frames to SQLite (idempotent upserts) and ensures
 /// the `sessions` row exists for ephemeral subagent sessions (their
 /// `native_messages` rows FK-reference `sessions(id)`).
 pub struct TranscriptPersister {
-    db: Arc<Db>,
+    /// The persistence seam (T5/S5b). This held a concrete `Arc<Db>` and the
+    /// seven calls below were inherent `Db` methods; every one of them is on
+    /// [`FulcrumPersistence`]'s surface, so the field is now the trait object
+    /// and the crate names no desktop type. The desktop's only construction
+    /// site (`session/mod.rs`'s `TranscriptPersister::new(db)`, `db: Arc<Db>`)
+    /// compiles UNCHANGED — `Arc<Db>` coerces, because `impl
+    /// FulcrumPersistence for storage::Db` is the seam S4 landed and pinned.
+    db: Arc<dyn FulcrumPersistence>,
     /// The `session_id` → `cwd` map (the `ensure_session_row` source —
     /// the `StoreFrame` carries no `cwd`). Populated by the
     /// `SessionManager` (main sessions) and the `WorkerManager`'s
@@ -59,7 +91,7 @@ pub struct TranscriptPersister {
 }
 
 impl TranscriptPersister {
-    pub fn new(db: Arc<Db>) -> Self {
+    pub fn new(db: Arc<dyn FulcrumPersistence>) -> Self {
         Self {
             db,
             cwd_map: Arc::new(StdMutex::new(HashMap::new())),
@@ -186,8 +218,10 @@ impl TranscriptPersister {
                 // "no figure" and writes NOTHING — the same discipline the
                 // child's capture holds (`a_child_that_reported_no_cost_reports_no_cost`:
                 // *"a non-number `costUsd` must not become money"*). Coercing
-                // one to `0.0` would both render a phantom `$0.00` (D5 / ADR
-                // 0082) and corrupt the accumulator, which sums deltas.
+                // one to `0.0` would render a phantom `$0.00` (D5 / ADR 0082)
+                // and — since the write is now a SNAPSHOT — would also OVERWRITE
+                // a session's real stored total with a zero, which is a worse
+                // failure than the summing store this arm used to write into.
                 let Some(cost) = payload
                     .get("payload")
                     .and_then(|p| p.get("costUsd"))
@@ -276,327 +310,5 @@ impl TranscriptPersister {
         if let Err(e) = self.db.record_session(&info) {
             eprintln!("ensure_session_row: {e}");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// A temp-dir `Db` + a `sessions` row (the `native_messages` FK
-    /// source), OWNED (#96 task 08). Guard FIRST: destructured locals drop in
-    /// reverse, so the `Db` — whose SQLite file lives INSIDE `dir` — closes
-    /// before `dir` is removed. Windows needs that; Linux cannot show it
-    /// (POSIX unlinks under an open handle and `ScratchDir::Drop` swallows the
-    /// failure), so this is enforced by reading. Matches the two `temp_db`
-    /// siblings tasks 03/06 converted.
-    ///
-    /// HONEST SIZING: all five callers already ran `remove_dir_all(&dir)` on the
-    /// green path, so this file's census delta is 0 BEFORE and 0 AFTER. The win
-    /// is the panic path — five dirs that survive a failed assertion today.
-    fn temp_db() -> (crate::test_support::ScratchDir, Arc<Db>) {
-        let dir = crate::test_support::ScratchDir::in_env_temp("persist-test-", "db");
-        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
-        (dir, db)
-    }
-
-    /// `apply` (Insert) → a `native_messages` row (idempotent — a
-    /// replayed frame collapses to one row).
-    #[test]
-    fn apply_insert_is_idempotent() {
-        let (_dir, db) = temp_db();
-        let p = TranscriptPersister::new(db.clone());
-        p.set_cwd("s1", "/tmp/space");
-        let frame = StoreFrame::Insert {
-            session_id: "s1".to_string(),
-            seq: 0,
-            role: "system".to_string(),
-            content_json: r#"{"role":"system"}"#.to_string(),
-        };
-        p.apply(false, &frame);
-        p.apply(false, &frame); // replay — must not duplicate.
-        let rows = db.load_native_messages("s1").unwrap();
-        assert_eq!(rows.len(), 1, "a replayed insert collapses to one row");
-    }
-
-    /// `apply` (Display) → a `messages` row (idempotent upsert).
-    #[test]
-    fn apply_display_is_idempotent() {
-        let (_dir, db) = temp_db();
-        let p = TranscriptPersister::new(db.clone());
-        p.set_cwd("s1", "/tmp/space");
-        let frame = StoreFrame::Display {
-            session_id: "s1".to_string(),
-            rows: vec![crate::agent::harness::store::DisplayRow {
-                kind: "agent-text".to_string(),
-                message_key: "m1".to_string(),
-                payload_json: serde_json::json!({ "text": "hi" }),
-                created_at: 1,
-            }],
-        };
-        p.apply(false, &frame);
-        p.apply(false, &frame); // replay.
-        let rows = db.messages_for("s1").unwrap();
-        assert_eq!(
-            rows.len(),
-            1,
-            "a replayed display upsert collapses to one row"
-        );
-    }
-
-    /// `apply` (ContextUsage) → the `sessions.context_usage_json` write.
-    #[test]
-    fn apply_context_usage_writes_the_session_row() {
-        let (_dir, db) = temp_db();
-        let p = TranscriptPersister::new(db.clone());
-        p.set_cwd("s1", "/tmp/space");
-        let frame = StoreFrame::ContextUsage {
-            session_id: "s1".to_string(),
-            used: 53_760,
-            window: 128_000,
-        };
-        p.apply(false, &frame);
-        let row = db.session("s1").unwrap().unwrap();
-        let usage: serde_json::Value =
-            serde_json::from_str(&row.context_usage_json.unwrap()).unwrap();
-        assert_eq!(usage["used"], 53_760);
-        assert_eq!(usage["window"], 128_000);
-    }
-
-    /// `ensure_session_row` (subagent) → a HIDDEN `sessions` row
-    /// (`is_subagent = 1` — absent from `list_sessions`) + the
-    /// `native_messages` FK holds (the insert succeeds).
-    #[test]
-    fn ensure_session_row_creates_a_hidden_subagent_row() {
-        let (_dir, db) = temp_db();
-        let p = TranscriptPersister::new(db.clone());
-        p.set_cwd("sub-1", "/tmp/space");
-        let frame = StoreFrame::Insert {
-            session_id: "sub-1".to_string(),
-            seq: 0,
-            role: "system".to_string(),
-            content_json: r#"{"role":"system"}"#.to_string(),
-        };
-        p.apply(true, &frame);
-        // The `sessions` row exists (the FK held).
-        let row = db
-            .session("sub-1")
-            .unwrap()
-            .expect("the subagent row exists");
-        assert!(row.is_subagent, "the subagent row is flagged");
-        // It is HIDDEN from `list_sessions`.
-        let all = db.list_sessions(true).unwrap();
-        assert!(
-            all.iter().all(|r| r.id != "sub-1"),
-            "the subagent row is hidden from list_sessions"
-        );
-        // Its transcript is loadable.
-        assert_eq!(db.load_native_messages("sub-1").unwrap().len(), 1);
-    }
-
-    /// Trap 1's pin: a `cost_update` for a session with **no `sessions` row
-    /// and no prior `StoreFrame`** must STILL persist.
-    ///
-    /// `record_session_cost` is a bare `UPDATE … WHERE id = ?1`, and an
-    /// `UPDATE` that matches no row is `Ok(())` with nothing written
-    /// (`record_session_cost_on_a_missing_row_is_a_silent_no_op` in `db.rs`).
-    /// `apply_interactive_event` therefore has to `ensure_session_row` BEFORE
-    /// the write — which is the whole reason it takes `is_subagent`: a
-    /// subagent's row is created lazily by the persister, and its FIRST priced
-    /// call can easily arrive before any of its `StoreFrame`s. Without the
-    /// ensure, that first frame is silently discarded and the child's stored
-    /// total starts out short of one call.
-    #[test]
-    fn a_cost_frame_for_a_session_with_no_row_yet_still_persists() {
-        let (_dir, db) = temp_db();
-        let p = TranscriptPersister::new(db.clone());
-        // The `cwd_map` entry `ensure_session_row` reads (the `StoreFrame`
-        // carries no `cwd`) — the same setup
-        // `ensure_session_row_creates_a_hidden_subagent_row` uses.
-        p.set_cwd("sub-cold", "/tmp/space");
-        // NO `record_session`, NO `apply(StoreFrame)`: the row does not exist.
-        assert!(db.session("sub-cold").unwrap().is_none());
-
-        p.apply_interactive_event(
-            "sub-cold",
-            true,
-            &serde_json::json!({
-                "sessionId": "sub-cold",
-                "seq": 0,
-                "event": "cost_update",
-                "payload": { "costUsd": 0.0000341, "source": "subagent" },
-            }),
-        );
-
-        // The row exists, flagged as the ephemeral subagent row…
-        let row = db
-            .session("sub-cold")
-            .unwrap()
-            .expect("the cost arm must ensure the row before writing (Trap 1)");
-        assert!(row.is_subagent, "the flag must reach the created row");
-        // …and the figure landed in it rather than vanishing.
-        assert_eq!(db.session_cost("sub-cold").unwrap(), Some(0.0000341));
-    }
-
-    /// A `costUsd` that is not a number writes NOTHING — the same discipline
-    /// the child's capture already holds (`a_child_that_reported_no_cost_reports_no_cost`:
-    /// *"a non-number `costUsd` must not become money"*). A string, a `null`,
-    /// an object, and an absent key are four spellings of "no figure", and the
-    /// column must stay `NULL` for all four: `NULL` renders nothing, whereas a
-    /// `0.0` coerced out of `"0.5"` would render a phantom `$0.00` (D5 / ADR
-    /// 0082) — and would additionally corrupt the accumulator, since a stored
-    /// figure is a SUM of deltas.
-    ///
-    /// (Named `cost_usd` rather than the plan's `costUsd`: `non_snake_case` is
-    /// a warn-by-way lint and this crate runs clippy at 0 warnings with no
-    /// `allow(non_snake_case)` anywhere.)
-    #[test]
-    fn a_non_numeric_cost_usd_writes_nothing() {
-        // The four spellings of "no figure", each as the frame's INNER
-        // `payload` object. The fourth has no `costUsd` key at all — passing
-        // `Value::Null` as a map VALUE would serialise an explicit `null` and
-        // so only re-test the second case.
-        let cases: [(&str, Value); 4] = [
-            ("a string", json!({ "costUsd": "0.5", "source": "main" })),
-            ("a null", json!({ "costUsd": null, "source": "main" })),
-            ("an object", json!({ "costUsd": { "amount": 0.5 } })),
-            ("an absent key", json!({ "source": "main" })),
-        ];
-        for (label, inner) in cases {
-            let (_dir, db) = temp_db();
-            let p = TranscriptPersister::new(db.clone());
-            p.set_cwd("s1", "/tmp/space");
-            p.apply_interactive_event(
-                "s1",
-                false,
-                &serde_json::json!({
-                    "sessionId": "s1",
-                    "seq": 0,
-                    "event": "cost_update",
-                    "payload": inner,
-                }),
-            );
-            assert_eq!(
-                db.session_cost("s1").unwrap(),
-                None,
-                "a non-number `costUsd` ({label}: {inner}) must not become money"
-            );
-        }
-    }
-
-    /// A REAL zero is a figure: it must reach the row (turning `NULL` into
-    /// `Some(0.0)`, which the renderer prints as `$0.00`). Deliberately NOT
-    /// filtered by a `!= 0.0` guard — that guard is what this repo's own ADR
-    /// 0082 lesson forbids.
-    #[test]
-    fn a_real_zero_cost_still_reaches_the_row() {
-        let (_dir, db) = temp_db();
-        let p = TranscriptPersister::new(db.clone());
-        p.set_cwd("s1", "/tmp/space");
-        p.apply_interactive_event(
-            "s1",
-            false,
-            &serde_json::json!({
-                "sessionId": "s1",
-                "seq": 0,
-                "event": "cost_update",
-                "payload": { "costUsd": 0.0, "source": "main" },
-            }),
-        );
-        assert_eq!(
-            db.session_cost("s1").unwrap(),
-            Some(0.0),
-            "a real zero is a figure, not an absence"
-        );
-    }
-
-    #[test]
-    fn apply_interactive_event_updates_and_clears_todos() {
-        let (_dir, db) = temp_db();
-        let p = TranscriptPersister::new(db.clone());
-        let info = SessionInfo {
-            session_id: "s1".to_string(),
-            cwd: PathBuf::from("/tmp"),
-            capabilities: Value::Null,
-            config_options: None,
-            archived: false,
-            title: None,
-            context_usage: None,
-            cost_usd: None,
-            is_subagent: false,
-        };
-        db.record_session(&info).unwrap();
-
-        // (a) update todos
-        let update_payload = serde_json::json!({
-            "sessionId": "s1",
-            "seq": 0,
-            "event": "todos_update",
-            "payload": {
-                "source": "native",
-                "todos": [
-                    { "content": "t1", "status": "pending" }
-                ]
-            }
-        });
-        p.apply_interactive_event("s1", false, &update_payload);
-        let stored = db
-            .session_todos("s1")
-            .unwrap()
-            .expect("todos should be stored");
-        assert!(stored.contains("t1"));
-
-        // (b) call with second update -> replaced
-        let update2_payload = serde_json::json!({
-            "sessionId": "s1",
-            "seq": 1,
-            "event": "todos_update",
-            "payload": {
-                "source": "native",
-                "todos": [
-                    { "content": "t2", "status": "completed" }
-                ]
-            }
-        });
-        p.apply_interactive_event("s1", false, &update2_payload);
-        let stored2 = db
-            .session_todos("s1")
-            .unwrap()
-            .expect("todos should be stored");
-        assert!(stored2.contains("t2"));
-        assert!(!stored2.contains("t1"));
-
-        // (c) call with event: "todos_clear" -> sets None
-        let clear_payload = serde_json::json!({
-            "sessionId": "s1",
-            "seq": 2,
-            "event": "todos_clear",
-            "payload": {}
-        });
-        p.apply_interactive_event("s1", false, &clear_payload);
-        assert_eq!(db.session_todos("s1").unwrap(), None);
-
-        // (d) call with unrelated event (e.g. state) or bad payload -> does not crash or touch todos_json
-        let unrelated = serde_json::json!({
-            "sessionId": "s1",
-            "event": "state",
-            "payload": { "foo": "bar" }
-        });
-        p.apply_interactive_event("s1", false, &unrelated);
-        assert_eq!(db.session_todos("s1").unwrap(), None);
-
-        // Reset with t1, then test bad payload
-        p.apply_interactive_event("s1", false, &update_payload);
-        assert!(db.session_todos("s1").unwrap().is_some());
-
-        let bad_payload = serde_json::json!({
-            "sessionId": "s1",
-            "event": "todos_update",
-            "payload": { "todos": "not-an-array" }
-        });
-        p.apply_interactive_event("s1", false, &bad_payload);
-        // todos_json was not overwritten with invalid payload
-        assert!(db.session_todos("s1").unwrap().unwrap().contains("t1"));
     }
 }

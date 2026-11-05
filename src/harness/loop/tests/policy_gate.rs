@@ -8,12 +8,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::*;
 use super::support::*;
-use crate::agent::events::{EventSink, RpcEvent};
-use crate::agent::harness::provider::{FinishReason, Provider, ProviderEvent, ToolCall};
-use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::permission::PermissionOutcome;
-use crate::agent::policy::Decision;
-use crate::storage::Db;
+use crate::events::{EventSink, RpcEvent};
+use crate::harness::provider::{FinishReason, Provider, ProviderEvent, ToolCall};
+use crate::harness::retry::RetryPolicy;
+use crate::permission::PermissionOutcome;
+use crate::policy::Decision;
+use crate::trust::StaticTrustSource;
 
 // ── (ADR 0030 Task 3) the file-access policy gate ───────────────────
 
@@ -62,15 +62,29 @@ fn allow_rule(path: &str) -> String {
     format!(r#"[{{ "path": "{path}", "direction": "write", "decision": "allow" }}]"#)
 }
 
-/// The policy-gate fixture: an `AgentLoop` whose `config_dir` holds a
-/// `settings.json` with the given policy JSON (`None` = NO `config_dir`
-/// at all — the no-settings-layer case), on a fresh `space_cwd`, with a
-/// RECORDING sink (the `TestSink` cannot see `permission-request`) and
-/// `trust: None` (untrusted — fail-closed, so an `Ask` really prompts).
-/// The `config_dir` is returned WITH the loop: it must outlive it (the
-/// loop re-reads the file every turn, and the temp dir is removed on
-/// drop — dropping it early would silently degrade every test to the
-/// all-`Allow` default).
+/// The policy-gate fixture: an `AgentLoop` whose PACKAGED policy comes from
+/// the given policy JSON (`None` = no packaged config at all — the
+/// no-settings-layer case), on a fresh `space_cwd`, with a RECORDING sink (the
+/// `TestSink` cannot see `permission-request`) and `trust: None` (untrusted —
+/// fail-closed, so an `Ask` really prompts).
+///
+/// (Fulcrum T3) The JSON is PARSED IN-PROCESS and handed to the loop through
+/// [`AgentLoop::set_desktop_config`]. It used to be written to
+/// `config_dir/settings.json` and read back by the loop on every turn — and
+/// the loop cannot read it any more, because the Worker process no longer
+/// opens desktop config (the prerequisite for the `fulcrum-core` crate split).
+///
+/// Parsing rather than hand-building the `FilePolicy` keeps the fixture's
+/// vocabulary the REAL WIRE DOCUMENT (the same `filePolicy` block the Settings
+/// UI writes), so a renamed wire key reddens here exactly as it reddened under
+/// the disk read. This is the SUPERVISOR's job in the fixture's clothing: in
+/// production `load_settings` parses that document and the Supervisor packages
+/// the result onto the `start` envelope; here the parse is the same serde call
+/// and the packaging is the setter.
+///
+/// The parsed `Settings` rides out as the tuple's third element for a test that
+/// wants to know what the loop STARTED with (the live-reload pins push a
+/// change over it); every other caller binds it to `_`.
 ///
 /// #96: the `space_cwd` scratch guard is the FIRST element (it is a
 /// production `PathBuf` field on `AgentLoop` and cannot live in the loop),
@@ -88,14 +102,23 @@ pub(super) fn build_policy_loop(
     events: mpsc::UnboundedSender<RpcEvent>,
     sink: Arc<dyn EventSink>,
     settings: Option<&str>,
-) -> (crate::test_support::ScratchDir, AgentLoop, Option<Tmp>) {
-    let config_dir = settings.map(|_| Tmp::new("cfg"));
-    if let (Some(dir), Some(json)) = (config_dir.as_ref(), settings) {
-        std::fs::write(dir.path().join("settings.json"), json).unwrap();
-    }
+) -> (
+    crate::test_support::ScratchDir,
+    AgentLoop,
+    Option<crate::config_types::Settings>,
+) {
+    // The same document `load_settings` would have parsed. A body this fixture
+    // writes is always a VALID partial `Settings` (every field is
+    // `#[serde(default)]`), so a parse failure here is the fixture's bug —
+    // loud, rather than the silent all-`Allow` degradation the disk version
+    // would have produced from an unreadable file.
+    let parsed = settings.map(|json| {
+        serde_json::from_str::<crate::config_types::Settings>(json)
+            .expect("the fixture's settings document parses")
+    });
     // `_cfg_space` is MOVED OUT into the return tuple below: dropping it
-    // here would remove the config dir while the caller still asserts
-    // against it.
+    // here would remove the loop's `space_cwd` while the caller still
+    // asserts against it.
     let (_cfg_space, mut loop_, _db) = build_loop_with_db(
         provider,
         events,
@@ -103,14 +126,26 @@ pub(super) fn build_policy_loop(
         watch::channel(0u64).0,
         RetryPolicy::new_with(5, Duration::from_millis(1)),
         vec![fake_model("m1")],
-        config_dir
-            .as_ref()
-            .map(|d| d.path().to_path_buf())
-            .as_deref(),
+        // No settings dir: there is nothing left for the loop to read.
+        None,
     );
     // Swap the `TestSink` for the recording one (the field is `pub`).
     loop_.sink = sink;
-    (_cfg_space, loop_, config_dir)
+    // THE packaging hop — the twin of `worker/core.rs`'s
+    // `default_build_loop` handing the envelope's five to a fresh loop. Only
+    // when there IS a document: `settings: None` must leave the loop on its
+    // `None` packaged fields (the layer that cannot speak), not install an
+    // all-default one, because those two states are the distinction T3 keeps.
+    if let Some(s) = parsed.as_ref() {
+        loop_.set_desktop_config(
+            Some(s.file_policy.clone()),
+            Some(s.web.clone()),
+            Some(s.agent_overrides.clone()),
+            s.providers.clone(),
+            s.mcp_servers.clone(),
+        );
+    }
+    (_cfg_space, loop_, parsed)
 }
 
 /// The tool call the policy tests share: a `read` of `path`.
@@ -217,18 +252,29 @@ fn read_scripts(path: &str) -> Vec<Option<Vec<ProviderEvent>>> {
 }
 
 /// Mark the loop's own Space trusted (the existing
-/// `a_trusted_space_suppresses_the_prompt_the_policy_would_raise` pattern: a
-/// fresh `Db` under the scratch home, the Space row marked trusted, and the
-/// swap done BEFORE the first prompt so the very first verdict sees it).
-fn trust_the_space(loop_: &mut AgentLoop, home: &std::path::Path) {
-    let db = Arc::new(Db::open(&home.join("trust.db")).unwrap());
-    let cwd = loop_.space_cwd.clone();
-    db.upsert_space(&cwd.display().to_string(), false).unwrap();
-    db.set_space_trusted(&cwd.display().to_string(), true)
-        .unwrap();
-    loop_.trust = Some(Arc::new(
-        crate::agent::harness::trust::SqliteTrustSource::new(db),
-    ));
+/// `a_trusted_space_suppresses_the_prompt_the_policy_would_raise` pattern), with
+/// the swap done BEFORE the first prompt so the very first verdict sees it.
+///
+/// (T5/S5b) RE-POINTED, not relocated. This used to mint a `trust.db` under the
+/// scratch home, `upsert_space` + `set_space_trusted` into it, and wrap it in
+/// `SqliteTrustSource` — three desktop calls whose ONLY purpose was to make a
+/// `TrustSource` answer `true`. What every test below asserts is the GATE's
+/// consumption of that answer (`Decision::Allow` where the policy says `Ask`,
+/// and no `permission-request` emitted), and the gate talks to the crate's
+/// `TrustSource` trait — so the fixture now injects the crate's own
+/// `StaticTrustSource(true)`, which is the same answer through the same seam and
+/// is what the Worker already ships.
+///
+/// What the swap does NOT cover, and where it lives instead: that
+/// `SqliteTrustSource::is_trusted` reads the `spaces.trusted` column, and the
+/// fail-closed-on-canonicalise-failure arm. Both are pinned DESKTOP-side, where
+/// the `Db` is — `src-tauri/tests/fulcrum_seams.rs::
+/// sqlite_trust_source_reads_the_space_flag` (S5a relocated it) and
+/// `src-tauri/tests/permission_gate_db.rs` (the `Db`-backed gate half, S5a
+/// again). `home` stays a parameter because the CALLER still needs the scratch
+/// home for `$HOME`; the fixture itself no longer writes into it.
+fn trust_the_space(loop_: &mut AgentLoop, _home: &std::path::Path) {
+    loop_.trust = Some(Arc::new(StaticTrustSource::new(true)));
 }
 
 /// The `permission-request` frames a sink recorded.
@@ -454,10 +500,19 @@ async fn the_default_policy_reads_and_writes_beyond_the_boundary_in_silence() {
     }
 }
 
-/// (ADR 0030 Deviation 4 — "affects an already-running session") the
-/// policy is re-read from `settings.json` at the top of EVERY prompt:
-/// a settings edit BETWEEN two prompts changes the SECOND prompt's
-/// gating, with no restart and no relaunch.
+/// (ADR 0030 Deviation 4 — "affects an already-running session", Fulcrum T3)
+/// the policy is RE-APPLIED at the top of EVERY prompt from the packaged
+/// state, and the packaged state is replaced by the `config-update` push: an
+/// edit BETWEEN two prompts changes the SECOND prompt's gating, with no
+/// restart and no relaunch.
+///
+/// The injection used to be `fs::write(config_dir/settings.json)` — the disk
+/// was the live-reload channel. It is now the push, because the Worker reads
+/// no file: this calls the in-process twin of the `config-update` frame
+/// ([`AgentLoop::apply_config_update`], which is exactly what
+/// `ControlCmd::ConfigUpdate` runs). The ASSERTION is unchanged — a
+/// per-session snapshot of the policy would still prompt on turn 2, and that
+/// is what this pins.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_settings_edit_between_prompts_changes_the_next_turns_gating() {
@@ -495,7 +550,7 @@ async fn a_settings_edit_between_prompts_changes_the_next_turns_gating() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
     let settings = policy_settings("ask", "ask", "ask");
-    let (_space, mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _started) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
@@ -503,9 +558,6 @@ async fn a_settings_edit_between_prompts_changes_the_next_turns_gating() {
         }),
         Some(&settings),
     );
-    // The loop's own `config_dir` (the fixture's temp dir): re-read
-    // between the prompts, exactly as a user editing Settings would.
-    let config_dir = loop_.config_dir.clone().expect("a settings dir");
 
     // Turn 1: `reads: ask` → the prompt fires (answered `allow`).
     let pending = loop_.pending_permissions.clone();
@@ -518,12 +570,16 @@ async fn a_settings_edit_between_prompts_changes_the_next_turns_gating() {
         "turn 1 prompts under `ask`"
     );
 
-    // The user edits the file BETWEEN the prompts: `ask` → `sandboxed`.
-    std::fs::write(
-        config_dir.join("settings.json"),
-        policy_settings("sandboxed", "sandboxed", "allow"),
-    )
-    .unwrap();
+    // The user edits Settings BETWEEN the prompts: `ask` → `sandboxed`. The
+    // Supervisor's `save_settings` hook pushes the changed policy; the loop
+    // applies it through the same entry point the control queue calls.
+    let edited = serde_json::from_str::<crate::config_types::Settings>(&policy_settings(
+        "sandboxed",
+        "sandboxed",
+        "allow",
+    ))
+    .expect("the edited document parses");
+    loop_.apply_config_update(Some(edited.file_policy.clone()), None, None);
 
     // Turn 2: the SAME out-of-boundary read is now a Deny — no prompt,
     // an error result. A per-session (or per-process) snapshot of the
@@ -532,7 +588,7 @@ async fn a_settings_edit_between_prompts_changes_the_next_turns_gating() {
     assert_eq!(
         permission_requests(&sink_events.lock().unwrap()).len(),
         1,
-        "the second turn must NOT prompt after the file changed to `sandboxed`"
+        "the second turn must NOT prompt after the push changed the policy to `sandboxed`"
     );
     let ends = tool_ends(&mut events_rx);
     let (result, is_error) = ends.get("t2").expect("a tool result for t2").clone();
@@ -602,7 +658,7 @@ async fn a_sandboxed_shell_dispatches_confined_with_no_prompt() {
     // build does not name the sandbox module, which is not compiled
     // there at all.
     #[cfg(target_os = "linux")]
-    let confined_here = crate::agent::tools::sandbox::landlock_available();
+    let confined_here = crate::tools::sandbox::landlock_available();
     #[cfg(not(target_os = "linux"))]
     let confined_here = false;
     if confined_here {
@@ -737,7 +793,7 @@ async fn a_user_deny_rule_refuses_an_agent_dir_write_with_the_unchanged_protecte
     // drift this shared text exists to prevent. Asserted against the SAME const
     // the executor-side test uses, by its full path (no re-export).
     assert!(
-        text.ends_with(crate::agent::tools::exec::access::PROTECTED_WRITE_ROUTE),
+        text.ends_with(crate::tools::exec::access::PROTECTED_WRITE_ROUTE),
         "the gate's refusal must end with the sanctioned route, got {text:?}"
     );
     assert!(
@@ -825,7 +881,7 @@ async fn a_recreated_protected_dir_is_refused_by_the_gate_without_a_new_session(
         "the refusal names the real reason, got {text:?}"
     );
     assert!(
-        text.ends_with(crate::agent::tools::exec::access::PROTECTED_WRITE_ROUTE),
+        text.ends_with(crate::tools::exec::access::PROTECTED_WRITE_ROUTE),
         "the gate's refusal must end with the sanctioned route, got {text:?}"
     );
     assert!(
@@ -875,17 +931,10 @@ async fn a_trusted_space_suppresses_the_prompt_the_policy_would_raise() {
         // `ask` — the policy WOULD prompt; Trust is what stops it.
         Some(&policy_settings("ask", "ask", "ask")),
     );
-    // The Space the loop's `space_cwd` points at, marked trusted (the
-    // `Db` the fixture built is reachable through `loop_.store`, so the
-    // trust source is wired to the same rows).
-    let db = Arc::new(Db::open(&home.path().join("trust.db")).unwrap());
-    let cwd = loop_.space_cwd.clone();
-    db.upsert_space(&cwd.display().to_string(), false).unwrap();
-    db.set_space_trusted(&cwd.display().to_string(), true)
-        .unwrap();
-    loop_.trust = Some(Arc::new(
-        crate::agent::harness::trust::SqliteTrustSource::new(db),
-    ));
+    // The loop's Space marked trusted — the same re-pointed seam as
+    // `trust_the_space` above (inlined here because this test builds its loop
+    // through `build_policy_loop` and asserts on the verdict right after).
+    loop_.trust = Some(Arc::new(StaticTrustSource::new(true)));
 
     // The gate's OWN verdict, read AFTER the turn (so `file_policy` is
     // the `ask` the settings file carries — before the first prompt the
@@ -1441,7 +1490,7 @@ async fn the_guard_prompt_end_to_end_carries_exactly_three_options_a_real_path_a
     // both platforms while staying green here. `canonicalize_lenient` peels to
     // the deepest EXISTING ancestor and re-appends `pwn`, which is exactly the
     // shape `guard_ancestor` produces from the resolved target.
-    let want = crate::agent::fs_backend::canonicalize_lenient(
+    let want = crate::fs_backend::canonicalize_lenient(
         target.parent().expect("the target is a file under a dir"),
     );
     assert_eq!(
@@ -1615,21 +1664,21 @@ async fn a_tilde_spelled_guarded_write_yields_an_ancestor_rule_for_matches() {
     // `rule_for` MATCHES the canonicalized target with it — the click stops the
     // next prompt. Spelled with a leading `~` too, via the session's own home,
     // because that is the other spelling a persisted rule can arrive in.
-    let canonical_target = crate::agent::fs_backend::canonicalize_lenient(&target);
+    let canonical_target = crate::fs_backend::canonicalize_lenient(&target);
     let home_canon = home.path().canonicalize().unwrap();
-    let as_written = crate::agent::policy::AccessRule {
+    let as_written = crate::policy::AccessRule {
         path: emitted.clone(),
-        direction: crate::agent::policy::RuleDirection::Write,
-        decision: crate::agent::policy::RuleDecision::Allow,
+        direction: crate::policy::RuleDirection::Write,
+        decision: crate::policy::RuleDecision::Allow,
     };
-    let rules = crate::agent::policy::default_rules()
+    let rules = crate::policy::default_rules()
         .into_iter()
         .chain(std::iter::once(as_written.clone()))
         .collect::<Vec<_>>();
     assert_eq!(
-        crate::agent::policy::rule_for(
+        crate::policy::rule_for(
             &rules,
-            crate::agent::policy::RuleDirection::Write,
+            crate::policy::RuleDirection::Write,
             &canonical_target,
             Some(&home_canon),
         ),
@@ -1640,19 +1689,19 @@ async fn a_tilde_spelled_guarded_write_yields_an_ancestor_rule_for_matches() {
 
     // HALF THREE: the `~` RULE spelling resolves too, against the session's
     // home — the spelling a hand-written `settings.json` carries.
-    let tilde_rule = crate::agent::policy::AccessRule {
+    let tilde_rule = crate::policy::AccessRule {
         path: "~/.pi/agent/agents".to_string(),
-        direction: crate::agent::policy::RuleDirection::Write,
-        decision: crate::agent::policy::RuleDecision::Allow,
+        direction: crate::policy::RuleDirection::Write,
+        decision: crate::policy::RuleDecision::Allow,
     };
-    let rules = crate::agent::policy::default_rules()
+    let rules = crate::policy::default_rules()
         .into_iter()
         .chain(std::iter::once(tilde_rule.clone()))
         .collect::<Vec<_>>();
     assert_eq!(
-        crate::agent::policy::rule_for(
+        crate::policy::rule_for(
             &rules,
-            crate::agent::policy::RuleDirection::Write,
+            crate::policy::RuleDirection::Write,
             &canonical_target,
             loop_.permissions.rules_home.as_deref(),
         ),
@@ -1662,9 +1711,9 @@ async fn a_tilde_spelled_guarded_write_yields_an_ancestor_rule_for_matches() {
     // And with NO home the same rule matches nothing (the pinned consequence,
     // asserted at the loop's own field so the two halves share one fixture).
     assert_eq!(
-        crate::agent::policy::rule_for(
+        crate::policy::rule_for(
             &rules,
-            crate::agent::policy::RuleDirection::Write,
+            crate::policy::RuleDirection::Write,
             &canonical_target,
             None,
         ),
@@ -1673,11 +1722,17 @@ async fn a_tilde_spelled_guarded_write_yields_an_ancestor_rule_for_matches() {
     );
 }
 
-/// Deviation 4 for the RULES layer: a rule added to `settings.json` BETWEEN
-/// prompts is enforced at the NEXT prompt, with no restart. This is the
-/// per-turn concat's promise (mirror of
+/// Deviation 4 for the RULES layer: a rule that arrives BETWEEN prompts is
+/// enforced at the NEXT prompt, with no restart. This is the per-turn concat's
+/// promise (mirror of
 /// `a_settings_edit_between_prompts_changes_the_next_turns_gating`, which pins
 /// the posture half).
+///
+/// (Fulcrum T3) The channel is the `config-update` push, not a
+/// `settings.json` write: the rules are DERIVED from the packaged `FilePolicy`
+/// by the per-turn concat, so pushing a policy that carries the new rule is
+/// what a Settings save now does. The assertion — turn 2 stops prompting
+/// because the rule moved the call from row 3 to row 1 — is unchanged.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_settings_rule_edit_between_prompts_changes_the_next_turns_gating() {
@@ -1712,7 +1767,7 @@ async fn a_settings_rule_edit_between_prompts_changes_the_next_turns_gating() {
     ]);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
-    let (_space, mut loop_, _cfg) = build_policy_loop(
+    let (_space, mut loop_, _started) = build_policy_loop(
         Box::new(provider),
         events_tx,
         Arc::new(RecordingSink {
@@ -1721,7 +1776,6 @@ async fn a_settings_rule_edit_between_prompts_changes_the_next_turns_gating() {
         // Turn 1: NO rules → the guard asks.
         Some(&policy_settings("allow", "allow", "allow")),
     );
-    let config_dir = loop_.config_dir.clone().expect("a settings dir");
 
     let pending = loop_.pending_permissions.clone();
     let answer = tokio::spawn(answer_permission(pending, "s1", "reject", None));
@@ -1733,18 +1787,20 @@ async fn a_settings_rule_edit_between_prompts_changes_the_next_turns_gating() {
         "turn 1 prompts (row 3, no rules)"
     );
 
-    // The user edits Settings BETWEEN the prompts: a deny rule appears.
-    std::fs::write(
-        config_dir.join("settings.json"),
-        policy_settings_with_rules("allow", "allow", "allow", &deny_rule("~/.agents/skills")),
+    // The user edits Settings BETWEEN the prompts: a deny rule appears. The
+    // push carries the WHOLE policy (the rule rides inside `filePolicy`), so
+    // the per-turn concat rebuilds `default_rules()` + the user rules from it.
+    let edited = serde_json::from_str::<crate::config_types::Settings>(
+        &policy_settings_with_rules("allow", "allow", "allow", &deny_rule("~/.agents/skills")),
     )
-    .unwrap();
+    .expect("the edited document parses");
+    loop_.apply_config_update(Some(edited.file_policy.clone()), None, None);
 
     bounded_prompt(&mut loop_, "two").await;
     assert_eq!(
         permission_requests(&sink_events.lock().unwrap()).len(),
         1,
-        "turn 2 must NOT prompt: the new rule moved the call from row 3 to row 1"
+        "turn 2 must NOT prompt: the pushed rule moved the call from row 3 to row 1"
     );
     let ends = tool_ends(&mut events_rx);
     let (result, is_error) = ends.get("t2").expect("a tool result for t2").clone();
@@ -1931,7 +1987,7 @@ async fn a_rule_deny_on_an_ordinary_dir_uses_the_rule_wording_not_an_escape_clai
 //     `Sandboxed` shell and a per-agent `Ask` still tightens one;
 //   * a per-agent `Deny` renders through `deny_tool_result` UNCHANGED, so the
 //     model's recovery cannot tell which layer said no.
-use crate::agent::definition_permission::{Action, PermissionBlock, Rule, Rules, ToolKey};
+use crate::definition_permission::{Action, PermissionBlock, Rule, Rules, ToolKey};
 
 /// A one-tool whole-tool ruleset (the bare `read: deny` spelling — the shape
 /// the gate can decide WITHOUT any pattern matcher).
@@ -2551,7 +2607,7 @@ async fn per_pattern_rules_leave_the_verdict_untouched() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones() {
-    use crate::agent::definition_permission::{FrontmatterNote, UnsupportedReason};
+    use crate::definition_permission::{FrontmatterNote, UnsupportedReason};
 
     let fm = "name: researcher\nmode: subagent\npermission:\n  \
               # Markdown only. In opencode `edit` gates write / edit / patch, patterns match the\n  \
@@ -2569,8 +2625,7 @@ async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones(
         .iter()
         .position(|l| l.starts_with("permission:"))
         .unwrap();
-    let (block, notes) =
-        crate::agent::definition_permission::parse_permission_block(&lines, idx, "");
+    let (block, notes) = crate::definition_permission::parse_permission_block(&lines, idx, "");
     let block = block.expect("the file that motivated #101 must parse");
     // The block reader's own announcement is the record that the bash rows are
     // UNSUPPORTED — the gate's `AsSelf` below is that decision, not a drop.
@@ -2670,7 +2725,7 @@ async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones(
 /// class #101 exists to fix.
 #[test]
 fn a_path_tool_pattern_map_announces_itself_unsupported() {
-    use crate::agent::definition_permission::{FrontmatterNote, UnsupportedReason};
+    use crate::definition_permission::{FrontmatterNote, UnsupportedReason};
 
     let fm = "name: p\npermission:\n  edit: {\"*\": deny, \"*.md\": allow}\n";
     let lines: Vec<&str> = fm.lines().collect();
@@ -2678,8 +2733,7 @@ fn a_path_tool_pattern_map_announces_itself_unsupported() {
         .iter()
         .position(|l| l.starts_with("permission:"))
         .unwrap();
-    let (block, notes) =
-        crate::agent::definition_permission::parse_permission_block(&lines, idx, "");
+    let (block, notes) = crate::definition_permission::parse_permission_block(&lines, idx, "");
     let block = block.expect("a pattern map on a path tool must PARSE");
     assert!(!block.tools[0].1.whole_tool, "an object is per-pattern");
     assert!(

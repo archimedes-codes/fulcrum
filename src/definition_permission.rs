@@ -29,7 +29,7 @@
 //!
 //! ## What this module is NOT
 //!
-//! * Not [`crate::agent::policy`] (`AccessPolicy` / `FilePolicy` /
+//! * Not [`crate::policy`] (`AccessPolicy` / `FilePolicy` /
 //!   `AccessRule`): that vocabulary is per-DIRECTION and global, and its
 //!   `Sandboxed` carries the Landlock meaning. This one is per-DEFINITION and
 //!   per-TOOL.
@@ -1457,8 +1457,15 @@ subtask: "true"
 
     #[test]
     fn the_two_parse_value_copies_are_untouched_by_the_permission_reader() {
-        let agents = include_str!("../agents.rs");
-        let skills = include_str!("../skills.rs");
+        // The relative path LOST a level in T5/S2: this file used to sit at
+        // `src-tauri/src/agent/definition_permission.rs` with `agents.rs`/
+        // `skills.rs` one directory UP at `src-tauri/src/`; all three moved into
+        // the crate's `src/` together, so they are SIBLINGS now. `include_str!`
+        // resolves relative to the containing file, so a stale `../` is a hard
+        // compile error (loud, not silent) — worth the note because the fix is
+        // "the directory relationship changed", not "the file moved".
+        let agents = include_str!("agents.rs");
+        let skills = include_str!("skills.rs");
         let agents_body = parse_value_copy(agents);
         let skills_body = parse_value_copy(skills);
 

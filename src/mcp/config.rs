@@ -124,7 +124,7 @@ pub fn server_infos(servers: &BTreeMap<String, ServerDef>) -> Vec<McpServerInfo>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::mcp::types::{AuthSpec, HttpDef, StdioDef};
+    use crate::mcp::types::{AuthSpec, HttpDef, StdioDef};
     use std::io::Write;
 
     /// Write a file (creating parents).

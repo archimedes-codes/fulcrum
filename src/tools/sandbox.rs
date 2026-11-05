@@ -76,7 +76,7 @@
 //!   are NOT listable.
 //! * read + write: the nullness/entropy nodes under `/dev` (`/dev/null` and
 //!   friends — `git --version` fails without `/dev/null` read-write), and
-//!   [`crate::agent::boundary::write_roots`] (the canonical session `cwd`) +
+//!   [`crate::boundary::write_roots`] (the canonical session `cwd`) +
 //!   `/tmp` + `/var/tmp`, MINUS the protected agent-definition dirs (below).
 //!
 //! # The protected dirs ARE subtracted (Landlock cannot subtract, so we
@@ -85,7 +85,9 @@
 //! everything beneath it, and the ruleset is the UNION of the rules: there
 //! is no narrower rule that takes a right back from an ancestor. So a write
 //! root that merely CONTAINS a protected dir cannot be ruled read-write.
-//! Instead ([`rule_write_root`]): the root itself is ruled read+execute and
+//! Instead (`Sandbox::rule_write_root`, a plain reference — it is a private
+//! inherent method, so an intra-doc link from this module doc cannot resolve
+//! it): the root itself is ruled read+execute and
 //! every SIBLING along the path down to the protected dir is ruled
 //! read-write, so the tree stays writable everywhere except the protected
 //! subtree. The cost, in exchange for the protection: when the session
@@ -473,8 +475,8 @@ fn mask_for_fd(fd: i32, access: u64) -> u64 {
 
 impl Sandbox {
     /// Build the ruleset for a session rooted at `cwd`. The write boundary
-    /// is [`crate::agent::boundary::write_roots`] MINUS
-    /// [`crate::agent::boundary::protected_dirs`], so a `cwd` that cannot be
+    /// is [`crate::boundary::write_roots`] MINUS
+    /// [`crate::boundary::protected_dirs`], so a `cwd` that cannot be
     /// canonicalized is a fail-closed error (the same rule the `FsBackend`
     /// follows) and a `cwd` inside an agent-definition dir is read-only.
     ///
@@ -531,14 +533,14 @@ impl Sandbox {
             sandbox.add_path(Path::new(dir), ACCESS_READ_FILE, false)?;
         }
         // The write boundary (minus the protected dirs) + the temp dirs.
-        let write_roots = crate::agent::boundary::write_roots(cwd);
+        let write_roots = crate::boundary::write_roots(cwd);
         if write_roots.is_empty() {
             return Err(format!(
                 "the session boundary {} cannot be canonicalized",
                 cwd.display()
             ));
         }
-        let protected: Vec<PathBuf> = crate::agent::boundary::protected_dirs();
+        let protected: Vec<PathBuf> = crate::boundary::protected_dirs();
         for dir in write_roots {
             sandbox.rule_write_root(&dir, &protected, true)?;
         }
@@ -607,7 +609,7 @@ impl Sandbox {
             // Unreadable: nothing more can be carved out, and `dir` keeps
             // only read+execute, so this fails closed.
             Err(e) => {
-                crate::agent::debuglog::log(&format!(
+                crate::debuglog::log(&format!(
                     "sandbox: cannot list {} ({}) — it stays read-only",
                     dir.display(),
                     e
@@ -644,7 +646,7 @@ impl Sandbox {
     /// is skipped with a debug note (distro-dependent paths).
     fn add_path(&mut self, path: &Path, access: u64, required: bool) -> Result<(), String> {
         let skip = |e: String| {
-            crate::agent::debuglog::log(&format!("sandbox: skip rule {e}"));
+            crate::debuglog::log(&format!("sandbox: skip rule {e}"));
             Ok(())
         };
         let fd = match open_rule_path(path) {

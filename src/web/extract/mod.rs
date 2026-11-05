@@ -1,5 +1,5 @@
-use crate::agent::tools::exec::ToolCtx;
-use crate::agent::web::net::{safe_fetch, FetchOpts};
+use crate::tools::exec::ToolCtx;
+use crate::web::net::{safe_fetch, FetchOpts};
 use url::Url;
 
 pub mod article;

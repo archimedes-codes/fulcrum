@@ -38,10 +38,10 @@ use rand::Rng as _;
 use sha2::Digest as _;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::mcp::callback::constant_time_eq;
-use crate::agent::mcp::callback::CallbackServer;
-use crate::agent::provider_auth::store::{self, OidcCredential};
-use crate::config::OidcConfig;
+use crate::config_types::OidcConfig;
+use crate::mcp::callback::constant_time_eq;
+use crate::mcp::callback::CallbackServer;
+use crate::provider_auth::store::{self, OidcCredential};
 
 /// The callback wait: 10 MINUTES — the same caller-side duration T5's native
 /// client passes to [`CallbackServer::wait`] (a parameter, not a constant in
@@ -542,7 +542,7 @@ async fn exchange_code(
         &claims,
         config,
         Some(nonce),
-        crate::agent::mcp::oauth::now_epoch_secs(),
+        crate::mcp::oauth::now_epoch_secs(),
     )?;
     let expires_at = body
         .get("expires_in")
@@ -653,7 +653,7 @@ pub async fn refresh(
         // `None`: a refresh performs no authorization, so there is no nonce to
         // echo — the `sub` guard below is the identity check at this stage.
         None,
-        crate::agent::mcp::oauth::now_epoch_secs(),
+        crate::mcp::oauth::now_epoch_secs(),
     )
     .map_err(|e| format!("the refreshed id_token failed validation: {e}"))?;
     // THE GUARD. Equal-length compare, constant time, before anything is written.
@@ -1172,7 +1172,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_code_captures_and_validates_the_id_token() {
-        let now = crate::agent::mcp::oauth::now_epoch_secs();
+        let now = crate::mcp::oauth::now_epoch_secs();
         let nonce = "the-nonce-we-sent";
         let server = wiremock::MockServer::start().await;
         let id_token = build_test_id_token(&claims_of(server.uri(), now, nonce));
@@ -1246,7 +1246,7 @@ mod tests {
     async fn exchange_code_refuses_a_token_that_fails_claims_validation() {
         // The claims check is INSIDE the exchange, so a bad `iss` cannot escape
         // into a session (and thence into the store or the proxy).
-        let now = crate::agent::mcp::oauth::now_epoch_secs();
+        let now = crate::mcp::oauth::now_epoch_secs();
         let server = wiremock::MockServer::start().await;
         let mut bad = claims_of(server.uri(), now, "nonce");
         bad["iss"] = serde_json::json!("https://attacker.example");

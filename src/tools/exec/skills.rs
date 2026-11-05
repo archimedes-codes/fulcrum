@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::agent::fs_backend::{FsBackend, FsError};
-use crate::agent::tools::types::{ToolCtx, ToolResult};
+use crate::fs_backend::{FsBackend, FsError};
+use crate::tools::types::{ToolCtx, ToolResult};
 
 /// The ONE discovery call the skill tools make per tool call (see
 /// [`ToolCtx::skill_roots`]): the pinned roots when set (the test seam),

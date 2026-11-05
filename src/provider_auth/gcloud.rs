@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::agent::debuglog;
+use crate::debuglog;
 
 /// The in-memory cache TTL: 50 minutes (spec Subissue 4 — "in-memory cache
 /// valid for 50 minutes"; Google's own access tokens live 60 minutes, so a

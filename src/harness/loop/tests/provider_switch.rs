@@ -10,8 +10,8 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::support::{build_loop_with_db, build_loop_with_headers_and_db, fake_model, text_prompt};
-use crate::agent::harness::provider::build_provider;
-use crate::agent::harness::retry::RetryPolicy;
+use crate::harness::provider::build_provider;
+use crate::harness::retry::RetryPolicy;
 
 const OK_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
      data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
@@ -149,7 +149,7 @@ async fn set_model_preserves_provider_when_composed_key_is_identical() {
 /// re-builds the provider through the header-less `build_provider` — the first
 /// prompt passes a gated gateway and the second 401s.
 ///
-/// The switch keeps the SAME provider id (so the `settings.json` row the
+/// The switch keeps the SAME provider id (so the PACKAGED row the
 /// re-lookup finds is the same row) but a DIFFERENT model `id` — the composed
 /// `ModelKey` is `(provider, id)` only, so the key changes and the rebuild
 /// fires. Both wires are asserted: the FIRST turn proves the initial provider
@@ -206,11 +206,11 @@ async fn set_model_reapplies_custom_headers_after_a_switch() {
     let models = vec![model_a.clone(), model_b.clone()];
 
     // The settings row carries the RAW template; the production expansion
-    // (`provider_headers_for` → `expand_map`) turns it into the wire value —
+    // (`headers_for_providers` → `expand_map`) turns it into the wire value —
     // so the asserted value is the EXPANDED one, computed by the same engine.
     let mut raw_headers = std::collections::HashMap::new();
     raw_headers.insert("x-env-test".to_string(), "$T2B_SWITCH_HEADER".to_string());
-    let expanded = crate::agent::provider_auth::headers::expand_map(&raw_headers);
+    let expanded = crate::provider_headers::expand_map(&raw_headers);
     assert_eq!(
         expanded.get("x-env-test").map(String::as_str),
         Some("switched"),
@@ -219,8 +219,7 @@ async fn set_model_reapplies_custom_headers_after_a_switch() {
 
     // The INITIAL provider is built the production way — through the header-
     // carrying construction entry.
-    let provider =
-        crate::agent::harness::provider::build_provider_with_headers(&model_a, Some(&expanded));
+    let provider = crate::harness::provider::build_provider_with_headers(&model_a, Some(&expanded));
 
     let (events_tx, _events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
@@ -230,7 +229,7 @@ async fn set_model_reapplies_custom_headers_after_a_switch() {
         updates: Arc::new(StdMutex::new(Vec::new())),
     });
 
-    let (_config_home, _space, mut loop_, _db) = build_loop_with_headers_and_db(
+    let (_space, mut loop_, _db) = build_loop_with_headers_and_db(
         provider,
         events_tx,
         turn_cancel,
@@ -274,7 +273,7 @@ async fn set_model_reapplies_custom_headers_after_a_switch() {
             .and_then(|v| v.to_str().ok()),
         Some("switched"),
         "the SECOND turn STILL carries the custom header — `set_model` \
-         re-resolved it from `settings.json` instead of dropping it (R1)"
+         re-resolved it from the PACKAGED provider rows instead of dropping it (R1)"
     );
 
     // Server A saw only the pre-switch turn (the switch really rebuilt).

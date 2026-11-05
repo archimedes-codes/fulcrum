@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::rpc::{parse_notification, parse_response, RpcRequest, RpcResponse};
 use super::types::{extract_tool_call_result, StdioDef, ToolCallResult, ToolInfo};
-use crate::agent::hostenv::EnvPatch;
+use crate::hostenv::EnvPatch;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -324,25 +324,25 @@ impl Drop for StdioClient {
 /// spawned. It is called by production `connect`, so it needs no `cfg` and no
 /// `allow`.
 fn build_command(def: &StdioDef, cwd: &Path) -> Command {
-    build_command_with(def, cwd, crate::agent::hostenv::for_child())
+    build_command_with(def, cwd, crate::hostenv::for_child())
 }
 
 /// [`build_command`] with the patch as an argument.
 ///
-/// Production passes exactly [`for_child`](crate::agent::hostenv::for_child) —
+/// Production passes exactly [`for_child`](crate::hostenv::for_child) —
 /// the parameter is there because that cached patch is EMPTY under `cargo test`
 /// (its gate needs this exe under `$APPDIR`; under cargo it is
 /// `target/debug/deps/<hash>`), so a test driven through `build_command` could
 /// not observe the ordering at all and could not fail.
 ///
-/// The constructor is `crate::agent::childproc`'s — it owns the child's Windows
+/// The constructor is `crate::childproc`'s — it owns the child's Windows
 /// console window policy (`CREATE_NO_WINDOW`); stdin stays our pipe (this is a
 /// Runtime child).
 fn build_command_with(def: &StdioDef, cwd: &Path, patch: &EnvPatch) -> Command {
-    let mut cmd = crate::agent::childproc::command(&def.command);
+    let mut cmd = crate::childproc::command(&def.command);
     cmd.args(&def.args);
     // The inherited env is SCRUBBED of the AppImage's own mount paths first
-    // (`crate::agent::hostenv`; evidence:
+    // (`crate::hostenv`; evidence:
     // `docs/research/appimage-child-process-env-leak.md`). This is the most
     // damaging site after `bash`: a stdio server is overwhelmingly
     // `npx` / `uvx` / `node` / `python` — the frozen-interpreter shapes that
@@ -382,14 +382,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The `fake_mcp_stdio` test-double binary (built by `cargo test` —
-    /// the `CARGO_MANIFEST_DIR`/`target/debug` path, the `fake_pi`
-    /// pattern).
+    /// The `fake_mcp_stdio` test-double binary (built by `cargo test`).
+    ///
+    /// T5/S3 (Step A-bis): this resolved `CARGO_MANIFEST_DIR.parent()`, which was
+    /// the repo root while this file lived in `src-tauri/` and is `crates/` now
+    /// that it lives in `crates/fulcrum-core/`. `target_debug_dir()` is the
+    /// crate's ONE resolver (TWO levels up) and the `childproc` pin
+    /// `target_debug_dir_is_where_cargo_actually_builds` is what proves it —
+    /// nothing here does, because this spawner has no vacuity guard of its own.
     fn fake_mcp_bin() -> PathBuf {
-        PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/fake_mcp_stdio"
-        ))
+        crate::test_support::target_debug_dir().join("fake_mcp_stdio")
     }
 
     /// A `StdioDef` pointing at the fake binary.
@@ -557,7 +559,7 @@ mod tests {
 
     // ── the AppImage child-env scrub, at the MCP spawn site ──────────────
     //
-    // `crate::agent::hostenv` pins the RULE (what a scrubbed child env looks
+    // `crate::hostenv` pins the RULE (what a scrubbed child env looks
     // like) and `tools/exec.rs`'s module pins that call site; this section
     // pins the stdio MCP site, which is the most damaging one after `bash`:
     // stdio servers are overwhelmingly `npx` / `uvx` / `node` / `python` —
@@ -591,21 +593,21 @@ mod tests {
     /// variable whose every entry was the bundle's, and an `env_remove` issued
     /// AFTER `envs(&def.env)` DISCARDS the user's entry (measured against a
     /// real `execve` — see the note on
-    /// [`EnvPatch::apply`](crate::agent::hostenv::EnvPatch::apply)). A
+    /// [`EnvPatch::apply`](crate::hostenv::EnvPatch::apply)). A
     /// transport that silently drops the environment a user wrote into their
     /// `mcpServers` config is worse than one that never scrubbed.
     ///
     /// The patch is injected through the seam rather than read from
-    /// [`for_child`](crate::agent::hostenv::for_child), which is EMPTY under
+    /// [`for_child`](crate::hostenv::for_child), which is EMPTY under
     /// `cargo test` — its gate needs this exe under `$APPDIR`, and under cargo
     /// it is `target/debug/deps/<hash>`. So a test built on `for_child()`
     /// asserts nothing; the fabricated host in
-    /// [`fixtures`](crate::agent::hostenv::fixtures) is what makes the patch
+    /// [`fixtures`](crate::hostenv::fixtures) is what makes the patch
     /// (and therefore the ordering) observable.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_mcp_server_env_wins_over_the_scrub() {
-        use crate::agent::hostenv::fixtures;
+        use crate::hostenv::fixtures;
 
         let patch = fixtures::tainted_patch();
         let mut def = fake_def();
@@ -654,7 +656,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn an_mcp_server_inherits_a_scrubbed_library_path() {
-        use crate::agent::hostenv::fixtures;
+        use crate::hostenv::fixtures;
 
         let patch = fixtures::tainted_patch();
         // `fake_def()`'s `env` is EMPTY — nothing overrides the scrub.

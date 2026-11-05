@@ -9,15 +9,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::CompactionRan;
 use super::support::*;
-use crate::agent::events::CompactionReason;
-use crate::agent::events::EventSink;
-use crate::agent::harness::catalog::{CompactionConfig, Model};
-use crate::agent::harness::compact::{self, Compactor};
-use crate::agent::harness::provider::{
+use crate::events::CompactionReason;
+use crate::events::EventSink;
+use crate::harness::catalog::{CompactionConfig, Model};
+use crate::harness::compact::{self, Compactor};
+use crate::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ModelRequest, Provider, ProviderError,
     ProviderEvent, ToolCall, Usage,
 };
-use crate::agent::harness::retry::RetryPolicy;
+use crate::harness::retry::RetryPolicy;
 
 // ── `context_usage_update` frames (the frontend's context-percentage
 // display: the session's current context size vs the model's window —

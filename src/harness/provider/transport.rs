@@ -153,7 +153,9 @@ pub(crate) async fn map_response(
     Err(map_status(status, body.as_deref()).expect("a non-success status maps to an error"))
 }
 
-pub(crate) const TITLE_SESSION_SUFFIX: &str = "-title";
+// (Step A.3) RAISED from `pub(crate)`: the STAYING desktop
+// `session/naming.rs` imports it, and a package boundary erases `pub(crate)`.
+pub const TITLE_SESSION_SUFFIX: &str = "-title";
 
 /// The LiteLLM session / request tracking headers (added when the request
 /// carries a session id): `x-litellm-session-id` + `x-request-id`, both set

@@ -40,8 +40,8 @@ use serde_json::json;
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::events::EventSink;
-use crate::agent::harness::trust::TrustSource;
+use crate::events::EventSink;
+use crate::trust::TrustSource;
 
 /// The user's decision on a permission prompt, as chosen via the
 /// `respond_permission` Tauri command.
@@ -144,10 +144,15 @@ pub fn permission_title(tool: &str, args: &serde_json::Value) -> String {
 /// Space that is trusted enough to make `trust-space` a one-click way to
 /// disable the protection the prompt exists to provide).
 ///
-/// `pub(crate)` because Task 3's CALLER picks the kind: the guard ask is
-/// raised from the harness gate, which knows the target path this module's
+/// The kind is a parameter because Task 3's CALLER picks it: the guard ask
+/// is raised from the harness gate, which knows the target path this module's
 /// gate signature does not carry.
-pub(crate) fn permission_options(boundary: bool) -> Vec<serde_json::Value> {
+///
+/// `pub`, not the desktop's `pub(crate)` (Step A.3): a package boundary erases
+/// `pub(crate)`, and the STAYING desktop `harness/loop/gate.rs` names this
+/// function at `crate::agent::permission::permission_options(..)` — which
+/// resolves here through `agent/mod.rs`'s module-level re-export.
+pub fn permission_options(boundary: bool) -> Vec<serde_json::Value> {
     if boundary {
         vec![
             json!({ "optionId": "allow", "name": "Allow", "kind": "allow" }),
@@ -295,12 +300,19 @@ pub async fn native_permission_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::harness::trust::SqliteTrustSource;
-    use crate::storage::Db;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    // The four `Db`-backed tests that used to sit in this module could not
+    // come along: `#[cfg(test)]` does not survive into an rlib (Step A.4),
+    // and this crate cannot reach `storage::Db` at all (`rusqlite` is not in
+    // its graph). They relocated VERBATIM to
+    // `src-tauri/tests/permission_gate_db.rs` — the side that sees both the
+    // crate's gate and the desktop's `Db` + `SqliteTrustSource`. The tests
+    // that touch ONLY the crate's own seam (the titles, the option lists, the
+    // serde pair, the no-deadline pin) moved with the file.
 
     /// (ADR 0030) The prompt titles are the human-readable shape the user
     /// decides on: a path tool names THE PATH (the thing being reached
@@ -462,220 +474,6 @@ mod tests {
         );
     }
 
-    /// A temp `Db` + a temp `cwd` dir (the `spaces` rows are keyed by
-    /// the CANONICAL path, so the cwd must exist), OWNED (#96 task 08).
-    ///
-    /// THE GUARD IS FIRST and the tuple is WIDER than it was
-    /// (`(Arc<Db>, PathBuf)` → `(ScratchDir, Arc<Db>, PathBuf)`): destructured
-    /// locals drop in REVERSE declaration order, so `cwd` → `db` → `dir`. That
-    /// is the order Windows needs — `dir` holds `db.sqlite`, and Windows refuses
-    /// to remove a directory containing an open file — and it is the order
-    /// `harness/store.rs::temp_db` (task 03) and `tests/harness_store.rs::temp_db`
-    /// (task 06) already use. The `cwd` is `dir.join("workspace")`, a CHILD of
-    /// the guard, so `Drop` takes it with the tree; it stays a `PathBuf` because
-    /// the tests pass it to `db.upsert_space(&cwd.display().to_string(), …)` and
-    /// to the gate.
-    ///
-    /// Linux cannot show a wrong order here (POSIX unlinks out from under an open
-    /// handle and `ScratchDir::Drop` swallows the failure), so this ordering is
-    /// enforced by reading, not by any gate on this box.
-    fn temp_db_cwd() -> (crate::test_support::ScratchDir, Arc<Db>, std::path::PathBuf) {
-        let dir = crate::test_support::ScratchDir::in_env_temp("perm-gate-", "db");
-        let db = Arc::new(Db::open(&dir.join("db.sqlite")).unwrap());
-        let cwd = dir.join("workspace");
-        std::fs::create_dir_all(&cwd).unwrap();
-        (dir, db, cwd)
-    }
-
-    fn fresh_pending() -> PendingPermissions {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
-    #[tokio::test]
-    async fn native_gate_trusted_space_auto_approves() {
-        let (_dir, db, cwd) = temp_db_cwd();
-        db.upsert_space(&cwd.display().to_string(), false).unwrap();
-        db.set_space_trusted(&cwd.display().to_string(), true)
-            .unwrap();
-        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
-        let pending = fresh_pending();
-        let cancel = CancellationToken::new();
-
-        let outcome = native_permission_gate(
-            "s1",
-            "r1",
-            "Allow bash?",
-            &sink,
-            &pending,
-            Some(&SqliteTrustSource::new(db)),
-            &cwd,
-            &cancel,
-            permission_options(true),
-        )
-        .await;
-
-        assert_eq!(
-            outcome,
-            PermissionOutcome::Selected {
-                option_id: "allow".into(),
-                value: None,
-            },
-            "a trusted Space is auto-approved (ADR 0010)"
-        );
-        assert!(
-            sink_rx.try_recv().is_err(),
-            "a trusted Space emits no permission-request"
-        );
-        assert!(
-            pending.lock().await.is_empty(),
-            "a trusted Space registers no oneshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn native_gate_untrusted_prompts_and_maps_the_outcome() {
-        let (_dir, db, cwd) = temp_db_cwd();
-        db.upsert_space(&cwd.display().to_string(), false).unwrap();
-        // Untrusted (the default) → the prompt flow.
-        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
-        let pending = fresh_pending();
-        let cancel = CancellationToken::new();
-        // Clones for the spawned task (the test keeps `pending` to
-        // resolve the oneshot + assert the map is drained after).
-        let task_pending = pending.clone();
-        let task_db = db.clone();
-        let task_cwd = cwd.clone();
-        let task_cancel = cancel.clone();
-        let task = tokio::spawn(async move {
-            native_permission_gate(
-                "s1",
-                "r1",
-                "Allow bash?",
-                &sink,
-                &task_pending,
-                Some(&SqliteTrustSource::new(task_db)),
-                &task_cwd,
-                &task_cancel,
-                permission_options(true),
-            )
-            .await
-        });
-
-        // Wait for the `permission-request` event (the oneshot is
-        // registered before it — the entry is already in the map).
-        let (_event, payload) = loop {
-            if let Ok(m) = sink_rx.try_recv() {
-                if m.0 == "permission-request" {
-                    break m;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        assert_eq!(payload["requestId"], "r1");
-        assert_eq!(payload["request"]["toolCall"]["title"], "Allow bash?");
-        assert_eq!(payload["request"]["options"].as_array().unwrap().len(), 3);
-        // The EMISSION path pins the boundary list: `trust-space` is the
-        // third option of the payload the UI actually receives.
-        assert_eq!(payload["request"]["options"][0]["optionId"], "allow");
-        assert_eq!(payload["request"]["options"][1]["optionId"], "reject");
-        assert_eq!(
-            payload["request"]["options"][2]["optionId"], "trust-space",
-            "the boundary prompt offers `trust-space`"
-        );
-
-        // Resolve with `allow` (the `respond_permission` path).
-        let key = permission_key("s1", "r1");
-        let sender = pending
-            .lock()
-            .await
-            .remove(&key)
-            .expect("the oneshot is registered");
-        sender
-            .send(PermissionOutcome::Selected {
-                option_id: "allow".into(),
-                value: None,
-            })
-            .unwrap();
-        assert_eq!(
-            task.await.unwrap(),
-            PermissionOutcome::Selected {
-                option_id: "allow".into(),
-                value: None,
-            }
-        );
-        // The entry is removed after the answer.
-        assert!(pending.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn native_gate_trust_space_allows_without_writing_the_flag() {
-        let (_dir, db, cwd) = temp_db_cwd();
-        db.upsert_space(&cwd.display().to_string(), false).unwrap();
-        assert!(!db.space_trusted(&cwd).unwrap(), "untrusted by default");
-        let (sink_tx, _sink_rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
-        let pending = fresh_pending();
-        let cancel = CancellationToken::new();
-        // Clones for the spawned task (the test keeps `pending` / `db`
-        // / `cwd` to resolve the oneshot + assert the flag after).
-        let task_pending = pending.clone();
-        let task_db = db.clone();
-        let task_cwd = cwd.clone();
-        let task_cancel = cancel.clone();
-        let task = tokio::spawn(async move {
-            native_permission_gate(
-                "s1",
-                "r2",
-                "Allow write?",
-                &sink,
-                &task_pending,
-                Some(&SqliteTrustSource::new(task_db)),
-                &task_cwd,
-                &task_cancel,
-                permission_options(true),
-            )
-            .await
-        });
-        // Wait for the prompt, then resolve with `trust-space`.
-        loop {
-            let map = pending.lock().await;
-            if map.contains_key(&permission_key("s1", "r2")) {
-                break;
-            }
-            drop(map);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let key = permission_key("s1", "r2");
-        pending
-            .lock()
-            .await
-            .remove(&key)
-            .unwrap()
-            .send(PermissionOutcome::Selected {
-                option_id: "trust-space".into(),
-                value: None,
-            })
-            .unwrap();
-        assert_eq!(
-            task.await.unwrap(),
-            PermissionOutcome::Selected {
-                option_id: "trust-space".into(),
-                value: None,
-            },
-            "the outcome is the user's selection (the caller maps it to allow)"
-        );
-        // (ADR 0025) The flag write is NOT in the gate anymore (the
-        // Worker has no `Db`): the Supervisor's `respond_permission`
-        // relay applies it (Task 4) + the Worker's `StaticTrustSource`
-        // is flipped (Task 2).
-        assert!(
-            !db.space_trusted(&cwd).unwrap(),
-            "the gate no longer writes the trust flag (the Supervisor does — ADR 0025)"
-        );
-    }
-
     /// The BOUNDARY prompt emits the old three options, in order, with
     /// `trust-space` still offered (the boundary prompt asks about the USER's
     /// own files beyond the read boundary, so "Don't ask again for this Space"
@@ -818,33 +616,5 @@ mod tests {
         );
         let decoded: PermissionOutcome = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, outcome, "the `value` round-trips");
-    }
-
-    #[tokio::test]
-    async fn native_gate_cancel_is_a_denial() {
-        let (_dir, db, cwd) = temp_db_cwd();
-        let (sink_tx, _sink_rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn EventSink> = Arc::new(RecSink { tx: sink_tx });
-        let pending = fresh_pending();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-
-        let outcome = native_permission_gate(
-            "s1",
-            "r3",
-            "Allow bash?",
-            &sink,
-            &pending,
-            Some(&SqliteTrustSource::new(db)),
-            &cwd,
-            &cancel,
-            permission_options(true),
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            PermissionOutcome::Cancelled,
-            "a cancel is a denial (never an auto-allow)"
-        );
     }
 }

@@ -4,7 +4,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use super::access::{read_backend, read_rule_refusal, write_backend, write_rule_refusal};
-use crate::agent::tools::types::{ContentBlock, ImageRef, ToolCtx, ToolResult};
+use crate::tools::types::{ContentBlock, ImageRef, ToolCtx, ToolResult};
 
 /// The max lines `exec_read` returns for a text file with no `limit`.
 pub(crate) const MAX_READ_LINES: usize = 2000;

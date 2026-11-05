@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::events::EventSink;
-use crate::agent::harness::catalog::{Model, ModelCatalog};
-use crate::agent::harness::provider::ToolCall;
-use crate::agent::subagent::{
-    AgentNameResolution, LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentMetrics,
-    SubagentOutcome, SubagentSessionManager,
+use crate::events::EventSink;
+use crate::harness::catalog::{Model, ModelCatalog};
+use crate::harness::provider::ToolCall;
+use crate::subagent::{
+    AgentNameResolution, LaunchConfig, SubagentCancel, SubagentFailureReason, SubagentOutcome,
+    SubagentSessionManager,
 };
-use crate::agent::tools::{ContentBlock, ToolResult};
+use crate::tools::{ContentBlock, ToolResult};
 
 /// The subagent dispatch seam (ADR 0025): `InProcessDispatcher`
 /// (delegates to `SubagentSessionManager::dispatch_native` — the current
@@ -218,24 +218,44 @@ pub(crate) struct SubagentParent<'a> {
     pub enabled_tools: Option<&'a [String]>,
     pub sink: &'a Arc<dyn EventSink>,
     pub catalog: &'a ModelCatalog,
-    pub config_dir: Option<&'a std::path::Path>,
+    /// (Fulcrum T3) The PACKAGED ADR 0066 override layer the parent loop holds
+    /// (was `config_dir`, which `resolve_launch` read `settings.json` from).
+    /// `None` = a layer that cannot speak; `Some(map)` = a layer that may be
+    /// empty — the distinction `resolve_launch` keeps.
+    pub agent_overrides:
+        Option<&'a std::collections::HashMap<String, crate::config_types::AgentOverrideFields>>,
 }
 
 /// The `subagent` dispatch's outcome (the `SubagentOutcome` mapping).
+///
+/// BOTH arms carry the child's reported cost out of the outcome, because the
+/// parent's loop owns the session total that must include it (see
+/// [`dispatch_subagent`]'s return type). The figure is LOOP STATE: it is folded
+/// into `AgentLoop::cost_acc` and framed as the parent's next `cost_update`. It
+/// is never put in the parent's PROMPT — that half of the original ruling
+/// stands, and `subagent_prompt_carries_no_money` /
+/// `the_folded_figure_never_enters_the_parents_prompt` pin it.
 enum SubagentWait {
     Completed {
         output: String,
+        /// The child's reported total
+        /// (`crate::subagent::SubagentMetrics::cost`), `None` = it never
+        /// reported a figure. Folded into the parent's accumulator, never
+        /// rendered into the parent's prompt.
+        cost: Option<f64>,
     },
     /// A **Dead Subagent** (ADR 0055): the three fields the `Failed` outcome
     /// gained, plus the human `error`. `output` is the salvage the parent
-    /// reads (rendered by `salvage_text` — the ONE place); `reason` /
-    /// `metrics` are carried for completeness and deliberately NOT put in the
-    /// parent's prompt (the Client reads them off `subagent-closed`).
+    /// reads (rendered by `salvage_text` — the ONE place); `reason` is carried
+    /// for completeness and deliberately NOT put in the parent's prompt (the
+    /// Client reads it off `subagent-closed`). `cost` is the one metric the
+    /// parent's LOOP needs — a child that was reaped mid-work was still billed
+    /// for it, and the parent's stored total must say so.
     Failed {
         reason: SubagentFailureReason,
         error: String,
         output: String,
-        metrics: SubagentMetrics,
+        cost: Option<f64>,
     },
     Cancelled,
 }
@@ -244,31 +264,50 @@ enum SubagentWait {
 /// `WorkerManager`'s `dispatch_subagent` flow — the child is a WORKER
 /// process; the ADR 0025 re-plumb — the in-process `AgentLoop` child
 /// is GONE).
+///
+/// Returns the `ToolResult` the parent reads AND the child's reported cost as a
+/// separate value (Fulcrum T2's one-writer fix). The cost is a return value and
+/// not a field of the `ToolResult` on purpose: `ToolResult::content` is the
+/// text that goes into the parent's transcript and therefore into the next
+/// model call's prompt, so money that rides in it is money the model reads.
+/// The CALLER — the parent's loop — folds it into `cost_acc` (see
+/// `AgentLoop::fold_child_cost`), which is the only thing that can produce a
+/// parent total that includes its children: the Supervisor that owns the child
+/// cannot see the parent's accumulator, and a frame it wrote to the parent's
+/// store key would be a SECOND writer racing the parent's own frames — which is
+/// exactly the defect this seam removed.
 pub(crate) async fn dispatch_subagent(
     dispatcher: Option<&Arc<dyn SubagentDispatcher>>,
     parent: &SubagentParent<'_>,
     params: &Value,
     turn: &CancellationToken,
-) -> ToolResult {
+) -> (ToolResult, Option<f64>) {
     let Some(dispatcher) = dispatcher else {
-        return ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "subagent dispatch is not available in this session".to_string(),
-            }],
-            details: None,
-            is_error: true,
-        };
-    };
-    let (task, launch) = match crate::agent::interactive::dispatch_params(params) {
-        Some(p) => p,
-        None => {
-            return ToolResult {
+        return (
+            ToolResult {
                 content: vec![ContentBlock::Text {
-                    text: "invalid params: `task` is required".to_string(),
+                    text: "subagent dispatch is not available in this session".to_string(),
                 }],
                 details: None,
                 is_error: true,
-            };
+            },
+            // Nothing was dispatched, so nothing was spent.
+            None,
+        );
+    };
+    let (task, launch) = match crate::interactive::dispatch_params(params) {
+        Some(p) => p,
+        None => {
+            return (
+                ToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: "invalid params: `task` is required".to_string(),
+                    }],
+                    details: None,
+                    is_error: true,
+                },
+                None,
+            );
         }
     };
     // The label is TRIMMED here, at the one binding that feeds BOTH consumers:
@@ -293,11 +332,11 @@ pub(crate) async fn dispatch_subagent(
     // changes nothing here — it is the payload the UI reads: `Unmatched` is a
     // name that matched no definition, i.e. a child running the parent's config
     // under a label no one wrote down.
-    let (launch, name_resolution) = crate::agent::harness::launch::resolve_launch(
+    let (launch, name_resolution) = crate::harness::launch::resolve_launch(
         &launch,
         &agent_name,
         parent.catalog,
-        parent.config_dir,
+        parent.agent_overrides,
         parent.space_cwd,
     );
     let (dispatch_rx, cancel) = dispatcher.dispatch(
@@ -313,7 +352,10 @@ pub(crate) async fn dispatch_subagent(
     );
     let outcome = tokio::select! {
         r = dispatch_rx => match r {
-            Ok(SubagentOutcome::Completed { output, .. }) => SubagentWait::Completed { output },
+            Ok(SubagentOutcome::Completed { output, metrics }) => SubagentWait::Completed {
+                output,
+                cost: metrics.cost,
+            },
             Ok(SubagentOutcome::Failed {
                 reason,
                 error,
@@ -323,7 +365,7 @@ pub(crate) async fn dispatch_subagent(
                 reason,
                 error,
                 output,
-                metrics,
+                cost: metrics.cost,
             },
             // The worker task vanished without resolving (app exit) —
             // the dispatch is gone: cancel. NO outcome was in scope, so
@@ -337,37 +379,52 @@ pub(crate) async fn dispatch_subagent(
         }
     };
     match outcome {
-        SubagentWait::Completed { output } => ToolResult {
-            content: vec![ContentBlock::Text { text: output }],
-            details: None,
-            is_error: false,
-        },
+        SubagentWait::Completed { output, cost } => (
+            ToolResult {
+                content: vec![ContentBlock::Text { text: output }],
+                details: None,
+                is_error: false,
+            },
+            cost,
+        ),
         SubagentWait::Failed {
             reason,
             error,
             output,
-            metrics,
+            cost,
         } => {
-            // The `reason` and the child's REAL usage are NOT part of the
-            // parent's prompt — the Client reads them off the `subagent-closed`
-            // payload (the sole hand-off of a child's usage). They are carried
-            // here so the dispatch layer has the full truth in scope.
-            let _ = (reason, metrics);
+            // The `reason` is NOT part of the parent's prompt — the Client
+            // reads it off the `subagent-closed` payload. The child's money is
+            // not in the prompt either: it leaves through the SECOND half of
+            // this return value, which the loop folds into its own accumulator.
+            // The salvage text below stays byte-identical — a parent must never
+            // see a price in the text its child produced.
+            let _ = reason;
+            (
+                ToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: salvage_text(&error, &output),
+                    }],
+                    details: None,
+                    is_error: true,
+                },
+                cost,
+            )
+        }
+        SubagentWait::Cancelled => (
             ToolResult {
                 content: vec![ContentBlock::Text {
-                    text: salvage_text(&error, &output),
+                    text: "cancelled".to_string(),
                 }],
                 details: None,
                 is_error: true,
-            }
-        }
-        SubagentWait::Cancelled => ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "cancelled".to_string(),
-            }],
-            details: None,
-            is_error: true,
-        },
+            },
+            // A cancelled dispatch has no outcome to read a figure off. The
+            // child's own frames still land on the CHILD's row, and the
+            // Supervisor's `subagent-closed` hand-off still reports its usage —
+            // the parent simply has nothing to fold.
+            None,
+        ),
     }
 }
 
@@ -396,11 +453,9 @@ fn salvage_text(error: &str, output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::events::EventSink;
-    use crate::agent::harness::ModelCatalog;
-    use crate::agent::subagent::SubagentOutcome;
-    use crate::agent::worker::client::{WorkerError, WorkerHandle};
-    use crate::agent::worker::manager::{WorkerFactory, WorkerManager};
+    use crate::events::EventSink;
+    use crate::harness::ModelCatalog;
+    use crate::subagent::SubagentOutcome;
     use std::time::Duration;
 
     /// A no-op `EventSink` (the `dispatch` signature's `sink` parameter —
@@ -427,111 +482,6 @@ mod tests {
             thinking_levels: Vec::new(),
             api: Some("openai-completions".to_string()),
         }
-    }
-
-    /// The `fake_worker` fixture factory (the `WorkerFactory` seam — the
-    /// `CARGO_MANIFEST_DIR`/`target/debug` convention; `cargo test` builds
-    /// the bin targets).
-    struct FakeWorkerFactory;
-
-    impl WorkerFactory for FakeWorkerFactory {
-        fn spawn(&self) -> Result<WorkerHandle, WorkerError> {
-            WorkerHandle::spawn(&std::path::PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/target/debug/fake_worker"
-            )))
-        }
-    }
-
-    /// A `SubagentSessionManager` on a `WorkerManager` (the ADR 0025 Task 5
-    /// re-plumb — the subagent runs in a `fake_worker` process): the parent
-    /// `parent-1` is `attach`ed with a single-model catalog (the
-    /// `dispatch_subagent` flow resolves the child's `model` against it),
-    /// and the `sink_for` lookup returns `None` (the lifecycle events are
-    /// not asserted on here — the oneshot is the observation point).
-    async fn make_manager() -> Arc<crate::agent::subagent::SubagentSessionManager> {
-        let factory: Arc<dyn WorkerFactory> = Arc::new(FakeWorkerFactory);
-        let wm = Arc::new(
-            WorkerManager::new(
-                factory,
-                Arc::new(|_id: String, _code: Option<i32>, _pid: Option<u32>| {}),
-                Arc::new(
-                    |_id: String,
-                     _is_subagent: bool,
-                     _evt: crate::agent::worker::client::WorkerInboundEvent| {},
-                ),
-                Arc::new(|_id: &str| None),
-            )
-            .with_dead_bound(Duration::from_secs(30)),
-        );
-        let env = crate::agent::worker::protocol::StartEnv::from_parts(
-            "parent-1".to_string(),
-            "/tmp/space".to_string(),
-            crate::agent::worker::protocol::StartMode::Fresh,
-            None,
-            test_model(),
-            ModelCatalog {
-                models: vec![test_model()],
-                ..Default::default()
-            },
-            None,
-            true,
-            None,
-            "/tmp/config".to_string(),
-            true,
-            None,
-            // (issue #101) `from_parts`' new trailing arg (parent fixture: no block).
-            None,
-        );
-        wm.attach("parent-1", &env)
-            .await
-            .expect("the parent attach completes");
-        let manager = Arc::new(crate::agent::subagent::SubagentSessionManager::new());
-        manager.set_worker_manager(wm);
-        manager
-    }
-
-    /// `InProcessDispatcher::dispatch` on a `SubagentSessionManager` (the
-    /// ADR 0025 Task 5 re-plumb — the `dispatch_native` delegation to the
-    /// `WorkerManager`'s `dispatch_subagent` flow — a `fake_worker` child
-    /// settles) resolves the oneshot (`Completed` — the
-    /// `SubagentCapture`'s final text), and returns the `SubagentCancel`
-    /// handle (its `cancel()` is idempotent — the `WorkerManager`'s
-    /// `cancel_subagent` for a gone drive is a no-op).
-    #[tokio::test]
-    async fn in_process_dispatcher_resolves_the_oneshot() {
-        let manager = make_manager().await;
-        let dispatcher = InProcessDispatcher::new(manager);
-        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
-        let cwd = std::env::temp_dir();
-        let (rx, cancel) = dispatcher.dispatch(
-            "parent-1",
-            &cwd,
-            &test_model(),
-            Vec::new(),
-            "tester".to_string(),
-            // A real `InProcessDispatcher` + a named Agent: the truthful value
-            // for this fixture (nothing here asserts on the resolution).
-            AgentNameResolution::Matched,
-            LaunchConfig::default(),
-            "do the thing".to_string(),
-            &sink,
-        );
-        // The oneshot resolves `Completed` (the `fake_worker` child
-        // settles — the `SubagentCapture`'s final text — the
-        // `dispatch_native` re-plumb's delegation works end-to-end).
-        let outcome = tokio::time::timeout(Duration::from_secs(10), rx)
-            .await
-            .expect("the oneshot resolved within the bound")
-            .expect("the oneshot was not dropped");
-        assert!(
-            matches!(outcome, SubagentOutcome::Completed { .. }),
-            "a settling child resolves `Completed` — got {outcome:?}"
-        );
-        // The `SubagentCancel` handle is returned + idempotent (the
-        // `WorkerManager`'s `cancel_subagent` — a gone drive is a no-op).
-        cancel.cancel();
-        cancel.cancel();
     }
 
     /// (ADR 0055 — the salvage) A `Failed` outcome WITH partial output gets
@@ -580,6 +530,9 @@ mod tests {
     /// The harness for both salvage tests: `dispatch_subagent` (the real flow
     /// — the params parse, the launch resolve, the `SubagentWait` `select!`)
     /// on a `MockDispatcher` resolving a `Failed` whose `output` is `output`.
+    /// Returns the `ToolResult` only — these two pins read the salvage TEXT;
+    /// the money half of the return value is pinned by
+    /// `a_failed_outcome_carries_the_childs_cost_out_of_the_select`.
     async fn dispatch_failed_with_output(output: &str) -> String {
         let dispatcher = MockDispatcher::new();
         let (tx, rx) = tokio::sync::oneshot::channel::<SubagentOutcome>();
@@ -588,14 +541,14 @@ mod tests {
             reason: SubagentFailureReason::Unresponsive,
             error: "unresponsive".to_string(),
             output: output.to_string(),
-            metrics: crate::agent::subagent::SubagentMetrics::default(),
+            metrics: crate::subagent::SubagentMetrics::default(),
         })
         .unwrap();
         let dispatcher: Arc<dyn SubagentDispatcher> = Arc::new(dispatcher);
         let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
         let catalog = ModelCatalog::default();
         let model = test_model();
-        let result = dispatch_subagent(
+        let (result, _cost) = dispatch_subagent(
             Some(&dispatcher),
             &SubagentParent {
                 session_id: "p1",
@@ -604,7 +557,7 @@ mod tests {
                 enabled_tools: None,
                 sink: &sink,
                 catalog: &catalog,
-                config_dir: None,
+                agent_overrides: None,
             },
             &serde_json::json!({ "task": "the task" }),
             &CancellationToken::new(),
@@ -618,6 +571,125 @@ mod tests {
             panic!("expected a text block, got {:?}", result.content);
         };
         text.clone()
+    }
+
+    /// The `reason` and the child's REAL usage are NOT part of the
+    /// parent's prompt — the Client reads them off the `subagent-closed`
+    /// payload (the sole hand-off of a child's usage). They are carried
+    /// here so the dispatch layer has the full truth in scope.
+    #[tokio::test]
+    async fn a_failed_outcome_carries_the_childs_cost_out_of_the_select() {
+        let (result, cost) = dispatch_failed_with_metrics(0.00001243).await;
+        assert_eq!(
+            cost,
+            Some(0.00001243),
+            "the child's figure leaves the dispatch as a VALUE — the parent's \
+             loop is the only thing that can add it to a total that also spans \
+             the parent's own calls"
+        );
+        let ContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected a text block")
+        };
+        assert!(
+            !text.contains("0.00001243"),
+            "the figure is loop state, never prompt content: {text}"
+        );
+    }
+
+    /// The harness for the money-carrying pins: the same `MockDispatcher`
+    /// `Failed` flow as `dispatch_failed_with_output`, but with a REAL
+    /// `metrics.cost` and returning BOTH halves of the return value.
+    async fn dispatch_failed_with_metrics(cost: f64) -> (ToolResult, Option<f64>) {
+        let dispatcher = MockDispatcher::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<SubagentOutcome>();
+        dispatcher.queue(rx, SubagentCancel::none());
+        tx.send(SubagentOutcome::Failed {
+            reason: SubagentFailureReason::Unresponsive,
+            error: "unresponsive".to_string(),
+            output: "partial".to_string(),
+            metrics: crate::subagent::SubagentMetrics {
+                output: "partial".to_string(),
+                input_tokens: 10,
+                output_tokens: 1,
+                cost: Some(cost),
+                duration_ms: 10,
+            },
+        })
+        .unwrap();
+        let dispatcher: Arc<dyn SubagentDispatcher> = Arc::new(dispatcher);
+        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
+        let catalog = ModelCatalog::default();
+        let model = test_model();
+        dispatch_subagent(
+            Some(&dispatcher),
+            &SubagentParent {
+                session_id: "p1",
+                space_cwd: std::path::Path::new("/tmp/space"),
+                model: &model,
+                enabled_tools: None,
+                sink: &sink,
+                catalog: &catalog,
+                agent_overrides: None,
+            },
+            &serde_json::json!({ "task": "the task" }),
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// A `Completed` child's figure crosses the seam too — and the parent's
+    /// prompt stays exactly the child's output.
+    ///
+    /// The `Completed` arm is the shape the money-loss defect lived in: it used
+    /// to destructure `{ output, .. }` and DROP the metrics, which is what made
+    /// a parent-owned total structurally unable to include children. This is
+    /// the pin that says the metrics are read now, and the pin that says only
+    /// the COST is read — the output stays byte-identical.
+    #[tokio::test]
+    async fn a_completed_outcome_carries_the_childs_cost_and_nothing_else() {
+        let dispatcher = MockDispatcher::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<SubagentOutcome>();
+        dispatcher.queue(rx, SubagentCancel::none());
+        tx.send(SubagentOutcome::Completed {
+            output: "the answer".to_string(),
+            metrics: crate::subagent::SubagentMetrics {
+                output: "the answer".to_string(),
+                input_tokens: 10,
+                output_tokens: 5,
+                cost: Some(0.002),
+                duration_ms: 1,
+            },
+        })
+        .unwrap();
+        let dispatcher: Arc<dyn SubagentDispatcher> = Arc::new(dispatcher);
+        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
+        let catalog = ModelCatalog::default();
+        let model = test_model();
+        let (result, cost) = dispatch_subagent(
+            Some(&dispatcher),
+            &SubagentParent {
+                session_id: "p1",
+                space_cwd: std::path::Path::new("/tmp/space"),
+                model: &model,
+                enabled_tools: None,
+                sink: &sink,
+                catalog: &catalog,
+                agent_overrides: None,
+            },
+            &serde_json::json!({ "task": "the task" }),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(cost, Some(0.002), "the child's figure is returned");
+        assert!(!result.is_error, "a `Completed` child is a success");
+        let ContentBlock::Text { text } = &result.content[0] else {
+            panic!("expected a text block")
+        };
+        assert_eq!(
+            text, "the answer",
+            "the parent's prompt is the child's output and NOTHING else — no \
+             cost, no token counts, no duration"
+        );
     }
 
     /// `MockDispatcher` — the test resolves the QUEUED oneshot (the test
@@ -648,10 +720,10 @@ mod tests {
         // The test resolves the QUEUED oneshot (the `dispatch` returned
         // its receiver — the loop's `select!` sees the outcome).
         tx.send(SubagentOutcome::Failed {
-            reason: crate::agent::subagent::SubagentFailureReason::Other,
+            reason: crate::subagent::SubagentFailureReason::Other,
             error: "canned".to_string(),
             output: String::new(),
-            metrics: crate::agent::subagent::SubagentMetrics::default(),
+            metrics: crate::subagent::SubagentMetrics::default(),
         })
         .unwrap();
         let outcome = tokio::time::timeout(Duration::from_secs(2), dispatch_rx)

@@ -1,15 +1,15 @@
 use serde_json::json;
 
 use super::support::*;
-use crate::agent::tools::exec::access::PROTECTED_WRITE_ROUTE;
-use crate::agent::tools::exec::execute_tool;
+use crate::tools::exec::access::PROTECTED_WRITE_ROUTE;
+use crate::tools::exec::execute_tool;
 #[cfg(unix)]
-use crate::agent::tools::exec::protected_refusal_text;
-use crate::agent::tools::types::ToolCtx;
+use crate::tools::exec::protected_refusal_text;
+use crate::tools::types::ToolCtx;
 // (T03) The rule vocabulary — every protected-dir pin below is now a RULE-row
 // pin (`default_rules()` is empty, so a refusal needs a rule) and the resolver
 // pins call `rule_for` directly.
-use crate::agent::policy::{AccessRule, RuleDecision, RuleDirection};
+use crate::policy::{AccessRule, RuleDecision, RuleDirection};
 
 // ── the policy tiers (ADR 0030) ───────────────────────────────────────
 
@@ -19,7 +19,7 @@ use crate::agent::policy::{AccessRule, RuleDecision, RuleDirection};
 /// rejected) — without it this test would pass vacuously.
 #[tokio::test]
 async fn read_beyond_the_boundary_succeeds_when_reads_allow() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     // A PARENT dir so the out-of-boundary file stays inside the test's
     // own temp tree (`../outside.txt` from the cwd lands in the parent).
     let parent = temp_cwd("tier-read");
@@ -91,7 +91,7 @@ async fn read_reaches_a_second_boundary_root_when_sandboxed() {
 /// contrast is `write_escape_rejected` above.
 #[tokio::test]
 async fn write_beyond_the_boundary_succeeds_when_writes_allow() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let parent = temp_cwd("tier-write");
     let cwd = parent.join("space");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -138,7 +138,7 @@ async fn write_beyond_the_boundary_succeeds_when_writes_allow() {
 /// and the two session-snapshot pins below.
 #[tokio::test]
 async fn a_write_into_a_protected_dir_with_no_rule_is_not_refused() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     for policy_writes in [
         AccessPolicy::Sandboxed,
         AccessPolicy::Ask,
@@ -219,7 +219,7 @@ async fn a_write_into_a_protected_dir_with_no_rule_is_not_refused() {
 /// — neither can cover the other's refusal site.
 #[tokio::test]
 async fn a_user_deny_rule_refuses_a_write_inside_the_cwd_with_the_protected_wording() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("user-deny-exec");
     let protected = cwd.join(".agents/skills");
     std::fs::create_dir_all(&protected).unwrap();
@@ -236,7 +236,7 @@ async fn a_user_deny_rule_refuses_a_write_inside_the_cwd_with_the_protected_word
     let c = ToolCtx {
         protected: vec![protected.clone()],
         // `default_rules()` ++ the user deny — the concatenation contract.
-        rules: crate::agent::policy::default_rules()
+        rules: crate::policy::default_rules()
             .into_iter()
             .chain(std::iter::once(deny))
             .collect(),
@@ -290,7 +290,7 @@ async fn a_user_deny_rule_refuses_a_write_inside_the_cwd_with_the_protected_word
 /// proves the `home` field is the thing that makes a `~` rule work.
 #[tokio::test]
 async fn a_rule_allow_makes_the_write_land() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("allow-rule-cwd");
     // The protected dir lives INSIDE the cwd so the `Sandboxed`-tier boundary
     // admits it and only the guard membership could refuse — which is what the
@@ -309,7 +309,7 @@ async fn a_rule_allow_makes_the_write_land() {
     let c = ToolCtx {
         protected: vec![guard_entry.clone()],
         // `default_rules()` ++ the user allow — the concatenation contract.
-        rules: crate::agent::policy::default_rules()
+        rules: crate::policy::default_rules()
             .into_iter()
             .chain(std::iter::once(allow))
             .collect(),
@@ -395,7 +395,7 @@ async fn a_rule_allow_makes_the_write_land() {
 /// hunting for a boundary that is not the problem).
 #[tokio::test]
 async fn a_rule_deny_refuses_a_non_protected_dir_with_the_deny_wording() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("rule-deny-wording");
     let secret = cwd.join("secrets");
     std::fs::create_dir_all(&secret).unwrap();
@@ -469,7 +469,7 @@ async fn a_rule_deny_refuses_a_non_protected_dir_with_the_deny_wording() {
 /// `home: None`; this states exactly what that buys and costs.
 #[test]
 fn a_tilde_rule_with_home_none_matches_nothing_and_with_a_real_home_matches_and_decides() {
-    use crate::agent::policy::{rule_for, RuleDecision, RuleDirection};
+    use crate::policy::{rule_for, RuleDecision, RuleDirection};
     let home = temp_cwd("home-none-consequence");
     std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
     let target = home.path().join(".pi/agent/agents/SKILL.md");
@@ -479,7 +479,7 @@ fn a_tilde_rule_with_home_none_matches_nothing_and_with_a_real_home_matches_and_
         decision: RuleDecision::Deny,
     };
     // `default_rules()` ++ the `~` rule (the concatenation contract).
-    let rules = crate::agent::policy::default_rules()
+    let rules = crate::policy::default_rules()
         .into_iter()
         .chain(std::iter::once(tilde.clone()))
         .collect::<Vec<_>>();
@@ -514,7 +514,7 @@ fn a_tilde_rule_with_home_none_matches_nothing_and_with_a_real_home_matches_and_
 /// assertion is that a rule with maximum reach has zero effect on `bash`.
 #[tokio::test]
 async fn a_deny_rule_never_narrows_bash_because_rules_do_not_apply_to_the_shell() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("bash-not-narrowed");
     std::fs::write(cwd.join("f.txt"), "READABLE").unwrap();
     let deny_all = AccessRule {
@@ -533,7 +533,7 @@ async fn a_deny_rule_never_narrows_bash_because_rules_do_not_apply_to_the_shell(
         decision: RuleDecision::Deny,
     };
     let c = ToolCtx {
-        rules: crate::agent::policy::default_rules()
+        rules: crate::policy::default_rules()
             .into_iter()
             .chain(std::iter::once(deny_all))
             .collect(),
@@ -574,7 +574,7 @@ async fn a_deny_rule_never_narrows_bash_because_rules_do_not_apply_to_the_shell(
 /// shape that issue #92 is about.
 #[tokio::test]
 async fn a_new_file_under_a_denied_protected_dir_is_refused() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("tier-protect-new");
     let protected = cwd.join(".pi/agent/skills");
     std::fs::create_dir_all(&protected).unwrap();
@@ -629,7 +629,7 @@ async fn a_new_file_under_a_denied_protected_dir_is_refused() {
 /// platform's own raw-vs-canonical spelling.
 #[tokio::test]
 async fn a_raw_protected_entry_still_refuses_a_canonical_path_under_it() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let base = temp_cwd("protect-sym");
     let real = base.join("real");
     let skills = real.join(".agents/skills");
@@ -835,7 +835,7 @@ impl Drop for RestoreHome {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_recreated_protected_dir_is_refused_by_the_executor_with_the_protected_wording() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
 
     let home = temp_cwd("recreated-home");
     let lock = crate::test_support::env_lock();
@@ -854,7 +854,7 @@ async fn a_recreated_protected_dir_is_refused_by_the_executor_with_the_protected
 
     // 1. The snapshot, built while the dir is MISSING — exactly what
     //    `AgentLoop::new` does for a real Session.
-    let protected = crate::agent::boundary::protected_dirs();
+    let protected = crate::boundary::protected_dirs();
 
     // 2. THE PREMISE (placed BEFORE the write attempt: a premise check
     //    belongs ahead of the thing it makes non-vacuous, and because
@@ -882,7 +882,7 @@ async fn a_recreated_protected_dir_is_refused_by_the_executor_with_the_protected
     };
     let c = ToolCtx {
         protected,
-        rules: crate::agent::policy::default_rules()
+        rules: crate::policy::default_rules()
             .into_iter()
             .chain(std::iter::once(deny))
             .collect(),
@@ -944,7 +944,7 @@ async fn a_recreated_protected_dir_is_refused_by_the_executor_with_the_protected
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_write_into_a_still_missing_protected_dir_is_refused() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
 
     let home = temp_cwd("still-missing-home");
     let lock = crate::test_support::env_lock();
@@ -956,7 +956,7 @@ async fn a_write_into_a_still_missing_protected_dir_is_refused() {
     std::fs::create_dir_all(home.path().join(".pi/agent")).unwrap();
     let agents = home.path().join(".pi/agent/agents");
 
-    let protected = crate::agent::boundary::protected_dirs();
+    let protected = crate::boundary::protected_dirs();
     assert!(
         protected.contains(&home.path().canonicalize().unwrap().join(".pi/agent/agents")),
         "the snapshot must carry the not-yet-existing dir — that is the premise: {protected:?}"
@@ -970,7 +970,7 @@ async fn a_write_into_a_still_missing_protected_dir_is_refused() {
     };
     let c = ToolCtx {
         protected,
-        rules: crate::agent::policy::default_rules()
+        rules: crate::policy::default_rules()
             .into_iter()
             .chain(std::iter::once(deny))
             .collect(),
@@ -1029,7 +1029,7 @@ async fn a_write_into_a_still_missing_protected_dir_is_refused() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_write_into_a_protected_dirs_parent_stays_allowed() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
 
     let home = temp_cwd("parent-home");
     let lock = crate::test_support::env_lock();
@@ -1046,7 +1046,7 @@ async fn a_write_into_a_protected_dirs_parent_stays_allowed() {
     let home_canon = home.path().canonicalize().unwrap();
     let agents = home_canon.join(".pi/agent/agents");
 
-    let protected = crate::agent::boundary::protected_dirs();
+    let protected = crate::boundary::protected_dirs();
     assert!(
         protected.contains(&agents),
         "the snapshot must carry the not-yet-existing dir — that is the premise: {protected:?}"
@@ -1107,7 +1107,7 @@ async fn a_write_into_a_protected_dirs_parent_stays_allowed() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_parent_deny_rule_does_not_move_the_guard_onto_the_parent_file() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
 
     let home = temp_cwd("parent-rule-home");
     let lock = crate::test_support::env_lock();
@@ -1120,7 +1120,7 @@ async fn a_parent_deny_rule_does_not_move_the_guard_onto_the_parent_file() {
     let home_canon = home.path().canonicalize().unwrap();
     let agents = home_canon.join(".pi/agent/agents");
 
-    let protected = crate::agent::boundary::protected_dirs();
+    let protected = crate::boundary::protected_dirs();
     assert!(
         protected.contains(&agents),
         "the snapshot must carry the not-yet-existing dir — that is the premise: {protected:?}"
@@ -1134,7 +1134,7 @@ async fn a_parent_deny_rule_does_not_move_the_guard_onto_the_parent_file() {
     };
     let c = ToolCtx {
         protected,
-        rules: crate::agent::policy::default_rules()
+        rules: crate::policy::default_rules()
             .into_iter()
             .chain(std::iter::once(deny))
             .collect(),
@@ -1220,7 +1220,7 @@ async fn bash_ignores_the_file_boundary() {
 /// the RULE side (where `rule_for` does expand, against `ToolCtx::home`).
 #[tokio::test]
 async fn a_tilde_spelled_write_argument_is_relative_and_does_not_reach_the_guard() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("tilde-arg-cwd");
     let guard_entry = cwd.join(".pi/agent/agents");
     std::fs::create_dir_all(&guard_entry).unwrap();

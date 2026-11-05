@@ -1,7 +1,7 @@
 //! `!command` key helpers (issue #129): an `api_key` starting with `!` names a
 //! helper PROGRAM whose stdout (trimmed) is the bearer token. NO shell, NO
 //! metacharacters, fail-closed (never dispatch through an interpreter). Lives
-//! in `agent/` so it may use `crate::agent::childproc` — the crate's ONE
+//! in the crate so it may use `crate::childproc` — the crate's ONE
 //! sanctioned `tokio::process::Command` constructor (the `CREATE_NO_WINDOW`
 //! policy, ADR 0060 + the childproc census).
 //!
@@ -111,9 +111,9 @@ async fn run_with_timeout(api_key: &str, timeout: Duration) -> Result<String, St
     // instead of blocking until the deadline. No `current_dir`, no env patch:
     // the helper inherits the Supervisor environment, which is exactly where
     // `VAULT_ADDR` / `VAULT_TOKEN` live.
-    let mut cmd = crate::agent::childproc::command(program);
+    let mut cmd = crate::childproc::command(program);
     cmd.args(&tokens[1..]);
-    crate::agent::childproc::closed_stdin(&mut cmd);
+    crate::childproc::closed_stdin(&mut cmd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true); // the timeout's teeth — no orphan past the deadline

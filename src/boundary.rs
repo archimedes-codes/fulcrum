@@ -8,7 +8,7 @@
 //!
 //! Two consumers, one source of truth:
 //! * the GATE (Tasks 3–5) asks "is this path beyond the boundary?", and
-//! * the EXECUTOR ([`crate::agent::fs_backend::FsBackend`]) enforces the
+//! * the EXECUTOR ([`crate::fs_backend::FsBackend`]) enforces the
 //!   `Sandboxed`-tier floor.
 //!
 //! The check itself is NOT reimplemented here — it is ADR 0029's
@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agent::policy::AccessPolicy;
+use crate::policy::AccessPolicy;
 
 /// The root-entry meaning "no containment" on UNIX (one floor of the
 /// `Ask`/`Allow` widening): every canonical absolute path is under `/`.
@@ -158,7 +158,7 @@ pub fn write_roots(cwd: &Path) -> Vec<PathBuf> {
 /// `protected_dirs_keeps_an_unresolvable_entry_raw`.
 fn push_protected<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
     for (path, _scope) in roots {
-        let c = crate::agent::fs_backend::canonicalize_lenient(&path);
+        let c = crate::fs_backend::canonicalize_lenient(&path);
         if !out.contains(&c) {
             out.push(c);
         }
@@ -175,14 +175,19 @@ fn push_protected<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
 ///
 /// NOT a rule set. This list feeds three consumers and none of them is a
 /// resolver:
-/// * [`crate::agent::harness::loop::gate`]'s row-3 membership (`is_guard_path`),
+/// * the harness gate's row-3 membership (`is_guard_path`, in the desktop's
+///   `agent/harness/loop/gate.rs`) — a PLAIN reference, not an intra-doc link:
+///   `harness` is the tight internal cycle T5 moves LAST (S5), so from inside
+///   this crate `crate::agent::harness::…` resolves to nothing and rustdoc says
+///   so. The compiler is silent on doc links, which is exactly why A.6 puts
+///   `cargo doc` in the gate;
 /// * the executor's guard/deny wording (`protected_refusal_text`), and
-/// * the Landlock subtraction in [`crate::agent::tools::sandbox`] — the ONLY
+/// * the Landlock subtraction in [`crate::tools::sandbox`] — the ONLY
 ///   reason a confined `bash` cannot write the agent's own instructions, since
 ///   Landlock rules are ADD-ONLY and cannot take a right back from an ancestor.
 ///
 /// That third consumer is why this stays a PLAIN four-path list and is never
-/// derived from [`crate::agent::policy::default_rules`]: a rule change must not
+/// derived from [`crate::policy::default_rules`]: a rule change must not
 /// be able to silently empty the subtraction and widen the shell. User rules
 /// never apply to `bash`, and a user `allow` rule naming one of these dirs
 /// never drops it from this list — pinned by
@@ -202,7 +207,7 @@ fn push_protected<T>(out: &mut Vec<PathBuf>, roots: Vec<(PathBuf, T)>) {
 /// The leniency is only half the protection: the comparison that consumes
 /// these entries must canonicalize its ENTRY side leniently too, or a
 /// still-missing entry matches nothing and this becomes a silent no-op — see
-/// `crate::agent::tools::exec::protected_refusal_text` and
+/// `crate::tools::exec::protected_refusal_text` and
 /// `a_write_into_a_still_missing_protected_dir_is_refused`.
 pub fn protected_dirs() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
@@ -240,7 +245,7 @@ pub fn executor_roots(cwd: &Path, boundary: &[PathBuf], policy: AccessPolicy) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::policy::AccessPolicy::*;
+    use crate::policy::AccessPolicy::*;
 
     /// A fresh temp dir (removed on drop — the removal belongs to the shared
     /// `test_support` guard; this only fixes the BASE and the PREFIX, so #96's
@@ -559,11 +564,7 @@ mod tests {
         let target = Tmp::new("unresolvable-target");
         let canonical_target = target.path().canonicalize().unwrap().join("SKILL.md");
         assert_eq!(
-            crate::agent::tools::exec::protected_refusal_text(
-                &protected,
-                "write",
-                &canonical_target
-            ),
+            crate::tools::exec::protected_refusal_text(&protected, "write", &canonical_target),
             None,
             "the recorded residue: a raw entry does not refuse a canonical \
              target — {canonical_target:?} vs {protected:?}"
@@ -610,7 +611,7 @@ mod tests {
         // HALF TWO: the rule set is EMPTY (the spec's pre-filled defaults are a
         // Settings draft pre-fill, not code defaults, and the four dirs are not
         // rules at all) — and the guard list is NOT empty alongside it.
-        let rules = crate::agent::policy::default_rules();
+        let rules = crate::policy::default_rules();
         assert!(
             rules.is_empty(),
             "`default_rules()` is EMPTY: the four dirs are the guard-membership \
@@ -628,9 +629,9 @@ mod tests {
         // plain write into one: the row-3 precondition, reached by construction.
         let target = home.path().join(".pi/agent/agents/SKILL.md");
         assert_eq!(
-            crate::agent::policy::rule_for(
+            crate::policy::rule_for(
                 &rules,
-                crate::agent::policy::RuleDirection::Write,
+                crate::policy::RuleDirection::Write,
                 &target,
                 Some(home.path()),
             ),
@@ -649,7 +650,7 @@ mod tests {
         // compare a value already put through `canonicalize_lenient`, so the
         // lenient form is the faithful one — and the target file does not
         // exist, which strict `canonicalize()` would fail on.
-        let target = crate::agent::fs_backend::canonicalize_lenient(&target);
+        let target = crate::fs_backend::canonicalize_lenient(&target);
         assert!(
             dirs.iter().any(|root| target.starts_with(root)),
             "…and the target IS under the guard-membership set: row 3 is the ask"
@@ -659,14 +660,14 @@ mod tests {
 
     /// (the honest limit, recorded NOT hidden — and the PIN that replaces the
     /// one that could not exist) An EMPTY rule set matches nothing, so
-    /// [`crate::agent::policy::rule_for`] answers `None` and the caller falls
+    /// [`crate::policy::rule_for`] answers `None` and the caller falls
     /// through — to the guard's row-3 ASK for a write under one of the four
-    /// dirs, and to the posture select ([`crate::agent::policy::decision_for`])
+    /// dirs, and to the posture select ([`crate::policy::decision_for`])
     /// everywhere else — whereas an empty `protected_dirs()` means "deny
     /// nothing".
     ///
     /// **THE EMPTY SET IS NOW THE DEFAULT, not a no-home edge.** Since the
-    /// round-3 spec correction, [`crate::agent::policy::default_rules`] returns
+    /// round-3 spec correction, [`crate::policy::default_rules`] returns
     /// an EMPTY list by design (the four agent dirs are the guard-membership
     /// set on `protected_dirs()`, not default deny rules), so this is the shape
     /// EVERY session starts with, not the degenerate case of an unresolvable
@@ -699,7 +700,7 @@ mod tests {
     /// residue test above; this nails the RULES side of the same edge.)
     #[test]
     fn an_empty_rule_set_matches_nothing_so_the_posture_select_decides() {
-        use crate::agent::policy::{rule_for, RuleDirection};
+        use crate::policy::{rule_for, RuleDirection};
         let home = Tmp::new("empty-rule-set");
         let target = home.path().join(".pi/agent/agents/SKILL.md");
 
@@ -715,14 +716,14 @@ mod tests {
         // NON-VACUITY: the SAME path with ONE rule naming its directory does
         // get a verdict, so the `None` above came from the empty list and not
         // from a fixture nothing can ever match.
-        let deny = crate::agent::policy::AccessRule {
+        let deny = crate::policy::AccessRule {
             path: home
                 .path()
                 .join(".pi/agent/agents")
                 .to_string_lossy()
                 .into_owned(),
             direction: RuleDirection::Write,
-            decision: crate::agent::policy::RuleDecision::Deny,
+            decision: crate::policy::RuleDecision::Deny,
         };
         let rules = [deny.clone()];
         assert_eq!(
@@ -766,7 +767,7 @@ mod tests {
     /// rather than a hardcoded unix `/`.
     #[test]
     fn the_unrestricted_root_contains_every_absolute_path() {
-        use crate::agent::fs_backend::FsBackend;
+        use crate::fs_backend::FsBackend;
         let a = Tmp::new("floor-a");
         let b = Tmp::new("floor-b");
         let target = b.path().join("x.txt");
@@ -800,7 +801,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_ask_floor_contains_the_temp_dirs_drive_root() {
-        use crate::agent::fs_backend::FsBackend;
+        use crate::fs_backend::FsBackend;
         let cwd = Tmp::new("floor-drive-cwd");
         // Where CI's refused file lived: a file under the temp dir.
         let secret = std::env::temp_dir().join(format!("boundary-secret-{}", uuid::Uuid::new_v4()));

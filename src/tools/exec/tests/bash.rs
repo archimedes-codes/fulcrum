@@ -4,11 +4,11 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::support::*;
-use crate::agent::tools::exec::{
+use crate::tools::exec::{
     bash_exit_report, clamp_timeout_ms, execute_tool, DEFAULT_BASH_TIMEOUT, MAX_BASH_TIMEOUT,
     MAX_OUTPUT_BYTES,
 };
-use crate::agent::tools::types::{ContentBlock, ToolCtx, ToolResult};
+use crate::tools::types::{ContentBlock, ToolCtx, ToolResult};
 
 /// Nanny CPU load: one `sh` busy-loop per logical CPU, SIGKILLed (and
 /// reaped) when the guard drops, so no spinner outlives the test.
@@ -174,9 +174,16 @@ async fn bash_without_stdin_reaches_eof_instead_of_the_deadline() {
     let (read_half, write_half) =
         std::io::pipe().expect("a pipe to stand in for the Worker's stdin");
     let exe = std::env::current_exe().expect("a test binary has a path");
-    let mut cmd = crate::agent::childproc::command(&exe);
+    let mut cmd = crate::childproc::command(&exe);
     cmd.arg(format!(
-        "agent::tools::exec::tests::bash::{}",
+        // The crate's module path, NOT the desktop's: T5/S2 moved this file from
+        // `agent::tools::exec::tests::bash` to `tools::exec::tests::bash`, and
+        // `--exact` below means a stale `agent::` prefix selects ZERO tests —
+        // libtest exits 0 on an empty filter, so the parent would have "passed"
+        // while the child ran nothing. The `LIVE_STDIN_RAN` marker assertion is
+        // what turns that into a red instead of a green lie; it fired on exactly
+        // this drift when the file moved.
+        "tools::exec::tests::bash::{}",
         stringify!(bash_without_stdin_reaches_eof_instead_of_the_deadline)
     ));
     cmd.arg("--exact");
@@ -257,7 +264,7 @@ async fn live_stdin_child_half() {
 /// in `agent::tools::sandbox`'s tests; this is the executor's wiring.
 #[tokio::test]
 async fn a_sandboxed_shell_runs_confined_or_fails_closed_visibly() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("bash-sandboxed");
     let confined = ctx_policy(
         &cwd,
@@ -304,7 +311,7 @@ async fn a_sandboxed_shell_runs_confined_or_fails_closed_visibly() {
 /// refused — its direction is `reads`/`writes`).
 #[tokio::test]
 async fn a_sandboxed_shell_does_not_touch_the_path_tools() {
-    use crate::agent::policy::{AccessPolicy, FilePolicy};
+    use crate::policy::{AccessPolicy, FilePolicy};
     let cwd = temp_cwd("bash-sandboxed-read");
     std::fs::write(cwd.join("a.txt"), "hello").unwrap();
     let confined = ctx_policy(
@@ -354,7 +361,7 @@ async fn bash_cancel_kills_child() {
         cancel: token.clone(),
         skill_roots: None,
         boundary: vec![cwd.to_path_buf()],
-        file_policy: crate::agent::policy::FilePolicy::default(),
+        file_policy: crate::policy::FilePolicy::default(),
         protected: Vec::new(),
         // (T03) The two new `ToolCtx` fields (churn-only): no rules, no home.
         rules: Vec::new(),
@@ -519,7 +526,7 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
         cancel: token.clone(),
         skill_roots: None,
         boundary: vec![cwd.to_path_buf()],
-        file_policy: crate::agent::policy::FilePolicy::default(),
+        file_policy: crate::policy::FilePolicy::default(),
         protected: Vec::new(),
         // (T03) The two new `ToolCtx` fields (churn-only): no rules, no home.
         rules: Vec::new(),
@@ -567,7 +574,7 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
 #[test]
 fn cmd_input_redirection_is_diagnosed_as_the_no_console_input_tool_policy() {
     let cmd_error = "ERROR: Input redirection is not supported, exiting the process immediately";
-    let note = crate::agent::tools::exec::bash::cmd_input_redirection_diagnostic(cmd_error);
+    let note = crate::tools::exec::bash::cmd_input_redirection_diagnostic(cmd_error);
     let note = note.unwrap_or_else(|| panic!("cmd's own error sentence must be translated"));
     assert!(
         note.contains("no console input"),
@@ -579,7 +586,7 @@ fn cmd_input_redirection_is_diagnosed_as_the_no_console_input_tool_policy() {
     );
     // A line without cmd's sentence is untouched (a shape pin, not the effect).
     assert_eq!(
-        crate::agent::tools::exec::bash::cmd_input_redirection_diagnostic("echo hi"),
+        crate::tools::exec::bash::cmd_input_redirection_diagnostic("echo hi"),
         None
     );
     // The negative is pinned against FAILURE text, not just a success line
@@ -589,7 +596,7 @@ fn cmd_input_redirection_is_diagnosed_as_the_no_console_input_tool_policy() {
     // `bash_exit_report`, whose plain `(Some(n), None)` arm keeps the run an
     // `is_error` with no note).
     assert_eq!(
-        crate::agent::tools::exec::bash::cmd_input_redirection_diagnostic(
+        crate::tools::exec::bash::cmd_input_redirection_diagnostic(
             "grep: cannot open 'missing.txt': No such file or directory"
         ),
         None,
@@ -1665,7 +1672,7 @@ async fn bash_success_after_closing_its_pipes_is_not_an_error() {
 /// guessed after a grace period. Two shapes, same expectation: the
 /// short one pins the ordinary case (the bounded post-loop reap usually
 /// catches a 0.2 s sleep, so it cannot pin the hole alone), and
-/// the long one — a sleep that outlasts [`crate::agent::tools::exec::DRAIN_GRACE`] — pins the
+/// the long one — a sleep that outlasts [`crate::tools::exec::DRAIN_GRACE`] — pins the
 /// read loop's OWN EOF break: it must wait for the exit status itself
 /// instead of leaning on the post-loop reap, which expires under CPU
 /// contention and reports a run that really exited 7 as "unknown".

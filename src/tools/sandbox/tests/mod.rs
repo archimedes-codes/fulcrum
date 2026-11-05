@@ -1,6 +1,6 @@
 use super::*;
-use crate::agent::policy::{AccessPolicy, FilePolicy};
-use crate::agent::tools::{execute_tool, ContentBlock, ToolCtx, ToolResult};
+use crate::policy::{AccessPolicy, FilePolicy};
+use crate::tools::{execute_tool, ContentBlock, ToolCtx, ToolResult};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
@@ -1420,7 +1420,7 @@ async fn a_session_cwd_inside_a_protected_dir_cannot_write_there() {
     // The protected set must actually contain the dir under test, or the
     // test proves nothing.
     assert!(
-        crate::agent::boundary::protected_dirs()
+        crate::boundary::protected_dirs()
             .iter()
             .any(|p| skills.starts_with(p)),
         "the pinned `$HOME` must produce a protected dir containing the skill"
@@ -1487,7 +1487,7 @@ async fn a_write_root_containing_a_protected_dir_stays_writable_around_it() {
     // The session is rooted at `$HOME` itself (a real setup: a session
     // opened on the home directory).
     std::fs::create_dir_all(pin.path().join("project")).unwrap();
-    assert!(!crate::agent::boundary::protected_dirs().is_empty());
+    assert!(!crate::boundary::protected_dirs().is_empty());
     let ctx = confined_ctx(pin.path(), AccessPolicy::Allow);
     // The protected file survives every write primitive.
     let skill = skills.join("SKILL.md");
@@ -1538,7 +1538,7 @@ fn protected_dirs_ignore_user_rules_because_bash_never_applies_them() {
     };
     std::fs::create_dir_all(pin.path().join(".agents/skills")).unwrap();
 
-    let before = crate::agent::boundary::protected_dirs();
+    let before = crate::boundary::protected_dirs();
     assert_eq!(
         before.len(),
         4,
@@ -1547,12 +1547,12 @@ fn protected_dirs_ignore_user_rules_because_bash_never_applies_them() {
 
     // A user `allow` rule naming one of the four — the exact exclusion a
     // rules-derived subtraction WOULD honor.
-    let user_allow = crate::agent::policy::AccessRule {
+    let user_allow = crate::policy::AccessRule {
         path: "~/.agents/skills".to_string(),
-        direction: crate::agent::policy::RuleDirection::ReadWrite,
-        decision: crate::agent::policy::RuleDecision::Allow,
+        direction: crate::policy::RuleDirection::ReadWrite,
+        decision: crate::policy::RuleDecision::Allow,
     };
-    let after = crate::agent::boundary::protected_dirs();
+    let after = crate::boundary::protected_dirs();
     assert_eq!(
         before, after,
         "a user rule must not change the Landlock subtraction list"
@@ -1563,14 +1563,14 @@ fn protected_dirs_ignore_user_rules_because_bash_never_applies_them() {
     // concatenation contract — DOES decide the write. The path tools honor
     // it; `bash` does not. That asymmetry is the bash exclusion doing its
     // job, not a dead assertion.
-    let rules = crate::agent::policy::default_rules()
+    let rules = crate::policy::default_rules()
         .into_iter()
         .chain(std::iter::once(user_allow.clone()))
         .collect::<Vec<_>>();
     assert_eq!(
-        crate::agent::policy::rule_for(
+        crate::policy::rule_for(
             &rules,
-            crate::agent::policy::RuleDirection::Write,
+            crate::policy::RuleDirection::Write,
             &pin.path().join(".agents/skills/anything"),
             Some(pin.path()),
         ),
@@ -1607,22 +1607,22 @@ async fn an_allow_rule_for_a_protected_dir_never_widens_a_sandboxed_bash() {
     std::fs::create_dir_all(&skills).unwrap();
     std::fs::write(skills.join("SKILL.md"), "original instructions").unwrap();
     assert!(
-        crate::agent::boundary::protected_dirs()
+        crate::boundary::protected_dirs()
             .iter()
             .any(|p| skills.starts_with(p)),
         "premise: the pinned `$HOME` must protect the skill dir"
     );
 
-    let user_allow = crate::agent::policy::AccessRule {
+    let user_allow = crate::policy::AccessRule {
         path: "~/.agents/skills".to_string(),
-        direction: crate::agent::policy::RuleDirection::Write,
-        decision: crate::agent::policy::RuleDecision::Allow,
+        direction: crate::policy::RuleDirection::Write,
+        decision: crate::policy::RuleDecision::Allow,
     };
     // The SAME context, one field wider than `confined_ctx`: the rule list
     // carries the allow, and `home` is set so the `~` really expands — a
     // rule that could not even match would make this test vacuous.
     let ctx = ToolCtx {
-        rules: crate::agent::policy::default_rules()
+        rules: crate::policy::default_rules()
             .into_iter()
             .chain(std::iter::once(user_allow.clone()))
             .collect(),
@@ -1634,9 +1634,9 @@ async fn an_allow_rule_for_a_protected_dir_never_widens_a_sandboxed_bash() {
     // the allow, so the path tools would let it through. The shell's refusal
     // below is therefore the exclusion, not a rule that never matched.
     assert_eq!(
-        crate::agent::policy::rule_for(
+        crate::policy::rule_for(
             &ctx.rules,
-            crate::agent::policy::RuleDirection::Write,
+            crate::policy::RuleDirection::Write,
             &skills.join("SKILL.md"),
             ctx.home.as_deref(),
         ),

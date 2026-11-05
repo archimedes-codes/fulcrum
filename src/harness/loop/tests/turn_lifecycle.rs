@@ -8,12 +8,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::*;
 use super::support::*;
-use crate::agent::events::RpcEvent;
-use crate::agent::harness::provider::{
+use crate::events::RpcEvent;
+use crate::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
 };
-use crate::agent::harness::retry::RetryPolicy;
-use crate::agent::tools::ContentBlock;
+use crate::harness::retry::RetryPolicy;
+use crate::tools::ContentBlock;
 
 /// (finding 3 — ADR 0025's UNBOUNDED `events` channel): a slow /
 /// blocked consumer NEVER drops an event (the pre-fix bounded channel
@@ -136,15 +136,25 @@ async fn the_persisted_ask_row_and_the_emitted_request_carry_the_same_payload() 
 
     // The PERSISTED payload (`load_history` reads this row back on a
     // reload; `rowToMessages` hands its `rawInput` to the transcript).
+    //
+    // (T5/S5b) RE-POINTED at `MemoryStore::display_rows()`. This used to read
+    // `db.messages_for("s1")` off a real `Db`, and the S5b `MemoryStore` swap
+    // left the call behind — the fifteenth compile error in this cluster, hidden
+    // behind the fourteen path errors because name resolution failed before type
+    // checking ran. The RE-POINT is honest here: the invariant this test exists to
+    // hold is `persisted == emitted`, i.e. what the loop HANDED the store seam,
+    // and `display_rows()` answers that exactly. What the double does not model —
+    // the `(session_id, kind, message_key)` UPSERT collapse — is not asserted
+    // anywhere in this test, and is pinned on the desktop side
+    // (`src-tauri/tests/harness_store.rs`, `src-tauri/src/agent/harness/store.rs`).
     let persisted = {
         let mut found = None;
         for _ in 0..100 {
             found = db
-                .messages_for("s1")
-                .expect("messages_for")
-                .iter()
-                .find(|r| r.kind == "tool-call" && r.message_key.as_deref() == Some("t1"))
-                .and_then(|r| serde_json::from_str::<Value>(&r.payload_json).ok())
+                .display_rows()
+                .into_iter()
+                .find(|(_, kind, key, _)| kind == "tool-call" && key == "t1")
+                .and_then(|(_, _, _, payload)| serde_json::from_str::<Value>(&payload).ok())
                 .and_then(|payload| {
                     payload["rawInput"]["questions"]
                         .is_array()
@@ -1212,7 +1222,7 @@ fn result_text_takes_the_first_text_block() {
     let r = ToolResult {
         content: vec![
             ContentBlock::Image {
-                image: crate::agent::tools::ImageRef {
+                image: crate::tools::ImageRef {
                     data: "a".into(),
                     mime_type: "image/png".into(),
                 },
@@ -1331,7 +1341,7 @@ async fn a_prompt_with_images_pushes_a_blocks_user_message() {
     loop_
         .handle_prompt(&PromptTurn {
             text: "describe".to_string(),
-            images: vec![crate::agent::tools::ImageRef {
+            images: vec![crate::tools::ImageRef {
                 data: "BASE64DATA".to_string(),
                 mime_type: "image/png".to_string(),
             }],
@@ -1362,7 +1372,7 @@ async fn a_prompt_with_images_pushes_a_blocks_user_message() {
     loop_
         .handle_prompt(&PromptTurn {
             text: String::new(),
-            images: vec![crate::agent::tools::ImageRef {
+            images: vec![crate::tools::ImageRef {
                 data: "D".to_string(),
                 mime_type: "image/gif".to_string(),
             }],
@@ -1471,10 +1481,17 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
     let dir = crate::test_support::ScratchDir::in_env_temp("mcp-loop-test-", "roundtrip");
     // Stays: this makes a SUBDIR inside the guard's dir, not the root.
     std::fs::create_dir_all(dir.join(".pi")).unwrap();
-    let bin = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/fake_mcp_stdio"
-    ));
+    // The workspace root's `target/debug`, through the crate's ONE resolver.
+    // (T5/S5b) This file moved from `src-tauri/` to `crates/fulcrum-core`, and its
+    // local `CARGO_MANIFEST_DIR.parent()` arithmetic came with it — which is
+    // exactly the trap the T5 plan's MAJOR finding #3 names: one `.parent()` was
+    // the repo root while the file lived in `src-tauri/`, and is `…/crates` from
+    // `crates/fulcrum-core`, so the path named `crates/target/debug/fake_mcp_stdio`
+    // and BOTH mcp tests here failed with ENOENT (`spawn failed: No such file or
+    // directory`) while everything still COMPILED. `test_support::target_debug_dir`
+    // walks up TWO levels and `childproc::target_debug_dir_is_where_cargo_actually_builds`
+    // pins it against `current_exe()`, so it cannot go green on a wrong level count.
+    let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
     std::fs::write(
         dir.join(".pi/mcp.json"),
         serde_json::json!({
@@ -1553,10 +1570,17 @@ async fn a_stop_mid_mcp_call_cancels() {
     let dir = crate::test_support::ScratchDir::in_env_temp("mcp-loop-stop-", "cancel");
     // Stays: a SUBDIR inside the guard's dir, not the root.
     std::fs::create_dir_all(dir.join(".pi")).unwrap();
-    let bin = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/fake_mcp_stdio"
-    ));
+    // The workspace root's `target/debug`, through the crate's ONE resolver.
+    // (T5/S5b) This file moved from `src-tauri/` to `crates/fulcrum-core`, and its
+    // local `CARGO_MANIFEST_DIR.parent()` arithmetic came with it — which is
+    // exactly the trap the T5 plan's MAJOR finding #3 names: one `.parent()` was
+    // the repo root while the file lived in `src-tauri/`, and is `…/crates` from
+    // `crates/fulcrum-core`, so the path named `crates/target/debug/fake_mcp_stdio`
+    // and BOTH mcp tests here failed with ENOENT (`spawn failed: No such file or
+    // directory`) while everything still COMPILED. `test_support::target_debug_dir`
+    // walks up TWO levels and `childproc::target_debug_dir_is_where_cargo_actually_builds`
+    // pins it against `current_exe()`, so it cannot go green on a wrong level count.
+    let bin = crate::test_support::target_debug_dir().join("fake_mcp_stdio");
     std::fs::write(
         dir.join(".pi/mcp.json"),
         serde_json::json!({
