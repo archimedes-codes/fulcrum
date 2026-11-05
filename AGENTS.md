@@ -1,7 +1,8 @@
 # AGENTS.md
 
 `fulcrum-core` — the agent engine extracted from
-[`archimedes-codes/desktop`](https://github.com/archimedes-codes/desktop): the tool loop, provider clients, tools
+[`archimedes-codes/archimedes`](https://github.com/archimedes-codes/archimedes), the
+desktop app (renamed from `archimedes-codes/desktop` after the extraction): the tool loop, provider clients, tools
 and sandbox, the MCP client, and the out-of-process worker. A library. It knows nothing about windows, trays, or
 the UI that renders it.
 
@@ -45,11 +46,17 @@ adding a `cargo build --all-targets` step to CI** — that would keep the suite 
 re-arming the exact trap. Measured: bare `cargo test` on a target dir that never existed passes the whole suite, so no
 build step is needed.
 
-**The two fixture bins are `fake_worker_core` and `fake_mcp_stdio_core`, and the `_core` suffix is load-bearing.**
-The desktop package builds the same bodies under the unsuffixed names. Two workspace members declaring a bin of the
-same name collide on the output filename in a shared `target/debug/` — cargo only *warns* and **the last writer
-silently wins**, so a suite can spawn the other package's fixture and never notice. The bodies live in
-`src/fixtures/` as ordinary lib code; each bin is a three-line `main`.
+**The two fixture bins are `fake_worker_core` and `fake_mcp_stdio_core`.** The bodies live in `src/fixtures/` as
+ordinary lib code; each bin is a three-line `main`.
+
+**Why the `_core` suffix, and why it stays.** The desktop builds the same bodies under the *unsuffixed* names. While
+this package was a workspace member of the desktop, both members' bins landed in ONE shared `target/debug/`, and two
+members declaring a bin of the same name collide on the output filename — cargo only *warns* and **the last writer
+silently wins**, so a suite can spawn the other package's fixture and never notice. That is why the names differ. The
+desktop now consumes this crate as a git dependency, and **a dependency's bins are not built by the dependent**, so the
+collision cannot happen from the desktop's checkout anymore. **The suffix is still load-bearing, because re-adding this
+package to the desktop's `members` — a normal move for local engine work — re-arms the collision silently.** Renaming
+these bins to drop the suffix is the way to reintroduce a bug that produced wrong test results with a green suite.
 
 **`Path::is_file()` does not append `EXE_SUFFIX`; `CreateProcessW` does.** A fixture path built without the suffix
 spawns fine and fails an existence check. `test_support::fixture_bin()` owns the suffix; `target_debug_dir()` names a
