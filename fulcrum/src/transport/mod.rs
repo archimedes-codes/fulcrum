@@ -73,7 +73,7 @@ pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
-pub use frame::Connection;
+pub use frame::{Connection, ConnectionWriter};
 
 #[cfg(unix)]
 pub use unix::{connect, default_endpoint, Listener};

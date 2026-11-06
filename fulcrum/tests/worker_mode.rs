@@ -1001,9 +1001,15 @@ async fn serve_cli_binds_the_socket_it_was_given_and_answers_hello() {
     let daemon_pid = spawned.pid();
 
     let endpoint = fulcrum::transport::Endpoint::socket(dir.path().join("cli.sock"));
-    let mut conn = dial_until_listening(&endpoint).await;
+    let conn = dial_until_listening(&endpoint).await;
+    // T4a: the write half is a separate type. The reader stays the thing that
+    // receives the `hello` reply; the writer is dropped at the end of the test
+    // scope exactly as the single `Connection` used to be, so the socket's
+    // lifetime (and the daemon's view of the peer) is unchanged.
+    let (mut conn, mut writer) = conn.split_writer();
 
-    conn.send_frame(&serde_json::json!({ "type": "hello" }))
+    writer
+        .send_frame(&serde_json::json!({ "type": "hello" }))
         .await
         .expect("send `hello`");
     let reply = tokio::time::timeout(HANDSHAKE_BUDGET, conn.recv())
@@ -1082,9 +1088,14 @@ async fn serve_cli_binds_the_socket_it_was_given_and_answers_hello() {
         .expect("serve_cli_args puts the pipe name third")
         .clone();
     let endpoint = fulcrum::transport::Endpoint::pipe(format!(r"\\.\pipe\{name}"));
-    let mut conn = dial_until_listening(&endpoint).await;
+    let conn = dial_until_listening(&endpoint).await;
+    // T4a: the write half is a separate type (see the unix leg of this test for
+    // the reasoning — identical here). The reader receives the `hello` reply and
+    // the writer drops at the end of the scope, as the single `Connection` did.
+    let (mut conn, mut writer) = conn.split_writer();
 
-    conn.send_frame(&serde_json::json!({ "type": "hello" }))
+    writer
+        .send_frame(&serde_json::json!({ "type": "hello" }))
         .await
         .expect("send `hello`");
     let reply = tokio::time::timeout(HANDSHAKE_BUDGET, conn.recv())
