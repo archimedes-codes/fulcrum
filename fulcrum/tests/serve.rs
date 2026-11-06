@@ -2409,3 +2409,478 @@ async fn a_child_killed_by_sigkill_is_reported_and_can_be_started_again() {
 
     daemon.shutdown();
 }
+
+/// A connection that sends frames BEFORE saying `hello` is refused, not served
+/// (issue #4 — the required handshake).
+///
+/// The `hello` frame already existed and `handle_frame` already answered it; what
+/// was missing was that NOTHING REQUIRED IT. Any local process that could reach
+/// the socket could go straight to `start` — the greeting was decoration, so a
+/// stray connection was implicitly trusted to know the protocol. This test pins
+/// the opposite: frames before `hello` get no service at all, and after
+/// [`MAX_PRE_HELLO_FRAMES`] of them the peer is told once and hung up on.
+///
+/// # Why the frames are written RAW
+///
+/// Same reason as `a_malformed_line_gets_an_error_and_the_stream_continues`: this
+/// peer must not be a well-behaved `Client`, and it must not read through a
+/// `Connection` whose reader task would consume the very reply this test asserts
+/// on. So: `raw_dial`, split, `write_all` the offending frames, read the raw lines
+/// back.
+///
+/// # What is asserted, in order
+///
+/// 1. NO `start-result` ever arrives — a pre-`hello` `start` is DROPPED, not
+///    answered. This is the load-bearing half: "reject rather than serve" is the
+///    issue's wording, and a daemon that answered the pre-`hello` `start` and THEN
+///    complained would pass an assertion written only on the error frame.
+/// 2. Exactly ONE `error` frame arrives, and it names the handshake requirement.
+///    One, not three: the peer is told once and closed, not lectured per frame.
+/// 3. The stream then EOFs — the daemon closed the connection rather than leaving
+///    a hostile peer's socket open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_sends_frames_before_hello_is_rejected_not_served() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    let (read_half, mut write_half) = tokio::io::split(raw_dial(&endpoint).await);
+    // Three `start` frames and not one `hello`. Written in one write so they are
+    // three queued frames the moment the daemon's reader gets to them — the
+    // pipelined shape, which is the shape a real client that skipped the greeting
+    // would actually produce.
+    let mut flood = String::new();
+    for _ in 0..3 {
+        flood.push_str(&serde_json::to_string(&start_frame(&start_env("pre-hello", cwd))).unwrap());
+        flood.push('\n');
+    }
+    write_half
+        .write_all(flood.as_bytes())
+        .await
+        .expect("write three pre-hello frames");
+    write_half.flush().await.expect("flush");
+
+    // Read whatever the daemon sends, until it hangs up or the budget expires.
+    let mut reader = BufReader::new(read_half);
+    let mut lines: Vec<String> = Vec::new();
+    let saw_eof = {
+        let deadline = Instant::now() + FRAME_BUDGET;
+        let mut hit_eof = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let mut line = String::new();
+            let read = tokio::time::timeout(left, reader.read_line(&mut line))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the daemon neither refused the pre-hello peer nor closed it \
+                         within {FRAME_BUDGET:?} (frames so far: {lines:?}) — a peer \
+                         that never greets must be told once and hung up on, not \
+                         held open"
+                    )
+                })
+                .expect("read a reply line");
+            if read == 0 {
+                hit_eof = true;
+                break;
+            }
+            lines.push(line);
+        }
+        hit_eof
+    };
+
+    let frames: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| {
+            serde_json::from_str(l.trim())
+                .unwrap_or_else(|e| panic!("the reply line is not a JSON frame: {l:?} ({e})"))
+        })
+        .collect();
+
+    // (1) Not one pre-`hello` frame was SERVED. A `start-result` here would mean
+    //     the daemon spawned a child for a peer it is refusing.
+    assert!(
+        frames.iter().all(|f| f["type"] != "start-result"),
+        "a `start` sent before `hello` must be dropped, not answered: {frames:?}"
+    );
+    // (2) One refusal, naming the requirement.
+    let refusals: Vec<&serde_json::Value> =
+        frames.iter().filter(|f| f["type"] == "error").collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the pre-hello peer must be told ONCE and then closed; got {frames:?}"
+    );
+    let message = refusals[0]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal carries a message: {}", refusals[0]));
+    assert!(
+        message.contains("hello"),
+        "the refusal must name what the peer failed to send, so a client with a \
+         wrong first frame knows what to fix; got: {message}"
+    );
+    // (3) And the connection is closed.
+    assert!(
+        saw_eof,
+        "the daemon must CLOSE a peer it refused for skipping the handshake, not \
+         leave its socket open; frames seen: {frames:?}"
+    );
+
+    // The daemon is unharmed for a client that does greet — the same "one bad peer
+    // costs nothing" claim every other hardening test in this file makes.
+    let mut later = Client::dial(&endpoint).await;
+    later.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(
+        later.recv_until("hello").await["type"],
+        "hello",
+        "a refused pre-hello peer must not take the daemon down with it"
+    );
+
+    daemon.shutdown();
+}
+
+/// A peer that floods NON-GREETING frames is refused and closed, and the daemon
+/// stays healthy for the next client (issue #4 — the inbound frame-rate bound).
+///
+/// # Why the flood is `prompt` and not `hello`
+///
+/// The existing flood test,
+/// `a_client_that_never_reads_is_throttled_and_the_daemon_stays_flat`, floods
+/// `hello` and pins the numbers the inbound QUEUE produces (blocked write, RSS
+/// flat). This gate is a different bound on a different axis — the RATE at which
+/// decoded frames are served — and it deliberately counts non-greeting frames
+/// only, because `start`/`prompt` cost the daemon a syscall each while `hello`
+/// costs one `json!`. So this test floods `prompt` and that one keeps flooding
+/// `hello`; neither is a stand-in for the other.
+///
+/// `prompt` for a session that does not exist is answered (`prompt-result` with
+/// `ok: false`) and needs no worker, no fixture, no database row — which makes
+/// this a test of the gate rather than of session machinery.
+///
+/// # Why the writes are INTERLEAVED with the reads
+///
+/// The first version wrote a 5-second flood without reading, and the assertion
+/// then died on `ECONNRESET` instead of seeing the refusal: when a socket is
+/// closed with data still unread in the receive buffer, Linux sends RST, and RST
+/// discards what the daemon had already written. That is the kernel's behaviour,
+/// not a daemon bug — but it makes the refusal frame unobservable, and the
+/// refusal is the contract being pinned.
+///
+/// So the writer stops as soon as the refusal appears, and writes in small chunks
+/// between reads. The daemon's reader keeps up, the buffer is empty at close, and
+/// what the test observes is the daemon's own answer rather than a kernel artefact.
+///
+/// # What is asserted, and what is deliberately NOT
+///
+/// Asserted: ONE `error` frame naming the frame-rate limit, then the connection
+/// ends (clean EOF or a reset — both mean "the daemon closed it"); and a
+/// subsequent healthy client gets the full hello → start → prompt exchange.
+///
+/// NOT asserted: any frame count, and no RSS number. The bucket drains at
+/// [`FRAME_RATE`] tokens/s after a `FRAME_RATE_BURST` burst, so "how many
+/// `prompt-result` frames escaped before the refusal" is a schedule on a loaded CI
+/// box. A test that pinned it would be a flake that reads like a regression. The
+/// BOUNDARY — told once, then closed — is schedule-independent, and that is the
+/// contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_non_greeting_frames_is_refused_and_the_daemon_survives() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+
+    let (read_half, mut write_half) = tokio::io::split(raw_dial(&endpoint).await);
+    // Greet first, so the refusal this test waits for can ONLY be the rate gate.
+    // Without the `hello` the same stream would be refused by the handshake gate
+    // after three frames and this would be testing the wrong bound.
+    write_half
+        .write_all(b"{\"type\":\"hello\"}\n")
+        .await
+        .expect("write the greeting");
+
+    // `prompt` for an id nothing is running: answered cheaply, no child, no row.
+    const FRAME: &[u8] = b"{\"type\":\"prompt\",\"sessionId\":\"nobody\",\"text\":\"x\"}\n";
+    // Small enough that the daemon's reader has drained the socket by the time the
+    // gate fires — see "Why the writes are INTERLEAVED with the reads".
+    const CHUNK: usize = 32;
+
+    let mut reader = BufReader::new(read_half);
+    let mut refusal: Option<serde_json::Value> = None;
+    // How the connection ended, if it did: `true` for a clean EOF, `false` for a
+    // reset, and neither is a failure — see the read arm below.
+    let mut closed = false;
+    let mut written = 0usize;
+    let deadline = Instant::now() + FRAME_BUDGET;
+
+    'flood: while Instant::now() < deadline {
+        // Write a burst-sized chunk. A blocked write means the socket is full,
+        // which is the OTHER bound (the inbound queue) doing its job; stop and
+        // read, because the gate's answer arrives on the read half either way.
+        let mut chunk = Vec::with_capacity(CHUNK * FRAME.len());
+        for _ in 0..CHUNK {
+            chunk.extend_from_slice(FRAME);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // A blocked or failed write is not this loop's business: the first means
+        // the socket is full (the inbound queue's bound doing its job) and the
+        // second means the daemon closed the connection. Either way the answer this
+        // test asserts on arrives on the READ half, which the loop turns to next.
+        if let Ok(Ok(())) = tokio::time::timeout(left, write_half.write_all(&chunk)).await {
+            written += CHUNK;
+        }
+
+        // Then read whatever the daemon has to say about it, with a short budget:
+        // this is a POLL, not a wait. The refusal only appears after the burst is
+        // spent, so most turns of this loop see `prompt-result` frames.
+        loop {
+            let left = Duration::from_millis(20);
+            let mut line = String::new();
+            match tokio::time::timeout(left, reader.read_line(&mut line)).await {
+                Err(_) => continue 'flood, // nothing yet; go flood some more
+                Ok(Ok(0)) => {
+                    closed = true;
+                    break 'flood;
+                }
+                Ok(Ok(_)) => {
+                    let frame: serde_json::Value = serde_json::from_str(line.trim())
+                        .unwrap_or_else(|e| {
+                            panic!("the reply line is not a JSON frame: {line:?} ({e})")
+                        });
+                    if frame["type"] == "error" {
+                        assert!(
+                            refusal.is_none(),
+                            "the peer was refused twice ({refusal:?} and {frame}) — \
+                             the contract is told ONCE and then closed"
+                        );
+                        refusal = Some(frame);
+                    }
+                }
+                // A reset is the daemon closing a socket that still held unread
+                // bytes; Linux turns that into RST. It IS the close this contract
+                // requires, so it ends the loop rather than failing the test — but
+                // it is only acceptable AFTER the refusal, because a reset instead
+                // of a refusal would mean the daemon hung up without saying why.
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    closed = true;
+                    break 'flood;
+                }
+                Ok(Err(e)) => panic!("the stream failed while reading the refusal: {e}"),
+            }
+        }
+    }
+
+    assert!(
+        written > 0,
+        "not one frame reached the daemon, so this test would certify nothing about \
+         the rate gate"
+    );
+    let refusal = refusal.unwrap_or_else(|| {
+        panic!(
+            "a peer that sent {written} non-greeting frames was never refused by the \
+             rate gate (no `error` frame within {FRAME_BUDGET:?}, connection closed \
+             {closed}) — the daemon is still serving a flood at whatever rate it \
+             arrives, which is the unbounded-cost case issue #4 is about"
+        )
+    });
+    let message = refusal["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal carries a message: {refusal}"));
+    assert!(
+        message.contains("rate"),
+        "the refusal must name the limit it hit, so a merely badly-written client \
+         can tell this from the handshake refusal; got: {message}"
+    );
+    assert!(
+        closed,
+        "the daemon told the flooding peer and then left its socket open — the \
+         refusal must be followed by a close, or the peer keeps a daemon-side \
+         connection for free"
+    );
+
+    // And the daemon is unharmed: a healthy client gets the full exchange.
+    let mut healthy = Client::dial(&endpoint).await;
+    healthy.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(healthy.recv_until("hello").await["type"], "hello");
+    let cwd = daemon._dir.path().to_str().unwrap();
+    healthy
+        .send(start_frame(&start_env("after-flood", cwd)))
+        .await;
+    assert_eq!(
+        healthy.recv_until("start-result").await["ok"],
+        true,
+        "a rate-limit flood must not cost the daemon its next session"
+    );
+
+    daemon.shutdown();
+}
+
+/// Concurrent sessions are bounded, and the bound RELEASES on `close` (issue #4).
+///
+/// # The hole
+///
+/// Every local process that can reach the socket can `start`, and `start` spawns a
+/// child process. Before this bound the only ceiling on how many children one
+/// daemon would run was the process table — so a buggy client in a retry loop, or
+/// a hostile local one, could take the machine's ability to fork away from
+/// everything else running as this user. The outbound and inbound buffers were
+/// bounded long ago (see `CLIENT_QUEUE_CAPACITY` and `frame::MAX_QUEUED_INBOUND_FRAMES`
+/// for those measurements); the session COUNT was not.
+///
+/// # Why the test loops to the bound instead of hardcoding it
+///
+/// The limit is a private const in `serve.rs` (`SESSION_LIMIT`), and the task
+/// forbids widening `Daemon::new` or adding a test-only setter to make it
+/// injectable. So the test discovers the number the only honest way: start
+/// sessions until one is refused. That makes the test outlive a change to the
+/// constant, which a hardcoded `for i in 0..32` would not — a bumped limit would
+/// turn a hardcoded version green-while-testing-nothing, the failure shape this
+/// file's header exists to refuse.
+///
+/// # The three claims, in order
+///
+/// 1. The refusal happens, and its message names the bound and says what to do
+///    about it (`close` a session).
+/// 2. `close` RELEASES a slot: after closing one session, a NEW id starts fine.
+///    Without this half, a counter that never decrements would pass claim 1
+///    forever and quietly brick the daemon for its whole uptime.
+/// 3. Nothing leaked: after closing every session that was opened, another `start`
+///    still succeeds. This is the counter-faithfulness pin — the same class of
+///    leak `Daemon::dead` used to have, and the reason `close`'s doc calls the
+///    release-everything rule an invariant.
+///
+/// Every session this opens is CLOSED before it returns: the worker children are
+/// real processes, and the post-suite stray-process census fails the run for one
+/// that outlives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_limit_refuses_one_past_the_bound_and_releases_on_close() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    let mut client = Client::dial(&endpoint).await;
+    client.send(serde_json::json!({"type": "hello"})).await;
+    client.recv_until("hello").await;
+
+    // Start sessions until one is refused, remembering every id that got in.
+    let mut started: Vec<String> = Vec::new();
+    let refusal = loop {
+        let id = format!("bounded-{}", started.len());
+        client.send(start_frame(&start_env(&id, cwd))).await;
+        let result = client.recv_until("start-result").await;
+        if result["ok"] == true {
+            started.push(id);
+            // A ceiling on the loop, so a daemon with NO bound fails this test
+            // instead of filling the process table and taking the runner with it.
+            assert!(
+                started.len() <= 256,
+                "the daemon accepted {} sessions without refusing any — there is no \
+                 session bound, which is the hole issue #4 exists to close",
+                started.len()
+            );
+        } else {
+            break result;
+        }
+    };
+
+    assert!(
+        !started.is_empty(),
+        "the daemon refused its FIRST session, so it is not bounding the count, it \
+         is refusing everything: {refusal}"
+    );
+    // The bound is `serve.rs`'s private `SESSION_LIMIT`; the test discovers it
+    // rather than duplicating it (see the header note), but the NUMBER is part of
+    // the issue's acceptance criteria, so a change to it must be a deliberate one
+    // that lands here too.
+    assert_eq!(
+        started.len(),
+        32,
+        "the daemon accepted {} sessions before refusing — the bound is documented \
+         as 32 in `serve.rs` (`SESSION_LIMIT`); if that constant moved, move this \
+         number and the doc in the same change",
+        started.len()
+    );
+    let message = refusal["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refused `start` says why: {refusal}"));
+    assert!(
+        message.contains("session limit"),
+        "the refusal must name the bound that was hit (not a generic failure) so a \
+         client can tell this from a broken worker exe; got: {message}"
+    );
+
+    // (2) `close` releases a slot — TWO slots, by closing two sessions, so claim
+    // (3) below can spend both and the arithmetic is exact. One `close` frees one
+    // slot; the first draft of this test closed one and started two, and the
+    // failure it produced was the test's bug, not the daemon's.
+    for _ in 0..2 {
+        let released = started
+            .pop()
+            .expect("at least two sessions were started above");
+        client
+            .send(serde_json::json!({"type": "close", "sessionId": released}))
+            .await;
+        let closed = client.recv_until("closed").await;
+        assert_eq!(
+            closed["ok"], true,
+            "the session that was started must be closable: {closed}"
+        );
+    }
+    client
+        .send(start_frame(&start_env("after-release", cwd)))
+        .await;
+    let restarted = client.recv_until("start-result").await;
+    assert_eq!(
+        restarted["ok"], true,
+        "closing one session must free one slot — a counter that only ever grows \
+         would pass the refusal half of this test and then brick the daemon for its \
+         whole uptime: {restarted} (limit message was {message:?})"
+    );
+
+    // (3) Nothing leaked: a SECOND round, spending the other freed slot. One round
+    //     is not enough to tell a faithful counter from one that releases only
+    //     once.
+    client
+        .send(start_frame(&start_env("second-after-release", cwd)))
+        .await;
+    assert_eq!(
+        client.recv_until("start-result").await["ok"],
+        true,
+        "a second start past the bound (after two closes) must also be accepted"
+    );
+
+    for id in started {
+        client
+            .send(serde_json::json!({"type": "close", "sessionId": id}))
+            .await;
+        client.recv_until("closed").await;
+    }
+
+    // Below the bound again, so the census has nothing to find: every child this
+    // test spawned is reaped by its `close`.
+    let mut remaining = 0usize;
+    for id in ["after-release", "second-after-release"] {
+        client
+            .send(serde_json::json!({"type": "close", "sessionId": id}))
+            .await;
+        let frame = client.recv_until("closed").await;
+        if frame["ok"] == true {
+            remaining += 1;
+        }
+    }
+    assert_eq!(
+        remaining, 2,
+        "both sessions started after the release must still be running to be closed \
+         (a `false` here means one died on its own and the count this test measured \
+         was not the count it thought)"
+    );
+
+    daemon.shutdown();
+}

@@ -44,6 +44,10 @@
 //!
 //! client → daemon:
 //! * `hello` — negotiate; the daemon answers `hello` with `protocolVersion`.
+//!   **This one is required**: it is the first frame the daemon will serve, and a
+//!   connection that sends anything else first is refused — see
+//!   `MAX_PRE_HELLO_FRAMES` for the exact shape (a couple of frames are dropped
+//!   unseen, then one `error`, then the close).
 //! * `start` — the `StartEnv` fields verbatim (`sessionId`, `cwd`, `mode`,
 //!   `model`, `catalog`, …) plus `"type":"start"`; spawns the session's Worker.
 //! * `prompt {sessionId, text, images?}` — one turn.
@@ -88,8 +92,38 @@
 //! shutdown frame, so `run` never returns and `WorkerManager::reap_all` is not
 //! wired (T6's pins and T12's sidecar lifecycle own that; the daemon is killed,
 //! and a killed daemon's children exit on their stdin EOF — the Worker's own
-//! clean-exit path). No authentication: the socket is the credential, which is
-//! why it lives in the user's own data dir.
+//! clean-exit path).
+//!
+//! # The local endpoint's defenses, and what they still do not buy
+//!
+//! There is still **no authentication** — that is T13. What T3 (issue #4) added
+//! is the local-level hardening that has to exist regardless of T13, in three
+//! layers, each with its own numbers named at its own definition:
+//!
+//! * **Peer identity** at accept: the unix leg refuses a peer whose uid is not the
+//!   daemon's ([`TransportError::PeerIdentity`], and `transport::unix`'s platform
+//!   table). The Windows leg cannot prove this and says so in
+//!   `transport::windows`'s header. So the sentence "the socket is the credential"
+//!   is now: the socket's mode is the credential, AND the peer-credential check is
+//!   the second, defense-in-depth check.
+//! * **A required `hello` handshake**: `MAX_PRE_HELLO_FRAMES`. The `hello` frame
+//!   already existed and already got answered; what was missing was that anything
+//!   sent before it was served anyway. That is measured, not rhetorical — a raw
+//!   socket writing `start` with no greeting got `ok: true` and a child's pid.
+//! * **Bounded inbound**: `SESSION_LIMIT` concurrent MAIN sessions and
+//!   `FRAME_RATE` non-greeting frames per second per connection. Before the
+//!   session bound, one client was measured taking 249 sessions before the runner
+//!   hit `EMFILE`.
+//!
+//! None of these is authentication, and none should be described as such. A
+//! same-uid process still reaches this daemon on every platform; the residual is
+//! T13's.
+//!
+//! **Open question (issue #4, and a non-goal of both T3 and T13):** transcripts
+//! are stored in plaintext in `fulcrum.db`. Nothing here encrypts them at rest,
+//! and T13's protocol-layer auth does not either — a bearer token on the wire says
+//! nothing about the file. If a compliance requirement ever demands encryption at
+//! rest, it is its own task, not a clause of this one.
 //!
 //! # ⚠ A slow frame on ONE connection stalls THAT connection's own relay
 //!
@@ -145,7 +179,7 @@ use fulcrum_core::worker::protocol::{StartEnv, PROTOCOL_VERSION};
 use fulcrum_core::worker::{WorkerFactory, WorkerManager};
 
 use crate::db::Db;
-use crate::transport::{Connection, Endpoint, Listener};
+use crate::transport::{Connection, Endpoint, Listener, TransportError};
 
 pub use crate::worker_factory::{DaemonWorkerFactory, WorkerExeError};
 
@@ -262,6 +296,111 @@ const _: () = assert!(
     "CLIENT_QUEUE_CAPACITY must be below FAN_OUT_CAPACITY: the per-client queue \
          must not be able to buffer more than the shared ring upstream holds"
 );
+
+// ── The per-connection hardening bounds (issue #4) ───────────────────────────
+
+/// How many NON-`hello` frames one connection may send before it has greeted.
+///
+/// The `hello` frame already existed in the protocol and `handle_frame` already
+/// answered it — what did NOT exist was a requirement to send it. Any local
+/// process that reached the socket could go straight to `start` and get a child
+/// process spawned for it. That is measured, not argued: before this gate existed,
+/// a raw socket writing three `start` frames and no `hello` got
+/// `ok: true` plus a worker pid on the first one.
+///
+/// Two, not zero, and not one: the greeting is one frame, and a client that
+/// PIPELINED `hello` + `start` in one write (which
+/// `tests/serve.rs::two_connections_racing_to_start_one_id_leave_exactly_one_child`
+/// does on purpose, to keep two `start`s in flight together) must not be refused
+/// for a race its own test is studying. Two non-`hello` frames get dropped
+/// unseen; the third is refused by name and the connection is closed. Refusing
+/// rather than serving is the issue's wording — a pre-`hello` frame gets NO reply,
+/// because answering a `start` before the handshake would leak routing behaviour
+/// to a peer that has not identified itself as a client at all.
+const MAX_PRE_HELLO_FRAMES: usize = 2;
+
+/// How many NON-GREETING frames one connection may pull out of the inbound queue
+/// per second, sustained (issue #4).
+///
+/// A token bucket, [`FRAME_RATE_BURST`] deep, refilled at this rate, and a HARD
+/// rejection when it runs dry: the peer gets one `error` frame and then a closed
+/// socket. Never a delay — a delayed flood stresses the queue, and the queue is
+/// the buffer this daemon has already been measured growing on (see
+/// [`CLIENT_QUEUE_CAPACITY`]'s "What this bound does NOT buy" section); a closed
+/// socket puts the pressure back on the sender's own kernel.
+///
+/// # Why `hello` frames are NOT counted, and why that is not a hole
+///
+/// `hello` is answered by one `json!` construction with no session, no child, no
+/// database row. The frames this gate exists to bound are `start` (a process
+/// spawn) and `prompt` (a relay to a live child) — the frames that cost the daemon
+/// a syscall each.
+///
+/// A hostile client can still flood `hello`, and that is deliberately left to the
+/// bound that already exists and is already measured: the inbound reader queue
+/// (`frame::MAX_QUEUED_INBOUND_FRAMES`) plus socket backpressure, whose numbers
+/// `tests/serve.rs::a_client_that_never_reads_is_throttled_and_the_daemon_stays_flat`
+/// pins (1 375 frames then blocked, RSS 15 → 19 MB, against 1 168 009 frames and
+/// 895 MB unbounded). Counting `hello` here would close that connection at ~600
+/// frames into the same flood and break that test's measurement — which is not a
+/// reason to keep it green for its own sake, but IS the measurement that says the
+/// `hello` path is already bounded by something better placed than this gate.
+const FRAME_RATE: usize = 200;
+
+/// The burst the bucket starts with, and its ceiling (issue #4).
+///
+/// Three seconds' worth of the sustained rate. Generous on purpose: a client
+/// opening a dozen sessions at once (a supervisor starting a fan-out) is
+/// well-behaved and should not be refused for it, while a loop that wants to
+/// exhaust the process table hits the wall inside a second. The frames counted here
+/// are already DECODED and already queued, so a burst costs the daemon the queue
+/// depth it has already paid for, not a new buffer.
+const FRAME_RATE_BURST: usize = FRAME_RATE * 3;
+
+/// The per-connection inbound frame-rate gate (issue #4).
+///
+/// Plain f64 tokens, `Instant` (monotonic — a wall-clock jump must not be able to
+/// refill the bucket or starve it), and no new dependency. Per-connection LOCAL
+/// state, deliberately: the rate is a property of one socket, so it belongs to the
+/// one task that reads that socket, not to `Daemon` — and keeping it a local in
+/// `serve_client`'s header region is what lets the whole gate move into a reader
+/// half intact when that function is split.
+struct FrameRateGate {
+    /// Tokens available now (one per frame the peer may still send).
+    tokens: f64,
+    /// When the bucket was last refilled.
+    last: std::time::Instant,
+}
+
+impl FrameRateGate {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            tokens: FRAME_RATE_BURST as f64,
+            last: now,
+        }
+    }
+
+    /// Take one token, refilling by elapsed time first. `false` means refuse.
+    fn accept(&mut self, now: std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * FRAME_RATE as f64).min(FRAME_RATE_BURST as f64);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+/// Where one connection's handshake has got to (issue #4).
+enum Handshake {
+    /// Nothing has greeted yet, with the count of non-greeting frames seen so far.
+    WaitingHello { pre_hello: usize },
+    /// The peer said `hello`; every frame type is now on the table (subject to
+    /// [`FrameRateGate`]).
+    Done,
+}
 
 // ── argv ──────────────────────────────────────────────────────────────────────
 
@@ -508,7 +647,88 @@ struct Daemon {
     /// process, which is the exact leak the guard exists to prevent. Holding the
     /// id across the await makes check-and-claim atomic.
     starting: Arc<StdMutex<HashSet<String>>>,
+    /// How many MAIN sessions this daemon is committed to running (issue #4).
+    ///
+    /// The session bound needs a COUNT, and this is the only honest place to keep
+    /// one: `WorkerManager` exposes no `len()` and `handle_for` iterates nothing,
+    /// so a derived count would need an engine change (out of scope here), and a
+    /// second registry would be the thing this file has repeatedly promised not to
+    /// become ("there is deliberately no second registry here").
+    ///
+    /// # It counts COMMITMENTS, not live handles — and the difference is the point
+    ///
+    /// The slot is taken in [`Daemon::claim_session`], BEFORE `attach`, and handed
+    /// to the session by [`SessionClaim::commit`] when `attach` returns `Ok`. So a
+    /// session in flight counts. That is deliberate: the threat is a flood of
+    /// `start`s, and a counter that only counted registered workers would let an
+    /// unbounded number of `attach`es queue up behind the bound.
+    ///
+    /// Four touch points, and the ORDER of the first two is load-bearing:
+    ///
+    /// * **increment** — in [`Daemon::claim_session`], under the `starting` lock.
+    ///   MAIN only, which it is by definition: a subagent's row comes from
+    ///   `dispatch_subagent`, never from `start`.
+    /// * **release-on-failure** — in [`SessionClaim::drop`], when the claim was
+    ///   never committed: a `start` whose row write or `attach` failed holds nothing.
+    ///   Without this, `SESSION_LIMIT` failed starts (a typoed `--worker-exe` retried
+    ///   thirty times) would consume every slot and blame the session limit for the
+    ///   typo. Pinned by `a_failed_start_gives_its_session_slot_back`.
+    /// * **decrement** — in [`close`], and ONLY when `detach` returned `Some`.
+    ///   `None` means nothing was running, and decrementing that would drive the
+    ///   counter below zero — which on an `AtomicUsize` is not a panic and not a
+    ///   clamp but a WRAP to `usize::MAX`, i.e. a session limit that fires for the
+    ///   rest of the daemon's life. Pinned by
+    ///   `a_close_with_nothing_running_releases_nothing`.
+    /// * **decrement** — in `Daemon::new`'s `on_crash`, guarded on the `subagents`
+    ///   map having NO record for the id. `on_crash` receives only
+    ///   `(session_id, code, pid)` — no `is_subagent` flag — so that lookup is how
+    ///   this closure knows whether the dead id was ever counted; decrementing a
+    ///   child's id wraps the counter the same way.
+    ///
+    /// Taking the slot before the child exists means the increment precedes any
+    /// `on_crash` (nothing can crash a session that has not been spawned), which is
+    /// the ordering that keeps the counter from wrapping. One window remains and it
+    /// is stated rather than glossed: `attach` registers the worker BEFORE it
+    /// returns, so a `close` for the same id arriving from ANOTHER connection
+    /// between that registration and [`SessionClaim::commit`] decrements the slot
+    /// this claim took, and the commit then stops `Drop` from giving it back — the
+    /// counter ends up one BELOW the live-session count. That direction is the safe
+    /// one (a bound that is momentarily one permissive, never a wrap: the claim's
+    /// own `+1` is still in the counter when the foreign `close` takes its `-1`, so
+    /// the subtraction cannot cross zero), and closing it would mean holding the
+    /// `starting` lock across the `attach` await, which this file's own rule forbids.
+    /// No site here therefore needs a saturating decrement.
+    ///
+    /// That is the whole discipline, and it is the discipline `Daemon::dead` failed
+    /// (see [`close`]'s invariant note: a per-session set is one of the two places
+    /// that has to release it). An atomic counter was chosen over a set precisely
+    /// because there is nothing here to forget to remove.
+    ///
+    /// `Arc` so the `on_crash` closure and each `SessionClaim` can hold it without
+    /// reaching back at the `Daemon` they are dependencies of — the same late-binding
+    /// reason `manager_slot` exists.
+    attached_sessions: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// How many MAIN sessions one daemon will run at once (issue #4).
+///
+/// Every local process that can reach the socket can `start`, and `start` spawns a
+/// child. Without a bound the ceiling on that is the process table, so one buggy
+/// client in a retry loop — measured, before this bound existed: 249 sessions
+/// accepted before the runner hit `EMFILE` — takes fork away from every other
+/// process running as this user.
+///
+/// 32, sized against the use and not against the machine: this daemon supervises
+/// ONE user's interactive sessions, so 32 is far above any realistic concurrent
+/// count and far below the fd/memory ceiling the real constraint is. Deliberately
+/// well above what this repo's own suite ever opens (the widest test holds two
+/// sessions at once), so the bound is invisible to legitimate traffic and loud to
+/// a runaway client.
+///
+/// Enforced in [`Daemon::claim_session`] — the seam every `start` already routes
+/// through — rather than in `serve_client`, so a future second entry point cannot
+/// bypass it.
+const SESSION_LIMIT: usize = 32;
 
 impl Daemon {
     fn new(db: Arc<Db>, factory: Arc<dyn WorkerFactory>) -> Arc<Self> {
@@ -519,6 +739,8 @@ impl Daemon {
         let subagents: Arc<StdMutex<HashMap<String, SubagentRecord>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let starting: Arc<StdMutex<HashSet<String>>> = Arc::new(StdMutex::new(HashSet::new()));
+        let attached_sessions: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let manager_slot: Arc<std::sync::OnceLock<std::sync::Weak<WorkerManager>>> =
             Arc::new(std::sync::OnceLock::new());
 
@@ -624,6 +846,7 @@ impl Daemon {
         let fan_crash = fan_out.clone();
         let crash_manager = Arc::clone(&manager_slot);
         let crash_subagents = Arc::clone(&subagents);
+        let crash_sessions = Arc::clone(&attached_sessions);
         let on_crash: OnCrash = Arc::new(move |session_id, code, pid| {
             // Clear the dead registration (1 above). `Weak::upgrade` fails only
             // once the `Daemon` is gone, and then there is nothing to clean.
@@ -632,6 +855,22 @@ impl Daemon {
             // owns — so a `None` here for a child is expected, not a miss.
             if let Some(manager) = crash_manager.get().and_then(std::sync::Weak::upgrade) {
                 manager.detach(&session_id);
+            }
+            // Release the session slot (issue #4) — but only for a MAIN session,
+            // because only MAIN sessions were ever counted. `on_crash` is handed an
+            // id and an exit, no `is_subagent` flag, so the child→parent map is how
+            // this closure tells the two apart: a record means the id is a
+            // dispatched CHILD, which `start` never incremented, and decrementing it
+            // would underflow an `AtomicUsize` (and a wrapped counter is a session
+            // limit that fires on the daemon's first client).
+            //
+            // Scoped, because `crash_report_frame` takes this same mutex — holding
+            // the guard into that call would self-deadlock a `std` mutex.
+            {
+                let subagents = crash_subagents.lock().unwrap_or_else(|p| p.into_inner());
+                if !subagents.contains_key(&session_id) {
+                    crash_sessions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             let _ = fan_crash.send(crash_report_frame(&crash_subagents, &session_id, code, pid));
         });
@@ -664,6 +903,7 @@ impl Daemon {
             fan_out,
             subagents,
             starting,
+            attached_sessions,
         });
 
         // A subagent's `sessions` row is created lazily by the persister, and the
@@ -695,7 +935,60 @@ impl Daemon {
     /// the grace is bounded, and the `kill` is a no-op on a reaped child — see
     /// `childproc::kill_process_group`'s discarded `ESRCH`).
     fn claim_session(&self, session_id: &str) -> Result<SessionClaim, String> {
+        // ── The session bound (issue #4) ─────────────────────────────────────
+        //
+        // Counted HERE, under the `starting` lock, rather than after `attach`
+        // returns. Two reasons, and the second is the one that matters:
+        //
+        // 1. Check-and-increment under ONE lock means N simultaneous `start`s at
+        //    the bound cannot all pass the check and all land. With the increment
+        //    after the ~5 s `attach` await, they could — the bound would be
+        //    overshootable by exactly the number of clients that dialed in the
+        //    same instant.
+        // 2. It makes the increment precede any `on_crash` this session can cause:
+        //    the child does not exist until `attach` spawns it, so no crash can be
+        //    reported for it before this line. (A `close` from ANOTHER connection can
+        //    still land between `attach`'s registration and this claim's `commit` —
+        //    see [`Daemon::attached_sessions`] for why that off-by-one is the safe
+        //    direction and why closing it is not worth the lock.) What this ordering
+        //    buys is that the counter never goes NEGATIVE by ordering: the one thing
+        //    that would matter, because an `AtomicUsize` at zero does not clamp and
+        //    does not panic, it WRAPS to `usize::MAX`, which is a session limit that
+        //    refuses every `start` for the rest of the daemon's life.
+        //
+        // The counter therefore means "sessions the daemon is committed to running",
+        // not "sessions with a live handle" — the more protective reading, and the
+        // relevant one, since the threat is a flood of `start`s. A claim that never
+        // becomes a session (a bad `--worker-exe`, a refused row write) gives the
+        // slot back when the guard drops; see [`SessionClaim`].
         let mut starting = self.starting.lock().unwrap_or_else(|p| p.into_inner());
+        // An id already in flight, or already live, is refused below with its OWN
+        // message, and must not be charged a slot it already holds. Those two
+        // messages are load-bearing for existing tests: the race test asserts the
+        // loser's error is a string, and the crash-recovery test asserts a live
+        // session answers "already" — neither may become the limit message.
+        // (`handle_for` is called under this lock by the guard further down too —
+        // the engine's accessor does not take this mutex, so holding it here is the
+        // existing shape, not a nesting hazard.)
+        let re_claim =
+            starting.contains(session_id) || self.manager.handle_for(session_id).is_some();
+        if !re_claim {
+            let live = self
+                .attached_sessions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if live >= SESSION_LIMIT {
+                // Undo the reservation: this `start` was refused, so it holds
+                // nothing. (`fetch_add` then `fetch_sub` rather than a CAS loop
+                // because the lock above already makes this the only writer for
+                // this id, and the counter is allowed to be transiently one high.)
+                self.attached_sessions
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(format!(
+                    "session limit of {SESSION_LIMIT} reached (a session already \
+                     started must close first)"
+                ));
+            }
+        }
         if starting.contains(session_id) {
             return Err(format!("session {session_id} is already starting"));
         }
@@ -727,6 +1020,8 @@ impl Daemon {
         Ok(SessionClaim {
             starting: Arc::clone(&self.starting),
             session_id: session_id.to_string(),
+            committed: false,
+            attached_sessions: Arc::clone(&self.attached_sessions),
         })
     }
 
@@ -783,6 +1078,27 @@ impl Daemon {
 struct SessionClaim {
     starting: Arc<StdMutex<HashSet<String>>>,
     session_id: String,
+    /// Whether `start` has taken responsibility for the slot this claim took.
+    /// `false` at creation: the slot belongs to the CLAIM, so `Drop` gives it back.
+    /// [`SessionClaim::commit`] hands it to the SESSION, after which `close` /
+    /// `on_crash` are the only things that release it — which is the pairing the
+    /// counter's correctness rests on.
+    ///
+    /// The default is deliberately the conservative one: a `start` that returns
+    /// early (a malformed envelope's row write failing, an `attach` that times out)
+    /// releases the slot automatically, because forgetting to is the exact bug this
+    /// guard exists to prevent.
+    committed: bool,
+    attached_sessions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SessionClaim {
+    /// Hand the session slot from this claim to the session (issue #4). Called
+    /// once, by [`start`], when `attach` returns `Ok` — the moment the slot stops
+    /// being "a `start` in flight" and becomes "a running session".
+    fn commit(&mut self) {
+        self.committed = true;
+    }
 }
 
 impl Drop for SessionClaim {
@@ -791,6 +1107,10 @@ impl Drop for SessionClaim {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.session_id);
+        if !self.committed {
+            self.attached_sessions
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -1119,6 +1439,31 @@ pub async fn run(listener: Listener, db: Arc<Db>, factory: Arc<dyn WorkerFactory
                 let handle = tokio::spawn(serve_client(daemon, connection));
                 log_on_join_error(handle);
             }
+            // A refused peer (issue #4) is counted rather than logged per
+            // attempt. A hostile LOCAL process can dial this socket in a loop —
+            // it needs no credentials to try — and one `eprintln!` per attempt
+            // would hand it the operator's stderr as the DoS surface. The first
+            // three rejections print (an operator's own mistake must be visible
+            // immediately); after that every 1024th, so the counter stays
+            // discoverable without being the attack's amplifier.
+            //
+            // Note this is NOT the second-daemon refusal: that one fails at BIND
+            // time (`reclaim_stale_socket`'s probe) and never reaches this loop.
+            // Its probe connection lands here as an ordinary EOF-with-no-frame
+            // peer, which `serve_client` already treats silently.
+            Err(TransportError::PeerIdentity {
+                peer_uid,
+                expected_uid,
+            }) => {
+                let seen =
+                    REJECTED_FOREIGN_PEERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if seen <= 3 || seen.is_multiple_of(1024) {
+                    eprintln!(
+                        "fulcrum serve: rejected a peer (uid {peer_uid}, expected \
+                         {expected_uid}) — {seen} such rejection(s) so far"
+                    );
+                }
+            }
             // An `accept` failure is a per-connection condition (a descriptor
             // limit, a client that vanished between `poll` and `accept`), not a
             // reason to stop supervising the sessions already running. The loop
@@ -1127,6 +1472,15 @@ pub async fn run(listener: Listener, db: Arc<Db>, factory: Arc<dyn WorkerFactory
         }
     }
 }
+
+/// How many peers have been refused for not being this daemon's uid (issue #4).
+///
+/// A process-global counter rather than per-listener state because there is one
+/// accept loop per process and the number is an operator-facing total; it is never
+/// reset, which is what makes the "every 1024th" reporting schedule stay flat
+/// instead of restarting its flood potential after each quiet spell.
+static REJECTED_FOREIGN_PEERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Surface a panicked client task instead of letting tokio swallow it.
 ///
@@ -1200,6 +1554,21 @@ async fn serve_client(daemon: Arc<Daemon>, mut connection: Connection) {
     // connected and hung up" from "a client that talked to us and left".
     let mut seen = 0usize;
 
+    // ── The per-connection hardening state (issue #4) ───────────────────────
+    //
+    // Both are LOCALS in this header region on purpose: a handshake and a frame
+    // rate are properties of ONE socket, so they belong to the one task that reads
+    // it, not to `Daemon` (which would make a hostile client's counters a shared
+    // resource — the DoS shape this file keeps re-learning). Keeping them here,
+    // before the `select!`, is also what lets them move into a reader half as-is.
+    //
+    // Starts WAITING: a connection that sends nothing (the stale-socket probe, a
+    // `curl`-style liveness check, `wait_until_listening`) never reaches the gate
+    // at all — `recv` returns `None` and the loop breaks on the first arm, so the
+    // `seen == 0` no-log rule below still fires and the probe stays invisible.
+    let mut handshake = Handshake::WaitingHello { pre_hello: 0 };
+    let mut rate = FrameRateGate::new(std::time::Instant::now());
+
     loop {
         tokio::select! {
             // The peer's frames first: a client that sends `close` expects the
@@ -1222,6 +1591,90 @@ async fn serve_client(daemon: Arc<Daemon>, mut connection: Connection) {
                         continue;
                     }
                 };
+                // ── The required handshake (issue #4) ────────────────────────
+                //
+                // Decode FIRST (above), so a malformed line keeps its existing
+                // answer-and-continue path and is charged to neither gate: a peer's
+                // JSON typo is not our reason to hang up, and it is not evidence of
+                // an attack either.
+                //
+                // `hello` itself is NOT a grant of authority — it is a pure
+                // greeting, and the rate gate and the session bound still apply
+                // after it. What this gate decides is only whether the peer is
+                // allowed to ask for anything yet.
+                let is_hello =
+                    frame.get("type").and_then(serde_json::Value::as_str) == Some("hello");
+                // The state transition is decided first and APPLIED after, because
+                // the arm that sets `Done` cannot also hold the `&mut` that read
+                // `pre_hello` — and because the two outcomes ("drop it" / "close
+                // it") have to escape this block to reach the `continue`/`break`
+                // below, where only the loop's own control flow can end the arm.
+                let mut drop_pre_hello = false;
+                let mut refuse_pre_hello = false;
+                match &mut handshake {
+                    Handshake::Done => {}
+                    Handshake::WaitingHello { pre_hello } => {
+                        if is_hello {
+                            handshake = Handshake::Done; // `handle_frame` answers it below.
+                        } else {
+                            *pre_hello += 1;
+                            if *pre_hello > MAX_PRE_HELLO_FRAMES {
+                                refuse_pre_hello = true;
+                            } else {
+                                drop_pre_hello = true;
+                            }
+                        }
+                    }
+                }
+                if refuse_pre_hello {
+                    // Told ONCE, then closed. The refusal goes through `send_frame`
+                    // directly rather than `enqueue` because this is the last thing
+                    // this task ever writes on that socket: the queue's drain path
+                    // exists for frames a client has time to receive, and there is
+                    // no such frame now. One refusal, because a peer that sends a
+                    // hundred pre-hello frames does not get a hundred lectures.
+                    //
+                    // `send_frame` stays the ONLY writer here — `transport::frame`
+                    // documents why a second one is a desync, not an optimisation.
+                    eprintln!(
+                        "fulcrum serve: a peer sent more than {MAX_PRE_HELLO_FRAMES} \
+                         frame(s) before `hello`; closing the connection"
+                    );
+                    let _ = connection
+                        .send_frame(&serde_json::json!({
+                            "type": "error",
+                            "message": "this daemon requires a `hello` frame before \
+                                        any other frame",
+                        }))
+                        .await;
+                    break;
+                }
+                if drop_pre_hello {
+                    // Under the limit: counted and DROPPED, no reply. Serving it
+                    // would mean a peer that never identified itself gets a child
+                    // process — the exact behaviour this gate was written to remove.
+                    continue;
+                }
+                // ── The inbound frame rate (issue #4) ────────────────────────
+                //
+                // NON-greeting frames only, for the reasons in [`FRAME_RATE`]'s doc
+                // (which also names the bound that already covers a `hello` flood).
+                if !is_hello && !rate.accept(std::time::Instant::now()) {
+                    eprintln!(
+                        "fulcrum serve: a peer exceeded the {FRAME_RATE}-frame/s \
+                         inbound limit; closing the connection"
+                    );
+                    let _ = connection
+                        .send_frame(&serde_json::json!({
+                            "type": "error",
+                            "message": format!(
+                                "frame rate limit exceeded (at most {FRAME_RATE} \
+                                 non-greeting frames per second per connection)"
+                            ),
+                        }))
+                        .await;
+                    break;
+                }
                 // INLINE, on purpose and at a cost: a `start` here awaits
                 // `attach` for up to 5 s and the `select!` is not re-polled
                 // meanwhile, so this connection's own relay arm is stalled for
@@ -1472,7 +1925,7 @@ async fn start(
     //     child process — the exact leak this guard's own comment claims to
     //     prevent. Holding the id in `Daemon::starting` across the await closes
     //     the window, and the guard below releases it on every exit path.
-    let _claim = match daemon.claim_session(&session_id) {
+    let mut claim = match daemon.claim_session(&session_id) {
         Ok(claim) => claim,
         Err(reason) => return start_result(frame, false, None, Some(reason)),
     };
@@ -1492,6 +1945,11 @@ async fn start(
 
     match daemon.manager.attach(&session_id, &env).await {
         Ok(()) => {
+            // Hand the [`SESSION_LIMIT`] slot from the CLAIM to the SESSION
+            // (issue #4): from here, `close` (on a `Some` detach) and `on_crash`
+            // (for a main session) are the only things that release it. See
+            // [`Daemon::attached_sessions`] for why those and no others.
+            claim.commit();
             watching.insert(session_id.clone());
             let pid = daemon
                 .manager
@@ -1608,7 +2066,8 @@ fn prompt(daemon: &Arc<Daemon>, frame: &serde_json::Value) -> serde_json::Value 
 /// Nothing here is optional, because the daemon is long-lived and a session id
 /// that leaves a trace in a set nobody removes is a trace that outlives every
 /// session. What `close` therefore releases, one line each: the connection's
-/// `watching` set, and the registry entry (via `detach`). `starting` needs
+/// `watching` set, the registry entry (via `detach`), and the [`SESSION_LIMIT`]
+/// slot (only when that `detach` returned `Some` — see below). `starting` needs
 /// nothing — a `start` claim is an RAII guard released on every exit path — and
 /// `subagents` is keyed by minted CHILD ids and is pruned on the next `start`.
 ///
@@ -1638,6 +2097,18 @@ fn close(
     };
     watching.remove(session_id);
     let detached = daemon.manager.detach(session_id);
+    // Release the session slot (issue #4) — only on a `Some`, because `None` means
+    // nothing was running under that id and therefore nothing was counted. An
+    // idempotent `close` (the shape a client sends on shutdown) must not be able to
+    // drive the counter down, or a client that closes twice gets a free session.
+    //
+    // This is the `close` half of the invariant this function's doc states: a
+    // per-session resource is one of the two places that has to release it.
+    if detached.is_some() {
+        daemon
+            .attached_sessions
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
     serde_json::json!({
         "type": "closed",
         "sessionId": session_id,
@@ -2307,6 +2778,81 @@ mod tests {
         assert!(
             daemon.starting.lock().expect("lock").is_empty(),
             "a failed start must not leave the id claimed"
+        );
+    }
+
+    /// A `start` that FAILS must give its [`SESSION_LIMIT`] reservation back.
+    ///
+    /// The bound is now taken at claim time (issue #4), which is what makes the
+    /// increment precede any possible decrement — but it moves the reservation
+    /// earlier than the thing that can fail. So a `start` whose `attach` never
+    /// happened has to release the slot, or `SESSION_LIMIT` failed starts (a wrong
+    /// `--worker-exe`, which a user can typo once and retry thirty times) would
+    /// consume every slot and leave the daemon unable to start ANY session, with a
+    /// message about the session limit that points nowhere near the typo.
+    ///
+    /// This is the failure mode the RAII release in [`SessionClaim::drop`] exists
+    /// for, so it is pinned rather than trusted: `SESSION_LIMIT + 4` doomed starts,
+    /// and not one of them may be refused for want of a slot.
+    #[tokio::test]
+    async fn a_failed_start_gives_its_session_slot_back() {
+        let Harness { daemon, _dir } = test_daemon();
+        for attempt in 0..(SESSION_LIMIT + 4) {
+            let env = test_env(&format!("doomed-{attempt}"));
+            let mut frame = serde_json::to_value(&env).expect("encodable");
+            frame
+                .as_object_mut()
+                .expect("an object")
+                .insert("type".to_string(), serde_json::json!("start"));
+            let reply = start(&daemon, &mut HashSet::new(), &frame).await;
+            assert_eq!(reply["ok"], false, "the bogus exe must still fail: {reply}");
+            let error = reply["error"].as_str().expect("a reason");
+            assert!(
+                !error.contains("session limit"),
+                "attempt {} was refused by the session LIMIT, so a failed `start` \
+                 kept its reservation — {} doomed starts would leave the daemon \
+                 unable to start anything, blaming the session bound for a bad \
+                 --worker-exe: {error}",
+                attempt + 1,
+                SESSION_LIMIT + 4,
+            );
+        }
+        assert_eq!(
+            daemon
+                .attached_sessions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "every failed start must have released its slot — a non-zero counter \
+             here is a leak, and the leak `Daemon::dead` was deleted for having"
+        );
+    }
+
+    /// The bound must not be exhausted by a `close` that never had a session.
+    ///
+    /// `close` reports `ok: false` for an id nothing is running (the idempotent
+    /// shutdown shape a client sends), and that `false` is exactly what guards the
+    /// decrement — an unconditional one would let any client drive the counter
+    /// negative by calling `close` on ids it never started, and a wrapped
+    /// `AtomicUsize` is a session limit that fires forever.
+    #[test]
+    fn a_close_with_nothing_running_releases_nothing() {
+        let Harness { daemon, _dir } = test_daemon();
+        for attempt in 0..(SESSION_LIMIT + 4) {
+            let reply = close(
+                &daemon,
+                &mut HashSet::new(),
+                &serde_json::json!({"type": "close", "sessionId": format!("never-{attempt}")}),
+            );
+            assert_eq!(reply["ok"], false, "nothing was running: {reply}");
+        }
+        assert_eq!(
+            daemon
+                .attached_sessions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an idempotent `close` must not move the counter — a decrement on a \
+             `None` detach wraps an `AtomicUsize` at zero to `usize::MAX`, and that \
+             is a session limit that refuses every start for the daemon's whole life"
         );
     }
 

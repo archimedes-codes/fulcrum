@@ -38,6 +38,47 @@
 //! only real mitigation available without a `windows-sys` dependency (which this
 //! member deliberately does not carry) is the one T13 owns: authenticate at the
 //! protocol layer. See `README`'s "What the local endpoint grants".
+//!
+//! # What this platform can and cannot prove about a peer (issue #4)
+//!
+//! The unix leg resolves a peer credential at `accept` (`SO_PEERCRED` on Linux,
+//! `getpeereid` on the BSDs) and refuses a peer whose uid is not the daemon's.
+//! **This leg cannot, and this file says so rather than pretending otherwise.**
+//!
+//! | | Claim |
+//! |---|---|
+//! | **Can prove** | the caller is LOCAL. `reject_remote_clients(true)` (see `create_pipe` below) means a client reaching this pipe over the network is refused by the OS, and the one-instance invariant means it is *this* daemon answering. That is the same class of guarantee unix gets from the socket family itself. |
+//! | **Cannot prove** | WHO the caller is. The honest statement: **the named pipe cannot prove the caller's identity beyond "a local process that passed the pipe's DACL"; the DACL is the creating token's default (the NULL `lpSecurityAttributes` above); same-session peers are indistinguishable; T13's protocol-layer auth is the only real mitigation on Windows.** |
+//!
+//! The one Win32 call that would close the gap is `GetNamedPipeClientProcessId`,
+//! and it is deliberately NOT called here. It is reachable only through the
+//! `Kernel32` bindings of the `windows` / `windows-sys` crates, neither of which
+//! this member declares — `Cargo.toml`'s tokio comment says the crate "is
+//! deliberately ABSENT and must not be added", and this file's header repeats it.
+//! Hand-rolled `#[cfg(windows)]` FFI (an `unsafe extern "system"` declaration and
+//! a raw `HANDLE` cast) was considered and rejected, for three reasons:
+//!
+//! 1. **It fights the house pattern for its own sake.** This member's precedent
+//!    for a Win32 fact is a raw constant — `is_pipe_busy`'s `231`,
+//!    `childproc.rs`'s `CREATE_NO_WINDOW` — precisely to avoid a dependency. FFI
+//!    is not that precedent; it is a different, heavier thing.
+//! 2. **It would be an untestable unsafe surface.** `extern "system"`,
+//!    `GetLastError` discipline and handle-lifetime correctness are exactly the
+//!    obligations that show up at LINK time and at RUN time — and, per this file's
+//!    "PROOF LEVEL" note above, this file has never been executed anywhere. An
+//!    unsafe FFI boundary nobody can run is a worse trade than a documented gap
+//!    anyone can read.
+//! 3. **The residual it would close is already small, and the number it returns
+//!    is weak evidence anyway.** `GetNamedPipeClientProcessId` yields the client's
+//!    PID — not its integrity level, not its token, not a secret — and any process
+//!    running as you can forge which PID it appears as by timing. Combined with
+//!    `reject_remote_clients(true)`, the only callers left are local processes
+//!    holding your logon token: the same-user case, which is precisely the case no
+//!    peer-credential check on any platform closes (see `unix.rs`'s residual note,
+//!    which is the same sentence about a different OS).
+//!
+//! So the platform difference is documented, not papered over: unix proves the
+//! connecting uid; Windows proves the connection is local and nothing more.
 
 use std::ffi::OsStr;
 use std::sync::Mutex as StdMutex;
@@ -178,6 +219,24 @@ impl Listener {
     /// exactly as it was rather than with nothing to offer.
     ///
     /// The lock is never held across the `connect()` await.
+    ///
+    /// # No peer credential is checked here, and that is a documented platform
+    /// limit, not an oversight (issue #4)
+    ///
+    /// The unix leg's `Listener::accept` resolves the peer's uid from the accepted
+    /// fd (`SO_PEERCRED` / `getpeereid`) and returns
+    /// [`TransportError::PeerIdentity`] for a peer under another account, before a
+    /// `Connection` is ever built. The equivalent here would be
+    /// `GetNamedPipeClientProcessId`, which needs a crate this member is forbidden
+    /// to declare — and which returns a forgeable PID rather than an identity
+    /// anyone could act on. The full reasoning, and the exact statement of what
+    /// this platform can and cannot prove, is in this module's header ("What this
+    /// platform can and cannot prove about a peer").
+    ///
+    /// Consequence for `serve::run`: the `PeerIdentity` arm of its accept-error
+    /// match is unreachable on Windows, and deliberately so — it is not dead code
+    /// to be removed, it is the unix leg's path. Nothing on this platform reaches
+    /// that arm, because nothing on this platform can refuse a peer for who it is.
     pub async fn accept(&self) -> Result<Connection, TransportError> {
         let next = create_pipe(&self.name, false)?;
         let server = {

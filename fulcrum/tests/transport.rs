@@ -1136,4 +1136,249 @@ mod unix_specific {
             .expect_err("nothing is listening, so this cannot succeed");
         assert!(matches!(err, TransportError::Io(_)), "got: {err}");
     }
+
+    /// The peer-credential check does not break the client it is meant to allow.
+    ///
+    /// The real socket, through `Listener::accept`'s guard, with the uid the
+    /// kernel actually reported: bind, dial, accept. This is the positive half of
+    /// the check — the half testable unprivileged, because the test process IS the
+    /// daemon's uid by definition. Without it, a guard with an inverted comparison
+    /// (`!=` where it should be `==`) would pass every other test in this file and
+    /// then refuse every client in production.
+    ///
+    /// # What this cannot prove, stated rather than implied
+    ///
+    /// It cannot prove the REJECT path: a peer with a different uid cannot be
+    /// manufactured without root. That half is pinned two ways — the comparison
+    /// itself by `unix.rs`'s own `#[cfg(test)]` mod (which can name the private
+    /// `verify_peer_uid`), and the end-to-end refusal by
+    /// [`foreign_uid_peer_is_rejected_under_root`], `#[ignore]`d and root-only.
+    #[tokio::test]
+    async fn same_uid_peer_is_accepted() {
+        let (_keepalive, endpoint) = super::test_endpoint();
+        let listener = bind(endpoint.clone()).expect("bind the test socket");
+
+        let server = tokio::spawn(async move {
+            // `accept_one` fails the test if `accept` returns `Err`, and that IS
+            // the assertion: the guard let the daemon's own uid through.
+            let mut conn = accept_one(&listener).await;
+            let frame = recv_one(&mut conn).await;
+            conn.send_frame(&json!({"echoed": frame}))
+                .await
+                .expect("send: the peer is still reading");
+            conn
+        });
+
+        let mut client = dial(endpoint).await;
+        client
+            .send_frame(&json!({"probe": "same uid"}))
+            .await
+            .expect("the owner can dial a socket whose accept path checks credentials");
+        let echoed = recv_one(&mut client).await;
+        assert_eq!(
+            echoed["echoed"]["probe"], "same uid",
+            "a same-uid peer must be served, not refused"
+        );
+        drop(server.await.expect("the echo task ran"));
+    }
+
+    /// A peer under ANOTHER uid is refused at `accept` — end to end, over a real
+    /// socket, with a real foreign uid the kernel reported.
+    ///
+    /// `#[ignore]`d, because it needs root: the only way to get a process whose
+    /// REAL uid differs from the daemon's is to start as root and drop it. CI's
+    /// runners are all unprivileged, so on every automated run this is SKIPPED and
+    /// the automated proof of the reject path is the unit test of the comparison in
+    /// `unix.rs`. An operator who wants the end-to-end half runs
+    /// `sudo cargo test -p fulcrum --test transport -- --ignored`.
+    ///
+    /// # Why the socket's mode is WIDENED first, and why that is not cheating
+    ///
+    /// `bind_private` puts the socket at 0600 under a 0700 directory — layer 1 of
+    /// this daemon's access control. A foreign-uid peer cannot reach the inode past
+    /// layer 1 at all: its `connect` fails `EACCES`. So a test that asserted "the
+    /// foreign peer got refused" against the real mode would pass with the
+    /// credential check DELETED, because it would be measuring the filesystem.
+    ///
+    /// This test therefore removes layer 1 deliberately (socket 0777, directory
+    /// 0755), leaving exactly one thing between that peer and a `Connection`: the
+    /// credential check. Delete the guard and this goes red. Layer 1 has its own
+    /// pin — [`a_bound_socket_is_owner_only`] — and in a real deployment it refuses
+    /// this peer long before the credential check is consulted.
+    ///
+    /// # Why the CHILD dials and the PARENT asserts
+    ///
+    /// The claim is about what `accept` RETURNS — `Err(PeerIdentity)`, and no
+    /// `Connection`. The child cannot observe the refusal usefully: `connect(2)` on
+    /// an `AF_UNIX` stream socket succeeds the moment the listener queues it,
+    /// whether or not the daemon is about to hang up.
+    ///
+    /// The child is this same test binary, re-executed with `--ignored --exact`
+    /// naming [`child_dials_as_a_foreign_uid`] plus two env vars it reads — which
+    /// keeps the proof inside one binary instead of reaching for `setpriv`,
+    /// `sudo -u nobody`, `socat` or a shell that can dial a unix socket, none of
+    /// which a CI image is obliged to provide.
+    ///
+    /// # What it does NOT cover
+    ///
+    /// Linux only (`#[cfg(target_os = "linux")]`), because `SO_PEERCRED` is the
+    /// Linux arm of `peer_uid`. The `getpeereid` arm that macOS and the BSDs
+    /// compile is the same two-line shape and is type-checked by CI's macOS leg; it
+    /// is not executed here and this test does not claim otherwise.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root: only root can drop to a different uid and still dial"]
+    async fn foreign_uid_peer_is_rejected_under_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if unsafe { libc::geteuid() } != 0 {
+            panic!(
+                "this test is `#[ignore]`d precisely because it needs root, and it is \
+                 running as uid {} — run it via `sudo cargo test -p fulcrum --test \
+                 transport -- --ignored`, or do not select it at all",
+                unsafe { libc::geteuid() }
+            );
+        }
+        // A uid that exists here and is not ours. Read from `/etc/passwd` rather
+        // than hardcoded to `65534`: `nobody` is absent on some images, and a child
+        // whose `setresuid` then failed would dial as ROOT and make this pass on a
+        // same-uid accept — the wrong-reason green this file's header refuses.
+        let target = first_foreign_uid().expect(
+            "no non-root uid in /etc/passwd to drop the child to — this test cannot \
+             build a foreign peer here",
+        );
+
+        let (keepalive, endpoint) = super::test_endpoint();
+        let listener = bind(endpoint.clone()).expect("bind the test socket");
+        let path = match &endpoint {
+            Endpoint::Socket(path) => path.clone(),
+            Endpoint::Pipe(name) => panic!("a pipe endpoint on unix: {name}"),
+        };
+        // Strip layer 1 — see the doc above. BOTH are needed: the directory is 0700
+        // (tempfile's own mode) and it must be traversable to reach the inode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))
+            .expect("widen the socket so the filesystem is not what refuses");
+        std::fs::set_permissions(keepalive.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("open the socket's directory for traversal");
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                concat!("unix_specific::", "child_dials_as_a_foreign_uid"),
+            ])
+            .env("FULCRUM_PEER_DIAL_SOCKET", &path)
+            .env("FULCRUM_PEER_DIAL_UID", target.to_string())
+            // The child's libtest summary would interleave into the parent's; its
+            // FAILURE, which is the thing worth seeing, goes to stderr.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("re-exec the test binary as the dialing child");
+
+        // Bounded, per this file's deadline rule: a child that never dials (its
+        // `setresuid` failed, the mode change did not take) must read as a named
+        // timeout, not as the hang that rule exists to prevent.
+        let accepted = tokio::time::timeout(FRAME_BUDGET, listener.accept())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "`accept` never returned within {FRAME_BUDGET:?}: the child never \
+                     dialed. Its stderr says why — a failed `setresuid` or an \
+                     unreadable socket path both land here, and either one means this \
+                     test proved nothing about credentials"
+                )
+            });
+        let accepted = accepted.expect_err(
+            "a peer whose uid is not the daemon's must be refused at `accept`, and \
+             `accept` must NOT hand back a `Connection` for it — no `Connection` means \
+             no reader task and no client task spawned for a peer we are refusing",
+        );
+
+        // Reap the child BEFORE asserting: a child outliving the suite is exactly
+        // what the stray-process census fails the run for.
+        let child_ok = child.wait().expect("reap the dialing child").success();
+        assert!(
+            child_ok,
+            "the child reported it could NOT dial — the mode widening above did not \
+             take effect, so nothing ever reached the credential check"
+        );
+
+        match accepted {
+            TransportError::PeerIdentity {
+                peer_uid,
+                expected_uid,
+            } => {
+                assert_eq!(
+                    peer_uid, target,
+                    "the refusal must name the uid the kernel reported"
+                );
+                assert_eq!(expected_uid, 0, "running as root, the daemon demands 0");
+            }
+            other => panic!(
+                "a foreign peer must be refused as `PeerIdentity`, not as {other:?} — \
+                 `serve::run` matches on the VARIANT to log it on the counted \
+                 schedule instead of once per attempt"
+            ),
+        }
+    }
+
+    /// The child half of [`foreign_uid_peer_is_rejected_under_root`]: drop to the
+    /// uid the parent named, dial, hang up.
+    ///
+    /// `#[ignore]`d so a normal pass never runs it — alone it tests nothing, and
+    /// panicking for want of its env vars is the honest failure rather than a
+    /// silent skip. The parent reaches it through `--ignored --exact`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child entry point: only the peer-credential test spawns it"]
+    fn child_dials_as_a_foreign_uid() {
+        let path = std::env::var("FULCRUM_PEER_DIAL_SOCKET")
+            .expect("the parent must name the socket to dial");
+        let target: u32 = std::env::var("FULCRUM_PEER_DIAL_UID")
+            .expect("the parent must name the uid to drop to")
+            .parse()
+            .expect("the target uid is a number");
+
+        // Drop real, effective AND saved-set uid. `SO_PEERCRED` reports the REAL
+        // uid, and a process that keeps a root saved set can climb back — so
+        // `setuid` alone is not enough to make the child genuinely foreign.
+        let dropped = target;
+        if unsafe { libc::setresuid(dropped, dropped, dropped) } != 0 {
+            panic!(
+                "setresuid({target}) failed: {}; refusing to dial as root and call \
+                 that a foreign peer",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_eq!(
+            unsafe { libc::getuid() },
+            target,
+            "the child still reports uid {}, not the {target} it dropped to",
+            unsafe { libc::getuid() }
+        );
+
+        // Blocking `std` connect, deliberately: this child has no runtime, and a
+        // unix `connect` either succeeds or fails immediately.
+        match std::os::unix::net::UnixStream::connect(&path) {
+            // Dropping the stream closes it. The parent was already woken when the
+            // connection was queued, and the parent asserts the refusal; success
+            // here means only "I got as far as dialing".
+            Ok(_peer) => {}
+            Err(e) => panic!("the foreign peer could not dial {path}: {e}"),
+        }
+    }
+
+    /// The first uid in `/etc/passwd` that is not this process's, if any.
+    #[cfg(target_os = "linux")]
+    fn first_foreign_uid() -> Option<u32> {
+        let mine = unsafe { libc::geteuid() };
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        passwd.lines().find_map(|line| {
+            let mut fields = line.split(':');
+            let (_name, _password, uid) = (fields.next()?, fields.next()?, fields.next()?);
+            let uid: u32 = uid.trim().parse().ok()?;
+            (uid != mine).then_some(uid)
+        })
+    }
 }
