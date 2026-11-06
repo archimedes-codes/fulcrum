@@ -1652,9 +1652,9 @@ async fn serve_client(daemon: Arc<Daemon>, connection: Connection) {
     // READER's sender going away.
     let (tx, queued) = tokio::sync::mpsc::channel::<serde_json::Value>(CLIENT_QUEUE_CAPACITY);
 
-    // Issue #4's protocol-gate refusal, across the task boundary. TWO one-shots, because
-    // the reader's guarantee is "told ONCE, then closed" while closing is the reader's
-    // job and writing is the writer's:
+    // Issue #4's protocol-gate refusal, across the task boundary. TWO one-shots,
+    // because the reader's guarantee is "told ONCE, then closed" while closing is
+    // the reader's job and writing is the writer's:
     //
     //   reader: refuse_tx.send(frame); ack_rx.await; break
     //   writer: refuse_rx fires → send_frame(frame) → ack_tx.send(()) → exit
