@@ -151,6 +151,45 @@ const ATTACH_READY_CEILING: Duration = Duration::from_secs(5);
 /// silently weaken, so the drift cost is a red here rather than a wrong answer.
 const LONG_STREAM_GAP_MS: u64 = 100;
 
+/// Mirror of the fixture's `__long_stream__` chunk count (`LONG_STREAM_CHUNKS`).
+///
+/// Same mirror-not-import caveat as [`LONG_STREAM_GAP_MS`]. Drift is loud in both
+/// directions: if the fixture grows the stream, this mirror UNDER-states the window
+/// and the asserts below get stricter than they need to be (cost: headroom); if the
+/// fixture shrinks it, this mirror OVER-states the window, the budgets can outrun the
+/// real end of stream, and the slow-start test reports a TEST-INSTRUMENT failure
+/// naming this exact mismatch — not a relay-stall claim.
+const LONG_STREAM_CHUNKS: u64 = 30;
+
+/// How long the fixture's `__long_stream__` scenario PRODUCES: 30 × 100 ms =
+/// **3.0 s of chunks**, and the LAST chunk lands at ~2.9 s.
+///
+/// This is the second ceiling the slow-start test's park span must fit under, and
+/// it is a FLOOR, not an estimate: the fixture sleeps for real, so production can
+/// be LATER than this on a loaded runner but never earlier. It exists because the
+/// probe's `try_recv` reports `None` for BOTH "no chunk arrived while the reader
+/// was parked" and "the stream is over" — and the second one is not a relay stall,
+/// it is the fixture running out of chunks. The test tells them apart (the
+/// settle frame, see `a_slow_start_does_not_stall_that_clients_own_event_relay`),
+/// but telling them apart only turns a false red into an honest one; fitting under
+/// this window is what keeps either verdict from being needed. Hence the
+/// [`PARK_PRELUDE_ALLOWANCE`]-qualified compile-time assert below.
+const LONG_STREAM_WINDOW: Duration = Duration::from_millis(LONG_STREAM_CHUNKS * LONG_STREAM_GAP_MS);
+
+/// Everything the slow-start test does BEFORE its three budgets start, charged
+/// against [`LONG_STREAM_WINDOW`]: the first-chunk barrier (chunk 0 is emitted the
+/// moment the prompt lands, so this is one socket hop), arming the gate (one file
+/// write), and writing session B's `start`.
+///
+/// Deliberately NOT one of the measured budgets — it is not a wait the test
+/// performs, it is the elapsed time the budgets do not own. 200 ms against a real
+/// cost of a few socket hops plus one small file write is the same kind of
+/// panic-timer generosity as [`READY_GATE_STAMP_BUDGET`] (the worker spawn it races
+/// is charged to that timer, not to this one). It is in the assert because leaving
+/// it out would let the three budgets consume the WHOLE stream window and leave
+/// nothing for the steps that come first.
+const PARK_PRELUDE_ALLOWANCE: Duration = Duration::from_millis(200);
+
 /// How long no chunk has to arrive for to count as "the stream went quiet" — three
 /// cadences, so one late chunk on a loaded runner is not read as the end of the
 /// stream.
@@ -165,7 +204,14 @@ const CHUNK_SILENCE: Duration = Duration::from_millis(3 * LONG_STREAM_GAP_MS);
 /// appears within it then the gate is not working, and the test panics rather than
 /// falling through to a verdict: a missing stamp is a broken instrument, not a red
 /// on the code under test.
-const READY_GATE_STAMP_BUDGET: Duration = Duration::from_millis(1500);
+///
+/// It was 1500 ms, and that is what put this test's worst case PAST the fixture's
+/// 3.0 s of production (see [`LONG_STREAM_WINDOW`]) — a stream that had already run
+/// dry looked exactly like a stalled relay. 500 ms still covers what this timer
+/// actually waits for, which is one `fork`+`exec` of a small binary plus one
+/// `fs::write`; a runner slow enough to exceed that is a runner this test cannot
+/// instrument, and the panic says so.
+const READY_GATE_STAMP_BUDGET: Duration = Duration::from_millis(500);
 
 /// The FORWARD bound on a session-A chunk arriving while session B's reader is
 /// provably parked: ~100 ms cadence, so this is ~15× the real latency.
@@ -174,23 +220,33 @@ const READY_GATE_STAMP_BUDGET: Duration = Duration::from_millis(1500);
 /// once the absorb step has drained the pre-park residue, the single-task design has
 /// no writer at all during the held park, so its silence there does not depend on
 /// this number.
+///
+/// This is the one budget in the block that was NOT cut to fit [`LONG_STREAM_WINDOW`],
+/// and deliberately: shrinking it buys stream headroom by weakening the margin the
+/// FIXED design is measured against, i.e. it converts a rare false red on the buggy
+/// design into a false red on the good one. The two timers that are pure
+/// broken-instrument allowances — [`READY_GATE_STAMP_BUDGET`] and
+/// [`ABSORB_BUDGET`] — are the ones that gave.
 const RELAY_ARRIVAL_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Upper bound on the absorb step (drain the pre-park residue until quiet).
-/// ≈ 7 cadences: the residue is a FINITE set of bytes already written to the socket
+/// ≈ 5 cadences: the residue is a FINITE set of bytes already written to the socket
 /// before the park, so it drains in milliseconds; the bound is a ceiling for a
-/// loaded CI runner, not a margin the old design can win.
-const ABSORB_BUDGET: Duration = Duration::from_millis(700);
+/// loaded CI runner, not a margin the old design can win. It cannot go below
+/// [`CHUNK_SILENCE`] (300 ms) — the step cannot declare quiet without spending one
+/// full silence window — which is where the floor is, and why 500 ms is the last
+/// value that still leaves the absorb meaningful.
+const ABSORB_BUDGET: Duration = Duration::from_millis(500);
 
 /// The proof's hard invariant, checked at COMPILE TIME (the same class of guard as
 /// `serve.rs`'s `CLIENT_QUEUE_CAPACITY > 0` / `< FAN_OUT_CAPACITY` asserts):
 ///
 /// ```text
 /// READY_GATE_STAMP_BUDGET + ABSORB_BUDGET + RELAY_ARRIVAL_BUDGET < ATTACH_READY_CEILING
-///      1500 ms            +    700 ms      +      1500 ms         <      5 000 ms
+///       500 ms            +    500 ms      +      1500 ms         <      5 000 ms
 /// ```
 ///
-/// 3.7 s against a 5 s ceiling, ~1.3 s of headroom. WHY IT MUST HOLD: all three
+/// 2.5 s against a 5 s ceiling, ~2.5 s of headroom. WHY IT MUST HOLD: all three
 /// steps run while the reader is parked, and if their sum reached the ceiling then
 /// `wait_ready`'s own timeout would fire FIRST — the reader unparks, the buffered
 /// frames are drained onto the socket, and the probe measures the daemon's backlog
@@ -213,6 +269,44 @@ const _: () = assert!(
      timeout unpark the reader mid-verdict — the single-task design would then drain \
      its buffered frames onto the socket and the slow-start test would pass on code \
      that has the bug"
+);
+
+/// The SECOND invariant of the same proof, for the ceiling nobody asserted:
+///
+/// ```text
+/// PARK_PRELUDE_ALLOWANCE + READY_GATE_STAMP_BUDGET + ABSORB_BUDGET + RELAY_ARRIVAL_BUDGET
+///        200 ms          +        500 ms           +    500 ms      +      1500 ms
+///                                                              <  LONG_STREAM_WINDOW = 3 000 ms
+/// ```
+///
+/// 2.7 s against the fixture's own production window (30 chunks land at t = 0 …
+/// ~2.9 s after the prompt, so 3.0 s is the conservative form of the same fact, and
+/// the 2.7 s sum still ends ~200 ms — two cadences — before the LAST chunk).
+///
+/// `ATTACH_READY_CEILING` is not the only clock that can end this test's park: the
+/// stream it probes ENDS, 30 chunks × 100 ms after the prompt, and the last chunk
+/// lands at ~2.9 s. A probe that starts after that can only see silence, and
+/// `try_recv` cannot tell "the relay stalled" from "there was nothing left to
+/// relay" — the earlier budget sum (1500 + 700 + 1500 = 3.7 s, plus an unbudgeted
+/// prelude) sat PAST that point, so a loaded runner could turn this test red for the
+/// wrong reason: the exact symptom, indistinguishable from, the regression it exists
+/// to catch. The test now also distinguishes the two cases at RUNTIME (the settle
+/// frame), but a discriminator that fires is a test that has already stopped proving
+/// anything — so the numbers fit first and the message is the backstop.
+///
+/// Same `as_millis()` spelling as the assert above, for the same reason.
+const _: () = assert!(
+    PARK_PRELUDE_ALLOWANCE.as_millis()
+        + READY_GATE_STAMP_BUDGET.as_millis()
+        + ABSORB_BUDGET.as_millis()
+        + RELAY_ARRIVAL_BUDGET.as_millis()
+        < LONG_STREAM_WINDOW.as_millis(),
+    "PARK_PRELUDE_ALLOWANCE + READY_GATE_STAMP_BUDGET + ABSORB_BUDGET + \
+     RELAY_ARRIVAL_BUDGET must stay below LONG_STREAM_WINDOW: the fixture's \
+     `__long_stream__` scenario stops producing after LONG_STREAM_CHUNKS × \
+     LONG_STREAM_GAP (src/fixtures/worker.rs), and a probe that runs after the \
+     stream has drained sees silence that is NOT a stalled relay — a red that \
+     reads like the regression this test exists to catch"
 );
 
 /// The `fake_worker_core` path, materialised if this cargo invocation did not
@@ -775,6 +869,15 @@ struct Client {
     /// has consumed it, and those assertions are exactly the ones that must
     /// survive a matcher that ran earlier in the same test.
     delivered: Vec<serde_json::Value>,
+    /// Set the first time a read returns EOF — the daemon closed this connection.
+    ///
+    /// `try_recv` cannot otherwise distinguish its two `None`s: "nothing arrived
+    /// within the budget" and "the stream is over" both surface as `None`, and a
+    /// test that reads the second as the first reports a stall that never happened
+    /// (see the slow-start relay test, whose whole verdict is a silence claim).
+    /// `recv_until*` already treats EOF as a panic, so this flag is only ever read
+    /// by the tests that deliberately probe for silence.
+    stream_ended: bool,
 }
 
 impl Client {
@@ -791,6 +894,7 @@ impl Client {
             writer,
             pending: std::collections::VecDeque::new(),
             delivered: Vec::new(),
+            stream_ended: false,
         }
     }
 
@@ -895,6 +999,11 @@ impl Client {
     ///
     /// Takes from the FRONT of `pending`, matching socket order — `pop()` takes
     /// the back, which would report the newest frame as the oldest.
+    ///
+    /// `None` means EITHER the budget expired OR the stream ended — the two are
+    /// different claims, and a test that has to tell a stall from a finished stream
+    /// reads [`Client::stream_ended`] after it, because this signature cannot carry
+    /// both answers.
     async fn try_recv(&mut self, budget: Duration) -> Option<serde_json::Value> {
         if let Some(frame) = self.pending.pop_front() {
             return Some(frame);
@@ -905,7 +1014,10 @@ impl Client {
                 Some(frame)
             }
             Ok(Some(Err(e))) => panic!("a malformed frame arrived: {e}"),
-            Ok(None) => None,
+            Ok(None) => {
+                self.stream_ended = true;
+                None
+            }
             Err(_) => None,
         }
     }
@@ -930,7 +1042,13 @@ impl Client {
                     out.push(frame);
                 }
                 Ok(Some(Err(e))) => panic!("a malformed frame arrived: {e}"),
-                Ok(None) => return out,
+                // EOF ends the drain AND is recorded — see `stream_ended`: a test
+                // that drains to silence must be able to tell "nothing came" from
+                // "the socket is gone".
+                Ok(None) => {
+                    self.stream_ended = true;
+                    return out;
+                }
                 Err(_) => return out,
             }
         }
@@ -948,8 +1066,9 @@ impl Client {
 /// `"session-update"`. Comparing the `RpcEvent` path to a string silently never
 /// matches, and the symptom is a 30 s timeout that looks like a stalled stream.
 ///
-/// Naming it once is the fix; the two call sites below are the two spellings the
-/// mistake came in.
+/// Naming it once is the fix; the call sites are the two spellings the mistake came
+/// in (the settle waits) plus the slow-start relay test's stream-exhaustion
+/// discriminator, which needs the same path to recognise the fixture's terminal frame.
 fn rpc_event_is(frame: &serde_json::Value, name: &str) -> bool {
     frame["type"] == "event"
         && frame["frame"]["type"] == "event"
@@ -1544,23 +1663,35 @@ async fn two_sessions_on_two_sockets_do_not_see_each_others_events() {
 ///   which is precisely what the reader/writer split delivers.
 ///
 /// The budgets that bound this span are in the [`ATTACH_READY_CEILING`] block, and
-/// the compile-time assert there is what keeps the span inside `attach`'s own
-/// timeout — a hold that outlived it would let the timeout unpark the reader, the
-/// backlog would drain, and the probe would measure a flush instead of a relay: a
-/// false green.
+/// the two compile-time asserts there are what keep the span inside BOTH clocks that
+/// can end the park: `attach`'s own 5 s timeout — a hold that outlived it would let
+/// the timeout unpark the reader, the backlog would drain, and the probe would
+/// measure a flush instead of a relay, a false green — and the fixture's own
+/// [`LONG_STREAM_WINDOW`], the 3.0 s after which this session has NO MORE CHUNKS to
+/// relay, so a probe that runs later sees silence that is not a stall and the verdict
+/// is a false red.
 ///
-/// # The two steps of the verdict, and why both are needed
+/// # The three steps of the verdict, and why all three are needed
 ///
 /// 1. **Absorb.** The old design may have written a small RESIDUE before it parked —
 ///    the chunks its `select!` relayed between the marker being created and the
 ///    reader actually parking. The pre-`start` barrier below (consuming the first
 ///    chunk) bounds that to a couple of frames, so the absorb drains it to quiet in
-///    milliseconds. Chunks STILL arriving at the end of [`ABSORB_BUDGET`] (~7
+///    milliseconds. Chunks STILL arriving at the end of [`ABSORB_BUDGET`] (~5
 ///    cadences of continuous production) cannot be residue: that is already the
 ///    good outcome.
 /// 2. **Probe.** Once quiet, the socket is structurally silent for the old design for
 ///    as long as the marker holds, so ONE chunk arriving within
 ///    [`RELAY_ARRIVAL_BUDGET`] is conclusive.
+/// 3. **Discriminate the negative.** Silence has three causes and only one of them is
+///    the bug: the relay stalled, the STREAM ended, or the connection died. The
+///    fixture's terminal `agent_settled` (which a WORKING relay carries too, so it
+///    cannot be conjured by a stalled one) separates the second, and
+///    [`Client::stream_ended`] — set on socket EOF — separates the third. A negative
+///    with the stream still live and the socket still open is the stall this test
+///    exists to catch; a negative with the settle already seen is reported as a
+///    TEST-INSTRUMENT failure naming the budget that was too tight, never as a stall
+///    and never as a pass.
 ///
 /// # What the teardown half adds
 ///
@@ -1645,6 +1776,21 @@ async fn a_slow_start_does_not_stall_that_clients_own_event_relay() {
     // The reader is parked now, and stays parked until THIS test releases it.
     // Everything between here and the release is inside that park.
     let is_streaming_chunk = agent_message_chunk_for(streaming);
+    // The fixture's TERMINAL frame for the streaming session. `__long_stream__`
+    // emits its canned turn after its last chunk and that turn ends with
+    // `agent_settled` (src/fixtures/worker.rs), so this frame means "there will be
+    // no more chunks" — the one fact that separates a stalled relay from a stream
+    // that simply ran out. `sessionId` is required because a settle from the PARKED
+    // session would mean something else entirely (and cannot arrive anyway while its
+    // `attach` has not returned).
+    let is_streaming_settle = |frame: &serde_json::Value| {
+        frame["sessionId"] == streaming && rpc_event_is(frame, "agent_settled")
+    };
+    // Whether the stream ended before the verdict could be taken. `stream_ended`
+    // covers the OTHER way production stops (the connection died), which is a daemon
+    // bug rather than an instrument failure, so it gets its own verdict below
+    // instead of being folded into this flag.
+    let mut stream_exhausted = false;
 
     // ── Step 1: absorb the pre-park residue. ─────────────────────────────────
     let absorb_started = Instant::now();
@@ -1661,6 +1807,10 @@ async fn a_slow_start_does_not_stall_that_clients_own_event_relay() {
         let window = left.min(CHUNK_SILENCE);
         match client.try_recv(window).await {
             Some(frame) if is_streaming_chunk(&frame) => residue += 1,
+            Some(frame) if is_streaming_settle(&frame) => {
+                stream_exhausted = true;
+                break;
+            }
             Some(_) => {} // a non-chunk frame is not the relay flowing
             None if window >= CHUNK_SILENCE => {
                 quiet = true;
@@ -1673,28 +1823,65 @@ async fn a_slow_start_does_not_stall_that_clients_own_event_relay() {
 
     // ── Step 2: the probe, in the held park. ─────────────────────────────────
     let mut probe_elapsed = Duration::ZERO;
-    let mut relayed_while_parked = !quiet && residue > 0;
-    if !relayed_while_parked {
+    // The residue shortcut: chunks STILL arriving when `ABSORB_BUDGET` expires cannot
+    // be pre-park residue (that is a couple of frames), so they already are the good
+    // outcome — and it is genuine evidence under BOTH designs, because the absorb step
+    // runs entirely inside the observed park: the single-task design writes NOTHING to
+    // this socket while its reader is parked, so any frame that lands there came from a
+    // relay that runs independently of it.
+    //
+    // `stream_exhausted` VETOES it. A settle seen during the absorb means the whole
+    // stream — chunks AND terminal frame — was already in flight when the park was
+    // taken, so "frames arrived during the park" is no longer something this run
+    // observed: the run would then be reporting the backlog the daemon wrote BEFORE
+    // `start` B, which is precisely the shape that passes on the buggy design. That is
+    // an instrument failure, not a green and not a stall. Reaching it takes a park
+    // taken ~2.4 s into the stream: the absorb window is
+    // `prelude + stamp_wait … + ABSORB_BUDGET`, and the settle lands at ~2.9 s, so the
+    // two only overlap once `prelude + stamp_wait` has eaten 2.4 s of the 3.0 s window
+    // — and since the stamp wait is capped at 500 ms by its own panic timer, that means
+    // ≥ 1.9 s of bare prelude on a runner that cannot complete three socket hops and a
+    // file write in it. Nothing in this test is measurable under that much stall.
+    let mut relayed_while_parked = !quiet && residue > 0 && !stream_exhausted;
+    // A stream that ended during the absorb step is ALREADY accounted for — probing
+    // it further could only produce silence that reads like a stall.
+    if !relayed_while_parked && !stream_exhausted {
         let probed = Instant::now();
         let probe_deadline = probed + RELAY_ARRIVAL_BUDGET;
         relayed_while_parked = loop {
             let left = probe_deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                // The budget ran out with the stream still unaccounted for: THIS is
+                // the stall the test exists to catch.
                 break false;
             }
             match client.try_recv(left).await {
                 Some(frame) if is_streaming_chunk(&frame) => break true,
+                Some(frame) if is_streaming_settle(&frame) => {
+                    // The stream ended inside the park. No chunk arrived, but NOT
+                    // because the relay stalled — there was nothing left to relay —
+                    // so this must not be reported as one.
+                    stream_exhausted = true;
+                    break false;
+                }
                 // Any other frame is not the relay flowing; keep waiting out the
                 // budget so a stall is reported as a stall.
                 Some(_) => {}
-                // `try_recv` says `None` for BOTH "the budget expired" and "the
-                // stream ended". Either way no chunk arrived, and a torn-down stream
-                // must not be spun on for the rest of the budget.
+                // `None` here means EITHER the budget expired (the stall) or the
+                // socket reached EOF — `try_recv` cannot carry both answers, so
+                // `client.stream_ended` is what tells them apart below. Spinning on
+                // a closed socket for the rest of the budget would buy nothing.
                 None => break false,
             }
         };
         probe_elapsed = probed.elapsed();
     }
+    // The negative verdict, if there is one, has exactly three possible causes and
+    // two of them are now OBSERVED rather than inferred. Deriving the third instead
+    // of flagging it inside the loop is what keeps the diagnosis honest: a `None`
+    // from `try_recv` on the budget's final tick must not be reported as a stall if
+    // the socket in fact reached EOF.
+    let relay_stalled = !relayed_while_parked && !stream_exhausted && !client.stream_ended;
 
     // The verdict's precondition, asserted rather than trusted: the hold that makes
     // it conclusive must still be in force.
@@ -1710,22 +1897,84 @@ async fn a_slow_start_does_not_stall_that_clients_own_event_relay() {
          ATTACH_READY_CEILING exists to rule out)"
     );
 
+    // A negative verdict is only a stall claim once the two other reasons for
+    // silence have been ruled out, and both are now OBSERVED rather than assumed:
+    //
+    // * the stream ending (`stream_exhausted`) — the fixture emits its terminal
+    //   `agent_settled` immediately after its last `__long_stream__` chunk, and a
+    //   WORKING relay carries that frame too, so seeing it means "no more chunks are
+    //   coming" and NOT "the relay stalled";
+    // * the connection dying (`client.stream_ended`) — the socket reached EOF, so no
+    //   frame of any kind could have arrived.
+    //
+    // The `__long_stream__` fixture stops producing after `LONG_STREAM_CHUNKS` chunks
+    // (3.0 s), so on a runner slow enough to push the probe past that, silence means
+    // "the fixture finished" — which is why the compile-time assert on
+    // `LONG_STREAM_WINDOW` keeps the park span inside the production window in the
+    // first place, and why the residual case is reported as an instrument failure
+    // rather than a red on the daemon.
+    //
+    // Deliberately NO extra "confirm the stream really ended" read after a timeout:
+    // it would extend the park span past the sum that assert bounds, and it cannot
+    // rescue the buggy design anyway — that design buffers the settle along with the
+    // chunks, so a further read would see the same silence.
+    let socket_eof = client.stream_ended;
     eprintln!(
         "slow-start relay: park observed after {park_observed_at:?}; absorb \
          {absorb_elapsed:?} saw {residue} chunk(s) and reached quiet = {quiet}; \
-         probe waited {probe_elapsed:?} → relayed while parked = {relayed_while_parked}"
+         probe waited {probe_elapsed:?} → relayed while parked = {relayed_while_parked} \
+         (stream exhausted = {stream_exhausted}, socket EOF = {socket_eof}, relay \
+         stalled = {relay_stalled})"
+    );
+
+    // A connection the daemon closed mid-park is neither a stall nor an instrument
+    // problem — it is the relay's transport dying, and it must not be laundered into
+    // either message below.
+    assert!(
+        !client.stream_ended || relayed_while_parked,
+        "`{streaming}`'s stream stopped arriving because the DAEMON CLOSED this \
+         connection while `{parkable}`'s `start` was parked in `attach` (park \
+         observed {park_observed_at:?}; absorb {absorb_elapsed:?} drained {residue} \
+         residue chunk(s); probe waited {probe_elapsed:?}). That is not a relay \
+         stall — no frame can arrive on a socket the daemon hung up — so find out \
+         why `reader_loop`/`writer_loop` ended this connection."
+    );
+
+    // Stream-exhaustion is NOT a relay stall, and it must not pass either: a verdict
+    // taken after the fixture's terminal frame proved nothing about the relay.
+    assert!(
+        !stream_exhausted || relayed_while_parked,
+        "TEST INSTRUMENT FAILURE, not a relay stall: `{streaming}`'s \
+         `__long_stream__` stream ENDED before the probe could be conclusive \
+         (the fixture's terminal `agent_settled` arrived inside the park — \
+         absorb {absorb_elapsed:?} drained {residue} residue chunk(s), probe \
+         waited {probe_elapsed:?} of {RELAY_ARRIVAL_BUDGET:?}). Silence after \
+         the last chunk is NOT evidence of a stalled relay, and this test must \
+         not answer \"the relay stalled\" to it. The budget that was too tight \
+         is the park span that outran the fixture: PARK_PRELUDE_ALLOWANCE + \
+         READY_GATE_STAMP_BUDGET ({READY_GATE_STAMP_BUDGET:?}) + ABSORB_BUDGET \
+         ({ABSORB_BUDGET:?}) + RELAY_ARRIVAL_BUDGET ({RELAY_ARRIVAL_BUDGET:?}) \
+         must stay below LONG_STREAM_WINDOW ({LONG_STREAM_WINDOW:?}), and that \
+         sum is asserted at compile time — so if you are reading this the STREAM \
+         got shorter or later instead: `LONG_STREAM_CHUNKS` × `LONG_STREAM_GAP` \
+         in src/fixtures/worker.rs no longer matches the mirrors in this file, \
+         or this runner is slow enough that the prelude alone ate the window."
     );
 
     assert!(
-        relayed_while_parked,
+        !relay_stalled,
         "`{streaming}`'s chunks stopped arriving while `{parkable}`'s `start` was \
          parked in `attach` (park observed {park_observed_at:?} after the `start` \
          was written; absorb {absorb_elapsed:?} drained {residue} residue chunk(s) \
          to quiet = {quiet}; then the probe waited {probe_elapsed:?} for one chunk \
-         and got none within {RELAY_ARRIVAL_BUDGET:?}). While the marker held, the \
-         daemon's reader could not return, so this connection's relay must be run by \
-         ANOTHER task — that is the reader/writer split. A single `serve_client` task \
-         with the fan-out as one of its `select!` arms is silent here by construction."
+         and got none within {RELAY_ARRIVAL_BUDGET:?}). Neither of the two other \
+         reasons for that silence was observed: the stream's terminal \
+         `agent_settled` never arrived (so the stream was STILL LIVE — \
+         `__long_stream__` produces for {LONG_STREAM_WINDOW:?}) and the socket never \
+         reached EOF. While the marker held, the daemon's reader could not return, so \
+         this connection's relay must be run by ANOTHER task — that is the \
+         reader/writer split. A single `serve_client` task with the fan-out as one of \
+         its `select!` arms is silent here by construction."
     );
 
     // ── Release, and show the parked `start` really completes. ───────────────
@@ -2157,15 +2406,32 @@ async fn repeated_disconnects_do_not_degrade_the_daemon() {
 ///
 /// * **1 168 009 requests absorbed, daemon RSS 15 MB → 895 MB.**
 ///
-/// The outbound queue cannot produce that number, because `serve_client` is ONE
-/// task running one `select!`: while the drain arm's body awaits a blocked
-/// `send_frame`, the `select!` is not re-polled, so the inbound arm cannot run and
-/// cannot enqueue. The queue's depth is therefore ~1 — confirmed by instrumenting
-/// it. The buffer that grew was the transport's: `Connection`'s reader task drains
-/// the socket into an `mpsc::unbounded_channel` that nothing was consuming, so the
-/// kernel's ~200 KB of socket became an unbounded queue in the daemon's heap. The
-/// fix is in `transport::frame` (`MAX_QUEUED_INBOUND_FRAMES`); the outbound queue
-/// is bounded too, for the same reason and to the same budget.
+/// The outbound queue could not produce that number even then, and the reason it
+/// could not is HISTORY now, so it is stated as history: at measurement time
+/// `serve_client` was ONE task running one `select!`, so while the drain arm's body
+/// awaited a blocked `send_frame` the `select!` was not re-polled, the inbound arm
+/// could not run, and could not enqueue — which capped that queue's depth at ~1
+/// (confirmed by instrumenting it). T4b (`6b149c4`) split `serve_client` into
+/// `reader_loop` + `writer_loop`, and that serialisation is gone with the single
+/// task: the queue has TWO producers now (the reader's replies, and the writer's
+/// relayed fan-out frames), so the depth is no longer bounded by the drain blocking
+/// its only producer. What bounds it today is three things, all of them explicit:
+/// `CLIENT_QUEUE_CAPACITY` (1 024) is the channel's real ceiling; a relayed frame
+/// that finds it full is DROPPED, counted, and announced as a `gap` rather than
+/// buffered; and `writer_loop` holds the only `ConnectionWriter`, so exactly one
+/// task can be inside `send_frame` and the queue has one consumer draining to the
+/// socket — no second buffer can silently form downstream of it. The measured peak
+/// of ~353 on the old shape was that shape's number, not this one's: post-split the
+/// queue CAN fill, and 1 024 is what stops it.
+///
+/// The conclusion the measurement was actually establishing is untouched, because
+/// the flood was never limited by the outbound queue in the first place: the buffer
+/// that grew was the transport's — `Connection`'s reader task drained the socket
+/// into an `mpsc::unbounded_channel` that nothing was consuming, so the kernel's
+/// ~200 KB of socket became an unbounded queue in the daemon's heap. The fix is in
+/// `transport::frame` (`MAX_QUEUED_INBOUND_FRAMES`), and the split does not touch
+/// the inbound path at all; the outbound queue is bounded too, for the same reason
+/// and to the same budget.
 ///
 /// # What the bound makes observable
 ///
