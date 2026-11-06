@@ -143,9 +143,9 @@ desktop's half must work in that checkout, which is a DIFFERENT REPO — see Blo
 
 | # | Task | Area | Plan file | Wave | Owns (file set — disjointness evidence) | Status |
 |---|------|------|-----------|------|------------------------------------------|--------|
-| T1 | CI process census: fail the run when a daemon or worker outlives the suite (issue #5) | ci-verification | `docs/roadmap/daemon-hardening-task01-stray-process-census.md` | 1 | `scripts/check-no-stray-processes.sh` (new), `.github/workflows/ci.yml` | `vetted` |
-| T2 | Cross-repo schema drift fingerprint + comparison workflow (issue #6) | daemon-store | `docs/roadmap/daemon-hardening-task02-schema-drift-fingerprint.md` | 1 | `fulcrum/src/db/schema.rs`, `fulcrum/tests/db.rs`, `schema-sha.txt` (new), `scripts/check-schema-drift.sh` (new), `.github/workflows/schema-drift.yml` (new), `README.md`, `AGENTS.md` | `vetted` |
-| T3 | Peer-credential check + rate/session limits + required `hello` handshake (issue #4) | transport-serve | `docs/roadmap/daemon-hardening-task03-socket-hardening.md` | 1 | `fulcrum/src/transport/unix.rs`, `fulcrum/src/transport/windows.rs`, `fulcrum/src/serve.rs`, `fulcrum/src/main.rs`, `fulcrum/tests/serve.rs`, `fulcrum/tests/transport.rs` | `vetted` |
+| T1 | CI process census: fail the run when a daemon or worker outlives the suite (issue #5) | ci-verification | `docs/roadmap/daemon-hardening-task01-stray-process-census.md` | 1 | `scripts/check-no-stray-processes.sh` (new), `.github/workflows/ci.yml` | `done` `491bb99` |
+| T2 | Cross-repo schema drift fingerprint + comparison workflow (issue #6) | daemon-store | `docs/roadmap/daemon-hardening-task02-schema-drift-fingerprint.md` | 1 | `fulcrum/src/db/schema.rs`, `fulcrum/tests/db.rs`, `schema-sha.txt` (new), `scripts/check-schema-drift.sh` (new), `.github/workflows/schema-drift.yml` (new), `README.md`, `AGENTS.md` | `done` `0c9c27e` |
+| T3 | Peer-credential check + rate/session limits + required `hello` handshake (issue #4) | transport-serve | `docs/roadmap/daemon-hardening-task03-socket-hardening.md` | 1 | `fulcrum/src/transport/unix.rs`, `fulcrum/src/transport/windows.rs`, `fulcrum/src/transport/mod.rs`, `fulcrum/src/serve.rs`, `fulcrum/src/main.rs`, `fulcrum/tests/serve.rs`, `fulcrum/tests/transport.rs` | `done` `6d6887a` |
 | T4 | Split `Connection` and `serve_client` so a slow attach cannot stall that client's event relay (issue #3) | transport-serve | `docs/roadmap/daemon-hardening-task04-split-serve-client.md` | 2 | `fulcrum/src/transport/frame.rs`, `fulcrum/src/transport/mod.rs`, `fulcrum/src/transport/unix.rs`, `fulcrum/src/transport/windows.rs`, `fulcrum/src/serve.rs`, `fulcrum/tests/serve.rs`, `fulcrum/tests/transport.rs`, `fulcrum/tests/worker_mode.rs`, `src/fixtures/worker.rs` | `vetted` |
 
 T3 and T4 overlap in five files by design — that overlap IS the wave-2 edge, recorded above. T1∥T2∥T3 share nothing.
@@ -223,6 +223,59 @@ One line per task: hash, what shipped, gate numbers at that moment. Figures belo
 - **T2** planned → vet R1 **PASS**, no 🔴, no 🟠. One implementation-time note: run the added fixtures once to retire the extraction-vacuity gap before merge.
 - **T3** planned → vet R1 **PASS**, no 🔴. Stale dirty-tree claim removed from the plan by the orchestrator (see Decisions).
 - **T4** planned → vet R1 **pass-with-issues + 3 🔴** → refined → vet R2 **pass-with-issues + 1 new 🔴** (writer can outlive `serve_client`) → refined → vet R3 **PASS**.
+
+### Wave 1 — implemented and gated (Step 5–6)
+
+Execution mode was changed from the graph's width-3 to **1 worktree + 2 serial in the primary checkout**,
+for a measured reason, not a dependency: each worktree pays a cold cargo build and this box has 8 cores /
+78 G free against a 23 G warm `target/`. T1 (bash + YAML, zero cargo) took a worktree and ran concurrently;
+T2 and T3 ran serially against the warm target. The graph still says T2 ∥ T3 — this was an execution
+economy, and the wave's disjointness was verified independently (`T1∩T2 = T1∩T3 = T2∩T3 = ∅`).
+`BASE` for the wave was `b5f3c64`.
+
+- **T1 `491bb99`** — `scripts/check-no-stray-processes.sh` (new) + `.github/workflows/ci.yml` (+37, purely
+  additive). Census pair sits after `cargo test` on all three legs; the ⚠ no-build-step block is byte-identical
+  to base. Self-test: 40+ cases, all green, **10 mutants tried and 9 killed**. Its own catch: `/^Ppid:/` vs
+  `PPid:` (awk is case-sensitive) meant the ancestor chain was never built and the census **killed its own
+  parent** — Case L is the pin. Zombie handling was changed from the plan (a zombie renders as
+  `[fake_worker_cor] <defunct>`, truncated to 15, so the exact-basename rule can never fire on one); it now
+  attributes a zombie by its PARENT's marker, pinned by live Case M.
+- **T2 `0c9c27e`** — fingerprint pin `schema-sha.txt` + `scripts/check-schema-drift.sh` + new
+  `.github/workflows/schema-drift.yml` + prose. Measured by the orchestrator, not taken on report: real check
+  GREEN on the agreeing tree; `--self-test` 15 cases green including **a reordered column pair is drift**
+  (the by-index hazard), a retyped column, an added column, a dropped index, and five REFUSE-not-compare paths
+  at exit 2. Two red paths exist and they are not the same test: a raw `SCHEMA` edit reddens the guard +
+  `the_pinned_shapes_match_the_ddl_they_claim_to_describe`; `schema-sha.txt` vs `TABLE_SHAPES` is what
+  `tests/db.rs` pins.
+- **T3 `6d6887a`** — peer credential (unix) + `SESSION_LIMIT` + per-connection frame rate + mandatory `hello`.
+  `tests/` is **purely additive** — no existing test edited, which independently confirms the hello-first audit.
+  `frame.rs` untouched, `Connection::new` untouched, `permission` absent from the diff, 4096/1024 and their
+  asserts intact. Two honest gaps recorded: the root-only foreign-uid peer test is `#[ignore]`d (it widens the
+  socket to 0777 deliberately so the *filesystem* cannot be the thing that passes it), and Windows is a
+  documented limitation, not enforcement.
+
+**Wave 1 gate on the integrated tree (measured by the orchestrator, not reported):**
+`cargo test` **exit 0 — 1582 passed / 0 failed / 3 ignored** (baseline 1570/0/1; the +12 are T2's and T3's
+new tests, the +2 ignored are T3's root-only peer test and one platform-conditional).
+`cargo fmt --all -- --check` exit 0 · `cargo clippy --all-targets -D warnings` exit 0 ·
+`bash scripts/check-rquickjs-allocator.sh` exit 0. `cargo check --target x86_64-pc-windows-gnu` remains
+**unmeasured** (cross-target not installed here); CI's Windows leg is the proof for that.
+
+**T1's census was then tested against real processes, not fixtures** — this is the check the whole task exists
+for. With `FULCRUM_CI_RUN_MARKER` exported and a real `fulcrum serve` planted: a daemon carrying a DIFFERENT
+marker value was **left alone** ("not ours to touch"), a daemon carrying THIS run's marker was named a leak,
+killed with TERM and confirmed gone, exit 1. And with no marker exported it **refused at exit 2** rather than
+reporting clean — both the false-positive guard and the vacuity floor, observed live rather than asserted.
+Afterwards `ps` showed zero `fulcrum`-family processes.
+
+### Deviations recorded at fan-in (Step 5 DEVIATION rule)
+
+- **T3 edited `fulcrum/src/transport/mod.rs`, which its `Owns` column did not list — the column was wrong, not the child.** The plan's own Step 1 mandates adding `TransportError::PeerIdentity` in `mod.rs` AND constructing it in `unix.rs` in one commit so the variant is never dead code. The edit is 26 lines, additive, one enum variant with its doc. **The tree outranks the text: the `Owns` cell was corrected rather than the code reverted.** No wave-1 disjointness was broken — T2 never touched `transport/`, and T4's `Owns` already included `transport/mod.rs`, which is why this file was never a collision risk.
+- **T1's zombie path was unimplementable as planned and was redesigned by the implementer with proof.** `ps` renders a zombie as `[fake_worker_cor] <defunct>` — truncated to 15 — so the exact-basename rule can never fire on one, and matching the truncated form would violate Case B3's "leave the same-comm decoy alone". Resolution: carry `ppid`/`stat` and attribute zombies by the **parent's marker** (provenance, not name), with `kill_leak` signalling the parent. Live Case M proves it. Accepted: the plan's mechanism could not have worked.
+- **T1 self-reported and self-corrected a false claim about CI argv.** Its first header said the script self-matches because CI checks out into `…/fulcrum`; false, because the kernel rewrites argv for `#!` scripts so the step appears as `bash …`. Corrected in place; Case L now pins the real reproducing shape. Recorded because it is the same class of error as the `Ppid:`/`PPid:` parent-kill bug: a plausible claim about the environment that was never run.
+- **T3's `#[ignore]`d root-only peer test is real coverage that does not run.** It needs root to connect as a foreign uid; it deliberately widens the socket to 0777 / dir 0755 so the *filesystem* cannot be what makes it pass. Left `#[ignore]`d rather than deleted so it is not silently lost. **This means issue #4's "a peer of a different uid is rejected" is reasoned-and-structured but NOT executed in CI.** Goes to the follow-ups file.
+- **T3's Windows half is a documented limitation, not enforcement** (see Blockers #4 — `windows`/`windows-sys` forbidden). Issue #4's peer-credential criterion is met on unix only.
+- **T2's cross-repo comparison still has no counterpart** (Blockers #1/#2, unchanged by implementation): the desktop publishes no fingerprint and pins a fulcrum rev with no schema at all, so `schema-drift.yml` runs fulcrum's side and refuses loudly. Owner decision, not open work in this branch.
 
 ### Decisions added by vetting
 
