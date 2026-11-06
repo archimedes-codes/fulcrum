@@ -20,6 +20,17 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    # The stray-process census's run-scoping discriminator, exported BEFORE `cargo
+    # test` so every process the suite spawns inherits it and the census steps (same
+    # job, so the same value) can prove which survivors belong to this run. Job-level
+    # rather than per-step: a value set on one step's `env:` cannot reach a later
+    # step, and the census is a later step. `run_attempt` increments on a rerun, so a
+    # rerun on a self-hosted machine re-scopes cleanly instead of inheriting the
+    # previous attempt's processes. The `|| 'unset'` guard keeps the value
+    # non-empty where a context is absent; the census refuses (exit 2) rather than
+    # certify a table it cannot attribute, so a missing marker is red, not green.
+    env:
+      FULCRUM_CI_RUN_MARKER: ${{ (github.run_id != '') && format('{0}-{1}', github.run_id, github.run_attempt) || 'unset' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -70,6 +81,32 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+      # Detect daemon/worker processes this run lost track of. WHY A CHECK AND NOT A
+      # TEST: per-test guards ask only "is the pid I spawned gone?"; nobody asks
+      # "are there leftover daemon/worker processes from THIS run nobody is
+      # tracking?" — a test that crashes before recording a pid, or spawns a
+      # grandchild it never tracked, passes every existing assertion and still leaks.
+      # The env marker (exported on every leg) is the discriminator: the census kills
+      # processes proven to share this run's secret and refuses to certify a table it
+      # could not read. The ps enumerator (not pgrep -x) is used because comm is
+      # truncated to 15 chars: pgrep -x cannot match the 19-char fake_mcp_stdio_core
+      # at all, and the truncated 15-char form is prefix-ambiguous
+      # (fake_worker_corruptor and fake_worker_core share it), so the census matches
+      # the FULL image basename against ps's untruncated argv instead.
+      #
+      # The Windows leg is ADVISORY: it reports every live match and kills nothing,
+      # because no bash-accessible mechanism there can read another process's
+      # environment to attribute it to this run. Issue #5's "fail the run" criterion
+      # is therefore ENFORCED ON UNIX ONLY, and the step says so in its own output.
+      # On macOS a candidate whose provenance cannot be read makes the step exit 2 —
+      # a leg that passes because it could not look is the failure class that rule
+      # makes impossible.
+      - name: Prove the stray-process census can fail
+        run: bash scripts/check-no-stray-processes.sh --self-test
+
+      - name: Check for stray daemon/worker processes from this run
+        run: bash scripts/check-no-stray-processes.sh
 
       # The guard on the real build graph. WHY A CHECK AND NOT A TEST: a dependency
       # turning on rquickjs's `rust-alloc`/`allocator` makes `set_memory_limit` a
