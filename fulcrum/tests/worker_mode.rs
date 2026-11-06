@@ -101,6 +101,109 @@ fn pid_is_reaped(pid: u32) -> bool {
     }
 }
 
+// ── the reaping guard's single source of truth ────────────────────────────────
+//
+// One macro holds the needle names; a continuation macro turns that same list
+// into the ARRAY the scan reads and into the DOC LIST the guard's comment shows.
+// That shape is not decoration: the doc used to hand-write a list of names that
+// the array did not contain (`release` and `forget` were documented, never
+// checked), and a mutation as ordinary as `impl Handle { fn release(&self) {} }`
+// walked straight through. A list two humans maintain in two places drifts; a
+// list expanded twice from one place cannot.
+//
+// Every name is SPLIT across two literals, and the continuations `concat!` them
+// back together. Written whole, the definition lines would contain the very
+// strings the scan hunts, and the guard would fail for containing its own needles
+// — which is exactly what happened when these were literals. Do not "simplify"
+// a split back to a whole literal.
+macro_rules! reaping_opt_out_needles {
+    ($k:tt) => {
+        $k! {
+            "de" "tach",
+            "aban" "don",
+            "or" "phan",
+            "le" "ak",
+            "diso" "wn",
+            "re" "lease",
+            "for" "get",
+            "keep_" "alive",
+        }
+    };
+}
+
+/// The continuation that turns the needles into the array the scan iterates.
+macro_rules! needles_as_array {
+    ($($head:literal $tail:literal),* $(,)?) => {
+        [$(concat!($head, $tail)),*]
+    };
+}
+
+/// The continuation that turns the needles into the markdown list the doc shows.
+macro_rules! needles_as_doc_list {
+    ($($head:literal $tail:literal),+ $(,)?) => {
+        concat!($("\n- `", $head, $tail, "`"),+)
+    };
+}
+
+/// The same expansion the guard's `#[doc = …]` attribute below feeds, bound to a
+/// name so a test can assert it covers the array (`NEEDLE_DOC_LIST` is what
+/// `the_guard_doc_names_every_needle_the_array_checks` reads — the rendered
+/// comment itself is not readable at runtime, so this const is the handle on it).
+const NEEDLE_DOC_LIST: &str = reaping_opt_out_needles!(needles_as_doc_list);
+
+/// Every file in this member that can hold a `fulcrum` child, discovered rather
+/// than hand-listed.
+///
+/// The rule is "names this member's own bin", which is how a test here reaches
+/// the daemon at all (`env!("CARGO_BIN_EXE_fulcrum")` is package-local — see the
+/// module header and `serve.rs`'s). A file that merely *mentions* the marker in
+/// prose is scanned too, and that direction of error is the safe one: scanning a
+/// file that does not spawn costs nothing, missing one that does is the defect.
+///
+/// `src/main.rs` is included unconditionally rather than by the rule: it does not
+/// spawn today (`WorkerHandle::spawn` in the engine is the only child
+/// constructor — `worker_factory.rs` explains why a daemon-side `Command::new`
+/// would be wrong), and if that changes the guard should already be looking.
+///
+/// # What this does NOT find
+///
+/// A spawner that reaches the daemon by some route other than the own-bin marker
+/// — a hardcoded `target/debug/fulcrum`, a path handed in by the engine, a
+/// helper in another file. The marker is the documented route for this member's
+/// bin and the only one in use, so the rule covers reality; it is a rule about
+/// text, not a proof about processes, and a future third route needs the rule
+/// widened in the same change that adds it.
+///
+/// Paths are `PathBuf` rather than hand-joined strings so the file-name
+/// comparisons the guards make go through `file_name()` — splitting on `/` would
+/// silently mis-parse a Windows path, and this member's tests are built by the
+/// Windows leg of CI.
+fn spawn_sites() -> Vec<std::path::PathBuf> {
+    // Split so this line is not itself the marker it hunts.
+    let marker = concat!("CARGO_BIN_EXE_", "fulcrum");
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut sites = vec![manifest.join("src").join("main.rs")];
+    let tests = manifest.join("tests");
+    let entries = std::fs::read_dir(&tests)
+        .unwrap_or_else(|e| panic!("read {} to find the spawn sites: {e}", tests.display()));
+    // Sorted so a failure names files in the same order on every run and every
+    // filesystem — `read_dir` makes no ordering promise.
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|text| text.contains(marker))
+                // An unreadable file is a reason to look, not a reason to skip.
+                .unwrap_or(true)
+        })
+        .collect();
+    found.sort();
+    sites.extend(found);
+    sites
+}
+
 /// The guard behind point 2 above: the opt-out must stay deleted, in EVERY file
 /// that spawns a `fulcrum` process.
 ///
@@ -125,11 +228,22 @@ fn pid_is_reaped(pid: u32) -> bool {
 ///
 /// # What this CAN catch, and what it cannot
 ///
-/// CAN: a definition or a call of a reaping-opt-out by any of the names below
-/// (`detach`, `abandon`, `orphan`, `leak`, `disown`, `release`, `forget`,
-/// `keep_alive`), in any scanned file; and the two name-INDEPENDENT ways to skip
-/// a `Drop` — `std::mem::forget` and `ManuallyDrop` — which is the point, since
-/// those are not defeated by renaming.
+/// CAN: a definition or a call of a reaping-opt-out by any of the names in the
+/// list generated below, in any file `spawn_sites` finds; and the two
+/// name-INDEPENDENT ways to skip a `Drop` — `std::mem::forget` and `ManuallyDrop`
+/// — which is the point, since those are not defeated by renaming. (`forget` is
+/// on the name list too, so it is caught both ways; the other seven names are
+/// caught only by the name.)
+///
+/// The list below is not typed out by hand. It is a `#[doc]` attribute expanded
+/// from `reaping_opt_out_needles!`, the same expansion that builds the array this
+/// scan reads, and `the_guard_doc_names_every_needle_the_array_checks` asserts the
+/// two agree. That exists because this comment once named eight names while the
+/// array checked six, and `release`/`forget` escaped: a doc describing a check
+/// that does not run is worse than no doc, because a reader trusts it.
+#[doc = "\nThe names the scan hunts, generated from the same macro that builds the \
+         array — this list and the check cannot disagree:"]
+#[doc = reaping_opt_out_needles!(needles_as_doc_list)]
 ///
 /// CANNOT, and a reader should not assume otherwise:
 ///
@@ -137,11 +251,17 @@ fn pid_is_reaped(pid: u32) -> bool {
 ///   passing the `Child` out of the struct walks straight past a name-based check.
 ///   The list is a net with known holes, not a proof. The structural needles above
 ///   close the two holes that matter most; they do not close this one.
-/// * **A file that is not in the list below.** A new test file that spawns a
-///   daemon is invisible until it is added here. That is the maintenance
-///   obligation this design accepts in exchange for being able to catch anything
-///   at all, and `the_spawn_sites_are_all_covered` below is what makes adding a
-///   file a loud step rather than a silent omission.
+/// * **A name used in a shape the matcher does not look for.** The match is
+///   call/definition shaped (`fn <name>` or `.<name>()`), not a bare substring,
+///   because `release` and `forget` are ordinary English words that appear in
+///   this file's prose legitimately — a bare substring match would fail the guard
+///   for a comment. So `fn release(&self)` and `handle.release()` are caught; a
+///   `release` that is neither a definition nor a zero-arg call is not.
+/// * **A spawner the discovery rule does not see.** The file list is machined
+///   from `tests/*.rs` by the own-bin marker, so a new test file that spawns the
+///   daemon is covered the moment it exists — but a file that reaches the binary
+///   some other way (a hardcoded `target/debug/fulcrum` path, a helper elsewhere)
+///   is invisible to the rule. See `spawn_sites`, which states this in code.
 /// * **Anything the compiler would catch anyway** — moving a `Child` out with
 ///   `into_inner`, `mem::replace`, or a plain field read is not a name, and a
 ///   text scan does not see the type.
@@ -155,38 +275,24 @@ fn pid_is_reaped(pid: u32) -> bool {
 // free to reintroduce the opt-out.
 #[test]
 fn no_opt_out_of_reaping_can_come_back_in_any_spawn_site() {
-    // Every file in this crate that holds a `Child` it is responsible for.
-    // `main.rs` is scanned too rather than skipped: it does not spawn today
-    // (`WorkerHandle::spawn` in the engine does), and if that changes, the guard
-    // should already be looking.
-    let files = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/worker_mode.rs"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/serve.rs"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"),
-    ];
+    let files = spawn_sites();
     // The needles are assembled so this test cannot match ITS OWN SOURCE LINES.
     // Written as literals they did, and the guard failed for containing the
     // strings it looks for. `concat!` is compile-time concatenation, so the
-    // comparison is exact while the source line reads `concat!("fn ", "detach")`
+    // comparison is exact while the source line reads `concat!("de", "tach")`
     // — which is not the needle. Do not "simplify" these back to literals.
     //
     // The name list is the honest response to the guard's own weakness: the
     // original checked ONE name, and "call it something else" is the first thing
     // anyone reintroducing this would try. Each entry is a word a future author
     // would plausibly reach for when they want a child to survive a `Drop`.
-    let opt_out_names = [
-        concat!("de", "tach"),
-        concat!("aban", "don"),
-        concat!("or", "phan"),
-        concat!("le", "ak"),
-        concat!("diso", "wn"),
-        concat!("keep_", "alive"),
-    ];
+    let opt_out_names = reaping_opt_out_needles!(needles_as_array);
     let mut offenders: Vec<(&str, usize, String)> = Vec::new();
-    for file in files {
+    for file in &files {
         let source = std::fs::read_to_string(file)
-            .unwrap_or_else(|e| panic!("read {file} for the reaping guard: {e}"));
-        let name = file.rsplit('/').next().unwrap_or(file);
+            .unwrap_or_else(|e| panic!("read {} for the reaping guard: {e}", file.display()));
+        // Borrows from `files`, which outlives the assertion below.
+        let name = file.to_str().unwrap_or("<path is not utf-8>");
         for (at, line) in source.lines().enumerate() {
             let trimmed = line.trim_start();
             // Comments naming the old method are fine and expected — this very
@@ -195,17 +301,7 @@ fn no_opt_out_of_reaping_can_come_back_in_any_spawn_site() {
             if trimmed.starts_with("//") {
                 continue;
             }
-            // Name-independent first: skipping a `Drop` does not require a method.
-            // Assembled needles, for the same reason as `opt_out_names` — written
-            // as literals this line matches itself and the guard fails for
-            // containing what it looks for.
-            let forget = concat!("mem", "::forget");
-            let manual_drop = concat!("Manually", "Drop");
-            let structural = trimmed.contains(forget) || trimmed.contains(manual_drop);
-            let by_name = opt_out_names.iter().any(|n| {
-                trimmed.contains(&format!("fn {n}")) || trimmed.contains(&format!(".{n}()"))
-            });
-            if structural || by_name {
+            if line_opts_out_of_reaping(trimmed, &opt_out_names) {
                 offenders.push((name, at + 1, trimmed.to_string()));
             }
         }
@@ -222,35 +318,88 @@ fn no_opt_out_of_reaping_can_come_back_in_any_spawn_site() {
     );
 }
 
+/// The line-level matcher the reaping guard applies to every non-comment line.
+///
+/// Pulled out of the guard so `the_needle_matcher_actually_bites` can feed it
+/// synthetic lines: a scan over real files proves nothing if the matcher itself
+/// always answers "clean", and the only honest way to show it is not vacuous is
+/// to hand it something it must catch.
+fn line_opts_out_of_reaping(line: &str, names: &[&str]) -> bool {
+    // Name-independent first: skipping a `Drop` does not require a method.
+    // Assembled needles, for the same reason as the name list — written
+    // as literals the calling line matches itself and the guard fails for
+    // containing what it looks for.
+    let forget = concat!("mem", "::forget");
+    let manual_drop = concat!("Manually", "Drop");
+    if line.contains(forget) || line.contains(manual_drop) {
+        return true;
+    }
+    // Call/definition SHAPE, not a bare substring: `release` and `forget` are
+    // ordinary English words, and this file's prose uses them ("a daemon
+    // released here outlives the machine"). A substring match would redden the
+    // guard for writing English.
+    names
+        .iter()
+        .any(|n| line.contains(&format!("fn {n}")) || line.contains(&format!(".{n}()")))
+}
+
 /// The guard's own coverage is asserted, not assumed.
 ///
 /// Every test in this family asserts an ABSENCE, so every one of them passes on a
 /// file that contains nothing — and one that reads the wrong path passes just as
 /// happily. `tests/boundary.rs` builds its whole vacuity-floor machinery around
-/// exactly this; this is the same idea at the scale of one list. Two things are
-/// checked: that each scanned file is real and non-trivial, and that at least one
-/// scanned file still contains a `Drop` implementation (the mechanism the guard
-/// exists to protect — if every `Drop` left the list, the guard would be policing
-/// nothing).
+/// exactly this; this is the same idea at the scale of one list. Three things are
+/// checked: that the discovery rule still finds real files, that the two files
+/// known to spawn are among them, and that the scanned set still carries the
+/// `Drop` impls the guard exists to protect.
 #[test]
 fn the_spawn_sites_are_all_covered() {
-    let files = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/worker_mode.rs"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/serve.rs"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"),
-    ];
-    let mut drops = 0usize;
-    for file in files {
-        let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
-            panic!("{file} is in the guard's file list but cannot be read: {e}")
-        });
+    let files = spawn_sites();
+    // The floor against vacuity: a discovery rule whose glob or marker quietly
+    // broke would return just `main.rs` and every guard reading it would go green
+    // while scanning nothing. These two files DO spawn the bin today, so their
+    // absence means the rule broke, not that the code changed.
+    let expected = ["worker_mode.rs", "serve.rs"];
+    for expected in expected {
         assert!(
-            text.len() > 1_000,
-            "{file} is in the guard's list but is {len} bytes — a file that small \
-             is a stub, and scanning a stub proves nothing about the real spawn \
-             sites",
-            len = text.len()
+            files.iter().any(|f| f.ends_with(expected)),
+            "`tests/{expected}` spawns this member's own bin but `spawn_sites` did \
+             not find it — the discovery rule (the marker split in `spawn_sites`, or \
+             the `tests/` directory) is broken, so every guard that reads this list \
+             is now scanning nothing and passing"
         );
+    }
+    assert!(
+        files.len() >= 3,
+        "expected at least the two spawning test files plus `src/main.rs`; found \
+         {files:?} — a list this short means the rule stopped seeing files that exist"
+    );
+
+    let mut drops = 0usize;
+    for file in &files {
+        let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
+            panic!(
+                "{} is in the guard's file list but cannot be read: {e}",
+                file.display()
+            )
+        });
+        // The size floor applies only to the two files that have always spawned
+        // the bin. Applying it to everything would punish the exact thing
+        // discovery exists to welcome: a NEW, small test file that spawns the
+        // daemon should be scanned, not rejected for being short. For the known
+        // pair, though, a file that has shrunk to a stub means the spawn sites
+        // moved and the guards are reading a husk.
+        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if expected.contains(&name) {
+            assert!(
+                text.len() > 1_000,
+                "{} is a known spawn site but is {len} bytes — a file that \
+                 small is a stub, and scanning a stub proves nothing about the \
+                 real spawn sites",
+                file.display(),
+                len = text.len()
+            );
+        }
         if text.contains("impl Drop for") {
             drops += 1;
         }
@@ -262,6 +411,125 @@ fn the_spawn_sites_are_all_covered() {
          impls moved elsewhere, this guard is scanning files that no longer own a \
          child and its file list needs updating, not its needles"
     );
+}
+
+/// The doc's name list and the array the scan reads are the SAME expansion.
+///
+/// This is the test that makes the drift that motivated it impossible rather than
+/// merely fixed: the guard's comment used to hand-write eight names while the
+/// array held six, and `release`/`forget` escaped the net while the doc promised
+/// they were in it. Both sides now come from `reaping_opt_out_needles!`, so they
+/// cannot disagree — but "they are both generated" is a claim about this file's
+/// shape, and a claim a guard family like this does not assert is a claim that
+/// quietly rots. So it is asserted: every name the array checks must appear in
+/// the doc list, and every name the doc list shows must be in the array.
+#[test]
+fn the_guard_doc_names_every_needle_the_array_checks() {
+    let names = reaping_opt_out_needles!(needles_as_array);
+
+    // The doc list is compile-time text, so it cannot be read off the rendered
+    // comment at runtime; `NEEDLE_DOC_LIST` is the same `#[doc]` expansion bound
+    // to a const, which is what the loops below compare. That alone would be
+    // self-proving, so the load-bearing half is this: the guard's OWN attribute
+    // must still be the generated one. If someone deletes it and types a list of
+    // names back into the `///` block — the exact change that caused the original
+    // drift — this fails.
+    let own_source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("worker_mode.rs"),
+    )
+    .expect("this file, to check its own doc attribute is still generated");
+    let generated_doc = concat!(
+        "#[doc = ",
+        "reaping_opt_out_needles",
+        "!(needles_as_doc_list)]"
+    );
+    assert!(
+        own_source.contains(generated_doc),
+        "the guard's name list is no longer generated from the macro — a \
+         hand-written `///` list can drift from the array again, which is the bug \
+         this test was written for"
+    );
+
+    for name in names.iter() {
+        let shown = format!("- `{name}`");
+        assert!(
+            NEEDLE_DOC_LIST.contains(&shown),
+            "the scan checks `{name}` but the guard's doc does not list it — a \
+             reader who trusts the doc would believe this name is covered"
+        );
+    }
+    // The other direction: a documented name that is not checked is the exact
+    // defect this test was written for, so it must fail too.
+    for shown in NEEDLE_DOC_LIST.lines().filter(|l| !l.is_empty()) {
+        let bare = shown
+            .trim_start_matches("- `")
+            .trim_end_matches('`')
+            .to_string();
+        assert!(
+            names.contains(&bare.as_str()),
+            "the guard's doc advertises `{bare}` but the array does not check it — \
+             the doc would claim coverage that does not exist, which is the bug \
+             this test exists to catch"
+        );
+    }
+    // A list of one would satisfy both loops above while being no net at all.
+    assert!(
+        names.len() >= 8,
+        "the needle list has shrunk to {len} names: {names:?} — it exists because \
+         one name was not enough, and a shorter list is a wider hole",
+        len = names.len()
+    );
+}
+
+/// The matcher bites: every needle is caught in both shapes it claims to catch.
+///
+/// The reaping guard asserts an ABSENCE over files, so a matcher that always
+/// returned `false` would leave the whole suite green — and the `release`/`forget`
+/// hole was exactly a "green while blind" failure. The file-level plants in the
+/// review that produced this proved it; this pins the same property without
+/// needing to touch another file: synthetic lines, no filesystem, no child.
+#[test]
+fn the_needle_matcher_actually_bites() {
+    let names = reaping_opt_out_needles!(needles_as_array);
+    for name in names {
+        // Assembled so these lines are not themselves the needles they test.
+        let definition = format!("fn {}(&self) {{}}", name);
+        let call = format!("self.{}()", name);
+        assert!(
+            line_opts_out_of_reaping(&definition, &names),
+            "a definition named `{name}` slipped past the matcher"
+        );
+        assert!(
+            line_opts_out_of_reaping(&call, &names),
+            "a call of `{name}()` slipped past the matcher"
+        );
+    }
+    // The two name-independent routes, which is what makes renaming insufficient.
+    // Assembled so these lines do not contain the needles they test.
+    assert!(line_opts_out_of_reaping(
+        &format!("std::mem::{}child", "forget"),
+        &names
+    ));
+    assert!(line_opts_out_of_reaping(
+        &format!("let x = {}::new(child);", concat!("Manually", "Drop")),
+        &names
+    ));
+
+    // And the shape is narrow enough to survive ordinary English — the reason the
+    // match is not a bare substring. These appear in this file's prose today.
+    for prose in [
+        "a daemon released here outlives the machine",
+        "the original released the child here",
+        "the reader must not forget to reap the child",
+    ] {
+        assert!(
+            !line_opts_out_of_reaping(prose, &names),
+            "the matcher reddens on ordinary prose ({prose:?}) — a guard that \
+             fails on English gets deleted rather than obeyed"
+        );
+    }
 }
 
 /// One spawned `fulcrum` process with its stdin kept open and its stdout on a
