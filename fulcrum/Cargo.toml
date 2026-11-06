@@ -1,0 +1,117 @@
+[package]
+name = "fulcrum"
+version = "0.11.0"
+edition = "2021"
+
+# The `fulcrum serve` daemon (T9) — the long-lived worker supervisor that lives
+# as a SECOND PACKAGE in this repo so it can link the engine by `path = ".."`
+# and can never drift from it. A rev-pinned git dependency would let the two
+# move apart; a path dependency inside one workspace cannot be built in two
+# versions at once, which is the guarantee the daemon needs.
+#
+# The bin name is `fulcrum`. It MUST NEVER equal `fake_worker_core` or
+# `fake_mcp_stdio_core`: workspace members share one `target/debug/`, and cargo
+# only WARNS on a bin-name collision — last writer wins, so a fixture bin could
+# silently be replaced by the daemon binary and the census' fixture-driven tests
+# would be testing something else.
+
+# The lib target is NOT optional — see the warning above. Without it the
+# member's src/ modules are never type-checked and tests/ cannot name them.
+#
+# Measured in a scratch bin-only package: a genuine type error in an
+# `src/transport/mod.rs` that `main.rs` does not reference exits
+# `cargo check --all-targets` with 0 and prints nothing (rustc never compiles a
+# file no `mod` declares), and an integration test doing
+# `use binonly::transport::send();` fails `E0433: cannot find module or crate`.
+# A bin-only member would therefore let this plan's own gate certify later tasks
+# full of type errors. With the lib target, the planted error fails `E0308`, the
+# integration test resolves the path, and `CARGO_BIN_EXE_fulcrum` still
+# materialises on a cold target dir.
+[lib]
+name = "fulcrum"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fulcrum"
+path = "src/main.rs"
+
+# Every dependency Tasks 3, 4 and 5 need, declared ONCE, here — those tasks are
+# forbidden from editing this file, so the list must be complete or they stall.
+[dependencies]
+# The engine, by path. This is the whole reason the daemon is a sibling member
+# rather than a consumer of the published rev pin.
+fulcrum-core = { path = ".." }
+# `transport` (the framed stdio/pipe duplex), `serve` (the listener + supervisor
+# loop), and the retry sleeps in `transport::windows`. Feature set mirrors the
+# engine's plus `rt-multi-thread`, which the daemon needs for the worker-pool
+# runtime the engine's own list does not ask for. `net` alone gives the transport
+# on BOTH platforms: `tokio::net::UnixListener` on unix and
+# `tokio::net::windows::named_pipe::{NamedPipeServer, NamedPipeClient}` on
+# Windows (tokio's `net/mod.rs` gates `pub mod windows` behind
+# `cfg_net_windows!`) — so the `windows` / `windows-sys` crate is deliberately
+# ABSENT and must not be added.
+#
+# `time` is for the named-pipe connect retry (`windows.rs`), NOT for a shutdown
+# timer: this daemon has no shutdown path (see `serve`'s module header — T9 ships
+# no shutdown frame, so `run` never returns and `reap_all` is unwired). It used to
+# be justified as covering "the shutdown timers", which described nothing.
+tokio = { version = "1", features = [
+    "process",
+    "io-util",
+    "io-std",
+    "sync",
+    "macros",
+    "time",
+    "net",
+    "rt",
+    "rt-multi-thread",
+] }
+# The daemon's own store (Task 4). `bundled` mirrors the desktop's choice:
+# pure-C, compiles from source, and keeps `openssl-sys` / `native-tls` out of
+# the graph — which is what `scripts/check-rquickjs-allocator.sh` now checks
+# across the WHOLE workspace graph, since this member became part of it.
+#
+# `rusqlite` here is LEGAL and `rusqlite` in the engine is not: ADR 0091 forbids
+# it in `fulcrum-core` (the engine holds no disk), the daemon owns the disk.
+# `boundary_pins` walks `{CARGO_MANIFEST_DIR}/src` and reads only
+# `{CARGO_MANIFEST_DIR}/Cargo.toml`, so it does not police this manifest at all —
+# Task 6 adds the daemon's own pins. Do NOT widen `boundary_pins` to walk this
+# sibling in the meantime.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# The wire frames and the daemon's config DTOs.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `DaemonError`'s `Error` derive.
+thiserror = "2"
+# The socket / pipe path and the data dir. Version matches the engine's
+# `Cargo.toml:62` so feature unification resolves ONE copy.
+dirs = "6"
+
+# `libc` under the SAME unix gate the engine uses (`Cargo.toml:175`): the
+# daemon's `kill(-pgid, SIGKILL)` process-group teardown and `setpgid` are
+# `#[cfg(unix)]`, not Linux-only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# `#[tokio::test]` + `test-util` (paused-time supervisor tests) and the transport
+# loopback tests, which spawn the real `CARGO_BIN_EXE_fulcrum`.
+tokio = { version = "1", features = [
+    "process",
+    "io-util",
+    "io-std",
+    "sync",
+    "macros",
+    "time",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "test-util",
+] }
+tempfile = "3"
+
+# NOTE: no `[profile.*]` block here, on purpose. Cargo reads profiles from the
+# WORKSPACE ROOT ONLY — this member cannot set its own, and that is the point:
+# it inherits the root's `panic = "unwind"`, which ADR 0025 makes load-bearing.
+# A `panic = "abort"` daemon would take the whole supervisor down on the first
+# worker panic instead of losing one worker and staying alive.

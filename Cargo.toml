@@ -1,3 +1,75 @@
+# T9 — this repo is now a WORKSPACE so the `fulcrum serve` daemon can live
+# beside the engine as a second member and link it by `path = ".."` (a rev pin
+# would let the two drift; one workspace cannot build two versions of the same
+# path dependency).
+#
+# THE LAYOUT IS FORCED: `[package]` for `fulcrum-core` stays at THIS root, with
+# `src/` and `tests/` beside it. Do NOT move them into a `fulcrum-core/`
+# subdirectory, however idiomatic that looks. `src/childproc.rs`'s
+# `declaring_workspace_root` walks ANCESTORS ONLY, starting at
+# `manifest_dir().parent()`, so this `[workspace]` table — sitting AT the
+# manifest dir — is never examined; but a `[workspace]` one level ABOVE a moved
+# `fulcrum-core/` would resolve `Layout::WorkspaceMember`, and `source_roots()`
+# then hardcodes `workspace_root.join("src-tauri").join("src")`, which does not
+# exist here, so the childproc census PANICS with "the census resolved the wrong
+# root". The four layout witnesses in `childproc::tests` are what catch it.
+#
+# `members` lists ONLY `fulcrum`, never `"."`: cargo treats a root `[package]` as
+# an implicit member, so `"."` is unnecessary — and it would be WRONG for the
+# census matcher if that walk ever changed, because `member_entry_names_us`
+# compares `rel == entry || package == entry` and `relative_to_manifest` returns
+# the EMPTY STRING for a root package, so `"."` matches nothing. It would pass
+# today only because the walk never reaches the manifest dir. Write the form that
+# is true, not the form that happens not to be read.
+#
+# `default-members` lists BOTH packages, and it is load-bearing: it is what makes
+# the BARE forms of the gates reach the daemon member. Left to itself, a root that
+# is also a package makes cargo resolve `workspace_default_members` to
+# `fulcrum-core` ALONE (`cargo metadata` reported exactly one default member), so
+# every command that does not name a package — `ci.yml`'s `cargo test` and
+# `cargo clippy --all-targets -- -D warnings`,
+# `scripts/check-rquickjs-allocator.sh`'s `cargo tree -e features`, and whatever a
+# developer types locally — was PACKAGE-scoped to the engine and compiled the
+# daemon not at all. Measured both ways, with a planted
+# `E0308` in `fulcrum/src/transport/frame.rs` (a module `main.rs` never
+# references): before, bare clippy exited 0 while `--workspace` exited 101; after,
+# bare clippy exits 101 on the same error and exits 0 once the stub is restored,
+# and a bare `cargo test` runs `fulcrum`'s lib target and fails on a planted
+# `#[test]` there. Dropping this line therefore does not fail anything — it
+# silently UN-GATES the member, producing exactly the green-that-checked-nothing
+# this repo refuses elsewhere (`check-rquickjs-allocator.sh`'s vacuous `-p` form,
+# `childproc.rs`'s blind-census witnesses).
+#
+# Fixing it here rather than by adding `--workspace` to `ci.yml` is
+# deliberate: the manifest fixes every bare invocation at once, CI's steps
+# included, while widening only CI leaves the developer's local `cargo test`
+# blind — the exact trap that caught us. Do NOT "also" add `--workspace` to CI on
+# top of this; two mechanisms for one guarantee leaves a reader unable to tell
+# which is load-bearing.
+#
+# `"."` is the form used above, and it is accepted: `cargo metadata` resolves it
+# to the root package, giving two default members. Unlike `members`, where a root
+# `[package]` is pulled in implicitly and `"."` buys nothing, `default-members`
+# contains no implicit anything — a package absent from it is simply not built by
+# a bare command — so the root has to be spelled out, and `"."` is the path form
+# that reads as obviously-intentional. Note the `"."` ban above is NOT a cargo
+# syntax rule: measured, cargo accepts `"."` in `members` as well and dedupes it
+# against the implicit root member, leaving the member list unchanged. The ban
+# there is the census reason above, nothing more. And `default-members` IS
+# validated — a name there that is not a member is a hard cargo error, not a
+# silent no-op — so this line cannot rot into naming nothing.
+#
+# The census is unaffected by any of this: it reads manifests, not cargo's default
+# set, and `declaring_workspace_root` walks ancestors only — it never opens THIS
+# manifest at all. Verified, not reasoned: the census stays at 10 passed / 1392
+# filtered with `the_two_layout_witnesses_agree` green, and all 9 `boundary_pins`
+# pass with `default-members` present (the manifest pin matches key NAMES against
+# forbidden crate names, so a workspace key cannot trip it).
+[workspace]
+resolver = "2"
+members = ["fulcrum"]
+default-members = [".", "fulcrum"]
+
 [package]
 name = "fulcrum-core"
 version = "0.11.0"
