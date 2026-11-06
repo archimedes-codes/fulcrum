@@ -1220,11 +1220,29 @@ async fn a_second_daemon_on_the_same_endpoint_exits_non_zero_and_leaves_the_firs
         "and must say SOMETHING on stderr — a silent refusal is how an operator \
          concludes the command worked: {message:?}"
     );
+    // `cannot bind` is `ServeError::Bind`'s OWN wording (`serve.rs`'s
+    // `#[error("cannot bind: {0}")]`, printed verbatim by `main.rs`), so this
+    // half runs on every leg: the operator must be able to tell a refused BIND
+    // from a refused database open or a refused worker-exe lookup, and that
+    // distinction is the daemon's to guarantee regardless of OS.
+    assert!(
+        message.contains("cannot bind"),
+        "the refusal must name the STAGE that failed, on every platform; the \
+         operator cannot act on a bare non-zero exit: {message:?}"
+    );
+    // The REASON behind the refusal is unix-only prose, and deliberately stays
+    // gated: `in use` comes from `reclaim_stale_socket`, which PROVES the
+    // collision by connecting to the socket. Windows has no equivalent probe —
+    // connecting to a pipe would consume a real client slot on the predecessor
+    // (`transport::windows` documents this, and why the refusal is therefore not
+    // retried) — so the Windows leg genuinely cannot claim to know the pipe is
+    // live rather than merely reserved, and asserting a reason there would pin
+    // `Access is denied`, which is Microsoft's wording and not ours.
     #[cfg(unix)]
     assert!(
         message.contains("in use"),
-        "on unix it must name the collision (the operator needs to know a daemon \
-         is already there): {message:?}"
+        "on unix the refusal must also name the collision (the transport can \
+         prove it, so the operator gets to know a daemon is already there): {message:?}"
     );
 
     // The first daemon is undisturbed.

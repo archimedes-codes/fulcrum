@@ -174,8 +174,55 @@ mod tests {
     /// have been an assertion about a variant the production path never returns.
     /// What the daemon can actually rely on is the `Display` text, which is what
     /// `start_result` forwards to the client — so that is what is asserted.
+    ///
+    /// # ⚠ No operating system's error prose is matched here, and that is the point
+    ///
+    /// This assertion used to read `text.contains("No such file")`. Those words
+    /// are nobody's contract: not the daemon's, not the engine's. The engine's
+    /// contribution to the string ENDS at the colon —
+    /// `Io(format!("spawn the worker: {e}"))` in `worker/client.rs`, where `{e}`
+    /// is a `std::io::Error` — and everything after it is the operating system
+    /// rendering its own error in its own words: Linux says
+    /// `"No such file or directory (os error 2)"`, Windows says
+    /// `"program not found"`. Pinning either spelling therefore made this a
+    /// Linux test wearing a cross-platform name, and the `windows-latest` leg of
+    /// CI is the first thing that ran it and said so.
+    ///
+    /// The tempting repair — `cfg(windows)` => expect `"program not found"` —
+    /// repeats the error with Microsoft's prose standing in for the kernel's:
+    /// words this repo does not own, that Microsoft does not document as stable,
+    /// and that have changed between Windows releases. Two platform-shaped
+    /// assertions are not one portable one; they are two that fail one platform
+    /// apiece, and the inverted form fails silently on the leg nobody watches.
+    ///
+    /// So the assertion is the daemon's own contract, which holds everywhere:
+    ///
+    /// 1. the message **names the failure** — the engine-added
+    ///    `spawn the worker` context is present (verified in both platforms'
+    ///    observed strings; it is the engine's prose, so it is ours to pin), and
+    /// 2. it **carries a reason after it** — something follows the context,
+    ///    because a `start-result` reading `{"ok": false, "error": "…spawn the
+    ///    worker"}` with no cause is a frame the operator debugs blind. That is
+    ///    also exactly the shape a truncated format string produces, so the
+    ///    second half is what keeps the first half from passing on a message that
+    ///    says nothing.
+    ///
+    /// The reason is asserted as *non-empty after the context*, never as its
+    /// text — and a dangling `:` or padding does not qualify as a cause, so the
+    /// check still fires if the engine ever emits the context alone.
+    ///
+    /// The `worker error:` / `io:` prefixes are engine prose too and would be
+    /// portable to pin, but they are not pinned: the client's contract is that it
+    /// can tell a spawn failure from every other `WorkerError` and read why, and
+    /// every extra syllable of the engine's phrasing nailed down here is a future
+    /// edit to `client.rs` that breaks a daemon test for no change in behaviour.
     #[test]
     fn the_factory_is_the_engines_spawn_seam() {
+        // The engine's own context, the stable half of the message.
+        const CONTEXT: &str = "spawn the worker";
+        // Deliberately NOT asserted: `"No such file"` (Linux) and
+        // `"program not found"` (Windows) are the OS's rendering of the same
+        // `io::Error`, and neither is the daemon's wording to pin. See above.
         let factory: std::sync::Arc<dyn WorkerFactory> =
             std::sync::Arc::new(DaemonWorkerFactory::new("definitely-not-a-binary"));
         // `.err()` rather than `.expect_err()`: `WorkerHandle` holds the child's
@@ -188,11 +235,33 @@ mod tests {
             .err()
             .expect("a nonexistent executable cannot be spawned");
         let text = err.to_string();
+
+        // (1) Names the failure. Platform-independent: the engine adds this
+        // before the OS's words, so it is there on every leg.
         assert!(
-            text.contains("spawn the worker") && text.contains("No such file"),
-            "the error the client sees must name the spawn failure and why, \
-             got {text:?} — `serve::start` forwards this string verbatim into \
-             the `start-result`'s `error`"
+            text.contains(CONTEXT),
+            "the error the client sees must name the spawn failure, got {text:?} — \
+             `serve::start` forwards this string verbatim into the `start-result`'s \
+             `error`, and this context is the only part of it that says WHICH \
+             failure this is",
+        );
+
+        // (2) Carries a reason after the context — whatever the OS chose to call
+        // it. Strip the `: ` the engine puts between context and cause, and what
+        // is left must be an actual cause, not punctuation.
+        let reason = text
+            .split_once(CONTEXT)
+            .expect("(1) just proved the context is present")
+            .1
+            .trim()
+            .trim_end_matches(':')
+            .trim();
+        assert!(
+            !reason.is_empty(),
+            "the message names the spawn failure but gives no reason for it — a \
+             client reading this `start-result` cannot tell a missing binary from \
+             a permissions problem or an unclean image, got {text:?} (everything \
+             after {CONTEXT:?} was {reason:?})",
         );
     }
 }
