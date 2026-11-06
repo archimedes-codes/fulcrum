@@ -26,6 +26,13 @@ use std::time::Duration;
 
 use fulcrum_core::worker::protocol::PROTOCOL_VERSION;
 
+/// The shared process-table probe. One copy, included by both files that ask the
+/// question (`worker_mode.rs`'s `pid_is_reaped` and `serve.rs`'s `pid_is_alive`),
+/// because the two private versions that came before had already drifted into
+/// sharing the same wrong answer. See its module header.
+#[path = "proctable/mod.rs"]
+mod proctable;
+
 /// The bin under test — this member's own, named the way cargo means it.
 const BIN: &str = env!("CARGO_BIN_EXE_fulcrum");
 
@@ -75,9 +82,25 @@ const BIN: &str = env!("CARGO_BIN_EXE_fulcrum");
 /// original defect through: `detach()` skipped both the `kill` and the `wait`.
 ///
 /// Both platforms, because both daemon tests assert with it and the Windows leg
-/// gets no other coverage of the claim. The Windows branch is `tasklist` filtered
-/// on the pid — the same instrument `tests/serve.rs`'s `pid_is_alive` uses, and
-/// with the same caveat: compile-checked here, first run by the Windows leg of CI.
+/// gets no other coverage of the claim. The instrument is the shared probe in
+/// [`mod@proctable`] — shared with `tests/serve.rs`'s `pid_is_alive` because the
+/// two private copies this file and that one carried had already diverged while
+/// sharing one bug: both searched for `,` + pid + `,` in `tasklist /FO CSV`
+/// output, and `tasklist` quotes every field (`,"8620",`), so both answered "gone"
+/// for a live process. CI's `windows-latest` leg is what proved it. The parser and
+/// its fixtures live in `tests/proctable/mod.rs`, where the platform-independent
+/// part is TESTED rather than compile-checked.
+///
+/// ⚠ **The reaped-vs-zombie half of this claim does not exist on Windows, and is
+/// not claimed there.** There is no zombie state: `TerminateProcess` removes the
+/// process from the process list `tasklist` enumerates, whether or not the parent
+/// ever waited, and the kernel object that lingers while a handle is open is not
+/// a row in that list. So on Windows this answers "was it killed", and only on
+/// unix does it answer "was it killed AND reaped" (`kill(pid, 0)` says `ESRCH`
+/// only after the wait). That is still the whole of what this guard exists to
+/// catch — the original defect killed nothing at all, so the daemon stayed a live
+/// row on both platforms — but a reader must not take the Windows green as proof
+/// that `wait()` happens. It isn't.
 fn pid_is_reaped(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -87,17 +110,12 @@ fn pid_is_reaped(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let Ok(out) = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output()
-        else {
-            // Cannot ask; do not claim. `true` would silence the leak assertion
-            // on the platform that most needs it to be honest.
-            return false;
-        };
-        let text = String::from_utf8_lossy(&out.stdout);
-        // A CSV row naming the pid means it is still there.
-        !text.lines().any(|line| line.contains(&format!(",{pid},")))
+        // The probe panics when `tasklist` cannot be read rather than answering
+        // "gone", which is the direction the old code failed in (`return false`
+        // on a failed lookup, i.e. "still leaking"). For a leak guard a false
+        // "gone" is the one answer that must never be guessed: it is the answer
+        // that lets a 34-daemon leak pass.
+        !proctable::in_process_table(pid)
     }
 }
 

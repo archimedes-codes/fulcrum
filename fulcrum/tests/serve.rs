@@ -43,6 +43,38 @@
 //! Every wait here has one, per `tests/fixture_bins.rs`: a hung test is worse
 //! than a red one, because it prints nothing and takes the suite's output with
 //! it.
+//!
+//! # This file is written cross-platform, and CI's Windows leg is its first reader
+//!
+//! Three of this branch's Windows failures were the same mistake wearing three
+//! different clothes: **a Linux assumption expressed as a cross-platform
+//! assertion.** All three were in this file (the third in a helper it shared,
+//! duplicated, with `worker_mode.rs`):
+//!
+//! * `trim_start_matches(r"\\.\pipe\")` before dialing — the CLI's `--pipe` value
+//!   is the bare name because `parse_serve_options` re-adds the prefix, but
+//!   `CreateFileW` is not the CLI and resolves a bare name to nothing. Two tests
+//!   died with `NotFound` on a live daemon. Now: `endpoint_flag_value` for argv,
+//!   `pipe_name` for dialing, each naming the other.
+//! * `assert_eq!(exitCode, Null)` — Linux's *representation* of a signal death.
+//!   Windows has no signals; `taskkill /F` yields a code. Now: the portable
+//!   contract (both crash frames carry one code, passed through, not invented)
+//!   asserted everywhere, the OS's own rendering gated with the reason.
+//! * `line.contains(",{pid},")` against `tasklist /FO CSV` — the process table's
+//!   shape, which quotes every field, so four assertions called a live child dead.
+//!   Now the shared, fixture-tested parser in `tests/proctable/mod.rs`.
+//!
+//! And one precedent, fixed by the commit before this work:
+//! `assert!(message.contains("No such file"))` — the kernel's prose, not the
+//! daemon's; Windows says "program not found" (`worker_factory.rs`).
+//!
+//! So: any assertion about an **OS-rendered value** — error prose, an exit code,
+//! a process-table shape, a path or pipe-name prefix — must either state the
+//! daemon's own contract (the thing this repo can actually break) or be gated
+//! `#[cfg]` with a comment naming why the other platform cannot claim it. Do not
+//! "fix" a Windows failure by swapping in Microsoft's literal: two platform-shaped
+//! assertions are not one portable one, they are two that each fail a platform,
+//! and the inverted one fails on the leg nobody watches.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -50,6 +82,11 @@ use std::time::{Duration, Instant};
 
 use fulcrum::transport::{connect, Connection, Endpoint};
 use fulcrum_core::worker::protocol::{StartEnv, StartMode, PROTOCOL_VERSION};
+
+/// The shared process-table probe, whose own header explains why it is one module
+/// included by two test binaries rather than a helper in each (they had already
+/// drifted into sharing one wrong answer).
+mod proctable;
 
 /// The daemon binary under test (this member's own bin — the route cargo
 /// guarantees for an integration test of the package that declares it).
@@ -205,7 +242,7 @@ impl Daemon {
         cmd.args(["--socket"]);
         #[cfg(windows)]
         cmd.args(["--pipe"]);
-        cmd.arg(endpoint_path_str(&endpoint))
+        cmd.arg(endpoint_flag_value(&endpoint))
             .arg("--db")
             .arg(&db_path)
             // Explicit, so the test is not accidentally testing the
@@ -314,20 +351,44 @@ impl Drop for Daemon {
     }
 }
 
-/// The address string the CLI takes for an endpoint (the flag value is the bare
-/// path on unix and the bare name on Windows — `serve::parse_serve_options` adds
-/// the `\\.\pipe\` prefix, so the test must not).
+/// The flag VALUE the CLI takes for an endpoint — argv, not an address to dial.
+///
+/// The two platforms' flags take different shapes: `--socket` takes a path, and
+/// `--pipe` takes the bare NAME (`serve.rs`'s own help text: "named pipe to
+/// bind, without the `\\.\pipe\` prefix"), because `parse_serve_options` re-adds
+/// the prefix so an operator types the name they chose rather than the
+/// platform's address syntax. So the strip below is REQUIRED here and is not a
+/// general "endpoint → string" conversion.
+///
+/// ⚠ It is therefore the wrong helper for dialing: `CreateFileW` wants the full
+/// `\\.\pipe\…` name, which is what [`Endpoint::pipe`] stores and what
+/// `transport::windows::connect` passes. Dialing the stripped form is exactly
+/// what made two tests fail on the Windows leg with `NotFound` ("The system
+/// cannot find the file specified.") — a bare `fulcrum-serve-…` is not a pipe
+/// address. Use [`pipe_name`] for that, or `transport::connect`.
 #[cfg(unix)]
-fn endpoint_path_str(endpoint: &Endpoint) -> String {
+fn endpoint_flag_value(endpoint: &Endpoint) -> String {
     socket_path(endpoint).display().to_string()
 }
 
 #[cfg(windows)]
-fn endpoint_path_str(endpoint: &Endpoint) -> String {
+fn endpoint_flag_value(endpoint: &Endpoint) -> String {
     endpoint
         .to_string()
         .trim_start_matches(r"\\.\pipe\")
         .to_string()
+}
+
+/// The full pipe name to hand to the OS when DIALING (the counterpart of
+/// [`socket_path`], and the mirror image of [`endpoint_flag_value`]: that strips
+/// the prefix because the CLI flag wants it gone, this keeps it because
+/// `CreateFileW` wants it present).
+#[cfg(windows)]
+fn pipe_name(endpoint: &Endpoint) -> &str {
+    match endpoint {
+        Endpoint::Pipe(name) => name,
+        Endpoint::Socket(path) => panic!("a socket endpoint on windows: {}", path.display()),
+    }
 }
 
 #[cfg(unix)]
@@ -363,10 +424,20 @@ async fn raw_dial(endpoint: &Endpoint) -> impl tokio::io::AsyncRead + tokio::io:
         // `open` is synchronous in tokio's named-pipe wrapper (a `CreateFileW`),
         // and the daemon is already listening by the time a test gets here —
         // `Daemon::start` probed before returning.
+        //
+        // The FULL name, prefix and all — the same thing
+        // `transport::windows::connect` passes, and the reason this takes
+        // `pipe_name` and not `endpoint_flag_value`: the CLI's flag value is the
+        // bare name because `parse_serve_options` re-adds the prefix, but
+        // `CreateFileW` does not. Handing it a bare `fulcrum-serve-…` resolved
+        // to nothing and this failed `NotFound` ("The system cannot find the
+        // file specified.") on the Windows leg; the transport's own `connect`,
+        // passing the full name, is the control that says which of the two was
+        // wrong.
         tokio::net::windows::named_pipe::ClientOptions::new()
             .read(true)
             .write(true)
-            .open(endpoint.to_string().trim_start_matches(r"\\.\pipe\"))
+            .open(pipe_name(endpoint))
             .expect("dial raw (windows)")
     }
 }
@@ -638,9 +709,16 @@ fn start_frame(env: &StartEnv) -> serde_json::Value {
 /// goes `ESRCH` within the window), and the row-count half is a separate,
 /// independent assertion.
 ///
-/// Windows: `tasklist` filtered on the pid. **Compile-checked here, never run by
-/// this suite on this machine** — see the report; the Windows leg of CI is the
-/// first thing that will exercise it.
+/// Windows: the shared probe in [`mod@proctable`]. It used to shell out to
+/// `tasklist` and search for `,` + pid + `,`, which matched NOTHING — `tasklist
+/// /FO CSV` quotes every field, so a live pid reads `,"8620",`. Four assertions
+/// in this file failed on CI's `windows-latest` leg against a live child for that
+/// reason; the parser and its fixtures live in `tests/proctable/mod.rs` so the
+/// shape is tested on the platforms that can run it, and so this file and
+/// `worker_mode.rs` cannot drift apart again. That helper panics rather than
+/// answering "not alive" when the output is not readable, because a silent false
+/// negative here makes the durability tests report a child that vanished when
+/// nothing vanished.
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -652,19 +730,7 @@ fn pid_is_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let out = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output();
-        match out {
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                // `tasklist` prints "INFO: No tasks are running which match the
-                // search criteria." when the pid is gone, and a CSV row naming
-                // the image when it is not.
-                text.lines().any(|line| line.contains(&format!(",{pid},")))
-            }
-            Err(_) => false,
-        }
+        proctable::in_process_table(pid)
     }
 }
 
@@ -1197,7 +1263,7 @@ async fn a_second_daemon_on_the_same_endpoint_exits_non_zero_and_leaves_the_firs
     #[cfg(windows)]
     second.arg("--pipe");
     let out = second
-        .arg(endpoint_path_str(&endpoint))
+        .arg(endpoint_flag_value(&endpoint))
         .arg("--db")
         .arg(daemon._dir.path().join("other.db"))
         .arg("--worker-exe")
@@ -1291,7 +1357,7 @@ async fn a_daemon_that_cannot_open_its_database_leaves_no_socket_behind() {
     #[cfg(windows)]
     cmd.arg("--pipe");
     let out = cmd
-        .arg(endpoint_path_str(&endpoint))
+        .arg(endpoint_flag_value(&endpoint))
         .arg("--db")
         .arg(&db_path)
         .arg("--worker-exe")
@@ -2058,11 +2124,16 @@ async fn a_fresh_client_receives_nothing_before_it_starts_anything() {
 /// `kill -9`, deliver a SIGNAL, and a signal death takes a different path through
 /// the frozen engine. `WorkerHandle::exited()` waits on
 /// `wait_for(|v| v.is_some())` and the read task publishes the code as
-/// `Status::code()`, which is `None` for a signal death — so the `exited()` WATCH
-/// waits FOREVER on exactly this case, while the `Exited` EVENT still fires with
-/// `exitCode: null`. Measured here: the frames this test asserts on are the
-/// evidence, and they are the reason the daemon keys recovery off the event
-/// rather than off the watch.
+/// `Status::code()`, which is `None` for a unix signal death — so the `exited()`
+/// WATCH waits FOREVER on exactly that case, while the `Exited` EVENT still fires.
+/// Measured here: the frames this test asserts on are the evidence, and they are
+/// the reason the daemon keys recovery off the event rather than off the watch.
+///
+/// On Windows the kill is `taskkill /F` (`TerminateProcess`), since there are no
+/// signals to deliver; the EVENT-vs-WATCH mechanism this test exists to prove is
+/// the same on both, but the code the event carries is the OS's to choose (`null`
+/// after `kill -9`, a number after `/F`), so nothing here pins the number — see
+/// the note at the assertions.
 ///
 /// # What it pins
 ///
@@ -2070,8 +2141,9 @@ async fn a_fresh_client_receives_nothing_before_it_starts_anything() {
 /// session" and a signal death is the common way a session dies:
 ///
 /// * the crash REACHES the socket (`worker-crashed`, main-session-labelled, with
-///   the dead child's pid) — so a client can tell its session died instead of
-///   inferring it from silence;
+///   the dead child's pid, and with the SAME code the `worker-exited` event
+///   carried) — so a client can tell its session died instead of inferring it
+///   from silence;
 /// * the same id is `start`able again with no `close` in between, and gets a NEW
 ///   live child — the recovery itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2126,23 +2198,37 @@ async fn a_child_killed_by_sigkill_is_reported_and_can_be_started_again() {
     );
 
     // THE SIGNAL-DEATH EVIDENCE. `worker-exited` is the daemon's own spelling of
-    // the `Exited` EVENT, and its code is `null` here where the `__crash__` test
-    // sees 137: a signal death carries no code, because
-    // `Status::code()` is `None` for one. That is the measurement finding 1 asked
-    // for — the WATCH-based probe (`exited()`) cannot be how a daemon notices an
-    // OOM kill, because the watch is only satisfied by `Some(_)`; the event is.
+    // the `Exited` EVENT, and it is what proves the daemon NOTICED: the
+    // WATCH-based probe (`exited()`) cannot be how a daemon learns of an OOM kill,
+    // because a watch is only satisfied by `Some(_)` and a unix signal death
+    // publishes `None` — the event fires either way. That mechanism claim is what
+    // finding 1 asked for, and it is platform-independent: it is about which of
+    // the two channels carried the news, not about what the code field contains.
+    //
+    // ⚠ What the code field CONTAINS is the operating system's business, and this
+    // assertion used to pin it as `Null`. That is Linux's representation of "how
+    // did it die": `Status::code()` is `None` for a signal death, so `kill -9`
+    // yields `null`. Windows has no signals at all — the kill below is
+    // `taskkill /F`, i.e. `TerminateProcess`, and a forcibly terminated process
+    // HAS an exit code (`1`). The daemon is right on both: it forwards whatever
+    // `Status::code()` reported. The test had pinned one OS's rendering, which is
+    // the same mistake the previous commit fixed for the spawn-failure prose, in
+    // the same file. So:
+    //
+    // * the PORTABLE half, asserted everywhere, is that both frames describe ONE
+    //   death — `worker-exited` (from `on_event`) and `worker-crashed` (from
+    //   `on_crash`) reach the socket carrying the SAME code. Both are built from
+    //   the one `Option<i32>` the pump was handed, so a daemon that invented a
+    //   code on either path (`unwrap_or(1)`, a default, a re-derivation) makes
+    //   them disagree and reddens this on every platform;
+    // * the platform's own representation is asserted per-platform below, with
+    //   the reason named, and never as a literal value.
     let exited = client
         .recv_until_matching("event", |frame| {
             frame["sessionId"] == "sigkill-then-restart"
                 && frame["frame"]["type"] == "worker-exited"
         })
         .await;
-    assert_eq!(
-        exited["frame"]["exitCode"],
-        serde_json::Value::Null,
-        "a signal death carries no exit code, and the daemon must pass that \
-         through rather than inventing one: {exited}"
-    );
 
     // And the crash REPORT — which only `on_crash` produces (`on_event` emits
     // `worker-exited`, never `worker-crashed`), so this frame is the direct
@@ -2163,11 +2249,37 @@ async fn a_child_killed_by_sigkill_is_reported_and_can_be_started_again() {
         "the report names the process that died, since that is the pid a crash \
          log's name carries: {crash}"
     );
+    // THE PASS-THROUGH GUARANTEE, in the form that holds on every OS: the two
+    // frames report ONE death. `worker_frame` and `crash_report_frame` are fed the
+    // same `Option<i32>` by the pump (`pump.rs`'s `Exited` arm calls `on_event`
+    // then `on_crash` with the code it was given), so any daemon that manufactured
+    // a code on one path — `unwrap_or(1)`, a `?? 0`, a re-derivation from the pid —
+    // makes these two disagree, HERE, on Linux and on Windows alike. That is the
+    // bug worth catching; "which value the OS chose" is not a bug on either leg.
     assert_eq!(
-        crash["frame"]["exitCode"],
-        serde_json::Value::Null,
-        "and it says so rather than guessing a code: {crash}"
+        crash["frame"]["exitCode"], exited["frame"]["exitCode"],
+        "the crash report must carry the SAME code the `worker-exited` event \
+         carried — one death, one code, passed through by both paths rather than \
+         invented by either (event: {exited}, report: {crash})"
     );
+    // The platform's own representation, gated and with the reason named, so the
+    // contract this file actually relies on stays pinned where it is true:
+    // unix's signal death has no code, and the daemon must not invent one.
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            exited["frame"]["exitCode"],
+            serde_json::Value::Null,
+            "on unix a signal death carries no exit code (`Status::code()` is \
+             `None`), and the daemon must pass that through rather than inventing \
+             one: {exited}"
+        );
+    }
+    // Not asserted on Windows, deliberately: `taskkill /F` is `TerminateProcess`,
+    // whose code is whatever the OS hands back (measured `1` on CI's runner), and
+    // naming that number would pin a Windows implementation detail the way the
+    // deleted `Null` pinned a Linux one. The pass-through above is the guarantee;
+    // the value is the OS's to choose.
 
     // THE RECOVERY, with no `close` in between.
     client.send(start_frame(&env)).await;
