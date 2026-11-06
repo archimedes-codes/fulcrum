@@ -1549,7 +1549,7 @@ fn log_on_join_error(handle: tokio::task::JoinHandle<()>) {
 ///
 /// * [`reader_loop`] — the reader half of the `Connection`, the `watching` set,
 ///   issue #4's hardening state (`Handshake`, `FrameRateGate`, `seen`), the reply side
-///   of the outbound queue, and the two wire-auth refusals.
+///   of the outbound queue, and the two protocol-gate refusals.
 /// * [`writer_loop`] — the `ConnectionWriter`, the fan-out subscription, the drain,
 ///   and the refusal sender. THE RELAY LIVES HERE, and that placement is the whole
 ///   point: only a task that never calls `handle_frame` can carry it through a slow
@@ -1652,7 +1652,7 @@ async fn serve_client(daemon: Arc<Daemon>, connection: Connection) {
     // READER's sender going away.
     let (tx, queued) = tokio::sync::mpsc::channel::<serde_json::Value>(CLIENT_QUEUE_CAPACITY);
 
-    // Issue #4's wire-auth refusal, across the task boundary. TWO one-shots, because
+    // Issue #4's protocol-gate refusal, across the task boundary. TWO one-shots, because
     // the reader's guarantee is "told ONCE, then closed" while closing is the reader's
     // job and writing is the writer's:
     //
@@ -2025,8 +2025,8 @@ async fn reader_loop(
 ///
 /// 1. `send_frame` returns `Err` — the peer is gone (its close, or the socket's final
 ///    `Arc` drop after the abort).
-/// 2. The refusal oneshot fires — issue #4's wire-auth path: send the one frame, ack
-///    the reader so its exit lands after the refusal is on the socket, exit.
+/// 2. The refusal oneshot fires — issue #4's protocol-gate path: send the one frame,
+///    ack the reader so its exit lands after the refusal is on the socket, exit.
 /// 3. The fan-out reports `Closed` — the `Daemon`'s own senders are gone, which needs a
 ///    whole-daemon teardown this daemon does not have yet.
 ///
@@ -2127,12 +2127,12 @@ async fn writer_loop(
                 }
             }
 
-            // Issue #4's wire-auth refusal (see `serve_client`): the one reader→writer
-            // control message. `send_frame_no_select`, then the ack, so the reader does
-            // not end the connection while the refusal is still unwritten. The send
-            // result is deliberately ignored: a refusal that cannot be written means
-            // the peer is gone, and the reader is leaving either way — what it waits
-            // for is the ACK, not the outcome.
+            // Issue #4's pre-protocol refusal (see `serve_client`): the one
+            // reader→writer control message. `send_frame_no_select`, then the ack, so
+            // the reader does not end the connection while the refusal is still
+            // unwritten. The send result is deliberately ignored: a refusal that
+            // cannot be written means the peer is gone, and the reader is leaving
+            // either way — what it waits for is the ACK, not the outcome.
             refused = &mut refuse_rx => {
                 // `Ok` carries the refusal frame; `Err` means the reader dropped its
                 // sender without asking for a refusal, i.e. it is already gone.

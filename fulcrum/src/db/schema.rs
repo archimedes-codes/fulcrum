@@ -396,7 +396,7 @@ pub const TABLE_SHAPES: [TableShape; 4] = [
 /// shape constants do not carry. This is the serialisation of the same fact
 /// `the_pinned_shapes_match_the_ddl_they_claim_to_describe` proves against `SCHEMA`,
 /// not a second representation.
-pub fn schema_shape_sections() -> Vec<(String, Vec<String>)> {
+pub(crate) fn schema_shape_sections() -> Vec<(String, Vec<String>)> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
     for shape in TABLE_SHAPES {
         out.push((
