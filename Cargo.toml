@@ -1,3 +1,49 @@
+# T9 — this repo is now a WORKSPACE so the `fulcrum serve` daemon can live
+# beside the engine as a second member and link it by `path = ".."` (a rev pin
+# would let the two drift; one workspace cannot build two versions of the same
+# path dependency).
+#
+# THE LAYOUT IS FORCED: `[package]` for `fulcrum-core` stays at THIS root, with
+# `src/` and `tests/` beside it. Do NOT move them into a `fulcrum-core/`
+# subdirectory, however idiomatic that looks. `src/childproc.rs`'s
+# `declaring_workspace_root` walks ANCESTORS ONLY, starting at
+# `manifest_dir().parent()`, so this `[workspace]` table — sitting AT the
+# manifest dir — is never examined; but a `[workspace]` one level ABOVE a moved
+# `fulcrum-core/` would resolve `Layout::WorkspaceMember`, and `source_roots()`
+# then hardcodes `workspace_root.join("src-tauri").join("src")`, which does not
+# exist here, so the childproc census PANICS with "the census resolved the wrong
+# root". The four layout witnesses in `childproc::tests` are what catch it.
+#
+# `members` lists ONLY `fulcrum`, never `"."`: cargo treats a root `[package]` as
+# an implicit member, so `"."` is unnecessary — and it would be WRONG for the
+# census matcher if that walk ever changed, because `member_entry_names_us`
+# compares `rel == entry || package == entry` and `relative_to_manifest` returns
+# the EMPTY STRING for a root package, so `"."` matches nothing. It would pass
+# today only because the walk never reaches the manifest dir. Write the form that
+# is true, not the form that happens not to be read.
+#
+# ⚠ MEASURED CONSEQUENCE OF KEEPING `[package]` HERE (T9 Task 1, measured, not
+# reasoned about): because the workspace root IS also a package, cargo resolves
+# `workspace_default_members` to `fulcrum-core` ALONE — `cargo metadata` reports
+# exactly one default member. So the BARE forms of the gates, which is what
+# `ci.yml` runs (`cargo test`, `cargo clippy --all-targets -- -D warnings`) and
+# what `scripts/check-rquickjs-allocator.sh` runs (`cargo tree -e features`), are
+# PACKAGE-scoped to the engine and do NOT reach this workspace's other member.
+# Measured: with a planted `E0308` in `fulcrum/src/transport/frame.rs`, bare
+# `cargo clippy --all-targets -- -D warnings` exits 0; `cargo tree -e features`
+# prints `fulcrum-core` only and zero `rusqlite` lines, while the `--workspace`
+# form prints the member and 6. The member IS covered by the `--workspace` forms
+# (both clippy gates and `cargo test --workspace` compile and lint `fulcrum`, and
+# the census is unaffected — it reads manifests, not cargo's default set). This is
+# a CONSEQUENCE OF THE FORCED LAYOUT, not a mistake in it: the alternative is
+# Layout B, which the census panics on. Widening `ci.yml` to `--workspace` is the
+# fix and is deliberately NOT taken here — Task 1 converts the layout and nothing
+# else, and changing what CI gates is the orchestrator's call, not a side effect
+# of a conversion commit.
+[workspace]
+resolver = "2"
+members = ["fulcrum"]
+
 [package]
 name = "fulcrum-core"
 version = "0.11.0"
