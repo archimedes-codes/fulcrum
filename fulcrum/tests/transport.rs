@@ -415,16 +415,22 @@ async fn the_receive_stream_ends_at_eof_rather_than_hanging() {
 //   * `a_partially_accepted_frame_is_drained_before_any_new_bytes` — the hazard
 //     as it appears in production: a frame the OS took only part of, followed by
 //     a second frame.
-//   * `a_shared_writer_under_a_mutex_never_interleaves_frames` — the pin that
-//     actually reddens a design where two tasks can be inside one stream's write
-//     loop without whole-send serialisation (a `Mutex<ConnectionWriter>` +
-//     re-added `Connection::send_frame`). It is a regression pin against a
-//     POSSIBLE future design, not a proof about the current one: the current
-//     design makes the hazard structurally unreachable (`ConnectionWriter` is
-//     neither `Clone` nor shareable, `send_frame` takes `&mut self`), and no
+//   * `a_shared_writer_under_a_mutex_never_interleaves_frames` — the only
+//     behavioural pin here that can see interleaving at all, and only the
+//     UNSERIALISED kind: two tasks reaching one `pending` with no lock spanning
+//     the write loop (a guard dropped before the await, or `pending` hoisted onto
+//     a `Clone`/`Sync` handle). It CANNOT see the serialising shape — a
+//     `Mutex<ConnectionWriter>` + re-added `Connection::send_frame` whose lock
+//     covers each send end to end — because that design produces exactly the
+//     whole-send serialisation this test itself implements, and its frames arrive
+//     clean. Nothing behavioural guards that shape and nothing needs to: it is
+//     unreachable in these types (`ConnectionWriter` is neither `Clone` nor
+//     shareable, `send_frame` takes `&mut self`, `Connection` has no write
+//     method), with `a_second_split_writer_panics` as the runtime pin on the one
+//     mistake that IS still expressible. This test is a regression pin against a
+//     POSSIBLE future design, not a proof about the current one — and no
 //     behavioural test can prove structural impossibility. The three pins above
-//     it all stay GREEN under that regression — the mutex serialises them —
-//     which is exactly why this one exists.
+//     it all stay GREEN under a mutex-shared design — the mutex serialises them.
 //   * `a_send_against_a_shut_down_connection_errors_that_the_writer_survives` —
 //     `ConnectionWriter::shutdown` closes the WRITE direction while the read
 //     half lives (the daemon's teardown contract, T4 D3).
@@ -446,7 +452,8 @@ async fn the_receive_stream_ends_at_eof_rather_than_hanging() {
 /// This is the behaviour the whole framing layer exists to protect, exercised
 /// through the `pending` drain path serially. It stays green through the split
 /// and through a serialised (mutex-shared) regression; the concurrent driver
-/// below is the one that reddens an interleaving design.
+/// below is the one that reddens an interleaving design — the unserialised kind,
+/// as its own doc spells out.
 #[tokio::test]
 async fn two_frames_from_the_sole_writer_arrive_as_two_clean_lines() {
     let (_keepalive, endpoint) = test_endpoint();
@@ -507,7 +514,9 @@ async fn two_frames_from_the_sole_writer_arrive_as_two_clean_lines() {
 /// than surfacing later as a corrupted frame on a production socket. Cheap
 /// structural pin — note it stays GREEN under a `Mutex<ConnectionWriter>`
 /// regression (that design never calls `split_writer` twice), which is why
-/// [`a_shared_writer_under_a_mutex_never_interleaves_frames`] exists beside it.
+/// [`a_shared_writer_under_a_mutex_never_interleaves_frames`] exists beside it —
+/// that one is the behavioural pin, and its doc states exactly which shapes of
+/// that regression it can and cannot see.
 #[tokio::test]
 #[should_panic(expected = "the writer was already taken")]
 async fn a_second_split_writer_panics() {
@@ -705,14 +714,43 @@ async fn a_partially_accepted_frame_is_drained_before_any_new_bytes() {
 
 /// Two tasks driving ONE writer never interleave a frame.
 ///
-/// The pin that actually goes red on the realistic regression — a shared
-/// `pending` reachable by two tasks (a `Mutex<ConnectionWriter>` plus a
-/// re-added `Connection::send_frame`, or `pending` moved back onto a `Clone`/
-/// `Sync` handle). Under such a design task A's `write` drains only part of its
-/// frame and task B's `write` lands in the middle of it, so the peer's line
-/// reader glues two halves into one non-JSON line and the assertion below fails.
-/// The three serial pins above it all stay green under that regression — the
-/// mutex serialises them — so without THIS test the regression ships green.
+/// # Exactly which regression shapes this reddens — and which it cannot see
+///
+/// This body holds the mutex guard across the WHOLE of `send_frame`'s await, so
+/// the two sends are fully serialised — which means the design this file worries
+/// about most is the one it CANNOT fail on: a `Mutex<ConnectionWriter>` plus a
+/// re-added `Connection::send_frame`, whose lock covers each send end to end,
+/// produces precisely the whole-send serialisation this test already implements.
+/// Its 40 frames arrive clean and this test stays GREEN under that regression.
+///
+/// What it does redden is a change that lets two tasks reach one `pending`
+/// WITHOUT whole-send serialisation, because then two `write` calls are live on
+/// one stream at once, each may take only part of its frame, and the peer's line
+/// reader glues the halves into one non-JSON line:
+///   * a guard dropped before the await (or the lock re-acquired per `write`), so
+///     the lock no longer spans the write loop;
+///   * `pending` hoisted onto a `Clone`/`Sync` handle, so each writer holds its
+///     OWN view of the tail and no lock serialises them at all.
+///
+/// The serialising shape is kept out of reach by the types, not by a behavioural
+/// test, and that is the right division of labour: `ConnectionWriter` is neither
+/// `Clone` nor otherwise shareable and is handed out only by
+/// `Connection::split_writer`; `send_frame` takes `&mut self`, so two tasks
+/// cannot both be inside it on one handle; and `Connection` has no write method
+/// left to reach `pending` with (T4b deleted the delegator). A
+/// `Mutex<ConnectionWriter>` + `Connection::send_frame` is therefore not a change
+/// this crate can be edited into while keeping those types — it requires
+/// re-widening them, and the type-level guarantee is what stops it.
+/// `a_second_split_writer_panics` is the runtime pin on the one mistake that
+/// remains expressible — asking for the writer twice — and it stays GREEN under
+/// the mutex design, which never calls `split_writer` twice.
+///
+/// So: this test pins the frame-whole property of the mutex-shared shape a future
+/// change might reach for; its GREEN says nothing about the current design's
+/// exclusivity, which no behavioural test can prove. The three serial pins above
+/// it stay green under any mutex-shared design too — the mutex serialises them.
+/// This is the only behavioural test here that can see interleaving at all, and
+/// it can see only the UNSERIALISED kind.
 ///
 /// # Why it is driven with `tokio::join!` and not two `spawn`s
 ///
@@ -1871,10 +1909,30 @@ mod unix_specific {
     /// whether or not the daemon is about to hang up.
     ///
     /// The child is this same test binary, re-executed with `--ignored --exact`
-    /// naming [`child_dials_as_a_foreign_uid`] plus two env vars it reads — which
-    /// keeps the proof inside one binary instead of reaching for `setpriv`,
+    /// naming [`child_dials_as_a_foreign_uid`] plus three env vars it reads —
+    /// which keeps the proof inside one binary instead of reaching for `setpriv`,
     /// `sudo -u nobody`, `socat` or a shell that can dial a unix socket, none of
     /// which a CI image is obliged to provide.
+    ///
+    /// # Why the child's success is a SENTINEL and not an exit code
+    ///
+    /// `--exact` selects the child by NAME, and libtest exits 0 when a filter
+    /// matches nothing. So a re-exec whose name no longer resolves — the child
+    /// entry point renamed, moved to another module, or deleted — runs ZERO
+    /// tests, reports success, and an exit-code-only parent would be satisfied by
+    /// a child that did nothing at all: the reject-path proof would evaporate
+    /// while this test stayed green. That is the same vacuity the file's bind
+    /// guard argues about from the other side (an absence-check whose needle
+    /// matches nothing asserts nothing).
+    ///
+    /// So the child's success is an OBSERVED fact instead: after a successful dial
+    /// it prints a line naming the nonce this run handed it, the uid it dialed as
+    /// and the descriptor it dialed on (see [`PEER_DIAL_SENTINEL`]), and the parent
+    /// requires that line in the child's captured stdout. "Ran nothing" cannot
+    /// produce it, and neither can "ran as the wrong uid" — the uid in the needle is
+    /// the one this test chose. The exit code is still asserted too (a child that
+    /// could not dial at all says so by failing), it is simply no longer
+    /// load-bearing on its own.
     ///
     /// # What it does NOT cover
     ///
@@ -1918,17 +1976,40 @@ mod unix_specific {
         std::fs::set_permissions(keepalive.path(), std::fs::Permissions::from_mode(0o755))
             .expect("open the socket's directory for traversal");
 
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        // Per-run nonce, so the sentinel the parent hunts for cannot be a stale
+        // line from an earlier run or a coincidental match in libtest's summary —
+        // only a child spawned by THIS run knows it.
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a wall clock past the epoch")
+                .as_nanos()
+        );
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args([
                 "--ignored",
                 "--exact",
+                // Without this the sentinel never arrives: libtest CAPTURES a
+                // passing test's stdout and prints it only on failure, so the
+                // child's green run — the only run whose output is the proof —
+                // would print nothing and this test would fail for the wrong
+                // reason.
+                "--nocapture",
                 concat!("unix_specific::", "child_dials_as_a_foreign_uid"),
             ])
             .env("FULCRUM_PEER_DIAL_SOCKET", &path)
             .env("FULCRUM_PEER_DIAL_UID", target.to_string())
-            // The child's libtest summary would interleave into the parent's; its
-            // FAILURE, which is the thing worth seeing, goes to stderr.
-            .stdout(std::process::Stdio::null())
+            .env("FULCRUM_PEER_DIAL_NONCE", &nonce)
+            // The child's stdout is captured rather than nulled OR inherited: it
+            // carries the sentinel that proves the child ran at all (see
+            // [`PEER_DIAL_SENTINEL`]). Its libtest summary lands here too, which is
+            // fine — the parent scans it for one line, and the summary only shows
+            // up in a failure message. Its FAILURE, which is the thing worth seeing
+            // as it happens, still goes to stderr unbuffered.
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("re-exec the test binary as the dialing child");
@@ -1953,12 +2034,42 @@ mod unix_specific {
         );
 
         // Reap the child BEFORE asserting: a child outliving the suite is exactly
-        // what the stray-process census fails the run for.
-        let child_ok = child.wait().expect("reap the dialing child").success();
+        // what the stray-process census fails the run for. `wait_with_output` both
+        // reaps and takes the pipe, and doing it in this order (rather than
+        // reading the pipe while the child still runs) is what keeps a parent from
+        // waiting on output a dead child will never send. It relies on the child's
+        // whole stdout fitting the OS pipe buffer — true for one libtest summary
+        // plus one sentinel line, and if this child ever grew a chatty stdout the
+        // read would have to move before the reap.
+        let output = child
+            .wait_with_output()
+            .expect("reap the dialing child and take its stdout");
+        let child_ok = output.status.success();
+        let child_stdout = String::from_utf8_lossy(&output.stdout);
+        // The exit code FIRST, because it is the specific diagnosis when the child
+        // ran and failed; the sentinel below is what the exit code CANNOT say.
         assert!(
             child_ok,
             "the child reported it could NOT dial — the mode widening above did not \
              take effect, so nothing ever reached the credential check"
+        );
+        // The expected line is built from the SAME helper family the child calls,
+        // so the parent's needle cannot drift from the child's print. The fd VALUE
+        // is the child's fact, so the needle ends at `fd=` — and the fd must still
+        // be there, and still be a number the child actually named.
+        let needle = peer_dial_sentinel_prefix(&nonce, target);
+        let dialed = child_stdout.lines().map(str::trim_end).any(|line| {
+            line.strip_prefix(needle.as_str())
+                .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
+        });
+
+        assert!(
+            dialed,
+            "the child never printed its dial sentinel `{needle}<fd>` — `{child_stdout}` \
+             has no such line. An exit code of 0 without it means the `--exact` filter \
+             matched ZERO tests (the child entry point was renamed, moved or deleted), \
+             so nothing dialed, so the refusal asserted below came from somewhere other \
+             than a foreign-uid peer and this test proved nothing."
         );
 
         match accepted {
@@ -1980,22 +2091,69 @@ mod unix_specific {
         }
     }
 
+    /// Every sentinel line starts with this: the marker [`child_dials_as_a_foreign_uid`]
+    /// prints once it has genuinely dialed, and which
+    /// [`foreign_uid_peer_is_rejected_under_root`] requires in the captured stdout.
+    ///
+    /// It exists because the parent selects the child by NAME, as a STRING
+    /// (`--exact unix_specific::child_dials_as_a_foreign_uid`). A rename, a move
+    /// to another module, or a deletion of the child therefore cannot be caught at
+    /// compile time, and libtest exits 0 when a filter matches ZERO tests — so an
+    /// exit code alone lets "ran nothing" look exactly like "ran and succeeded",
+    /// and the reject-path proof would evaporate silently. Requiring a line only
+    /// the running child can write makes its success an observed fact instead.
+    /// `nonce=` carries a per-run value so the line cannot be another run's
+    /// leftover or a coincidental match in libtest's own summary, `uid=` pins that
+    /// it dialed as the uid THIS run chose, and `fd=` names the descriptor it
+    /// dialed on.
+    #[cfg(target_os = "linux")]
+    const PEER_DIAL_SENTINEL: &str = "FULCRUM-PEER-DIAL-SENTINEL";
+
+    /// The one place the sentinel's shape is written — the pair
+    /// [`peer_dial_sentinel`] / [`peer_dial_sentinel_prefix`]. The child prints the
+    /// first, the parent hunts for the second, so the two sides cannot drift into a
+    /// parent that accepts a line no child ever prints.
+    ///
+    /// [`peer_dial_sentinel`] is what the child prints;
+    /// [`peer_dial_sentinel_prefix`] is what the parent hunts for — the same line
+    /// up to the `fd=` VALUE, which is the child's own fact (whichever descriptor
+    /// its `connect` got) and is not the parent's to guess. Requiring `fd=` to be
+    /// present still forces the child to name the descriptor it dialed on.
+    #[cfg(target_os = "linux")]
+    fn peer_dial_sentinel(nonce: &str, uid: u32, fd: i32) -> String {
+        format!("{}fd={fd}", peer_dial_sentinel_prefix(nonce, uid))
+    }
+
+    /// The parent's needle — see [`peer_dial_sentinel`].
+    #[cfg(target_os = "linux")]
+    fn peer_dial_sentinel_prefix(nonce: &str, uid: u32) -> String {
+        format!("{PEER_DIAL_SENTINEL} nonce={nonce} uid={uid} fd=")
+    }
+
     /// The child half of [`foreign_uid_peer_is_rejected_under_root`]: drop to the
     /// uid the parent named, dial, hang up.
     ///
     /// `#[ignore]`d so a normal pass never runs it — alone it tests nothing, and
     /// panicking for want of its env vars is the honest failure rather than a
-    /// silent skip. The parent reaches it through `--ignored --exact`.
+    /// silent skip. The parent reaches it through `--ignored --exact`, and reads
+    /// [`peer_dial_sentinel`] on its stdout as the proof this entry point actually
+    /// ran (see that constant for why an exit code is not the proof).
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "child entry point: only the peer-credential test spawns it"]
     fn child_dials_as_a_foreign_uid() {
+        use std::os::unix::io::AsRawFd as _;
+
         let path = std::env::var("FULCRUM_PEER_DIAL_SOCKET")
             .expect("the parent must name the socket to dial");
         let target: u32 = std::env::var("FULCRUM_PEER_DIAL_UID")
             .expect("the parent must name the uid to drop to")
             .parse()
             .expect("the target uid is a number");
+        // Echoed back in the sentinel, so the parent's needle cannot be satisfied
+        // by a line an earlier run left behind.
+        let nonce = std::env::var("FULCRUM_PEER_DIAL_NONCE")
+            .expect("the parent must name the sentinel nonce to echo");
 
         // Drop real, effective AND saved-set uid. `SO_PEERCRED` reports the REAL
         // uid, and a process that keeps a root saved set can climb back — so
@@ -2018,10 +2176,20 @@ mod unix_specific {
         // Blocking `std` connect, deliberately: this child has no runtime, and a
         // unix `connect` either succeeds or fails immediately.
         match std::os::unix::net::UnixStream::connect(&path) {
-            // Dropping the stream closes it. The parent was already woken when the
-            // connection was queued, and the parent asserts the refusal; success
-            // here means only "I got as far as dialing".
-            Ok(_peer) => {}
+            Ok(peer) => {
+                // The proof-of-life, printed AFTER the dial so a child that
+                // dropped its uid but never reached the socket cannot print it.
+                // Names the uid it dialed as and the descriptor it dialed on, plus
+                // the parent's nonce. `println!` reaches the parent's pipe because
+                // the parent passes `--nocapture` — without that flag libtest
+                // captures a PASSING test's stdout and the sentinel would be
+                // swallowed by exactly the green run this test is meant to observe.
+                println!("{}", peer_dial_sentinel(&nonce, target, peer.as_raw_fd()));
+                // Dropping the stream closes it. The parent was already woken when
+                // the connection was queued, and the parent asserts the refusal;
+                // success here means only "I got as far as dialing".
+                drop(peer);
+            }
             Err(e) => panic!("the foreign peer could not dial {path}: {e}"),
         }
     }
