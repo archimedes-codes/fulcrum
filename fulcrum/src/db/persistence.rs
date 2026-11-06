@@ -60,6 +60,12 @@ impl From<DbError> for StoreError {
                 "database schema version {found} is newer than this build supports ({supported})"
             )))
             }
+            // The schema fork keeps its own words. `TranscriptPersister` only
+            // `eprintln!`s this and continues, so nothing branches on it — but
+            // the operator who reads the line still has to be able to tell
+            // "newer desktop" from "corrupt file", which is the whole reason
+            // `SchemaFork` carries a sentence rather than a kind tag.
+            DbError::SchemaFork { .. } => StoreError::Io(io::Error::other(e.to_string())),
             DbError::Io(e) => StoreError::Io(e),
             DbError::Json(e) => StoreError::Json(e),
         }

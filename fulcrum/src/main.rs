@@ -82,14 +82,26 @@ fn main() {
     }
 }
 
-/// Open the store, bind the listener, and run the accept loop until the process
-/// is killed (T9 has no shutdown surface — see `serve::run`).
+/// Open the store, decide the Worker executable, bind the listener, and run the
+/// accept loop until the process is killed (T9 has no shutdown surface — see
+/// `serve::run`).
 ///
-/// The database opens BEFORE the bind, on purpose: a daemon that binds first and
-/// then fails to open `fulcrum.db` leaves a live socket behind that answers
-/// `hello` and fails every `start`, and Task 3's stale-socket reclaim will not
-/// clean it up (a live listener answers the probe, so the file is left alone —
-/// correctly). Failing before the socket exists leaves nothing to reclaim.
+/// The database opens and the factory resolves BEFORE the bind, on purpose: a
+/// daemon that binds first and then fails to open `fulcrum.db` leaves a live
+/// socket behind that answers `hello` and fails every `start`, and Task 3's
+/// stale-socket reclaim will not clean it up (a live listener answers the probe,
+/// so the file is left alone — correctly). Failing before the socket exists
+/// leaves nothing to reclaim. `tests/serve.rs`'s
+/// `a_daemon_that_cannot_open_its_database_leaves_no_socket_behind` is the pin —
+/// the code had drifted to bind-first while this doc said the opposite, which is
+/// the shape of rot a doc comment cannot fix on its own.
+///
+/// The Worker executable is resolved in the same pre-bind block for the same
+/// reason: `DaemonWorkerFactory::resolve` can fail (a `current_exe()` that
+/// returns nothing), and a daemon that had already bound a socket then notices
+/// the same way — same orphan. A named path that does not exist is deliberately
+/// NOT a startup failure, though: that one belongs in the `start-result` of the
+/// session that asked for it.
 ///
 /// The runtime is built here rather than inside `serve::run` so `Listener::bind`
 /// (a sync fn that needs a tokio reactor for `UnixListener`) and the accept loop
@@ -104,19 +116,21 @@ fn run_serve(config: serve::ServeConfig) -> Result<(), ServeError> {
     // reactor, so it needs the runtime's context — `block_on` would give it one
     // a frame too late.
     let _guard = runtime.enter();
-    let listener = fulcrum::transport::Listener::bind(config.endpoint.clone())
-        .map_err(|e| ServeError::Bind(e.to_string()))?;
 
     // ONE database handle for the process, shared as `Arc<Db>` (see `serve::run`:
     // a `Db` per client would make "the sole writer of fulcrum.db" untrue the
-    // moment two clients started a session).
+    // moment two clients started a session). FIRST, because it is the failure
+    // most likely to happen on a real machine (a full disk, a read-only data
+    // dir, a file owned by another user) and the one whose orphan is hardest for
+    // an operator to find.
     let db = std::sync::Arc::new(serve::open_db(&config)?);
 
-    // The Worker executable, decided BEFORE the loop: an unresolvable default
-    // (`current_exe()` failing) is a startup failure, whereas a named path that
-    // does not exist deliberately is not — that one belongs in the `start-result`
-    // of the session that asked for it.
+    // The Worker executable, decided before the bind too (see above).
     let factory = std::sync::Arc::new(serve::DaemonWorkerFactory::resolve(config.worker_exe)?);
+
+    let listener = fulcrum::transport::Listener::bind(config.endpoint.clone())
+        .map_err(|e| ServeError::Bind(e.to_string()))?;
+
     eprintln!(
         "fulcrum serve: listening on {} (worker exe: {})",
         listener.endpoint(),

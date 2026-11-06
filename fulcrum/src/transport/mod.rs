@@ -35,6 +35,28 @@
 //! already consumed. On a socket that is not a theoretical problem, it is a
 //! silently truncated frame. See the spawn site in [`frame`] for the full note.
 //!
+//! # Every buffer here is bounded (finding 7)
+//!
+//! Two, and both are reachable by ANY local process: `serve` has no
+//! authentication — legitimately deferred to T13 — so the socket is the only
+//! credential, and a buffer with no ceiling is a denial-of-service with no
+//! prerequisites.
+//!
+//! * [`frame::MAX_INBOUND_LINE_BYTES`] — the longest LINE one peer may make the
+//!   daemon assemble. A peer that sends bytes with no `\n` used to make
+//!   `read_line` grow for as long as it could send.
+//! * [`frame`]'s inbound queue (`MAX_QUEUED_INBOUND_FRAMES`) — how many decoded
+//!   lines may sit undelivered before the reader task stops draining the socket.
+//!   Measured before the bound: one connection, ten seconds, a client that read
+//!   nothing, **1 168 009 requests absorbed and the daemon's RSS 15 MB → 895 MB**.
+//!
+//! Both respond with BACKPRESSURE rather than by dropping: the reader waits, the
+//! socket fills, and the peer's own `write` blocks. Dropping an inbound REQUEST
+//! would be a client bug the daemon caused. The one exception is the oversized
+//! line, which cannot be backpressured (the peer is not going to stop) and cannot
+//! be skipped either — see [`TransportError::LineTooLong`] for why it ends the
+//! connection instead.
+//!
 //! # Out of scope: replay and sessions (T10)
 //!
 //! No `attach`, no `afterSeq`, no replay buffer, no session registry. The
@@ -108,6 +130,22 @@ pub enum TransportError {
     /// never as a closed connection — see [`Connection::recv`].
     #[error("decode frame: {0}")]
     Decode(String),
+    /// An inbound line exceeded `transport::frame::MAX_INBOUND_LINE_BYTES`
+    /// without a terminator (finding 7).
+    ///
+    /// The ONE error item that is also a full stop: it is delivered as the last
+    /// item and the stream ends. Skipping the bytes and resyncing on the next
+    /// newline would keep the connection and lose the agreement about where
+    /// frames begin — the client believes it sent a frame, the daemon has
+    /// re-cut the stream — and a desync is the failure this transport's framing
+    /// exists to prevent. Closing is the honest answer, and it costs the attacker
+    /// a reconnect instead of the daemon a buffer.
+    #[error("inbound line exceeds the {limit}-byte limit")]
+    LineTooLong {
+        /// The limit that was exceeded, so the message names the number the peer
+        /// has to get under.
+        limit: usize,
+    },
     /// A unix socket path that `sockaddr_un` cannot hold.
     ///
     /// `sun_path` is a FIXED-size array (104 bytes on macOS/BSD, 108 on Linux),

@@ -5,6 +5,7 @@
 //! 'UnixListener' in 'net'`. The Windows twin is `windows.rs`, and `mod.rs`
 //! re-exports one of the two, so callers see one `Listener`.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
@@ -116,11 +117,11 @@ fn bind_socket(path: PathBuf) -> Result<Listener, TransportError> {
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            ensure_private_dir(parent)?;
         }
     }
 
-    match TokioUnixListener::bind(&path) {
+    match bind_private(&path) {
         Ok(listener) => Ok(Listener {
             listener,
             endpoint: Endpoint::Socket(path),
@@ -130,7 +131,7 @@ fn bind_socket(path: PathBuf) -> Result<Listener, TransportError> {
         // That is the daemon's own failure mode, so the transport reclaims it.
         Err(e) if e.raw_os_error() == Some(libc::EADDRINUSE) => {
             reclaim_stale_socket(&path)?;
-            let listener = TokioUnixListener::bind(&path)?;
+            let listener = bind_private(&path)?;
             Ok(Listener {
                 listener,
                 endpoint: Endpoint::Socket(path),
@@ -138,6 +139,90 @@ fn bind_socket(path: PathBuf) -> Result<Listener, TransportError> {
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Bind `path` and make the resulting inode owner-accessible only.
+///
+/// The design's claim is "the socket is the credential" (see `serve`'s module
+/// header on why there is no authentication before T13). That claim is only true
+/// if the filesystem enforces it: a socket at the umask default is 0755, so ANY
+/// local process can connect, start a session with `bash` allowed and
+/// `permission` defaulting to `Allow`, and watch the transcript it writes. The
+/// mode is what turns "the socket is the credential" from a hope into a property.
+///
+/// Two mechanisms, because POSIX leaves the effect of `chmod` on a socket
+/// UNSPECIFIED and the platforms disagree (verified on this machine: Linux binds
+/// at 0755 and accepts a `chmod` to 0600, and connecting still works afterwards):
+///
+/// 1. The umask is tightened for the duration of `bind` alone. Linux derives a
+///    new socket inode's mode from `0777 & ~umask`, so this yields 0700 even on a
+///    platform where step 2 is refused. Restored on every path out of the call —
+///    an un-restored umask would silently narrow every file the daemon creates
+///    afterwards, including the WAL siblings SQLite makes on its own schedule.
+/// 2. An explicit `chmod` to 0600, which on Linux also drops the (meaningless,
+///    but noisy in an `ls`) execute bit.
+///
+/// If step 2 fails, the mode is READ BACK and only accepted if it is already
+/// owner-only — so a macOS `EPERM` leaves a 0700 socket and a passing daemon,
+/// while a filesystem that gave the world access is a hard error rather than a
+/// warning nobody reads.
+fn bind_private(path: &Path) -> std::io::Result<TokioUnixListener> {
+    // 0o077: nothing group- or world-accessible may be created inside this call.
+    let previous_umask = unsafe { libc::umask(0o077) };
+    // `umask` is not unwind-safe by construction, but `UnixListener::bind` does
+    // not panic on a path it can stat; and a panic here would end the process,
+    // which cannot leak the umask past it.
+    let bound = TokioUnixListener::bind(path);
+    unsafe { libc::umask(previous_umask) };
+    let listener = bound?;
+
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => Ok(listener),
+        Err(e) => {
+            let mode = std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o7777)
+                .ok();
+            if mode.is_some_and(|m| m & 0o077 == 0) {
+                return Ok(listener);
+            }
+            let described = mode
+                .map(|m| format!("{m:04o}"))
+                .unwrap_or_else(|| "unreadable".to_string());
+            Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot make {} owner-only: chmod to 0600 failed ({e}) and the \
+                     socket's actual mode is {described}, which would let any local \
+                     process reach the daemon",
+                    path.display()
+                ),
+            ))
+        }
+    }
+}
+
+/// Create the socket's parent directory at 0700, narrowing ONLY components this
+/// call actually created.
+///
+/// Delegates to [`crate::db::ensure_private_dir`] — the ONE copy in this crate.
+/// This used to be a byte-for-byte duplicate of it, justified by a comment
+/// claiming there was "no natural common home"; both modules live in this crate
+/// and `db` is declared by `lib.rs`, so `crate::db::ensure_private_dir` was
+/// always available and `lib.rs` did not need touching. The duplication was not
+/// harmless: the rule it encodes — never re-mode a directory this call did not
+/// create, so `--socket /home/me/x.sock` cannot quietly set `$HOME` to 0700 — is
+/// security-relevant, and two copies is how one gets fixed and the other
+/// forgotten.
+///
+/// The error type stays the transport's own: the shared function returns
+/// `std::io::Error` and [`TransportError::Io`] converts it via `?`, so neither
+/// module had to adopt the other's error vocabulary.
+///
+/// Not a plain `use` alias at the call site, because this wrapper is where the
+/// "why the store's function is the right home for a socket's directory" answer
+/// lives — the two callers share the RULE, not the file layout.
+fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    crate::db::ensure_private_dir(path)
 }
 
 /// Remove a socket file nothing is listening on, so a restart can bind again.

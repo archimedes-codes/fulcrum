@@ -1238,6 +1238,85 @@ async fn a_second_daemon_on_the_same_endpoint_exits_non_zero_and_leaves_the_firs
     daemon.shutdown();
 }
 
+/// A daemon whose database will not open must leave NO socket behind (finding G).
+///
+/// `main.rs`'s own doc states the order as intentional: "The database opens
+/// BEFORE the bind, on purpose: a daemon that binds first and then fails to open
+/// `fulcrum.db` leaves a live socket behind that answers `hello` and fails every
+/// `start`, and Task 3's stale-socket reclaim will not clean it up (a live
+/// listener answers the probe, so the file is left alone — correctly)."
+///
+/// The code did the reverse. The result was a socket that answers `hello` and
+/// refuses every `start` for a reason the client cannot see, and which the
+/// reclaim deliberately cannot remove because it is a LIVE listener — so the
+/// operator's only cure is to find and delete a file nothing told them about.
+/// Failing before the socket exists leaves nothing to reclaim.
+///
+/// The unwritable database is a path whose PARENT is a regular file, so
+/// `create_dir_all` fails with `ENOTDIR`. That is chosen over `chmod 000`
+/// deliberately: a chmod-based test passes for a normal user and FAILS OPEN when
+/// CI runs as root (root ignores the mode bits), and a test that silently stops
+/// testing anything on the machine that runs it most is worse than no test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_cannot_open_its_database_leaves_no_socket_behind() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = Daemon::endpoint_in(dir.path());
+    // A FILE where the database's parent directory has to be.
+    let blocker = dir.path().join("blocked");
+    std::fs::write(&blocker, b"not a directory").expect("write the blocker");
+    let db_path = blocker.join("fulcrum.db");
+
+    let mut cmd = Command::new(BIN);
+    cmd.arg("serve");
+    #[cfg(unix)]
+    cmd.arg("--socket");
+    #[cfg(windows)]
+    cmd.arg("--pipe");
+    let out = cmd
+        .arg(endpoint_path_str(&endpoint))
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--worker-exe")
+        .arg(worker_fixture())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the daemon");
+
+    assert!(
+        !out.status.success(),
+        "an unopenable database must be a failed startup, not a running daemon: {}",
+        out.status
+    );
+    let message = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        message.contains("database"),
+        "and must name what failed, or the operator is guessing: {message:?}"
+    );
+
+    // THE finding: nothing may be listening, and nothing may be left to reclaim.
+    #[cfg(unix)]
+    assert!(
+        !socket_path(&endpoint).exists(),
+        "a daemon that failed to open its store must not leave a socket at {} — \
+         a live listener answering `hello` while every `start` fails is the state \
+         the stale-socket probe deliberately refuses to unlink",
+        socket_path(&endpoint).display()
+    );
+    #[cfg(windows)]
+    {
+        // A named pipe leaves no file to stat, so the proof over there is that
+        // dialing the name fails — the same claim, read through the platform's
+        // own namespace.
+        let dialed = tokio::time::timeout(Duration::from_secs(2), connect(endpoint.clone())).await;
+        assert!(
+            !matches!(dialed, Ok(Ok(_))),
+            "the pipe must not exist after a failed startup: {dialed:?}"
+        );
+    }
+}
+
 /// A frame the daemon does not understand is answered, not fatal.
 ///
 /// The daemon's surface will grow (T10 adds `attach`), and a newer client will
@@ -1299,7 +1378,20 @@ async fn a_malformed_line_gets_an_error_and_the_stream_continues() {
     write_half.flush().await.expect("flush");
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await.expect("read the reply");
+    // Bounded, per this file's own deadline rule (the module header): an
+    // un-timed `read_line` here turns "the daemon ignored my garbage line" into
+    // a hung test that prints nothing and takes the suite's output with it —
+    // the exact failure mode the rule exists to prevent. A panic that names the
+    // budget is a diagnosis; a parked task is not.
+    let read = tokio::time::timeout(FRAME_BUDGET, reader.read_line(&mut line))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the daemon never answered a malformed line (no frame within \
+                 {FRAME_BUDGET:?}) — it must reply, not stall"
+            )
+        })
+        .expect("read the reply");
     assert!(read > 0, "the daemon must answer garbage, not hang up");
     let reply: serde_json::Value = serde_json::from_str(line.trim())
         .unwrap_or_else(|e| panic!("the reply must be a JSON error frame: {line:?} ({e})"));
@@ -1377,6 +1469,190 @@ async fn repeated_disconnects_do_not_degrade_the_daemon() {
         "three rounds, three session rows in the one database"
     );
     daemon.shutdown();
+}
+
+/// A client that never reads is THROTTLED, and the daemon's heap stays flat
+/// (finding 7 — the unbounded buffer).
+///
+/// `serve` has no authentication — legitimately deferred to T13 — so ANY local
+/// process that can reach the socket can drive this. The shape under test is the
+/// one that costs the daemon something: a peer that writes frames and reads no
+/// bytes back.
+///
+/// # What was actually unbounded, and how this was found
+///
+/// The review pointed at `serve.rs`'s per-client outbound queue. It is bounded
+/// now, and it needed bounding — but it was NOT the 895 MB. Measured against the
+/// daemon on Linux (one connection, `hello` frames, client reads nothing, 10 s):
+///
+/// * **1 168 009 requests absorbed, daemon RSS 15 MB → 895 MB.**
+///
+/// The outbound queue cannot produce that number, because `serve_client` is ONE
+/// task running one `select!`: while the drain arm's body awaits a blocked
+/// `send_frame`, the `select!` is not re-polled, so the inbound arm cannot run and
+/// cannot enqueue. The queue's depth is therefore ~1 — confirmed by instrumenting
+/// it. The buffer that grew was the transport's: `Connection`'s reader task drains
+/// the socket into an `mpsc::unbounded_channel` that nothing was consuming, so the
+/// kernel's ~200 KB of socket became an unbounded queue in the daemon's heap. The
+/// fix is in `transport::frame` (`MAX_QUEUED_INBOUND_FRAMES`); the outbound queue
+/// is bounded too, for the same reason and to the same budget.
+///
+/// # What the bound makes observable
+///
+/// Backpressure, and it is a large, schedule-independent signal: with the reader
+/// waiting for room, the socket fills, and the ATTACKER's OWN `write` blocks. The
+/// same probe against the fixed daemon:
+///
+/// * **1 375 requests pushed in 0.3 s, then the write blocks; RSS 15 MB → 19 MB.**
+///
+/// So the test asserts the throttle (a bounded number of requests accepted while
+/// the peer reads nothing) and, on unix, the flat heap — which is the finding's
+/// actual claim, "must not grow without bound", measured rather than inferred.
+/// The margin is three orders of magnitude, so this is not a timing race: the
+/// broken build pushes a million frames in the time the fixed one pushes 1.4 k.
+///
+/// And it pins what the fix must NOT break: a client that reads normally is
+/// unaffected, and a client that was throttled is still connected and still
+/// served once it starts reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_never_reads_is_throttled_and_the_daemon_stays_flat() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+
+    // Split up front so the READ HALF can be provably untouched during the flood:
+    // "never reads" is the whole attack, and a `Connection` cannot demonstrate it
+    // (its reader task drains the socket whether the test calls `recv` or not —
+    // which is exactly why the first version of this test passed against the
+    // broken daemon and proved nothing).
+    let (read_half, mut sink) = tokio::io::split(raw_dial(&endpoint).await);
+    let rss_before = daemon_rss(daemon.child.id());
+
+    // `hello\n`: 17 bytes, and the only frame the daemon answers WITHOUT a
+    // session, so the flood needs no worker, no database row, no fixture.
+    const FRAME: &[u8] = b"{\"type\":\"hello\"}\n";
+    // The ceiling the fixed daemon must not exceed. Measured 1 375; the broken one
+    // reached 1 168 009. Anything in the tens of thousands separates them by a
+    // factor of ten in both directions, so a machine with unusually generous
+    // socket buffers cannot flip this green-to-red or red-to-green by accident.
+    const CEILING: usize = 50_000;
+    // Long enough that "slow" cannot be mistaken for "throttled": a million
+    // frames arrive inside this window on the broken build.
+    let window = Duration::from_secs(5);
+
+    let mut pushed = 0usize;
+    let blocked = {
+        let deadline = Instant::now() + window;
+        let mut stopped = false;
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, sink.write_all(FRAME)).await {
+                // This is the success condition, not a failure: the daemon is no
+                // longer taking bytes because its queue is full and the socket is
+                // full, so OUR kernel is what blocks.
+                Err(_) => {
+                    stopped = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("the flood's write failed after {pushed}: {e}"),
+                Ok(Ok(())) => pushed += 1,
+            }
+        }
+        stopped
+    };
+
+    assert!(
+        pushed > 0,
+        "not one frame reached the daemon — it is not answering `hello` at all, \
+         so this test would certify nothing about any buffer"
+    );
+    assert!(
+        blocked && pushed < CEILING,
+        "a client that read NO bytes pushed {pushed} requests in {window:?} and \
+         was never throttled. One inbound frame per queued `Value` is the daemon \
+         paying for a stranger's backlog: the reader task must wait for room so \
+         the peer's own `write` is what blocks (measured: 1 375 when bounded, \
+         1 168 009 against the unbounded channel)"
+    );
+
+    // The heap, on unix — the finding's own words, measured. The bound allows a
+    // few MB of frames in flight; it does not allow hundreds.
+    let rss_after = daemon_rss(daemon.child.id());
+    assert!(
+        rss_after < rss_before + 64 * 1024,
+        "the daemon grew {} kB serving {pushed} requests from a client that never \
+         read a reply ({} → {} kB). The bound is meant to hold this in the single \
+         digits of MB; hundreds of MB is the unbounded queue, not a rounding error",
+        rss_after.saturating_sub(rss_before),
+        rss_before,
+        rss_after,
+    );
+
+    // A throttled client is not a banned client: the moment it reads, the daemon
+    // resumes and its backlog is served.
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let got = tokio::time::timeout(FRAME_BUDGET, reader.read_line(&mut line))
+        .await
+        .expect("the daemon answers once the client reads")
+        .expect("read the reply");
+    assert!(got > 0, "the daemon hung up on a client for being slow");
+    let first: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("the reply is a JSON frame");
+    assert_eq!(
+        first["type"], "hello",
+        "the first reply on a throttled connection: {first}"
+    );
+
+    // And the daemon is unharmed for the next client — the claim
+    // `a_client_that_never_reads_does_not_stall_the_daemon` makes against a
+    // streaming session, checked here against a request flood.
+    let mut later = Client::dial(&endpoint).await;
+    later.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(
+        later.recv_until("hello").await["type"],
+        "hello",
+        "a throttled connection must not take the daemon down with it"
+    );
+
+    daemon.shutdown();
+}
+
+/// The daemon's resident set in kilobytes, or 0 where this cannot be read.
+///
+/// `/proc/<pid>/status`'s `VmRSS` is the direct measurement of "did the daemon's
+/// heap grow without bound", which is the claim the throttle test makes — and
+/// reading it beats inferring it from frame counts, because a frame count says
+/// what the daemon accepted, not what it cost.
+///
+/// Unix (Linux) only, and the zero is honest rather than a guess: on the other
+/// legs the caller's assertion becomes `0 < 0 + 64 MB`, i.e. the heap half of the
+/// test is skipped and the throttle half — which is the portable one — still
+/// runs. `worker_children` documents the same split for the process-table half of
+/// the race test; a platform-specific probe that silently asserted a wrong number
+/// would be worse than one that admits it is not measuring.
+#[cfg(target_os = "linux")]
+fn daemon_rss(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap_or_else(|e| panic!("read /proc/{pid}/status: {e}"));
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("unparsable VmRSS in {line:?}: {e}"));
+        }
+    }
+    panic!("no `VmRSS` line in /proc/{pid}/status — is this Linux?");
+}
+
+/// Not Linux: nothing to read, so the heap half of the throttle test is skipped.
+#[cfg(not(target_os = "linux"))]
+fn daemon_rss(_pid: u32) -> u64 {
+    0
 }
 
 /// The daemon does not buffer forever for a client that stopped reading.
@@ -1458,6 +1734,207 @@ async fn a_client_that_never_reads_does_not_stall_the_daemon() {
         rows >= 2,
         "the stalled session's rows must land anyway ({rows}) — persistence is \
          not gated on a client keeping up"
+    );
+
+    daemon.shutdown();
+}
+
+/// Two connections racing to `start` the SAME id leave exactly ONE child
+/// (finding F — the TOCTOU in the duplicate guard).
+///
+/// The guard used to be `handle_for(id).is_some()`, then `record_session`, then
+/// `attach(…).await` — and `attach`'s registry `insert` is the ONLY atomic step
+/// in that sequence, ~5 s after the check was made. Two clients on two
+/// connections therefore both passed the check, both reached `attach`, and the
+/// second `insert` REPLACED the first's entry: a live child process with no
+/// owner, no handle, and no path to being killed. That is the exact leak the
+/// guard's own comment claimed to prevent, and the guard was the reason nobody
+/// looked for it.
+///
+/// The race is real rather than staged: both `start` frames are written without
+/// awaiting between them, so the two connection tasks are in `attach` at the
+/// same time — and `attach` contains a process spawn plus a `ready` handshake,
+/// which is a wide window on a loaded machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_connections_racing_to_start_one_id_leave_exactly_one_child() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+    let env = start_env("raced", cwd);
+
+    let mut a = Client::dial(&endpoint).await;
+    let mut b = Client::dial(&endpoint).await;
+    a.send(serde_json::json!({"type": "hello"})).await;
+    b.send(serde_json::json!({"type": "hello"})).await;
+    a.recv_until("hello").await;
+    b.recv_until("hello").await;
+
+    // Both `start`s are in flight before either can be answered.
+    a.send(start_frame(&env)).await;
+    b.send(start_frame(&env)).await;
+    let first = a.recv_until("start-result").await;
+    let second = b.recv_until("start-result").await;
+
+    let oks = [(&first, &second)]
+        .iter()
+        .flat_map(|(x, y)| [*x, *y])
+        .filter(|r| r["ok"] == true)
+        .count();
+    assert_eq!(
+        oks, 1,
+        "exactly one `start` may win a single session id; got {first} and {second}"
+    );
+    // WHICH of the two wins is a schedule, not a contract — so the assertion is
+    // on the pair, never on a named one. Pinning `a` to win would make this test
+    // flaky on a machine that ran `b`'s task first.
+    let loser = if first["ok"] == true { &second } else { &first };
+    assert!(
+        loser["error"].is_string(),
+        "the refused `start` must say why: {loser}"
+    );
+
+    // THE leak check: one winner means ONE child process. An orphan is invisible
+    // to the registry, so no `start-result` and no `close` would ever report it
+    // — only the process table can.
+    #[cfg(unix)]
+    {
+        let children = worker_children(daemon.child.id());
+        assert_eq!(
+            children.len(),
+            1,
+            "exactly one worker process may survive the race; found {children:?} \
+             (the daemon's pid is {}) — a second child is an ORPHAN: it is not in \
+             the registry, so nothing can ever kill it",
+            daemon.child.id()
+        );
+    }
+
+    daemon.shutdown();
+}
+
+/// The daemon's live Worker children, by pid.
+///
+/// Unix: `pgrep -P`, which reads the process table — the only place an orphaned
+/// child is visible at all, which is the whole reason this helper exists.
+///
+/// Windows: NOT IMPLEMENTED, and said so rather than approximated. `tasklist`
+/// has no parent-pid filter (its CSV columns are image / pid / session / memory)
+/// and the `wmic` form that did is deprecated and absent from recent builds, so
+/// the honest cross-platform story is "this assertion runs on unix". The
+/// `start-result` half of the test above — exactly one `ok: true` — is the part
+/// that runs everywhere; the process-table half is the unix leg of CI's.
+#[cfg(unix)]
+fn worker_children(daemon_pid: u32) -> Vec<u32> {
+    let out = Command::new("pgrep")
+        .args(["-P", &daemon_pid.to_string()])
+        .output()
+        .expect("pgrep is available on unix CI");
+    // `pgrep` exits 1 with no output when there are no children; anything else
+    // that is not 0 is a failed lookup, which must not read as "zero children".
+    if !out.status.success() && out.stdout.is_empty() {
+        return Vec::new();
+    }
+    assert!(
+        out.status.success(),
+        "pgrep -P {daemon_pid} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// A session whose Worker CRASHED can be started again (finding E).
+///
+/// This is the supervisor's whole reason to exist: recovery. The engine removes
+/// a worker from its map ONLY on `detach` / `reap_all` — `unexpected_exit`
+/// *reads* the `reaping` flag and the registry's single `remove` lives in
+/// `detach_worker` — so after a crash the session is still registered, and a
+/// `start` that asks `handle_for(id).is_some()` reports "already running"
+/// FOREVER. A client could not restart a crashed session unless it happened to
+/// send `close` first, and a client that does not know the child is dead has no
+/// reason to.
+///
+/// The child is crashed and REAPED by the time this asserts (the fixture exits
+/// 137 on `__crash__`, and the engine's read task `wait()`s it), so the dead
+/// registration is genuinely a dead registration — not a slow child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_whose_worker_crashed_can_be_started_again() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+    let mut client = Client::dial(&endpoint).await;
+    client.send(serde_json::json!({"type": "hello"})).await;
+    client.recv_until("hello").await;
+
+    let env = start_env("crash-then-restart", cwd);
+    client.send(start_frame(&env)).await;
+    let first = client.recv_until("start-result").await;
+    assert_eq!(first["ok"], true, "the first start must work: {first}");
+    let dead_pid = first["workerPid"]
+        .as_u64()
+        .expect("a started session reports its worker pid") as u32;
+
+    // Kill the child for real.
+    client
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": "crash-then-restart", "text": "__crash__",
+        }))
+        .await;
+    let deadline = Instant::now() + FRAME_BUDGET;
+    while pid_is_alive(dead_pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !pid_is_alive(dead_pid),
+        "the fixture must actually die on `__crash__` (pid {dead_pid} is alive) — \
+         otherwise this test asserts nothing about recovery"
+    );
+
+    // The crash is visible on the socket (the pump's `Exited` → the daemon's
+    // crash report), so a watching client knows to act.
+    let crash = client
+        .recv_until_matching("event", |frame| {
+            frame["sessionId"] == "crash-then-restart" && frame["frame"]["type"] == "worker-crashed"
+        })
+        .await;
+    assert_eq!(
+        crash["isSubagent"], false,
+        "a main session's crash is not a subagent's: {crash}"
+    );
+
+    // The recovery: `start` the SAME id again, with no `close` in between.
+    client.send(start_frame(&env)).await;
+    let again = client.recv_until("start-result").await;
+    assert_eq!(
+        again["ok"], true,
+        "a crashed session must be startable again — a supervisor that answers \
+         `already running` about a dead child can never recover it: {again}"
+    );
+    let new_pid = again["workerPid"]
+        .as_u64()
+        .expect("the restarted session reports its worker pid") as u32;
+    assert_ne!(
+        new_pid, dead_pid,
+        "the restart is a NEW child, not the dead registration"
+    );
+    assert!(
+        pid_is_alive(new_pid),
+        "and it is actually running (pid {new_pid})"
+    );
+
+    // A live session is still refused — the guard must survive the fix, or the
+    // daemon would orphan a child on every accidental double `start`.
+    client.send(start_frame(&env)).await;
+    let dup = client.recv_until("start-result").await;
+    assert_eq!(
+        dup["ok"], false,
+        "a LIVE session must still refuse a second `start`: {dup}"
+    );
+    assert!(
+        dup["error"].as_str().is_some_and(|m| m.contains("already")),
+        "and say so: {dup}"
     );
 
     daemon.shutdown();
@@ -1548,6 +2025,145 @@ async fn a_fresh_client_receives_nothing_before_it_starts_anything() {
         silence.is_none(),
         "a client that started nothing must receive nothing, got {silence:?}"
     );
+
+    daemon.shutdown();
+}
+
+/// A child killed by **SIGKILL from outside** can be started again, and the
+/// crash is reported on the socket (finding 1, step 1 — the mechanism question).
+///
+/// # Why this test exists separately from the `__crash__` one
+///
+/// `a_session_whose_worker_crashed_can_be_started_again` crashes the child by
+/// having the fixture `exit(137)` — a NORMAL exit with a code. That is NOT the
+/// shape this daemon most needs to survive: the OOM killer, and any operator's
+/// `kill -9`, deliver a SIGNAL, and a signal death takes a different path through
+/// the frozen engine. `WorkerHandle::exited()` waits on
+/// `wait_for(|v| v.is_some())` and the read task publishes the code as
+/// `Status::code()`, which is `None` for a signal death — so the `exited()` WATCH
+/// waits FOREVER on exactly this case, while the `Exited` EVENT still fires with
+/// `exitCode: null`. Measured here: the frames this test asserts on are the
+/// evidence, and they are the reason the daemon keys recovery off the event
+/// rather than off the watch.
+///
+/// # What it pins
+///
+/// Both halves, because the roadmap's claim is "the supervisor recovers a dead
+/// session" and a signal death is the common way a session dies:
+///
+/// * the crash REACHES the socket (`worker-crashed`, main-session-labelled, with
+///   the dead child's pid) — so a client can tell its session died instead of
+///   inferring it from silence;
+/// * the same id is `start`able again with no `close` in between, and gets a NEW
+///   live child — the recovery itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_killed_by_sigkill_is_reported_and_can_be_started_again() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+    let mut client = Client::dial(&endpoint).await;
+    client.send(serde_json::json!({"type": "hello"})).await;
+    client.recv_until("hello").await;
+
+    let env = start_env("sigkill-then-restart", cwd);
+    client.send(start_frame(&env)).await;
+    let first = client.recv_until("start-result").await;
+    assert_eq!(first["ok"], true, "the first start must work: {first}");
+    let dead_pid = first["workerPid"]
+        .as_u64()
+        .expect("a started session reports its worker pid") as u32;
+
+    // Kill it with a SIGNAL, from outside the daemon — the OOM-killer shape.
+    // Nothing in the daemon chose this, sent a `close`, or can see the signal.
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(dead_pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(rc, 0, "kill -9 {dead_pid} must be accepted");
+    }
+    #[cfg(not(unix))]
+    {
+        // `taskkill` without `/F` is a polite WM_CLOSE, which a headless console
+        // process ignores; `/F` is TerminateProcess, the nearest thing to a
+        // signal this platform has. Compile-checked here, first RUN by the
+        // Windows leg of CI (the same caveat the other process helpers carry).
+        let out = Command::new("taskkill")
+            .args(["/PID", &dead_pid.to_string(), "/F"])
+            .output()
+            .expect("taskkill is available on windows");
+        assert!(out.status.success(), "taskkill /F {dead_pid}: {out:?}");
+    }
+
+    // The daemon must NOTICE. Poll the process table rather than sleeping a
+    // fixed amount: `kill -9` is immediate here, but the read task's stdout EOF
+    // → `wait()` → `Exited` chain is what the assertion is actually about, and
+    // a fixed sleep would make that a race instead of a deadline.
+    let deadline = Instant::now() + FRAME_BUDGET;
+    while pid_is_alive(dead_pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !pid_is_alive(dead_pid),
+        "the SIGKILL did not remove pid {dead_pid} — the test would then be \
+         asserting recovery of a LIVE session"
+    );
+
+    // THE SIGNAL-DEATH EVIDENCE. `worker-exited` is the daemon's own spelling of
+    // the `Exited` EVENT, and its code is `null` here where the `__crash__` test
+    // sees 137: a signal death carries no code, because
+    // `Status::code()` is `None` for one. That is the measurement finding 1 asked
+    // for — the WATCH-based probe (`exited()`) cannot be how a daemon notices an
+    // OOM kill, because the watch is only satisfied by `Some(_)`; the event is.
+    let exited = client
+        .recv_until_matching("event", |frame| {
+            frame["sessionId"] == "sigkill-then-restart"
+                && frame["frame"]["type"] == "worker-exited"
+        })
+        .await;
+    assert_eq!(
+        exited["frame"]["exitCode"],
+        serde_json::Value::Null,
+        "a signal death carries no exit code, and the daemon must pass that \
+         through rather than inventing one: {exited}"
+    );
+
+    // And the crash REPORT — which only `on_crash` produces (`on_event` emits
+    // `worker-exited`, never `worker-crashed`), so this frame is the direct
+    // evidence that the pump's crash path fired for a signal death.
+    let crash = client
+        .recv_until_matching("event", |frame| {
+            frame["sessionId"] == "sigkill-then-restart"
+                && frame["frame"]["type"] == "worker-crashed"
+        })
+        .await;
+    assert_eq!(
+        crash["isSubagent"], false,
+        "a main session's crash is not a subagent's: {crash}"
+    );
+    assert_eq!(
+        crash["frame"]["pid"].as_u64(),
+        Some(dead_pid as u64),
+        "the report names the process that died, since that is the pid a crash \
+         log's name carries: {crash}"
+    );
+    assert_eq!(
+        crash["frame"]["exitCode"],
+        serde_json::Value::Null,
+        "and it says so rather than guessing a code: {crash}"
+    );
+
+    // THE RECOVERY, with no `close` in between.
+    client.send(start_frame(&env)).await;
+    let again = client.recv_until("start-result").await;
+    assert_eq!(
+        again["ok"], true,
+        "a SIGKILLed session must be startable again — the supervisor cannot \
+         answer `already running` about a process the kernel removed: {again}"
+    );
+    let new_pid = again["workerPid"]
+        .as_u64()
+        .expect("the restarted session reports its worker pid") as u32;
+    assert_ne!(new_pid, dead_pid, "the restart is a NEW child");
+    assert!(pid_is_alive(new_pid), "and it is running (pid {new_pid})");
 
     daemon.shutdown();
 }

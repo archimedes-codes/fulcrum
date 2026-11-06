@@ -29,6 +29,17 @@
 //! FIRST because it is the only one of the three that can silently fail to apply
 //! (see [`Db::open`]). `foreign_keys` is per-CONNECTION in SQLite and defaults to
 //! OFF, so it must be set on every open, not once at creation.
+//!
+//! ## A fourth step at open: the shape check
+//!
+//! After the pragmas and AFTER [`schema::migrate`], `Db::verify_shapes` (private) reads
+//! `PRAGMA table_info` for all four tables and refuses a file whose columns do not
+//! match [`schema::TABLE_SHAPES`] — a missing, renamed, reordered, retyped, or
+//! unexpected-extra column all stop the open rather than surfacing later as a
+//! positional read that returns the wrong value. Why the expectation is the full
+//! table shape and not the SELECT lists, and what this check therefore does NOT
+//! cover (the desktop's own file), is spelled out on
+//! [`schema::TABLE_SHAPES`] and in `schema`'s module docs.
 
 use std::path::Path;
 use std::sync::Mutex as StdMutex;
@@ -81,6 +92,32 @@ pub enum DbError {
         /// What this build can migrate to.
         supported: i64,
     },
+    /// A table in the file does not have the shape this build reads (finding 10;
+    /// see [`schema::TABLE_SHAPES`]).
+    ///
+    /// This is the "the two repos' schemas forked" error, and it exists so the
+    /// operator can tell the two causes apart from the message alone:
+    ///
+    /// * a column this build expects is **missing** → the file PREDATES this
+    ///   build (or is corrupt);
+    /// * a column the file has is **unknown** → the file comes from a NEWER
+    ///   schema than this build.
+    ///
+    /// Both refuse the open. `user_version` cannot carry that distinction,
+    /// because the desktop does not stamp it — its migrations are `ADD COLUMN`
+    /// gates over `archimedes.db` and never touch this counter — so the column
+    /// list is the only evidence available, and it is read at the one moment
+    /// where refusing costs nothing.
+    #[error("schema mismatch in table `{table}`: {detail}")]
+    SchemaFork {
+        /// The table whose `PRAGMA table_info` did not match.
+        table: String,
+        /// What was expected, what was found, and where — a full sentence, built
+        /// by `Self::verify_shapes` rather than a bare kind tag,
+        /// because the three failure shapes need three different diagnoses and
+        /// the operator reading a log line has to pick one.
+        detail: String,
+    },
 }
 
 /// The daemon's SQLite database — the sole writer of `fulcrum.db`.
@@ -91,6 +128,147 @@ pub struct Db {
     conn: StdMutex<Connection>,
 }
 
+/// Make `path` itself 0600, creating it if it is not there yet.
+///
+/// Why this exists at all: `fulcrum.db` holds `native_messages.content_json` —
+/// the FULL conversation transcript of every session the daemon has run — plus
+/// `sessions.cwd` and `sessions.cost_usd`. `rusqlite`'s `Connection::open` hands
+/// the create to the C library, which applies the process umask, so the default
+/// result is 0644: world-readable. Deferring that to T13's authentication is a
+/// category error — a file mode is not a credential check, it is the layer that
+/// decides whether another user's process can `open()` the file at all.
+///
+/// Two details that are not incidental:
+///
+/// * It CREATES the file before handing the path to rusqlite. `Connection::open`
+///   would otherwise be the creator and would apply the umask; creating first is
+///   the only way to own the mode without racing the creation.
+/// * It NARROWS an existing file. A fix that only acted on creation would leave
+///   every installation that already has real transcripts world-readable, which
+///   is the opposite of the population worth protecting.
+///
+/// `--db` lets an operator point this at a path that already exists with a mode
+/// they chose, and this call overrides it. That is deliberate: the failure mode
+/// of NOT overriding is a silently world-readable transcript, and the failure
+/// mode of overriding is an operator noticing their mode changed and reading this
+/// comment.
+#[cfg(unix)]
+fn make_private(path: &Path) -> Result<(), DbError> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    if !path.exists() {
+        // `create(true)` + `mode(0o600)`: the mode is applied AT creation, so
+        // there is no window where the file exists and is readable. Note that
+        // `OpenOptions::mode` is still masked by umask on some platforms, which
+        // is why the explicit `set_permissions` below is not redundant — 0600 is
+        // already the tightest umask can make it, but the belt costs nothing and
+        // the guarantee must not depend on the environment.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            // NOT `truncate`: this is a database. `create(true)` alone leaves an
+            // existing file's bytes alone, which is the only behaviour that can
+            // be correct here — truncating would destroy every transcript in the
+            // store before rusqlite ever opened it. Stated because `create`
+            // without an explicit `truncate` is a clippy lint precisely because
+            // the omission is usually an accident.
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Create `path` and every component this call had to create, each at 0700.
+///
+/// THE ONE COPY in this crate, and `pub(crate)` for exactly that reason. This
+/// function used to exist twice, byte-for-byte — here and in
+/// `transport::unix::ensure_private_dir`, with a comment apologising that there
+/// was "no natural common home". There is: both modules are in this crate, `db`
+/// is declared by `lib.rs`, and `transport::unix` can name `crate::db` without
+/// any change to `lib.rs`. Two copies of a security-relevant function is how one
+/// gets fixed and the other gets forgotten, and the property they both carry —
+/// "only the components I created get narrowed" — is the one protecting
+/// `$HOME` from a daemon started with `--db /home/me/fulcrum.db`.
+///
+/// # Error type
+///
+/// `std::io::Error`, because that is what this function actually does: filesystem
+/// syscalls, nothing SQLite. Each caller keeps ITS OWN error type by letting `?`
+/// convert — `db::DbError::Io` has a `#[from] std::io::Error`, and
+/// `transport::TransportError::Io` likewise — so sharing the body did not force
+/// either module to adopt the other's error vocabulary. That is the reason the
+/// shared function is not `fn … -> Result<(), DbError>`: it would have made the
+/// transport depend on a store error type for a `chmod`.
+///
+/// The DIRECTORY is the layer that actually protects the WAL siblings. SQLite
+/// creates `fulcrum.db-wal` and `fulcrum.db-shm` itself, with umask-derived modes
+/// (measured: 0644), and rotates them — so tightening only the `.db` file would
+/// leave the freshest, most complete transcript world-readable in the WAL. The
+/// daemon cannot fix that from the outside: it does not create those files and
+/// cannot know when SQLite will recreate them. A 0700 directory does bound them,
+/// because opening a file requires the search bit on every directory above it.
+///
+/// Only directories THIS call creates are narrowed. `chmod`ing one that already
+/// existed would let `--db /home/me/fulcrum.db` quietly set `$HOME` to 0700 —
+/// arguably the right mode for `$HOME`, but not this daemon's decision to make,
+/// and it would break any other program relying on traversal. So the components
+/// that are missing are recorded BEFORE the create and only those are narrowed
+/// afterwards; asking afterwards is not possible, since `create_dir_all` reports
+/// success for components it never touched and leaves no trace of which they were.
+#[cfg(unix)]
+pub(crate) fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    // The deepest component that already exists: everything strictly below it is
+    // ours to create and therefore ours to set. `ancestors()` runs leaf-first, so
+    // the first hit is the deepest.
+    let existing = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .map(|found| found.to_path_buf());
+    std::fs::create_dir_all(path)?;
+    // Narrow every component from `path` down to (but not including) the one that
+    // was already there. If the whole chain was missing — impossible for a real
+    // filesystem root, but `path` could be relative — the walk simply stops at
+    // the root and `$HOME` is never reached, because a component above the
+    // deepest existing one does not exist to be chmodded.
+    let mut cursor = Some(path);
+    while let Some(current) = cursor {
+        if Some(current) == existing.as_deref() {
+            break;
+        }
+        std::fs::set_permissions(current, std::fs::Permissions::from_mode(0o700))?;
+        cursor = current.parent();
+    }
+    Ok(())
+}
+
+/// The non-unix leg: nothing to set, and the reason is stated rather than hidden.
+///
+/// Windows carries this guarantee in the file's ACL, and the daemon does not
+/// touch ACLs — the named-pipe side has the same limitation and says so in
+/// `transport::windows`. Both are called out in the module docs and in `README`
+/// so the claim is never stronger than the code.
+#[cfg(not(unix))]
+fn make_private(_path: &Path) -> Result<(), DbError> {
+    Ok(())
+}
+
+/// The non-unix leg of [`ensure_private_dir`]: create, and nothing to set.
+///
+/// Windows carries this guarantee in the directory's ACL, and the daemon does not
+/// touch ACLs — the same limitation the named-pipe side documents in
+/// `transport::windows`, and the reason the shared function returns `io::Result`
+/// rather than a unix-flavoured permission error: there is no mode to fail at
+/// setting here.
+#[cfg(not(unix))]
+pub(crate) fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    if !path.as_os_str().is_empty() && !path.exists() {
+        std::fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
+
 impl Db {
     /// Open (creating if needed) the database at `path`, then migrate it.
     /// Parent directories are created as needed.
@@ -98,10 +276,17 @@ impl Db {
     /// The pragma order is load-bearing: `journal_mode` before `foreign_keys`,
     /// and `journal_mode` is READ BACK. See [`DbError::NotWal`] for why the read
     /// back is not paranoia.
+    ///
+    /// The FILE is owner-only (0600) and every directory this call creates is
+    /// 0700 — see [`make_private`] for why that is a correctness requirement and
+    /// not hygiene, and for the reason a pre-existing directory is left alone.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                ensure_private_dir(parent)?;
+            }
         }
+        make_private(path)?;
         let mut conn = Connection::open(path)?;
 
         // 1. WAL, FIRST, and then verified. `journal_mode` is persistent (it
@@ -130,9 +315,196 @@ impl Db {
         let version = conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
         schema::migrate(&mut conn, version)?;
 
-        Ok(Self {
+        // The schema cross-check, AFTER `migrate` — order is load-bearing, not
+        // style. Before the migration the four tables do not exist yet, so a
+        // check placed here-but-earlier would refuse every fresh database.
+        let db = Self {
             conn: StdMutex::new(conn),
-        })
+        };
+        db.verify_shapes()?;
+        Ok(db)
+    }
+
+    /// Verify every table this build reads against its pinned shape (finding 10).
+    ///
+    /// # What this asserts, and what it deliberately does not
+    ///
+    /// It asserts the FULL declared shape of each of the four tables: the name
+    /// AND the declared type of EVERY column, in declaration order. Not "the
+    /// columns we read are present" — see [`schema::TABLE_SHAPES`] for why the
+    /// SELECT lists cannot serve as the expectation (they are deliberate
+    /// subsets), and why an ADDED column is refused rather than ignored.
+    ///
+    /// It does NOT pin `NOT NULL`, the `DEFAULT` expressions, or the constraint
+    /// list. Those are pinned elsewhere, by probes that ask the DATABASE whether
+    /// the property holds rather than whether the text claims it:
+    /// [`Db::table_has_unique`] for both upsert keys, and
+    /// `deleting_a_session_cascades_to_its_messages` for `ON DELETE CASCADE` (a
+    /// cascade is only observable by deleting a row and watching what follows).
+    ///
+    /// # The honest scope of this check
+    ///
+    /// It detects a fork **inside the daemon's own file** — a `fulcrum.db` whose
+    /// tables do not have the shape this build was compiled against. It CANNOT
+    /// detect the desktop forking `archimedes.db`, because this daemon never
+    /// opens that file. What it buys against that scenario is indirect: a
+    /// `fulcrum.db` produced by a daemon built against a forked DDL, or one
+    /// shaped by hand/`sqlx`/a restore from the wrong file, is refused here
+    /// instead of mis-read. True cross-repo schema versioning — a shared,
+    /// negotiated version between the desktop and the daemon — is a follow-up
+    /// ticket, not this, and no amount of checking a file against its own
+    /// reader's expectations substitutes for it.
+    ///
+    /// # Why it refuses rather than warns
+    ///
+    /// `session_row_from` and `message_row_from` read BY INDEX. A shifted column
+    /// does not produce an error, it produces the wrong value: `archived` read
+    /// out of `context_usage_json`'s slot is an `InvalidColumnType` that
+    /// `persistence.rs` turns into `Ok(None)`, i.e. a session that silently
+    /// vanished. Refusing to start is recoverable; a supervisor that serves
+    /// mis-mapped rows is not.
+    fn verify_shapes(&self) -> Result<(), DbError> {
+        let guard = self.conn();
+        for shape in schema::TABLE_SHAPES {
+            // `PRAGMA table_info` reports `cid | name | type | notnull | dflt_value | pk`.
+            // The `type` column is NULL for a column declared without one
+            // (legal in SQLite), which `Option` here makes explicit rather than
+            // turning into a `InvalidColumnType` three frames up the stack.
+            let mut stmt = guard
+                .prepare(&format!("PRAGMA table_info('{}')", shape.name))
+                .map_err(|e| DbError::SchemaFork {
+                    table: shape.name.to_string(),
+                    detail: format!("cannot read `PRAGMA table_info`: {e}"),
+                })?;
+            let found = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| DbError::SchemaFork {
+                    table: shape.name.to_string(),
+                    detail: format!("cannot read `PRAGMA table_info`: {e}"),
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DbError::SchemaFork {
+                    table: shape.name.to_string(),
+                    detail: format!("cannot read `PRAGMA table_info`: {e}"),
+                })?;
+            drop(stmt);
+
+            // A MISSING TABLE reports zero rows, and zero rows would otherwise
+            // compare equal to "nothing to disagree about" — the naive read that
+            // lets a daemon claim health and then fail its first write.
+            if found.is_empty() {
+                return Err(DbError::SchemaFork {
+                    table: shape.name.to_string(),
+                    detail: format!(
+                        "the table is absent (`PRAGMA table_info` reports no columns \
+                         at all); this build expects {} column(s) starting with \
+                         `{}`",
+                        shape.columns.len(),
+                        shape.columns.first().map(|c| c.name).unwrap_or("?"),
+                    ),
+                });
+            }
+
+            // Walk the two lists together. `found` is in `cid` order, which is
+            // declaration order, which is the order the mappers assume.
+            let mut at = 0usize;
+            while at < shape.columns.len() {
+                let want = &shape.columns[at];
+                let Some((_, got_name, got_type)) = found.get(at) else {
+                    // Ran out of actual columns with expected ones left: the
+                    // file is behind this build.
+                    return Err(DbError::SchemaFork {
+                        table: shape.name.to_string(),
+                        detail: format!(
+                            "column `{}` (position {at}, declared `{}`) is MISSING — \
+                             the file has {} column(s), this build expects {}; this \
+                             file PREDATES this build or is corrupt",
+                            want.name,
+                            want.decl_type,
+                            found.len(),
+                            shape.columns.len(),
+                        ),
+                    });
+                };
+                if got_name != want.name {
+                    // The name at this position is someone else's. Two readings,
+                    // and the message gives the operator both because the fix
+                    // differs: a rename (the column exists elsewhere in the
+                    // table) or a reorder (it exists at another position).
+                    let elsewhere = found
+                        .iter()
+                        .position(|(_, n, _)| n == want.name)
+                        .map(|at_other| {
+                            format!(
+                                "`{}` IS present, at position {at_other} — the columns \
+                                 are REORDERED",
+                                want.name
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            format!(
+                                "`{}` is MISSING from the table entirely (no column of \
+                                 that name at any position)",
+                                want.name
+                            )
+                        });
+                    return Err(DbError::SchemaFork {
+                        table: shape.name.to_string(),
+                        detail: format!(
+                            "position {at}: this build expects `{}` (declared `{}`), \
+                             the file has `{}`. {elsewhere}",
+                            want.name, want.decl_type, got_name
+                        ),
+                    });
+                }
+                // Same name, same position: the declared type is the last thing
+                // that can differ, and it differs quietly (SQLite coerces), so
+                // it is compared too. Case-insensitively: SQLite stores the type
+                // as written, and the DDL here is upper case while a hand-edited
+                // file need not be.
+                let got_type = got_type.as_deref().unwrap_or("");
+                if !got_type.eq_ignore_ascii_case(want.decl_type) {
+                    return Err(DbError::SchemaFork {
+                        table: shape.name.to_string(),
+                        detail: format!(
+                            "column `{}` (position {at}) is declared `{}`, this build \
+                             expects `{}` — a RETYPED column, which SQLite coerces \
+                             silently instead of erroring",
+                            want.name, got_type, want.decl_type
+                        ),
+                    });
+                }
+                at += 1;
+            }
+
+            // Every expected column matched position for position; anything LEFT
+            // over in the file is a column this build has never heard of.
+            if found.len() > shape.columns.len() {
+                let extras: Vec<&str> = found[shape.columns.len()..]
+                    .iter()
+                    .map(|(_, name, _)| name.as_str())
+                    .collect();
+                return Err(DbError::SchemaFork {
+                    table: shape.name.to_string(),
+                    detail: format!(
+                        "the file has {} column(s), this build knows {} — UNEXPECTED \
+                         column(s) {}. This file comes from a NEWER schema than this \
+                         build; refusing rather than silently ignoring columns it \
+                         does not read",
+                        found.len(),
+                        shape.columns.len(),
+                        extras.join(", "),
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The lock, or the guard a panicked holder left behind.

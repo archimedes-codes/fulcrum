@@ -42,14 +42,19 @@ path = "src/main.rs"
 # rather than a consumer of the published rev pin.
 fulcrum-core = { path = ".." }
 # `transport` (the framed stdio/pipe duplex), `serve` (the listener + supervisor
-# loop), the shutdown timers. Feature set mirrors the engine's plus
-# `rt-multi-thread`, which the daemon needs for the worker-pool runtime the
-# engine's own list does not ask for. `net` alone gives the transport on BOTH
-# platforms: `tokio::net::UnixListener` on unix and
+# loop), and the retry sleeps in `transport::windows`. Feature set mirrors the
+# engine's plus `rt-multi-thread`, which the daemon needs for the worker-pool
+# runtime the engine's own list does not ask for. `net` alone gives the transport
+# on BOTH platforms: `tokio::net::UnixListener` on unix and
 # `tokio::net::windows::named_pipe::{NamedPipeServer, NamedPipeClient}` on
 # Windows (tokio's `net/mod.rs` gates `pub mod windows` behind
 # `cfg_net_windows!`) — so the `windows` / `windows-sys` crate is deliberately
 # ABSENT and must not be added.
+#
+# `time` is for the named-pipe connect retry (`windows.rs`), NOT for a shutdown
+# timer: this daemon has no shutdown path (see `serve`'s module header — T9 ships
+# no shutdown frame, so `run` never returns and `reap_all` is unwired). It used to
+# be justified as covering "the shutdown timers", which described nothing.
 tokio = { version = "1", features = [
     "process",
     "io-util",
@@ -61,10 +66,6 @@ tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
 ] }
-# `CancellationToken` on the supervisor's shutdown path — same crate the engine
-# carries the cancel handle on `ToolCtx` with, so feature unification keeps ONE
-# copy in the graph.
-tokio-util = "0.7"
 # The daemon's own store (Task 4). `bundled` mirrors the desktop's choice:
 # pure-C, compiles from source, and keeps `openssl-sys` / `native-tls` out of
 # the graph — which is what `scripts/check-rquickjs-allocator.sh` now checks

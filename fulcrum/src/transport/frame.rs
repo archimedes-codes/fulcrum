@@ -28,6 +28,86 @@ impl<T: AsyncRead + AsyncWrite + ?Sized> Duplex for T {}
 /// the platform-neutral signature.
 type DuplexBox = Box<dyn Duplex + Unpin + Send>;
 
+/// How many decoded inbound lines one connection's reader task may hold before
+/// it stops draining the socket (finding 7).
+///
+/// # Why this channel is bounded at all
+///
+/// The reader task used to hand every line to an `mpsc::unbounded_channel`, and
+/// `Connection::recv` was the only consumer. A peer that writes frames and never
+/// waits for replies therefore had an infinitely deep mailbox: the reader drained
+/// the socket as fast as the kernel would deliver bytes, `recv` lagged by whatever
+/// the peer chose to send, and the daemon's heap grew by one `serde_json::Value`
+/// per line with nothing to stop it.
+///
+/// Measured on Linux against the daemon, one connection, 10 s of `hello` frames
+/// from a client that read NO bytes at all: **1 168 009 requests absorbed, daemon
+/// RSS 15 MB → 895 MB.** The socket buffers are ~200 KB; the extra ~880 MB was
+/// this channel. That is a local denial-of-service available to any process that
+/// can reach the socket, and `serve` has no authentication before T13.
+///
+/// # Why backpressure is the right response, not dropping
+///
+/// The reader `await`s room instead of discarding, so the pressure propagates to
+/// the only party that can actually resolve it: the socket fills, the peer's own
+/// `write` blocks, and the attacker is throttled by their own kernel rather than
+/// by the daemon paying for their backlog. Dropping inbound frames would be worse
+/// than the disease here — a request that vanishes is a client bug the daemon
+/// caused, whereas a client that blocks on `write` is seeing a limit, and every
+/// real client reads its replies so never reaches it.
+///
+/// # Why 1024
+///
+/// The same budget as `serve::CLIENT_QUEUE_CAPACITY`, for the same reason: at a
+/// few hundred bytes per decoded `Value` this is well under a megabyte per
+/// connection, and it is comfortably above what any honest client needs in flight
+/// (the daemon answers a `hello` in one step and a `start` after one `attach`).
+/// It is deliberately NOT tied to `FAN_OUT_CAPACITY`: that is the daemon's
+/// outbound event ring and has no bearing on how many REQUESTS one peer may have
+/// outstanding.
+const MAX_QUEUED_INBOUND_FRAMES: usize = 1024;
+
+/// The longest inbound LINE (in bytes, terminator included) this transport will
+/// buffer from one peer (finding 7).
+///
+/// `pub` because it is a contract a client can act on: a caller that must send
+/// something near the limit needs to know it is being refused for length and not
+/// for syntax.
+///
+/// # Why a cap on the LINE, when the queue is already bounded
+///
+/// They stop two different attacks, and neither subsumes the other. The queue
+/// bound limits how many COMPLETED frames may sit undelivered. This limits how
+/// large ONE frame may be while it is still being assembled — and a line
+/// assembler is a buffer too. `AsyncBufReadExt::read_line` appends into its
+/// caller's `String` and keeps going until it sees a `\n`, so a peer that sends
+/// ten megabytes with no terminator holds ten megabytes in the reader task with
+/// no newline in sight and nothing in the daemon able to object. One connection,
+/// one allocation, no ceiling: `read_line` will happily grow until the process
+/// cannot.
+///
+/// # Why 1 MiB
+///
+/// The largest legitimate inbound frame is a `start`, which carries a
+/// `StartEnv` — cwd, capabilities, and a full `ModelCatalog`. A catalog of a few
+/// hundred models is tens of kilobytes, so 1 MiB is roughly an order of magnitude
+/// above the biggest thing a real client can send today, with room for the
+/// protocol to grow (T10's `attach` will carry more). Below that the daemon
+/// refuses; above it a single hostile connection costs 1 MiB of buffer instead of
+/// an amount chosen by the attacker.
+///
+/// # Why exceeding it closes the connection rather than skipping the line
+///
+/// The alternative — drop the bytes, resync on the next `\n` — is what "just
+/// ignore it" sounds like, and it is the worse failure. A frame the daemon
+/// refused is a frame the client believes it sent; the client's next frame then
+/// arrives on a stream the daemon has already re-interpreted, and the two sides
+/// disagree about where frames begin. That is the desync this file's whole design
+/// (one frame per line, a reader that is never abandoned mid-line) exists to
+/// avoid, so the cap ends the connection with a named error instead of
+/// inventing a resync the protocol has no framing to support.
+pub const MAX_INBOUND_LINE_BYTES: usize = 1024 * 1024;
+
 /// One framed connection to the daemon (or to a client, from the listener's
 /// side).
 ///
@@ -45,7 +125,11 @@ pub struct Connection {
     pending: Vec<u8>,
     /// Decoded inbound lines, in order. `None` (i.e. the channel closing) is
     /// EOF.
-    lines: mpsc::UnboundedReceiver<Result<serde_json::Value, TransportError>>,
+    ///
+    /// Bounded — see [`MAX_QUEUED_INBOUND_FRAMES`]. When it is full the reader
+    /// task waits, which is the backpressure: the socket fills and the peer's own
+    /// `write` blocks.
+    lines: mpsc::Receiver<Result<serde_json::Value, TransportError>>,
     /// The reader task. Held so `Drop` can abort it — otherwise a dropped
     /// `Connection` would leave a task parked on a dead socket forever.
     reader: tokio::task::JoinHandle<()>,
@@ -72,7 +156,10 @@ impl Connection {
         // `split` gives two handles over one stream, so the reader task and the
         // caller's `send_frame` never fight over a single `&mut`.
         let (read_half, write_half) = tokio::io::split(stream);
-        let (tx, lines) = mpsc::unbounded_channel();
+        // BOUNDED, and the reader waits for room — see [`MAX_QUEUED_INBOUND_FRAMES`]
+        // for the measurement that made this a correctness issue rather than
+        // hygiene.
+        let (tx, lines) = mpsc::channel(MAX_QUEUED_INBOUND_FRAMES);
 
         // A DEDICATED TASK, not a `read_line` future this struct owns.
         //
@@ -87,34 +174,62 @@ impl Connection {
         // stdout/stderr pipes — a socket reader carries the identical hazard.
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    // EOF — the peer is gone. A final line with NO trailing
-                    // newline still gets forwarded (a peer killed mid-write is
-                    // exactly the frame worth keeping), matching
-                    // `spawn_pipe_reader`.
-                    Ok(0) => {
-                        let tail = line.trim_end();
-                        if !tail.is_empty() {
-                            // Going away anyway, so the send result is moot.
-                            let _ = tx.send(decode(tail));
-                        }
-                        break;
-                    }
-                    Ok(_) => {
+                match read_capped_line(&mut reader).await {
+                    LineRead::Complete(bytes) => {
+                        // UTF-8 is checked here rather than by `read_line`
+                        // (which validated it as it appended). A line that is not
+                        // UTF-8 ENDS the stream, exactly as it did under
+                        // `read_line`'s `Err(_) => break`: the permissive rule is
+                        // about a line that is not JSON, not about a byte stream
+                        // that is not text.
+                        let Ok(line) = String::from_utf8(bytes) else {
+                            break;
+                        };
                         // `trim_end` drops the `\n` (and a `\r\n`'s `\r`). A
                         // blank line carries no frame, so it is skipped rather
                         // than surfaced as a decode error.
                         let line = line.trim_end();
-                        if !line.is_empty() && tx.send(decode(line)).is_err() {
-                            break; // the Connection is gone.
+                        if line.is_empty() {
+                            continue;
                         }
+                        // Awaits room. This task is never `select`ed over — the
+                        // whole reason it is a task (see below) — so being parked
+                        // here is safe: nothing can abandon it mid-line, and the
+                        // line it already decoded is held in `line`, not lost.
+                        // `Err` means the `Connection` is gone, which is the
+                        // reader's own EOF condition.
+                        if tx.send(decode(line)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // EOF — the peer is gone. A final line with NO trailing
+                    // newline still gets forwarded (a peer killed mid-write is
+                    // exactly the frame worth keeping), matching
+                    // `spawn_pipe_reader`.
+                    LineRead::Eof(bytes) => {
+                        if let Ok(tail) = String::from_utf8(bytes) {
+                            let tail = tail.trim_end();
+                            if !tail.is_empty() {
+                                // Going away anyway, so the send result is moot —
+                                // and `send` cannot block for long here, because
+                                // the receiver is alive only while the
+                                // `Connection` is.
+                                let _ = tx.send(decode(tail)).await;
+                            }
+                        }
+                        break;
+                    }
+                    // The cap fired: one error item naming the limit, then the
+                    // stream ends. See [`MAX_INBOUND_LINE_BYTES`] for why the
+                    // connection is closed rather than resynced.
+                    LineRead::TooLong { limit } => {
+                        let _ = tx.send(Err(TransportError::LineTooLong { limit })).await;
+                        break;
                     }
                     // A read error is indistinguishable from a closed peer here;
                     // ending the channel ends the stream for the consumer.
-                    Err(_) => break,
+                    LineRead::Failed => break,
                 }
             }
             // Dropping `tx` here is what makes `Connection::recv` report EOF.
@@ -191,6 +306,106 @@ impl Drop for Connection {
     }
 }
 
+/// One line read from a peer, and why it stopped.
+///
+/// `Debug` for the tests' failure messages.
+#[derive(Debug)]
+enum LineRead {
+    /// A full line, terminator included (the caller `trim_end`s it).
+    Complete(Vec<u8>),
+    /// The peer closed. Carries whatever had accumulated, which may be a line
+    /// with no terminator — still worth forwarding, see the reader task.
+    Eof(Vec<u8>),
+    /// [`MAX_INBOUND_LINE_BYTES`] was reached with no terminator in sight.
+    TooLong { limit: usize },
+    /// The stream errored.
+    Failed,
+}
+
+/// Read one `\n`-terminated line, refusing anything longer than
+/// [`MAX_INBOUND_LINE_BYTES`].
+///
+/// # Why not `AsyncBufReadExt::read_line`
+///
+/// Because `read_line` has no ceiling. It appends into its `String` until it sees
+/// a newline, so a peer that sends bytes and never sends a `\n` makes it allocate
+/// for as long as it can send — the second unbounded buffer finding 7 is about,
+/// and one the queue bound does not touch: the bytes are in the line buffer, not
+/// in the queue. (`read_until` is no better; it has the same shape over a `Vec`.)
+///
+/// # Why `fill_buf` / `consume` rather than a bounded read
+///
+/// It is the only pair that lets this look at bytes WITHOUT taking them. A
+/// chunk-oriented loop over `read(&mut [u8; N])` would work, but it re-reads
+/// nothing the peer has not already sent and it defeats the `BufReader`'s own
+/// buffering; `fill_buf` says "here is what is buffered, take as much as you
+/// want", so the newline scan and the length check run over kernel bytes with no
+/// copying at all until a decision is made. The copy into `buf` happens once per
+/// byte, and only for bytes that are actually being kept.
+///
+/// # Cancellation
+///
+/// NOT cancellation-safe, exactly like `read_line` — a future abandoned after it
+/// consumed some bytes leaves the stream positioned mid-line. That is safe here
+/// for the same reason the dedicated task makes `read_line` safe: this is awaited
+/// only inside that task, which is never `select`ed over, so it is never
+/// abandoned. Anyone tempted to wrap the reader in a `timeout` should read the
+/// comment at the spawn site first.
+async fn read_capped_line<R>(reader: &mut R) -> LineRead
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    read_capped_line_under(reader, MAX_INBOUND_LINE_BYTES).await
+}
+
+/// [`read_capped_line`] with the limit as an argument.
+///
+/// The parameter exists so the boundary is testable: at the real 1 MiB a test
+/// would have to write a megabyte to reach the edge and another to cross it, and
+/// an off-by-one at the limit is exactly the bug worth pinning. The production
+/// caller passes the constant and nothing else.
+async fn read_capped_line_under<R>(reader: &mut R, limit: usize) -> LineRead
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match reader.fill_buf().await {
+            // EOF. Whatever accumulated is the unterminated tail.
+            Ok([]) => return LineRead::Eof(buf),
+            Ok(chunk) => chunk,
+            Err(_) => return LineRead::Failed,
+        };
+
+        // The terminator wins over the cap, but the cap is still checked HERE: a
+        // line of exactly `MAX_INBOUND_LINE_BYTES` INCLUDING its `\n` is legal and
+        // one byte more is not. Testing `buf.len() + at + 1` rather than only
+        // `buf.len()` is what makes the documented number the real number —
+        // otherwise the last chunk's worth of bytes (up to `BufReader`'s 8 KiB)
+        // could ride in past it, and a bound the implementation quietly overshoots
+        // is a bound no client can rely on.
+        if let Some(at) = chunk.iter().position(|byte| *byte == b'\n') {
+            if buf.len() + at + 1 > limit {
+                return LineRead::TooLong { limit };
+            }
+            buf.extend_from_slice(&chunk[..=at]);
+            reader.consume(at + 1);
+            return LineRead::Complete(buf);
+        }
+
+        // No terminator in what is buffered. Keep what fits, and refuse the
+        // instant it stops fitting — `buf` never exceeds the cap, so the
+        // attacker's cost is the cap and not their patience.
+        let room = limit.saturating_sub(buf.len());
+        if room == 0 {
+            return LineRead::TooLong { limit };
+        }
+        let take = chunk.len().min(room);
+        buf.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+    }
+}
+
 /// Decode one inbound line. Permissive by design: the daemon's clients may be
 /// older or newer than it is, and a bad line is reported per-line rather than
 /// killing the connection (see [`Connection::recv`]).
@@ -212,5 +427,145 @@ pub(crate) fn wrong_platform(
         family,
         platform,
         endpoint,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `LineRead` rendered for a panic message: the SHAPE and a length, never
+    /// the bytes. `#[derive(Debug)]` prints the whole payload, and the payload
+    /// this file cares about is up to a megabyte — a test failure whose diagnosis
+    /// is buried under a megabyte of `a`s is not a diagnosis.
+    fn describe(read: &LineRead) -> String {
+        match read {
+            LineRead::Complete(bytes) => format!("Complete({} bytes)", bytes.len()),
+            LineRead::Eof(bytes) => format!("Eof({} bytes)", bytes.len()),
+            LineRead::TooLong { limit } => format!("TooLong {{ limit: {limit} }}"),
+            LineRead::Failed => "Failed".to_string(),
+        }
+    }
+
+    /// The reader, over an in-memory stream. A `BufReader` is the SAME
+    /// `AsyncBufRead` the socket half runs on, so the chunking the boundary
+    /// depends on is `BufReader`'s real 8 KiB `fill_buf` and not a simulation.
+    fn reader_over(bytes: Vec<u8>) -> tokio::io::BufReader<std::io::Cursor<Vec<u8>>> {
+        tokio::io::BufReader::new(std::io::Cursor::new(bytes))
+    }
+
+    /// A line of exactly the limit (terminator included) is COMPLETE, not too
+    /// long — the limit is a limit, not an off-by-one.
+    #[tokio::test]
+    async fn a_line_of_exactly_the_limit_is_accepted() {
+        let mut line = vec![b'x'; 63];
+        line.push(b'\n');
+        assert_eq!(line.len(), 64);
+        let mut reader = reader_over(line);
+        match read_capped_line_under(&mut reader, 64).await {
+            LineRead::Complete(ref got) => assert_eq!(got.len(), 64),
+            other => panic!(
+                "exactly-at-limit must be a complete line, got {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    /// One byte over the limit is refused — and the refusal is the dedicated
+    /// variant, not a decode error (the operator must be able to tell "your frame
+    /// is too big" from "your frame is not JSON").
+    #[tokio::test]
+    async fn one_byte_over_the_limit_is_refused() {
+        let mut line = vec![b'x'; 64];
+        line.push(b'\n');
+        let mut reader = reader_over(line);
+        match read_capped_line_under(&mut reader, 64).await {
+            LineRead::TooLong { limit } => assert_eq!(limit, 64),
+            other => panic!(
+                "one over the limit must be refused, got {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    /// The cap holds against a peer that never sends a terminator. This is the
+    /// attack `read_line` had no answer for: bytes arrive, no newline, and the
+    /// buffer would otherwise grow for as long as the peer can send.
+    #[tokio::test]
+    async fn an_unterminated_flood_is_refused_at_the_cap_and_no_further() {
+        // 8 KiB of bytes and no `\n` anywhere — four times the cap.
+        static FLOOD: &[u8] = &[b'a'; 8192];
+        let mut reader = reader_over(FLOOD.to_vec());
+        match read_capped_line_under(&mut reader, 256).await {
+            LineRead::TooLong { limit } => assert_eq!(limit, 256),
+            other => panic!(
+                "an unterminated flood must hit the cap, got {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    /// EOF with an unterminated tail still forwards the tail — the rule the
+    /// transport has always had (a peer killed mid-write is the frame worth
+    /// keeping), which the cap must not silently change.
+    #[tokio::test]
+    async fn an_unterminated_tail_at_eof_is_still_delivered() {
+        static TAIL: &[u8] = br#"{"half":"written"}"#;
+        let mut reader = reader_over(TAIL.to_vec());
+        match read_capped_line_under(&mut reader, 1024).await {
+            LineRead::Eof(ref got) => assert_eq!(got, TAIL),
+            other => panic!("EOF must report the tail, got {}", describe(&other)),
+        }
+    }
+
+    /// A clean EOF reports an empty tail (nothing to forward).
+    #[tokio::test]
+    async fn a_clean_eof_reports_nothing() {
+        let mut reader = reader_over(Vec::new());
+        match read_capped_line_under(&mut reader, 1024).await {
+            LineRead::Eof(ref got) => assert!(got.is_empty()),
+            other => panic!("empty stream must be EOF, got {}", describe(&other)),
+        }
+    }
+
+    /// The cap counts BYTES, not characters, because the limit is what the buffer
+    /// costs — and a multi-byte character is the case where the two differ.
+    #[tokio::test]
+    async fn the_cap_counts_bytes_not_characters() {
+        // Six 3-byte characters (`€` is U+20AC, 3 bytes in UTF-8) = 18 bytes,
+        // plus the terminator. The count is asserted rather than trusted, because
+        // the whole point of the test is that the number is BYTES: a source file
+        // that normalised these to a different encoding would change the length
+        // and silently change what the two arms below assert.
+        let line = "\u{20AC}\u{20AC}\u{20AC}\u{20AC}\u{20AC}\u{20AC}\n".as_bytes();
+        assert_eq!(line.len(), 19, "six 3-byte characters plus `\\n`");
+        let mut reader = reader_over(line.to_vec());
+        match read_capped_line_under(&mut reader, 19).await {
+            LineRead::Complete(ref got) => assert_eq!(got.len(), 19),
+            other => panic!(
+                "19 bytes at a 19-byte cap must pass, got {}",
+                describe(&other)
+            ),
+        }
+        let mut reader = reader_over(line.to_vec());
+        match read_capped_line_under(&mut reader, 18).await {
+            LineRead::TooLong { .. } => {}
+            other => panic!(
+                "19 bytes at an 18-byte cap must be refused, got {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    /// The `gap`-shaped notice and the length error are the two things a client
+    /// can be told that are not a frame it asked for, so both are named here.
+    #[test]
+    fn the_line_too_long_error_names_the_limit() {
+        let err = TransportError::LineTooLong { limit: 1024 * 1024 };
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("{}", 1024 * 1024)),
+            "the message must carry the number the peer has to get under: {message}"
+        );
     }
 }
