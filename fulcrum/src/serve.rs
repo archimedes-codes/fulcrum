@@ -6,15 +6,15 @@
 //! A process supervisor and a transport, nothing else. Every engine capability
 //! it needs already exists and is reused rather than re-made:
 //!
-//! * [`WorkerManager`] is the session-keyed Worker registry — `attach` spawns the
+//! * `WorkerManager` is the session-keyed Worker registry — `attach` spawns the
 //!   child, waits for `ready`, starts the read-loop pump, sends `start`, and
 //!   registers under the session id; crash detection, the **Dead bound**, and
 //!   subagent dispatch all live inside it. **There is deliberately no second
 //!   registry here.** The only per-session state this file keeps is which socket
 //!   wants which session's frames, which is routing, not supervision.
-//! * [`TranscriptPersister`] is the sole writer of `fulcrum.db`, fed from the
+//! * `TranscriptPersister` is the sole writer of `fulcrum.db`, fed from the
 //!   pump's `on_event` — the same seam the desktop drives.
-//! * [`WorkerHandle`] is the only child constructor (the `childproc` census exists
+//! * `WorkerHandle` is the only child constructor (the `childproc` census exists
 //!   to keep it that way; see `worker_factory.rs`).
 //!
 //! # The multiplex, and why it is shaped like this
@@ -101,7 +101,7 @@
 //! layers, each with its own numbers named at its own definition:
 //!
 //! * **Peer identity** at accept: the unix leg refuses a peer whose uid is not the
-//!   daemon's ([`TransportError::PeerIdentity`], and `transport::unix`'s platform
+//!   daemon's (`TransportError::PeerIdentity`, and `transport::unix`'s platform
 //!   table). The Windows leg cannot prove this and says so in
 //!   `transport::windows`'s header. So the sentence "the socket is the credential"
 //!   is now: the socket's mode is the credential, AND the peer-credential check is
@@ -125,44 +125,52 @@
 //! nothing about the file. If a compliance requirement ever demands encryption at
 //! rest, it is its own task, not a clause of this one.
 //!
-//! # ⚠ A slow frame on ONE connection stalls THAT connection's own relay
+//! # A slow frame on ONE connection no longer stalls that connection's own relay
 //!
-//! Stated here because it is a known latency of the daemon's own design, and
-//! because a commit message once claimed it was fixed when it was not.
+//! Stated here because it WAS a known latency of the daemon's own design, because a
+//! commit message once claimed it was fixed when it was not, and because the shape
+//! that fixed it is the one thing a future reader is most tempted to undo.
 //!
-//! `serve_client` is ONE task running ONE `select!`. A `start` runs inline in
-//! that arm — `attach` is the engine's ~5 s `ready` bound — so while a client is
-//! waiting for ITS `start-result`, the same task cannot drain that client's
-//! event relay. A client that starts a session and then streams sees its own
-//! first frames arrive after the start completes.
+//! `serve_client` used to be ONE task running ONE `select!`, with a `start` running
+//! inline in its inbound arm — `attach` is the engine's 5 s `ready` bound — so while a
+//! client waited for ITS `start-result`, the same task could not drain that client's
+//! event relay. It is now TWO tasks (`reader_loop` and `writer_loop`): the reader
+//! may stay parked in `attach` for its full bound while the writer keeps relaying this
+//! connection's fan-out and draining its queue.
+//! `tests/serve.rs::a_slow_start_does_not_stall_that_clients_own_event_relay` is the
+//! measurement, and it holds a worker fixture's `ready` frame so the park is a fact the
+//! test controls rather than a duration it guesses — which is what makes the old design
+//! red *by construction* in that span instead of by timing margin.
 //!
-//! What this does NOT do is affect any other connection: the task is per
-//! connection, so the stall is private to the client that caused it, and it is
-//! bounded by `attach`'s own timeout rather than unbounded. It is also not a
-//! correctness problem — no frame is lost, only delayed. Whether 5 s of one
-//! session's stream overruns the 4 096-frame fan-out ring is a function of the
-//! model's token rate and has NOT been measured here; what is measured is that a
-//! client which does fall behind gets a `gap` notice rather than silence (see
-//! [`CLIENT_QUEUE_CAPACITY`] for that path and its numbers).
+//! The stall was never a correctness problem (no frame was lost, only delayed) and
+//! never affected another connection (the task was per connection). What it cost was
+//! latency a client caused to itself, up to `attach`'s bound.
 //!
-//! The fix is to split `serve_client` into a reader/reply task and a writer task.
-//! It is deliberately NOT done in this pass, and the reason is the hazard
-//! `transport::frame` documents: `send_frame` keeps the unwritten tail of a
-//! partially-accepted frame in `Connection::pending`, because a JSONL stream has
-//! no way to resynchronise once two writers interleave. A safe split therefore
-//! needs the `Connection` itself split into an owning reader and an owning writer
-//! (`tokio::io::split` over the duplex, with `pending` moving to the writer), and
-//! that is a change to the one file whose entire purpose is preventing this class
-//! of desync — for a 5 s delay a client causes to itself. It is a KNOWN
-//! LIMITATION awaiting its own ticket, not a deferred detail; `serve_client`'s
-//! doc carries the same note next to the code that would change.
+//! # ⚠ Why the relay lives in the writer, and why you may not merge the tasks back
+//!
+//! The placement is load-bearing: the fan-out arm is in `writer_loop` because that
+//! task never calls `handle_frame`. Move the relay into the reader's loop — even with
+//! a second `select!`, even "temporarily" — and the split becomes decorative: the relay
+//! stalls for exactly the window the bug was about.
+//!
+//! And the reason a second writer is safe AT ALL is `transport::frame`: a JSONL stream
+//! has no way to resynchronise once two writers interleave a half-written line, so
+//! `Connection::pending` (the tail of a partially-accepted frame) must have exactly one
+//! owner. `ConnectionWriter` owns it, `Connection::split_writer` hands it out once, and
+//! `Connection` has no write method — so "two tasks reach `pending`" is not discouraged
+//! here, it is unrepresentable. Do not put a `Mutex<Connection>` back, do not re-add a
+//! convenience `send_frame` to the reader half, and do not hand a `ConnectionWriter` to
+//! anything but `writer_loop`. `tests/transport.rs`'s writer block is the pin behind
+//! that sentence, and `a_shared_writer_under_a_mutex_never_interleaves_frames` is the
+//! one in that block that reddens the mutex-shaped regression the others false-green on.
 //!
 //! Every buffer a client can grow is BOUNDED (finding 7) — the fan-out ring
 //! (`FAN_OUT_CAPACITY`), one connection's outbound queue
 //! (`CLIENT_QUEUE_CAPACITY`), whose full case produces a `gap` notice instead of
 //! an unbounded allocation), and in `transport::frame` the inbound line length and
 //! the reader's queue. The last pair is where the growth actually was; that
-//! module's header carries the measurement.
+//! module's header carries the measurement. The split adds a second PRODUCER to that
+//! queue, not a second buffer — see `CLIENT_QUEUE_CAPACITY`'s note.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -179,7 +187,7 @@ use fulcrum_core::worker::protocol::{StartEnv, PROTOCOL_VERSION};
 use fulcrum_core::worker::{WorkerFactory, WorkerManager};
 
 use crate::db::Db;
-use crate::transport::{Connection, Endpoint, Listener, TransportError};
+use crate::transport::{Connection, ConnectionWriter, Endpoint, Listener, TransportError};
 
 pub use crate::worker_factory::{DaemonWorkerFactory, WorkerExeError};
 
@@ -215,34 +223,55 @@ const FAN_OUT_CAPACITY: usize = 4096;
 /// # What this bound does NOT buy, measured
 ///
 /// Being straight about this, because the intuition is seductive and was wrong:
-/// this queue is NOT where finding 7's unbounded growth lived. `serve_client` is
-/// ONE task running ONE `select!`, so while the drain arm's body awaits a blocked
-/// `send_frame` the `select!` is not re-polled and the inbound arm cannot run and
-/// cannot enqueue — which caps the queue's depth at about 1 regardless of how
-/// much a peer sends. Instrumented directly: at a capacity of 4 the drop path
-/// fires constantly, and at 1024 a flood of 40 000 requests never fills it.
+/// this queue is NOT where finding 7's unbounded growth lived. In the SINGLE-task
+/// `serve_client` this file used to have, while the drain arm's body awaited a
+/// blocked `send_frame` the `select!` was not re-polled and the inbound arm could
+/// not run and could not enqueue — which capped the queue's depth at about 1
+/// regardless of how much a peer sent. Instrumented directly at the time: at a
+/// capacity of 4 the drop path fired constantly, and at 1024 a flood of 40 000
+/// requests never filled it.
 ///
 /// The buffer that actually grew was `transport::frame`'s inbound queue — the
 /// reader task draining the socket into an unbounded channel nothing was
 /// consuming. That is measured, with numbers, in that module's header, and it is
 /// where the fix for the growth is.
 ///
-/// This bound is still the right thing, for two reasons that do not depend on it
-/// being the big one: it is what makes "we dropped a frame for you" a thing the
-/// daemon knows and can say (see [`gap_frame`]), which an unbounded queue can
-/// never produce; and it is the second line of defence for the split this file
-/// does NOT do — see [`serve_client`]'s "known limitation" note, which is where
-/// the single-task shape and the head-of-line stall it implies are described. If
-/// that split is ever made, the depth stops being ~1 and becomes exactly as large
-/// as the peer's patience, and this number becomes the bound that matters.
+/// # After T4: two producers (reader replies + writer relay)
+///
+/// That "~1" is a property of the shape that no longer exists. `serve_client` is two
+/// tasks now, so [`reader_loop`] can enqueue replies while [`writer_loop`] is parked
+/// mid-`send_frame` to a slow peer — the depth is no longer capped by the drain
+/// blocking the producer, because they are different tasks. This number is therefore
+/// the bound that MATTERS, exactly as the paragraph below (written before the split)
+/// predicted it would: a stalled connection's queue is now genuinely as deep as its
+/// patience, and 1 024 is what stops it.
+///
+/// What did NOT change is the total write-path buffering per connection, and it is
+/// worth naming in one sentence because it is the number a reviewer should want:
+/// `CLIENT_QUEUE_CAPACITY` frames in the queue + `ConnectionWriter::pending`'s
+/// in-flight tail + the socket's own OS send buffer. All three are bounded, all three
+/// are per connection, and none of them grew.
+///
+/// The bound is still the right thing for the two reasons that never depended on it
+/// being the big one: it is what makes "we dropped a frame for you" a thing the daemon
+/// knows and can say (see [`gap_frame`]), which an unbounded queue can never produce;
+/// and it is what keeps one stalled client from holding the daemon's memory.
 ///
 /// # Consequence for the tests, stated rather than glossed
 ///
 /// The full-queue `gap` path is therefore NOT reachable from a socket test at this
-/// capacity, and no test pretends otherwise. Measured: a client that wrote 60 000
-/// requests and read nothing got 1 377 through in total — the inbound bound plus
-/// the kernel buffers cap the flood below the 1 024 the outbound queue needs, so
-/// the queue peaked around 353. What IS covered, and where:
+/// capacity, and no test pretends otherwise. Measured on the SINGLE-task shape: a
+/// client that wrote 60 000 requests and read nothing got 1 377 through in total —
+/// the inbound bound plus the kernel buffers cap the flood below the 1 024 the
+/// outbound queue needs, so the queue peaked around 353. (That peak is the old shape's
+/// number: with two tasks the queue can now fill, since the producer no longer waits
+/// on the drain. The measurement this rests on — the inbound bound capping the flood
+/// at ~1.4 k — is about `transport::frame`'s reader and the socket, and the split does
+/// not touch the inbound path at all, so the conclusion still holds; the depth figure
+/// is the part that belonged to the old shape. See
+/// `a_client_that_never_reads_is_throttled_and_the_daemon_stays_flat`, which still
+/// measures frames accepted and the daemon's RSS against the same caps.)
+/// What IS covered, and where:
 ///
 /// * the drop-and-count-and-keep mechanism, deterministically — `enqueue`'s unit
 ///   test, which drives a capacity-1 channel;
@@ -360,11 +389,12 @@ const FRAME_RATE_BURST: usize = FRAME_RATE * 3;
 /// The per-connection inbound frame-rate gate (issue #4).
 ///
 /// Plain f64 tokens, `Instant` (monotonic — a wall-clock jump must not be able to
-/// refill the bucket or starve it), and no new dependency. Per-connection LOCAL
-/// state, deliberately: the rate is a property of one socket, so it belongs to the
-/// one task that reads that socket, not to `Daemon` — and keeping it a local in
-/// `serve_client`'s header region is what lets the whole gate move into a reader
-/// half intact when that function is split.
+/// refill the bucket or starve it), and no new dependency. Per-connection LOCAL state,
+/// deliberately: the rate is a property of one socket, so it belongs to the one task
+/// that reads that socket, not to `Daemon` — and keeping it a local rather than daemon
+/// state is what let the whole gate move into [`reader_loop`] intact when
+/// `serve_client` was split (issue #4's state is READER-half state: the writer never
+/// sees a frame the reader refused, and it must not have to).
 struct FrameRateGate {
     /// Tokens available now (one per frame the peer may still send).
     tokens: f64,
@@ -1495,220 +1525,570 @@ fn log_on_join_error(handle: tokio::task::JoinHandle<()>) {
     });
 }
 
-/// One client: read its frames, answer them, and forward the events it asked for.
+/// One client: TWO tasks — one reads and answers, one owns the socket's writes.
 ///
-/// ONE task owns the `Connection`, because `Connection` is not `clone`able and
-/// its write half must not be fought over. So the inbound read, the outbound
-/// relay, and the replies all meet in one `select!`. Both directions are safe
-/// under it: `Connection::recv` awaits an `mpsc` (cancellation-safe), and
-/// `send_frame` keeps its unwritten tail in the connection and drains it on the
-/// next call, so an abandoned send cannot desync the stream (see `transport::frame`).
+/// Issue #3's fix. `serve_client` used to be ONE task running ONE `select!`, with
+/// `handle_frame` awaited INLINE in its inbound arm — and a `start` inside
+/// `handle_frame` awaits `WorkerManager::attach`, the engine's 5 s `ready` bound. For
+/// that window the task was not in its `select!` at all, so this connection's own
+/// fan-out arm could not run: a client that started a session while its other session
+/// was streaming saw its own events only after the start finished. The two halves are
+/// tasks of their own now, so the relay runs while the reader is parked.
 ///
-/// # ⚠ KNOWN LIMITATION: the relay is an arm of this `select!`, not a task
+/// # Why the split is safe at all, and why TWO tasks rather than one with a mutex
 ///
-/// There is no second task here and no writer task — the shape is exactly the one
-/// the sentence above describes. The consequence is that `handle_frame` runs
-/// INLINE in the inbound arm (see the `handle_frame(…).await` below), and a
-/// `start` inside it awaits `attach`, which is the engine's ~5 s `ready` bound.
-/// For those up-to-5 s this task is not in its `select!`, so this connection's
-/// own fan-out arm cannot run: a client that starts a session while its session
-/// is streaming sees its own events arrive late. Other connections are unaffected
-/// (one task per connection), no frame is lost, and the delay is bounded by
-/// `attach`'s timeout.
+/// A JSONL stream cannot resynchronise once two writers interleave a half-written
+/// line, so the tail of a frame the OS only partly took (`pending`) must have exactly
+/// one owner. That exclusivity is what `transport::frame` provides: `ConnectionWriter`
+/// owns `pending` and is the only type with a write method, and
+/// `Connection::split_writer` hands it out exactly once. So the writer task holds the
+/// only write handle by construction — not by discipline, and not by wrapping a
+/// `Mutex` around a `Connection`, which would make the desync merely unlikely instead
+/// of unrepresentable. `tests/transport.rs`'s `a_shared_writer_under_a_mutex_never_interleaves_frames`
+/// is the pin that reddens the mutex-shaped regression.
 ///
-/// This is a KNOWN LIMITATION with a ticket, not an oversight — and if you are
-/// reading this because you came to "fix" it by spawning a writer task, the thing
-/// to read first is `transport::frame`'s `Connection::pending`: the write half
-/// carries the unwritten tail of a partially-accepted frame precisely because
-/// there is no way to resynchronise a JSONL stream once two writers interleave.
-/// Two tasks may not call `send_frame` on one `Connection`. The split has to move
-/// the `Connection`'s write half (and `pending` with it) into the writer and leave
-/// the reader holding only the inbound channel — which is a change to the framing
-/// layer, not a change to this function.
-async fn serve_client(daemon: Arc<Daemon>, mut connection: Connection) {
-    // The frames this connection asked to see. Populated by `start`; a
-    // connection that never started anything sees nothing, which is the point of
-    // filtering by session rather than broadcasting everything to everyone.
-    let mut watching: HashSet<String> = HashSet::new();
-    // The outbound queue (replies + relayed events), BOUNDED — see
-    // [`CLIENT_QUEUE_CAPACITY`] for what it is sized against and for why the
-    // "unbounded so `send` is infallible" reasoning that replaced the bound
-    // originally was the defect. Every `send` below is a `try_send`, and the full
-    // case is handled the way the fan-out's lag case already was: drop, count,
-    // announce, keep the connection.
-    let (tx, mut queued) = tokio::sync::mpsc::channel::<serde_json::Value>(CLIENT_QUEUE_CAPACITY);
+/// * [`reader_loop`] — the reader half of the `Connection`, the `watching` set,
+///   issue #4's hardening state (`Handshake`, `FrameRateGate`, `seen`), the reply side
+///   of the outbound queue, and the two wire-auth refusals.
+/// * [`writer_loop`] — the `ConnectionWriter`, the fan-out subscription, the drain,
+///   and the refusal sender. THE RELAY LIVES HERE, and that placement is the whole
+///   point: only a task that never calls `handle_frame` can carry it through a slow
+///   `start`.
+///
+/// The two share exactly two pieces of per-connection state, `watching` and
+/// `dropped`, both behind an `Arc<StdMutex<..>>` (the `Daemon::subagents` /
+/// `Daemon::starting` precedent). NO guard is ever held across an `await` — see each
+/// loop's notes — because a `std::sync::MutexGuard` is `!Send`, which a spawned future
+/// cannot survive, and holding one across `attach` would re-create the very stall this
+/// split removes.
+///
+/// # The `gap` ordering contract, which the split changes deliberately
+///
+/// One task serialised every `send_frame`, so a `gap` notice could not interleave into
+/// the reply stream. Two producers into one queue can, and the contract is now stated
+/// instead of inherited:
+///
+/// * A `gap` may appear anywhere in the stream, INCLUDING before the very reply whose
+///   drop it reports — the drain announces `dropped` from the queue head when it wakes
+///   with a non-zero count, and a reply enqueued just before that wake races the
+///   announcement.
+/// * A `gap` never precedes a frame that predates the drops it reports: the queue is
+///   FIFO, so a prelude can only leak drops that happened before this drain wake.
+/// * The fan-out's `Lagged` arm still emits its `gap` as an ordinary queued frame (not
+///   folded into `dropped`), so it shares the queue with replies.
+///
+/// The shape (`{"type":"gap","skipped":N}`, no `sessionId`), the counts, and both
+/// buffer bounds are unchanged. No test in `tests/serve.rs` depended on
+/// reply-before-event ordering — the client harness matches frames by predicate, never
+/// by position — and `the_gap_drain_prelude_uses_the_current_drop_count` pins the
+/// prelude's new counting rule directly.
+///
+/// # Teardown: drop-based, and the writer is `abort()`ed, never joined
+///
+/// `ConnectionWriter::send_frame` loops `write(&self.pending)` with no timeout, so a
+/// peer that stops reading parks it — and while the writer task sits inside that
+/// future, NONE of its `select!` arms is pollable, so no message and no stop one-shot
+/// can reach it. Awaiting its `JoinHandle` would therefore hang forever. `serve_client`
+/// keeps the handle and `abort()`s it once the reader returns: aborting (not joining)
+/// makes the parked write-loop's drop SYNCHRONOUS, so no `Drop`-time `flush` is ever
+/// awaited (a flush on a half-closed socket would itself hang). That abort is the ONLY
+/// mechanism carrying "no task outlives `serve_client`" — dropping the handle would
+/// orphan the parked writer, and `tokio::io::split`'s halves share an `Arc` with no
+/// `Drop` impl, so dropping one half closes nothing while the other lives.
+///
+/// What the writer does on its OWN exits is `ConnectionWriter::shutdown` — the single
+/// place the daemon reaches `poll_shutdown`. There is no reader-side close and no
+/// raw-byte drain of any kind: draining the read half conveys nothing to the write
+/// direction (`ReadHalf::poll_read` never calls `poll_shutdown`), and a close at
+/// `serve_client`'s START would shut the daemon's own write direction before the
+/// writer had put one frame on the wire.
+///
+/// # What is deliberately NOT here
+///
+/// No `detach`, no `kill`, no session cleanup when the connection goes: dropping the
+/// subscription is the whole teardown and the sessions keep running and persisting.
+/// `tests/serve.rs`'s durability test is what keeps that true, and its `REAP_GRACE`
+/// window is why a wrong teardown cannot hide (`detach` does not kill — it runs
+/// `reap_worker`, a `close` then a 2 s grace then `kill`, so a wrong one looks like a
+/// child that dies 2 s LATE rather than one that dies at once).
+async fn serve_client(daemon: Arc<Daemon>, connection: Connection) {
+    // The frames this connection asked to see. Populated by `start`; a connection
+    // that never started anything sees nothing, which is the point of filtering by
+    // session rather than broadcasting everything to everyone.
+    //
+    // SHARED because the writer's relay arm has to read it while the reader's
+    // `handle_frame` owns it. The READER is the only writer of this set (see
+    // `reader_loop`'s mirror note); the writer only ever filters on a snapshot of it.
+    // `StdMutex` rather than `tokio::sync::Mutex` for that reason: the reader must not
+    // hold this across `attach`, and a `tokio` mutex would make the wrong shape
+    // (`lock().await`) look natural.
+    let watching: Arc<StdMutex<HashSet<String>>> = Arc::new(StdMutex::new(HashSet::new()));
     // Frames dropped for THIS connection since the last `gap` it was told about.
     //
-    // Kept out here rather than queued, because the queue is the thing that is
-    // full: an announcement of a drop cannot be allowed to fail for lack of room,
-    // and it cannot be sent inline either (this task owns the only write half and
-    // it is inside a `select!`). So the count waits for the drain arm to free a
-    // slot, and the notice goes out with the next frame the client actually gets.
-    let mut dropped: u64 = 0;
-    // Every queue push below calls [`enqueue`] directly rather than through a
-    // closure, because a closure capturing `&mut dropped` would hold that borrow
-    // across the `select!` arms — and the drain arm needs `dropped` too.
-    let mut events = daemon.fan_out.subscribe();
+    // Kept out of the queue because the queue is the thing that is full: an
+    // announcement of a drop cannot be allowed to fail for lack of room, and it cannot
+    // be sent inline either (the task that notices is not the task that owns the write
+    // half). So the count waits for the drain to free a slot, and the notice goes out
+    // with the next frame the client actually gets.
+    //
+    // `Arc` rather than a local because it OUTLIVES BOTH TASKS: the writer's relay arm
+    // increments it, the writer's drain announces it, and `serve_client` reads it after
+    // the abort to log what the client was never told. That last reader of it is the
+    // reason it cannot simply live inside `writer_loop` — an aborted task runs no code
+    // after its loop, so the notice would vanish on exactly the parked-writer path it
+    // exists to report.
+    let dropped: Arc<StdMutex<u64>> = Arc::new(StdMutex::new(0));
+    // The outbound queue (replies + relayed events), BOUNDED — see
+    // [`CLIENT_QUEUE_CAPACITY`] for what it is sized against and for why the
+    // "unbounded so `send` is infallible" reasoning that replaced the bound originally
+    // was the defect. Every push below is a `try_send` via [`enqueue_shared`], and the
+    // full case is handled the way the fan-out's lag case already was: drop, count,
+    // announce, keep the connection.
+    //
+    // `Sender` is `Clone`, so BOTH tasks hold one: the reader (replies) and the writer
+    // (the relay, and the `Lagged` gap). That is deliberate, and it has a teardown
+    // consequence worth naming — the channel can never close because ONE task dropped
+    // its handle, so the writer's `recv() == None` exit is driven specifically by the
+    // READER's sender going away.
+    let (tx, queued) = tokio::sync::mpsc::channel::<serde_json::Value>(CLIENT_QUEUE_CAPACITY);
 
-    // Frames seen from this peer, so the exit path can tell "a probe that
-    // connected and hung up" from "a client that talked to us and left".
+    // Issue #4's wire-auth refusal, across the task boundary. TWO one-shots, because
+    // the reader's guarantee is "told ONCE, then closed" while closing is the reader's
+    // job and writing is the writer's:
+    //
+    //   reader: refuse_tx.send(frame); ack_rx.await; break
+    //   writer: refuse_rx fires → send_frame(frame) → ack_tx.send(()) → exit
+    //
+    // So the refusal is really on the socket before the connection ends, which is what
+    // the old inline `send_frame(…).await; break;` did. If the writer is already gone,
+    // `send` returns `Err(frame)` and the reader's `ack_rx.await` yields
+    // `Err(Canceled)` — the same break either way, just without the frame. And a peer
+    // that neither reads nor closes parks the writer's refusal send, which parks the
+    // reader's ack await too: identical to the old inline behaviour, and not a
+    // teardown case (the connection never ends; the test suite's daemon kill closes
+    // every socket).
+    let (refuse_tx, refuse_rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // SPLIT FIRST, then spawn: `writer_loop` must receive its half already moved, and
+    // `split_writer` consumes the `Connection`, so what the reader task gets is the
+    // reader half. This ordering is also what makes "exactly one writer" checkable by
+    // reading the types — after this line, `connection` has no write method at all.
+    let (reader_conn, writer) = connection.split_writer();
+
+    let reader = tokio::spawn(reader_loop(
+        Arc::clone(&daemon),
+        reader_conn,
+        tx.clone(),
+        Arc::clone(&watching),
+        refuse_tx,
+        ack_rx,
+    ));
+    let writer_task = tokio::spawn(writer_loop(
+        writer,
+        queued,
+        tx,
+        daemon.fan_out.subscribe(),
+        SharedConnectionState {
+            watching,
+            dropped: Arc::clone(&dropped),
+        },
+        refuse_rx,
+        ack_tx,
+    ));
+
+    // The reader's whole life-span. `await` and NOT `select!`: the inbound channel is
+    // this task's only input, which is exactly why the split does not need the relay to
+    // share its loop. This parks for up to `attach`'s 5 s on a `start`, and that is the
+    // bounded per-connection stall issue #3 accepts — the difference from before is
+    // that the relay is no longer hostage to it.
+    //
+    // `expect` rather than a match: `reader_loop` has no error path, so the only way
+    // this fails is a panic, and a panic here is a bug worth a backtrace. The writer is
+    // still aborted below on that path, so a panicking reader cannot leak its writer
+    // either, and `run`'s `log_on_join_error` reports the panic itself.
+    reader.await.expect("reader_loop must not panic");
+
+    // The backstop, and the ONLY thing that ends a writer parked inside `send_frame`:
+    // a peer that closed its inbound half but left the write direction open gives the
+    // writer no error to notice, and while it sits in that write loop it cannot poll
+    // its own exit arms. `abort` — never `join`, the shape that can never resolve (see
+    // this function's teardown note). It makes the parked future's drop synchronous, so
+    // no `Drop`-time `flush` on a half-closed socket is ever awaited. A no-op for a
+    // writer that already exited, which is why it is unconditional: every path out of
+    // `reader.await` takes it, and "no task outlives `serve_client`" is mechanical
+    // rather than a promise. T1's process census on this branch is what reddens if it
+    // is ever removed.
+    writer_task.abort();
+
+    // The WRITER's exit epilogue lives here rather than inside `writer_loop`, and the
+    // reason is the abort itself: cancelling a task drops its future, so an epilogue
+    // written as code AFTER its `loop` would be skipped on exactly the one path that
+    // needs it most — a writer parked in `send_frame` for a peer that stopped reading is
+    // precisely a client that fell behind and was never told. `dropped` is an `Arc` for
+    // this reason as much as for the sharing.
+    //
+    // One accepted imprecision, because it is the kind that gets "fixed" into a bug:
+    // `abort` is a REQUEST, and a writer already running on another worker may reach its
+    // next yield point after this read. So this line can under-report by whatever the
+    // writer drops in those last microseconds. That is the right trade for a log line —
+    // the alternative is awaiting the writer, which is the deadlock this whole design
+    // exists to avoid. It is NOT a correctness surface: the frames are already gone
+    // either way, and the queue's own bound is what limits them.
+    let still_dropped = *dropped.lock().unwrap_or_else(|p| p.into_inner());
+    if still_dropped > 0 {
+        // The drops it never heard about are worth one line: without it, an operator
+        // debugging "the UI stopped mid-answer" has no evidence the daemon ever told
+        // that client it had fallen behind.
+        eprintln!(
+            "fulcrum serve: a client disconnected {still_dropped} frame(s) behind \
+             (it was never told)"
+        );
+    }
+
+    // `serve_client` returns; its `Arc<Daemon>` refcount drops. No stop one-shot, no
+    // join, no timeout — every shape that awaited the writer deadlocks against a peer
+    // that stopped reading, which is an ordinary client, not an attack.
+}
+
+/// The READER half of a split `serve_client`: the peer's frames, the gates, the
+/// replies. Never the socket.
+///
+/// Owns the reader half of the `Connection` and all three of issue #4's
+/// per-connection locals (`Handshake`, `FrameRateGate`, `seen`) — the state only the
+/// half that SEES inbound frames can meaningfully hold. The writer never reads any of
+/// it.
+///
+/// # The `watching` mirror, and why it is not a lock across the await
+///
+/// `handle_frame` takes `&mut HashSet<String>` and awaits `attach` for up to 5 s
+/// inside `start`. Handing it `&mut *watching.lock()` would hold a
+/// `std::sync::MutexGuard` across that await, which fails to compile in a spawned
+/// future (`MutexGuard` is `!Send`) and, if it could compile, would let a `start`
+/// freeze the writer's relay filter for the same 5 s — the exact stall this split
+/// exists to remove.
+///
+/// So the set is OWNED here and the shared `Arc<StdMutex<..>>` is a MIRROR the writer
+/// filters on: this task is the only writer of either copy, and it publishes its
+/// private copy after each `handle_frame` returns. Publishing unconditionally (rather
+/// than only on `start`/`close`) is deliberate — it costs one clone of a set capped at
+/// [`SESSION_LIMIT`] ids per inbound frame, and it buys the removal of a "did the
+/// caller remember to publish" hazard that would otherwise silently drop a session's
+/// frames forever.
+///
+/// Publishing AFTER the await is also the correct ordering, not merely the permitted
+/// one: `start` inserts only after `attach` succeeds, so a session with no worker
+/// cannot have any fan-out frames to miss; and the publish happens before the
+/// `start-result` is enqueued, so a client can never be told a session is live before
+/// this daemon's relay filter knows about it.
+/// # Why a reply WAITS for room, when the old code dropped one
+///
+/// This loop is the one place the split had to change a rule instead of moving it, and
+/// it is worth understanding before "simplifying" it back to `enqueue`:
+///
+/// The old single task both produced and drained this queue. Its drain arm awaited a
+/// blocked `send_frame`, so while a peer stopped reading, the `select!` was not
+/// re-polled and the inbound arm could not run — the head-of-line stall that caused
+/// issue #3 was ALSO what throttled a flood. That is measured, and the number is the
+/// suite's: `a_client_that_never_reads_is_throttled_and_the_daemon_stays_flat` records
+/// 1 375 frames accepted before the peer's own `write` blocked.
+///
+/// Removing the stall removes that side effect. With a free-running reader, the same
+/// peer drove **679 060 frames in 5 s** and the daemon's heap went with it — not because
+/// a buffer grew, but because the reader happily decoded a million requests in order to
+/// `try_send` a million replies into a full queue and DROP them. Dropping is the right
+/// answer for a relayed event a slow client is not reading; it is a bad answer for the
+/// reply to a request nobody asked to have dropped, and it is also what un-throttles the
+/// inbound edge, since a reader that drops never stops reading.
+///
+/// So replies go through `send().await`: a reader that cannot enqueue waits, the inbound
+/// queue fills, the socket fills, and the PEER'S OWN `write` is what blocks — which is
+/// the backpressure design this file has always claimed, restored on the correct edge.
+/// The relay arm in [`writer_loop`] keeps `enqueue`'s drop-and-count-and-`gap` behaviour,
+/// because a streaming client that cannot keep up is exactly what that path is for.
+///
+/// The cost is honest and bounded: a peer that stops reading parks the reader here
+/// instead of in `send_frame`, so `serve_client` cannot reach its `abort()` until that
+/// peer closes. That is the SAME stall the single task had (and the plan's teardown note
+/// already accepts for the writer: an open-but-unreading peer is backpressure, not a
+/// teardown case — the connection has not ended). Every real close unblocks both tasks:
+/// the peer's close makes the writer's `send_frame` fail, the writer's exit drops its
+/// `Sender`, and a `send` on a channel whose receiver is gone returns `Err`, which this
+/// loop treats as "the peer is gone" and breaks on.
+async fn reader_loop(
+    daemon: Arc<Daemon>,
+    mut connection: Connection,
+    tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    watching: Arc<StdMutex<HashSet<String>>>,
+    refuse_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ack_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    // The authoritative copy (see this function's mirror note). `handle_frame`'s
+    // signature is unchanged, so the `handle_frame`/`start`/`close` unit tests keep
+    // calling it with a plain `HashSet` exactly as before.
+    let mut watching_set: HashSet<String> = HashSet::new();
+
+    // Frames seen from this peer, so the exit path can tell "a probe that connected
+    // and hung up" from "a client that talked to us and left". READER-half state: it
+    // counts INBOUND frames, and the writer never sees a frame the reader refused.
     let mut seen = 0usize;
 
     // ── The per-connection hardening state (issue #4) ───────────────────────
     //
-    // Both are LOCALS in this header region on purpose: a handshake and a frame
-    // rate are properties of ONE socket, so they belong to the one task that reads
-    // it, not to `Daemon` (which would make a hostile client's counters a shared
-    // resource — the DoS shape this file keeps re-learning). Keeping them here,
-    // before the `select!`, is also what lets them move into a reader half as-is.
+    // Both are LOCALS on purpose: a handshake and a frame rate are properties of ONE
+    // socket, so they belong to the one task that reads it, not to `Daemon` (which
+    // would make a hostile client's counters a shared resource — the DoS shape this
+    // file keeps re-learning).
     //
     // Starts WAITING: a connection that sends nothing (the stale-socket probe, a
-    // `curl`-style liveness check, `wait_until_listening`) never reaches the gate
-    // at all — `recv` returns `None` and the loop breaks on the first arm, so the
+    // `curl`-style liveness check, `wait_until_listening`) never reaches the gate at
+    // all — `recv` returns `None` and the loop breaks on the first iteration, so the
     // `seen == 0` no-log rule below still fires and the probe stays invisible.
     let mut handshake = Handshake::WaitingHello { pre_hello: 0 };
     let mut rate = FrameRateGate::new(std::time::Instant::now());
 
     loop {
-        tokio::select! {
-            // The peer's frames first: a client that sends `close` expects the
-            // answer before it expects the next event.
-            inbound = connection.recv() => {
-                let Some(frame) = inbound else { break };
-                seen += 1;
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    // A malformed line is the peer's bug, not our reason to hang
-                    // up (`transport::frame` keeps the stream alive for the same
-                    // reason the worker protocol's decoder is permissive).
-                    Err(e) => {
-                        if !enqueue(&tx, serde_json::json!({
-                            "type": "error",
-                            "message": format!("malformed frame: {e}"),
-                        }), &mut dropped) {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                // ── The required handshake (issue #4) ────────────────────────
-                //
-                // Decode FIRST (above), so a malformed line keeps its existing
-                // answer-and-continue path and is charged to neither gate: a peer's
-                // JSON typo is not our reason to hang up, and it is not evidence of
-                // an attack either.
-                //
-                // `hello` itself is NOT a grant of authority — it is a pure
-                // greeting, and the rate gate and the session bound still apply
-                // after it. What this gate decides is only whether the peer is
-                // allowed to ask for anything yet.
-                let is_hello =
-                    frame.get("type").and_then(serde_json::Value::as_str) == Some("hello");
-                // The state transition is decided first and APPLIED after, because
-                // the arm that sets `Done` cannot also hold the `&mut` that read
-                // `pre_hello` — and because the two outcomes ("drop it" / "close
-                // it") have to escape this block to reach the `continue`/`break`
-                // below, where only the loop's own control flow can end the arm.
-                let mut drop_pre_hello = false;
-                let mut refuse_pre_hello = false;
-                match &mut handshake {
-                    Handshake::Done => {}
-                    Handshake::WaitingHello { pre_hello } => {
-                        if is_hello {
-                            handshake = Handshake::Done; // `handle_frame` answers it below.
-                        } else {
-                            *pre_hello += 1;
-                            if *pre_hello > MAX_PRE_HELLO_FRAMES {
-                                refuse_pre_hello = true;
-                            } else {
-                                drop_pre_hello = true;
-                            }
-                        }
-                    }
+        // No `select!` and no timeout: the inbound channel is this task's only input,
+        // and the relay it used to share a `select!` with is in the writer now.
+        let Some(frame) = connection.recv().await else {
+            break; // EOF — the peer is gone. No drain: see `serve_client`'s teardown.
+        };
+        seen += 1;
+        let frame = match frame {
+            Ok(frame) => frame,
+            // A malformed line is the peer's bug, not our reason to hang up
+            // (`transport::frame` keeps the stream alive for the same reason the
+            // worker protocol's decoder is permissive).
+            Err(e) => {
+                // `send().await`, not `enqueue`'s `try_send` — see this loop's "Why a
+                // reply WAITS for room". A malformed line is still the peer's bug and
+                // not our reason to hang up; it is only our reason to answer, and an
+                // answer the peer is not reading is a reason to stop reading.
+                if tx
+                    .send(serde_json::json!({
+                        "type": "error",
+                        "message": format!("malformed frame: {e}"),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break; // the writer is gone; nothing can reach this peer any more.
                 }
-                if refuse_pre_hello {
-                    // Told ONCE, then closed. The refusal goes through `send_frame`
-                    // directly rather than `enqueue` because this is the last thing
-                    // this task ever writes on that socket: the queue's drain path
-                    // exists for frames a client has time to receive, and there is
-                    // no such frame now. One refusal, because a peer that sends a
-                    // hundred pre-hello frames does not get a hundred lectures.
-                    //
-                    // `send_frame` stays the ONLY writer here — `transport::frame`
-                    // documents why a second one is a desync, not an optimisation.
-                    eprintln!(
-                        "fulcrum serve: a peer sent more than {MAX_PRE_HELLO_FRAMES} \
-                         frame(s) before `hello`; closing the connection"
-                    );
-                    let _ = connection
-                        .send_frame(&serde_json::json!({
-                            "type": "error",
-                            "message": "this daemon requires a `hello` frame before \
-                                        any other frame",
-                        }))
-                        .await;
-                    break;
-                }
-                if drop_pre_hello {
-                    // Under the limit: counted and DROPPED, no reply. Serving it
-                    // would mean a peer that never identified itself gets a child
-                    // process — the exact behaviour this gate was written to remove.
-                    continue;
-                }
-                // ── The inbound frame rate (issue #4) ────────────────────────
-                //
-                // NON-greeting frames only, for the reasons in [`FRAME_RATE`]'s doc
-                // (which also names the bound that already covers a `hello` flood).
-                if !is_hello && !rate.accept(std::time::Instant::now()) {
-                    eprintln!(
-                        "fulcrum serve: a peer exceeded the {FRAME_RATE}-frame/s \
-                         inbound limit; closing the connection"
-                    );
-                    let _ = connection
-                        .send_frame(&serde_json::json!({
-                            "type": "error",
-                            "message": format!(
-                                "frame rate limit exceeded (at most {FRAME_RATE} \
-                                 non-greeting frames per second per connection)"
-                            ),
-                        }))
-                        .await;
-                    break;
-                }
-                // INLINE, on purpose and at a cost: a `start` here awaits
-                // `attach` for up to 5 s and the `select!` is not re-polled
-                // meanwhile, so this connection's own relay arm is stalled for
-                // that window. See this function's "KNOWN LIMITATION" note — the
-                // fix is a `Connection` split, not a task spawn at this line.
-                let reply = handle_frame(&daemon, &mut watching, &frame).await;
-                if let Some(reply) = reply {
-                    if !enqueue(&tx, reply, &mut dropped) {
-                        break; // this task's own queue is gone; nothing to do.
+                continue;
+            }
+        };
+        // ── The required handshake (issue #4) ────────────────────────────────
+        //
+        // Decode FIRST (above), so a malformed line keeps its existing
+        // answer-and-continue path and is charged to neither gate: a peer's JSON typo
+        // is not our reason to hang up, and it is not evidence of an attack either.
+        //
+        // `hello` itself is NOT a grant of authority — it is a pure greeting, and the
+        // rate gate and the session bound still apply after it. What this gate decides
+        // is only whether the peer is allowed to ask for anything yet.
+        let is_hello = frame.get("type").and_then(serde_json::Value::as_str) == Some("hello");
+        // The state transition is decided first and APPLIED after, because the arm
+        // that sets `Done` cannot also hold the `&mut` that read `pre_hello` — and
+        // because the two outcomes ("drop it" / "close it") have to escape this block
+        // to reach the `continue`/`break` below, where only the loop's own control flow
+        // can end the iteration.
+        let mut drop_pre_hello = false;
+        let mut refuse_pre_hello = false;
+        match &mut handshake {
+            Handshake::Done => {}
+            Handshake::WaitingHello { pre_hello } => {
+                if is_hello {
+                    handshake = Handshake::Done; // `handle_frame` answers it below.
+                } else {
+                    *pre_hello += 1;
+                    if *pre_hello > MAX_PRE_HELLO_FRAMES {
+                        refuse_pre_hello = true;
+                    } else {
+                        drop_pre_hello = true;
                     }
                 }
             }
+        }
+        if refuse_pre_hello {
+            // Told ONCE, then closed. The refusal goes to the writer rather than to
+            // this task's own `send_frame`, because after `split_writer` this half has
+            // no write path — and the ack await is what keeps "told ONCE, THEN closed"
+            // true across the task boundary instead of letting the reader tear the
+            // connection down while the refusal is still unwritten.
+            //
+            // Not `enqueue`: the queue's drain exists for frames a client has time to
+            // receive, and a peer that skipped the handshake is about to be hung up on.
+            // One refusal, because a peer that sends a hundred pre-hello frames does
+            // not get a hundred lectures.
+            eprintln!(
+                "fulcrum serve: a peer sent more than {MAX_PRE_HELLO_FRAMES} \
+                 frame(s) before `hello`; closing the connection"
+            );
+            let _ = refuse_tx.send(serde_json::json!({
+                "type": "error",
+                "message": "this daemon requires a `hello` frame before \
+                            any other frame",
+            }));
+            let _ = ack_rx.await;
+            break;
+        }
+        if drop_pre_hello {
+            // Under the limit: counted and DROPPED, no reply. Serving it would mean a
+            // peer that never identified itself gets a child process — the exact
+            // behaviour this gate was written to remove.
+            continue;
+        }
+        // ── The inbound frame rate (issue #4) ────────────────────────────────
+        //
+        // NON-greeting frames only, for the reasons in [`FRAME_RATE`]'s doc (which also
+        // names the bound that already covers a `hello` flood).
+        if !is_hello && !rate.accept(std::time::Instant::now()) {
+            eprintln!(
+                "fulcrum serve: a peer exceeded the {FRAME_RATE}-frame/s \
+                 inbound limit; closing the connection"
+            );
+            let _ = refuse_tx.send(serde_json::json!({
+                "type": "error",
+                "message": format!(
+                    "frame rate limit exceeded (at most {FRAME_RATE} \
+                     non-greeting frames per second per connection)"
+                ),
+            }));
+            let _ = ack_rx.await;
+            break;
+        }
+        // A `start` here still awaits `attach` for up to 5 s, but the relay and the
+        // socket are in another task, so this connection keeps streaming while this one
+        // is parked.
+        let reply = handle_frame(&daemon, &mut watching_set, &frame).await;
+        // Publish the mirror, then reply — in that order, and see this function's
+        // mirror note for why both halves of that order matter. The lock is taken and
+        // released inside the statement, so it spans no await.
+        *watching.lock().unwrap_or_else(|p| p.into_inner()) = watching_set.clone();
+        if let Some(reply) = reply {
+            // `send().await` and NOT `enqueue`'s `try_send`, and this is the one place
+            // the split had to CHANGE a rule rather than move it. See this function's
+            // "Why a reply WAITS for room" note.
+            if tx.send(reply).await.is_err() {
+                break; // the writer is gone; nothing can reach this peer any more.
+            }
+        }
+    }
 
+    // The connection is gone. Drop this task's sender BEFORE the epilogue, so the
+    // writer's teardown starts now rather than after the log line. That is the whole
+    // extent of the reader's teardown: no stop signal (there is no stop channel in this
+    // design), no socket close, no drain.
+    //
+    // `refuse_tx` is deliberately NOT dropped here by name: `oneshot::Sender::send`
+    // CONSUMES the sender, so on the refusal path it is already gone, and naming it
+    // would be a use-of-moved-value. It drops with this function either way, which
+    // cancels an unread refusal a fraction of a microsecond later than the ideal — a
+    // refusal the writer is about to send on a connection that is ending anyway.
+    drop(tx);
+
+    // What the reader owns at the end is the inbound count, and nothing else. The
+    // `dropped` half of the old epilogue lives in `serve_client` (see its note): the
+    // writer drops frames for a full queue, but the line has to survive the writer's
+    // abort, and only `serve_client` is guaranteed to run after it.
+    //
+    // A connection that never sent a frame is not even worth a log line: Task 3's
+    // stale-socket probe (`transport::unix::reclaim_stale_socket`) lands exactly such a
+    // connection in this `accept()` backlog every time someone accidentally starts a
+    // second daemon, and a `curl`-style liveness check does the same. Both EOF with no
+    // frame. The loop treats them as ordinary, and the `seen == 0` case is the only one
+    // that could tempt someone into logging an error — which would train an operator to
+    // ignore the log.
+    if seen > 0 {
+        eprintln!("fulcrum serve: client disconnected after {seen} frame(s)");
+    }
+}
+
+/// The WRITER half of a split `serve_client`: the relay, the queue drain, and the
+/// socket. Never `handle_frame`.
+///
+/// THE ONLY task that calls `send_frame` — by construction, since `ConnectionWriter`
+/// is not `Clone` and its `send_frame` takes `&mut self`. It never awaits
+/// `handle_frame`, so `attach`'s 5 s can never park it: while the reader is parked in a
+/// `start`, this task keeps relaying the fan-out and draining the queue. That is the
+/// whole of issue #3's fix, and it is why the relay lives HERE and not in the reader's
+/// loop — an arm of the reader's `select!` would stall for exactly the window the bug
+/// is about, which would make the split decorative.
+///
+/// # Why this task is never joined
+///
+/// `send_frame` loops `write(&self.pending)` with no timeout. A peer that stops reading
+/// parks that loop at the OS send buffer, and while this task is inside that future
+/// none of its `select!` arms is pollable — so no message can reach it, and awaiting
+/// its `JoinHandle` would hang forever. `serve_client` therefore `abort()`s it after
+/// the reader returns. The exits this task CAN reach on its own:
+///
+/// 1. `send_frame` returns `Err` — the peer is gone (its close, or the socket's final
+///    `Arc` drop after the abort).
+/// 2. The refusal oneshot fires — issue #4's wire-auth path: send the one frame, ack
+///    the reader so its exit lands after the refusal is on the socket, exit.
+/// 3. The fan-out reports `Closed` — the `Daemon`'s own senders are gone, which needs a
+///    whole-daemon teardown this daemon does not have yet.
+///
+/// There is deliberately NO "`queued.recv()` returned `None`" exit, and the reason is
+/// worth keeping in mind before adding one: this task holds a `Sender` of its own (the
+/// relay arm needs it), and an `mpsc` channel closes only when EVERY sender is gone —
+/// so the reader ending cannot make this call return `None` while this task is alive.
+/// The plan named that as an exit; it is unreachable in this shape, and the honest
+/// consequence is that a writer with nothing to send simply stays parked in
+/// `events.recv()` until the abort. That is bounded (the abort follows the reader
+/// immediately) and it is the same backpressure-for-its-own-connection behaviour the
+/// single-task design had, so nothing here waits on a peer that is not there.
+///
+/// The exit NO writer path reaches at all is a peer that closed only its INBOUND half
+/// and left the write direction open: no error fires, and no arm is pollable. That one
+/// is the abort's job, and it is why the abort is unconditional.
+///
+/// A self-reached exit ends the same way: `ConnectionWriter::shutdown` — the daemon's
+/// only `poll_shutdown`, reached only from here, only after `send_frame` has returned,
+/// and never from inside the `select!`. The `dropped` epilogue is NOT here, because an
+/// aborted task never runs code after its loop; it lives in `serve_client`, after the
+/// abort, where it covers every path. See the note at the end of this function.
+async fn writer_loop(
+    mut writer: ConnectionWriter,
+    mut queued: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    tx: tokio::sync::mpsc::Sender<serde_json::Value>,
+    mut events: tokio::sync::broadcast::Receiver<serde_json::Value>,
+    shared: SharedConnectionState,
+    mut refuse_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+    ack_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    let SharedConnectionState { watching, dropped } = shared;
+    loop {
+        tokio::select! {
             // The fan-out. Filtered here, not upstream: one buffer for the whole
             // daemon is what keeps this from becoming a registry.
             fan = events.recv() => match fan {
                 Ok(frame) => {
-                    if watched(&frame, &watching) && !enqueue(&tx, frame, &mut dropped) {
-                        break;
+                    // The one read of shared per-connection state, and the guard dies
+                    // with this `let` statement — before `enqueue_shared`, whose own
+                    // lock is a different mutex. A filter holding `watching` across an
+                    // await would block the reader's `start` on this task.
+                    let wanted = watched(
+                        &frame,
+                        &watching.lock().unwrap_or_else(|p| p.into_inner()),
+                    );
+                    if wanted && !enqueue_shared(&tx, frame, &dropped) {
+                        break; // this connection's own queue is gone
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    // The client is slower than the session. Report it on the
-                    // socket (a UI that silently lost 400 tokens of answer is
-                    // worse than one that knows) and keep going — recovery is
-                    // T10's replay.
+                    // The client is slower than the session. Report it on the socket
+                    // (a UI that silently lost 400 tokens of answer is worse than one
+                    // that knows) and keep going — recovery is T10's replay.
                     eprintln!("fulcrum serve: a client lagged {skipped} frames");
-                    // Queued as its own frame, NOT folded into `dropped`: the
-                    // queue may well be empty here (the fan-out can lag while
-                    // this connection's socket is fine), and `dropped` is only
-                    // ever announced by the drain arm — which does not run on an
-                    // empty queue. Counting it there would mean a client that
-                    // lagged and then went idle was never told at all.
-                    if !enqueue(&tx, gap_frame(skipped), &mut dropped) {
+                    // Queued as its own frame, NOT folded into `dropped`: the queue may
+                    // well be empty here (the fan-out can lag while this connection's
+                    // socket is fine), and `dropped` is only ever announced by the
+                    // drain — which does not run on an empty queue. Counting it there
+                    // would mean a client that lagged and then went idle was never told
+                    // at all.
+                    if !enqueue_shared(&tx, gap_frame(skipped), &dropped) {
                         break;
                     }
                 }
@@ -1717,63 +2097,126 @@ async fn serve_client(daemon: Arc<Daemon>, mut connection: Connection) {
 
             // The queue, drained to the socket.
             queued_frame = queued.recv() => {
-                // Room just appeared, so anything dropped since the last notice
-                // can be announced NOW — with the frame the client is about to
-                // receive, rather than after a wait that may never come.
-                if dropped > 0 {
-                    let skipped = std::mem::take(&mut dropped);
-                    eprintln!("fulcrum serve: a client lagged {skipped} frames");
-                    if connection.send_frame(&gap_frame(skipped)).await.is_err() {
+                // Unwrapped FIRST, which differs from the old arm's order on purpose:
+                // with every sender gone there is nothing left this connection could be
+                // told, so announcing a `gap` first would be writing into a teardown.
+                // (See this task's doc for why that state is not reachable while this
+                // task holds its own sender — this is defensive, and the count is not
+                // lost either way: the epilogue below still logs it.)
+                let Some(frame) = queued_frame else { break };
+                // Room just appeared, so anything dropped since the last notice can be
+                // announced NOW — with the frame the client is about to receive, rather
+                // than after a wait that may never come.
+                //
+                // `take` inside a block, so the guard is gone before either
+                // `send_frame`: a parked write can outlive the task holding it, and a
+                // `std::sync::Mutex` held across that park would lock the reader's
+                // `enqueue` out of a connection that is still nominally being served.
+                let still_dropped = {
+                    let mut guard = dropped.lock().unwrap_or_else(|p| p.into_inner());
+                    std::mem::take(&mut *guard)
+                };
+                if still_dropped > 0 {
+                    eprintln!("fulcrum serve: a client lagged {still_dropped} frames");
+                    if send_frame_no_select(&mut writer, &gap_frame(still_dropped)).await.is_err() {
                         break; // the peer is gone (EPIPE / a closed socket).
                     }
                 }
-                let Some(frame) = queued_frame else { break };
-                if connection.send_frame(&frame).await.is_err() {
+                if send_frame_no_select(&mut writer, &frame).await.is_err() {
                     break; // the peer is gone (EPIPE / a closed socket).
                 }
+            }
+
+            // Issue #4's wire-auth refusal (see `serve_client`): the one reader→writer
+            // control message. `send_frame_no_select`, then the ack, so the reader does
+            // not end the connection while the refusal is still unwritten. The send
+            // result is deliberately ignored: a refusal that cannot be written means
+            // the peer is gone, and the reader is leaving either way — what it waits
+            // for is the ACK, not the outcome.
+            refused = &mut refuse_rx => {
+                // `Ok` carries the refusal frame; `Err` means the reader dropped its
+                // sender without asking for a refusal, i.e. it is already gone.
+                let Ok(frame) = refused else { break };
+                let _ = send_frame_no_select(&mut writer, &frame).await;
+                let _ = ack_tx.send(());
+                break;
             }
         }
     }
 
-    // A connection that was still behind when it hung up. The drops it never
-    // heard about are worth one line: without it, an operator debugging "the UI
-    // stopped mid-answer" has no evidence the daemon ever told that client it had
-    // fallen behind.
-    if dropped > 0 {
-        eprintln!(
-            "fulcrum serve: a client disconnected {dropped} frame(s) behind \
-             (it was never told)"
-        );
-    }
+    // Reached ONLY on an exit this task reached by itself. That qualification is the
+    // whole point of putting it here rather than in `serve_client`: `abort()` drops this
+    // future without polling it, so NOTHING below this loop runs on the parked-writer
+    // path — and that path does not need it, because the socket's final `Arc` drop (the
+    // reader's `Connection` plus this task's `ConnectionWriter`, both gone once the abort
+    // lands) closes the socket outright.
+    //
+    // The `dropped` epilogue is therefore NOT here; it lives in `serve_client` after the
+    // abort, where it runs on every path including this one.
+    //
+    // The teardown close (the daemon's ONLY `poll_shutdown`): asks the OS to close the
+    // write direction, so FUTURE writes fail and the peer sees EOF. Best-effort — an
+    // `Err` is ignored, because every path here is already leaving. It does NOT un-park a
+    // write already blocked in the OS (that is the peer's close, or the socket's final
+    // `Arc` drop after the abort), which is exactly why the abort and not this call is
+    // what bounds this task's life.
+    writer.shutdown().await;
+}
 
-    // ── The connection is gone. ───────────────────────────────────────────────
-    //
-    // Nothing else happens here. NO `detach`, NO `kill`, NO "cleanup" of the
-    // sessions this connection started — dropping the subscription is the whole
-    // teardown, and the sessions keep running and keep persisting. That is the
-    // roadmap's `done-when` and the reason this comment is next to the code that
-    // must not change; `tests/serve.rs`'s plant experiment is what keeps it true.
-    //
-    // If you are tempted to add a teardown here anyway, note what makes that
-    // experiment able to catch you: `detach` does not kill, it runs
-    // `reap_worker` (`close`, then a 2 s grace, then `kill`), so a wrong
-    // teardown here looks like a child that dies 2 s LATE rather than one that
-    // dies at once. `tests/serve.rs::REAP_GRACE` is the observation window that
-    // outlasts it, and the test's row-count half is the independent check. Both
-    // are load-bearing: a window shorter than the grace makes the pid check
-    // decorative, which is exactly how the inherited version of that test
-    // managed to pass while the daemon was killing the session.
-    //
-    // A connection that never sent a frame is not even worth a log line: Task 3's
-    // stale-socket probe (`transport::unix::reclaim_stale_socket`) lands exactly
-    // such a connection in this `accept()` backlog every time someone accidentally
-    // starts a second daemon, and a `curl`-style liveness check does the same.
-    // Both EOF with no frame. The loop treats them as ordinary, and the
-    // `seen == 0` case is the only one that could tempt someone into logging an
-    // error — which would train an operator to ignore the log.
-    if seen > 0 {
-        eprintln!("fulcrum serve: client disconnected after {seen} frame(s)");
-    }
+/// The two pieces of per-connection state the reader and the writer must share.
+///
+/// Grouped into one type because they are one concept — "what the other task needs to
+/// know about this connection" — and because passing them as two loose `Arc`s made
+/// `writer_loop` an eight-argument function, which is a smell worth naming rather than
+/// `allow`ing. There are exactly two of them and there must not be a third without
+/// thinking about it: every field here is a lock the OTHER task can see, and a lock held
+/// across an await in either task re-creates the head-of-line stall issue #3 was about.
+///
+/// * `watching` — written by [`reader_loop`] (it owns the authoritative copy and
+///   publishes a mirror; see its doc), read by the writer's relay filter.
+/// * `dropped` — written by the writer's own relay arm when the queue is full, read by
+///   the writer's drain prelude and by `serve_client`'s exit epilogue. The reader does
+///   NOT touch it: a reply is never dropped for a full queue, it waits
+///   (see [`reader_loop`]'s "Why a reply WAITS for room").
+///
+/// `Arc` rather than a bare reference because each half lives on its own task, so neither
+/// can borrow from the other's frame.
+struct SharedConnectionState {
+    watching: Arc<StdMutex<HashSet<String>>>,
+    dropped: Arc<StdMutex<u64>>,
+}
+
+/// Queue one frame for one connection, taking the shared `dropped` count for the
+/// duration of the `try_send` (see [`enqueue`], whose contract and signature are
+/// unchanged).
+///
+/// The adapter exists because `enqueue`'s signature is a PIN — both its unit tests
+/// drive it directly with a `&mut u64` — while the split makes the counter shared. The
+/// lock is taken and released inside this call, so it never spans an `await`.
+fn enqueue_shared(
+    tx: &tokio::sync::mpsc::Sender<serde_json::Value>,
+    frame: serde_json::Value,
+    dropped: &StdMutex<u64>,
+) -> bool {
+    enqueue(
+        tx,
+        frame,
+        &mut dropped.lock().unwrap_or_else(|p| p.into_inner()),
+    )
+}
+
+/// `ConnectionWriter::send_frame`, named so the writer's `select!` reads honestly: the
+/// send is one plain future the selector may drop when a competing arm fires, with its
+/// final `flush` (a no-op on an unbuffered socket) inside it rather than a second await
+/// the selector cannot reach past.
+///
+/// Not a replacement for `send_frame` — a thin wrapper that exists to make "nothing
+/// inside the `select!` can park this task" visible at the call site.
+async fn send_frame_no_select(
+    writer: &mut ConnectionWriter,
+    frame: &serde_json::Value,
+) -> Result<(), TransportError> {
+    writer.send_frame(frame).await
 }
 
 /// The notice that tells a client it fell behind (finding 7).
@@ -1804,10 +2247,13 @@ fn gap_frame(skipped: u64) -> serde_json::Value {
 ///
 /// Returns whether the connection should stay up: `Full` keeps it (a slow client
 /// is a slow client, not a banned one), `Closed` ends it. `Closed` cannot happen
-/// from an ordinary client — the receiver lives in this same task, so it is gone
-/// only while this function's caller is already returning — which is exactly why
-/// it is still reported rather than mapped to `true`: a `true` there would be a
-/// silently-ignored invariant.
+/// from an ordinary client on the single-task shape this function was written for,
+/// where the receiver lived in the same task; after T4b's split the receiver lives in
+/// [`writer_loop`], so `Closed` now means "the writer task is gone" — which is exactly
+/// as good a reason to stop, and slightly better observed, since the reader can no
+/// longer keep enqueueing into a queue whose drainer has already left. Either way it is
+/// reported rather than mapped to `true`: a `true` there would be a silently-ignored
+/// invariant.
 ///
 /// `dropped` counts frames THIS connection asked for and did not get. It is
 /// reported by the drain arm as a `gap` frame — the same notice the fan-out's lag
@@ -3065,6 +3511,103 @@ mod tests {
         assert!(
             watched(&frame, &watching),
             "the notice must survive the per-session filter"
+        );
+    }
+
+    /// What the writer's drain prelude ACTUALLY promises after the T4b split: its
+    /// `gap` carries the CURRENT `dropped` count at the moment the drain wakes, and
+    /// taking it does not disturb the queue's FIFO order.
+    ///
+    /// # Why this is the honest property, and what it deliberately does NOT claim
+    ///
+    /// Before the split, one task serialised every `send_frame`, so a `gap` could not
+    /// land in the middle of the reply stream. After it, the reader enqueues replies
+    /// while the writer drains, so a `gap` CAN be written before the very reply whose
+    /// drop it reports — `serve_client`'s doc states that as the new contract. A test
+    /// that asserted "the reply comes first" would be asserting the OLD contract and
+    /// would go red on correct new code; a test that asserted nothing about the
+    /// prelude would let the count itself drift. So this pins the three things that ARE
+    /// the writer's own guarantees, none of which depends on how the two tasks race:
+    ///
+    /// 1. the announced `skipped` equals the count at drain wake (not a stale one, and
+    ///    not a count that grew during the send);
+    /// 2. the count is TAKEN, so the next drain wake does not announce the same drops a
+    ///    second time;
+    /// 3. the queue stays FIFO — the prelude writes its notice around the frames, never
+    ///    reorders them.
+    ///
+    /// True reply-vs-`gap` ORDERING under load is a property of two tasks racing inside
+    /// `serve_client`, and it lives where it can be observed: the relay test in
+    /// `tests/serve.rs`, plus the contract in `serve_client`'s doc.
+    #[test]
+    fn the_gap_drain_prelude_uses_the_current_drop_count() {
+        // Capacity 1, so the second enqueue is the overflow — the same trick
+        // `a_full_client_queue_drops_counts_and_keeps_the_connection` uses, and for the
+        // same reason: the test need not know `CLIENT_QUEUE_CAPACITY`.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
+        // The SHARED shape, because this is what the split actually passes to the
+        // drain: driving `enqueue_shared` covers the adapter too (its lock is taken and
+        // released inside the call, which is the property that lets the writer hold no
+        // guard across `send_frame`).
+        let dropped = StdMutex::new(0u64);
+
+        assert!(enqueue_shared(
+            &tx,
+            serde_json::json!({"reply": "a"}),
+            &dropped
+        ));
+        assert!(
+            enqueue_shared(&tx, serde_json::json!({"reply": "b"}), &dropped),
+            "a full queue keeps the connection — it just drops the frame"
+        );
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            1,
+            "`b` did not fit, so exactly one drop is owed to the client"
+        );
+
+        // ── The drain arm, transcribed: wake, announce, send. ────────────────
+        let frame = rx.try_recv().expect("`a` is the queued frame");
+        assert_eq!(frame["reply"], "a", "the queue is FIFO from the head");
+
+        let still_dropped = {
+            let mut guard = dropped.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        assert_eq!(still_dropped, 1, "the prelude announces the CURRENT count");
+        let notice = gap_frame(still_dropped);
+        assert_eq!(
+            notice["skipped"].as_u64(),
+            Some(1),
+            "the notice the client sees carries the count, not a placeholder: {notice}"
+        );
+        assert_eq!(
+            *dropped.lock().unwrap(),
+            0,
+            "the count is TAKEN, not read — otherwise every later frame would \
+             re-announce the same drops and a client 1 frame behind would be told \
+             about it once per reply forever"
+        );
+
+        // ── The next wake has nothing to say, and the queue order survived. ──
+        assert!(enqueue_shared(
+            &tx,
+            serde_json::json!({"reply": "c"}),
+            &dropped
+        ));
+        let next = rx.try_recv().expect("`c` is queued behind nothing");
+        assert_eq!(
+            next["reply"], "c",
+            "`a` was delivered ahead of `c`, so the prelude reordered nothing"
+        );
+        let second_prelude = {
+            let mut guard = dropped.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        assert_eq!(
+            second_prelude, 0,
+            "no new drop means no second `gap` — the drain emits one only when the \
+             count is non-zero, exactly as the single-task design did"
         );
     }
 }

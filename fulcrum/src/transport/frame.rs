@@ -123,12 +123,21 @@ pub const MAX_INBOUND_LINE_BYTES: usize = 1024 * 1024;
 /// LAST handle — the reader here plus the peer's `ConnectionWriter`.
 pub struct Connection {
     /// The write half, held ONLY so [`Connection::split_writer`] can hand it out
-    /// once. `None` after `split_writer`.
+    /// once. `None` after `split_writer`, and `Connection` has NO write method.
     ///
-    /// It holds the whole [`ConnectionWriter`] rather than a bare `WriteHalf`
-    /// because the transient convenience method [`Connection::send_frame`] has to
-    /// borrow the writer — `pending` and all — out of this slot. `Option` being
-    /// `None` is exactly what makes that method and the split mutually exclusive.
+    /// `Option` rather than a plain field because `split_writer` consumes `self`
+    /// and must still be able to take the writer out: taking it from a `Some` and
+    /// leaving a `None` behind is what makes a second `split_writer` panic instead
+    /// of handing out a second handle to `pending`.
+    ///
+    /// It holds the whole [`ConnectionWriter`] and not a bare `WriteHalf` so that
+    /// `pending` moves out with it in one piece — there is no code path in this
+    /// type that can reach `pending` at all, which is the point: an unsplit
+    /// `Connection` cannot write, and a split one cannot write twice. (While the
+    /// split landed in two commits there was a transient `Connection::send_frame`
+    /// delegator that borrowed this slot; T4b deleted it, because a `Connection`
+    /// that can write alongside a live `ConnectionWriter` is exactly the two-handles
+    /// hazard this type exists to prevent.)
     writer: Option<ConnectionWriter>,
     /// Decoded inbound lines, in order. `None` (i.e. the channel closing) is
     /// EOF.
@@ -265,9 +274,9 @@ impl Connection {
 
         Self {
             // The write half waits here, whole, for `split_writer`. Keeping the
-            // `ConnectionWriter` (and not just the `WriteHalf`) is what lets the
-            // transient `Connection::send_frame` delegator below reach `pending`
-            // without owning a second copy of it.
+            // `ConnectionWriter` (and not just the `WriteHalf`) is what lets
+            // `pending` leave with it in one piece: nothing in this type reads
+            // either field.
             writer: Some(ConnectionWriter {
                 writer: write_half,
                 pending: Vec::new(),
@@ -281,10 +290,9 @@ impl Connection {
     /// leaving this `Connection` owning only the reader.
     ///
     /// May be called at most ONCE. The returned [`ConnectionWriter`] is the ONLY
-    /// way to send frames on this connection after the split; the only method on
-    /// `Connection` that writes is the transient delegator [`Connection::send_frame`],
-    /// which errors once this has been called. A second call is a caller bug and
-    /// panics (this is the same trust `tokio::io::split` gives).
+    /// way to send frames on this connection, full stop: `Connection` has no write
+    /// method, so a second call is not a lesser evil but the only remaining mistake,
+    /// and it panics (this is the same trust `tokio::io::split` gives).
     ///
     /// # Why both halves come back
     ///
@@ -303,47 +311,6 @@ impl Connection {
     pub fn split_writer(mut self) -> (Self, ConnectionWriter) {
         let writer = self.writer.take().expect("the writer was already taken");
         (self, writer)
-    }
-
-    /// Serialize `frame` as one JSON object and write it as one `\n`-terminated
-    /// line.
-    ///
-    /// Convenience delegator, kept ONLY while the split lands in two commits
-    /// (T4a frame split first, T4b serve split second): `serve.rs`'s four
-    /// production `send_frame` call sites (the pre-hello and rate-gate refusal
-    /// pair and the drain pair) are converted in T4b, so this method must keep
-    /// compiling until then. It borrows the writer out of the `Option` slot, so
-    /// it is the SAME `&mut`-exclusive path as [`ConnectionWriter::send_frame`] —
-    /// `pending` lives only inside the writer, and both access paths take
-    /// `&mut`, so two tasks still cannot reach it.
-    ///
-    /// DELETED in T4b, once `serve.rs`'s four call sites are converted. It must
-    /// NOT survive the final state: leaving it would let a future caller hold a
-    /// `Connection` AND a [`ConnectionWriter`] at once — two handles to
-    /// `pending` — which is issue #3's hazard. The deletion is load-bearing, not
-    /// tidiness.
-    ///
-    /// # Errors after the split
-    ///
-    /// Once [`Connection::split_writer`] has been called this half is the reader
-    /// and has no write path, so the call fails with
-    /// `TransportError::Io(ErrorKind::NotConnected)` rather than reporting a
-    /// success for a frame that never went out — pinned by
-    /// `send_frame_after_split_writer_fails_not_drops`.
-    pub async fn send_frame<T>(&mut self, frame: &T) -> Result<(), TransportError>
-    where
-        T: Serialize + ?Sized,
-    {
-        let Some(writer) = self.writer.as_mut() else {
-            // The writer was taken by `split_writer`; this `Connection` is the
-            // reader half now and has no write path. Fail loudly rather than
-            // silently dropping the frame.
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "the writer was taken by split_writer",
-            )));
-        };
-        writer.send_frame(frame).await
     }
 
     /// The next inbound frame.

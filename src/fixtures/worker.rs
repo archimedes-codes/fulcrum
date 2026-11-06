@@ -84,6 +84,11 @@
 //!   `outcome` rides verbatim).
 //! - `close`: exit 0 (the Worker self-exits — the Supervisor does NOT
 //!   close the stdin pipe).
+//!
+//! Separately from the prompt scenarios, `FULCRUM_FIXTURE_READY_GATE` (an env var
+//! naming a marker file) holds the `ready` frame between `hello` and `ready` for
+//! as long as that file exists — the daemon test's lever for parking a `start`
+//! inside `WorkerManager::attach`. See `hold_ready_until_released`.
 
 use std::io::{BufRead, Write};
 
@@ -542,6 +547,89 @@ fn emit_subagent_dispatch<W: Write>(
     );
 }
 
+/// The test-gated `ready` (T4, issue #3's proof): hold the `ready` frame until
+/// the test releases it.
+///
+/// # Why this exists at all
+///
+/// `fulcrum/tests/serve.rs`'s
+/// `a_slow_start_does_not_stall_that_clients_own_event_relay`
+/// has to prove that a client's own event relay keeps running while a `start` is
+/// still in flight. That needs the daemon's reader to be parked inside
+/// `WorkerManager::attach` — which awaits `handle.wait_ready(
+/// Duration::from_secs(5))` (`src/worker/manager/mod.rs`) — for a span the TEST
+/// chooses. A fixed `--slow-ready <ms>` delay cannot deliver that: the daemon's
+/// `attach` returns on the timer and the old single-task `serve_client` then
+/// drains its buffered frames instantly, so any measurement window placed by a
+/// clock guess is one the buggy design can win. Holding `ready` until the test
+/// removes a marker makes the park a fact the test opens and closes, and the
+/// verdict is taken while the hold still stands — so the buggy design is not
+/// racing a window, it simply has no way to write in it.
+///
+/// # Why an env var naming a marker FILE
+///
+/// `WorkerHandle::spawn` builds the worker's argv itself (`cmd.arg("--worker")`
+/// and nothing else, `src/worker/client.rs`), so an argv flag would mean threading
+/// a new flag through the engine's spawn and through the fixture's shim bins —
+/// files this task does not own. An environment variable set on the DAEMON's
+/// `Command` reaches the worker by plain fork-time inheritance: nothing between
+/// `Command::new(daemon)` and the worker spawn calls `env_clear()`
+/// (`hostenv::EnvPatch::apply` only rewrites the AppImage paths, and the patch is
+/// EMPTY under `cargo test`, see `src/worker/client.rs`'s `build_command_with`).
+/// A marker file is then the test's only control surface into a process it cannot
+/// hand a fd to, and "present = hold, absent = pass" is re-armable by creating the
+/// file again — so a marker a previous run left on disk cannot stall a test that
+/// never asked for the gate (it must be REMOVED to re-hold, not created).
+///
+/// # Why BEFORE `ready` and not on a prompt
+///
+/// `ready` IS the `attach` gate, and it is emitted before any inbound frame has
+/// ever been read — so no prompt-triggered delay can hold it. `hello` stays FIRST:
+/// `tests/fixture_bins.rs` pins the `hello`-then-`ready` order, and this only
+/// widens the gap between the two, never reorders them. `ready` also carries
+/// `session_id: None` (it precedes any `Start`), so the gate is necessarily
+/// per-process rather than per-session — which is fine, because `attach` spawns
+/// one fixture process per session anyway.
+///
+/// # Why no deadline in the loop
+///
+/// The bound lives on the DAEMON side: `wait_ready`'s own 5 s ceiling. The test
+/// that arms the gate is responsible for releasing it inside that ceiling
+/// (`tests/serve.rs`'s `ATTACH_READY_CEILING` and its compile-time budget-sum
+/// assert); a test that hangs instead fails on the daemon's `ready` timeout, which
+/// is a red rather than a hang. Unset env var, or a marker that does not exist,
+/// means this function does nothing at all — byte-identical behaviour for every
+/// existing caller of the fixture.
+fn hold_ready_until_released() {
+    let Ok(gate) = std::env::var("FULCRUM_FIXTURE_READY_GATE") else {
+        return;
+    };
+    let gate_path = std::path::Path::new(&gate);
+    // ABSENT = PASS, and PASS MEANS LEAVE — no stamp, no hold. That is what keeps
+    // session A's fixture (started before the test armed the marker) from writing
+    // an `.arrived` the test would then read as "B parked": only a fixture that
+    // really is holding may stamp, or the stamp stops being evidence.
+    //
+    // `exists()` and not `is_file()`, so the predicate is exactly the one the
+    // releasing test's `remove_file` flips.
+    if !gate_path.exists() {
+        return;
+    }
+    // The arrival stamp: written by the FIXTURE, WHILE the hold is engaged, so the
+    // test can observe that the park really happened instead of inferring it from
+    // having created the marker. Without it, "the daemon is parked" is a guess
+    // about process-startup latency; with it, the park is a fact read off the
+    // filesystem. `with_extension` replaces the marker's extension, which is why
+    // the test names its marker with one (`.hold` → `.arrived`).
+    let _ = std::fs::write(gate_path.with_extension("arrived"), b"1");
+    // … and NOW the hold the test measures against: PRESENT = HOLD, so removing
+    // the marker is the release, and re-creating it re-arms the gate for a fixture
+    // that starts afterwards.
+    while gate_path.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The fixture entry point (was this file's `fn main()` — moved VERBATIM from
 /// `src-tauri/src/bin/fake_worker.rs` in S8b.1 so ONE body backs both the
 /// desktop's `fake_worker` bin and the crate's `fake_worker_core` bin; the two
@@ -559,6 +647,12 @@ pub fn worker_main() {
             client_version: VERSION.to_string(),
         },
     );
+    // The test-gated `ready` (T4's slow-start proof): hold the `ready` frame
+    // until the test releases it, so "the daemon's reader is parked inside
+    // `attach`" is a FACT the test controls rather than a duration it guesses.
+    // See [`hold_ready_until_released`] for why the gate is an env-named marker
+    // FILE, and why it sits HERE — after `hello`, before `ready`.
+    hold_ready_until_released();
     emit_unstamped(
         &mut stdout,
         &Outbound::Ready {

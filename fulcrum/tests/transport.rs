@@ -428,9 +428,16 @@ async fn the_receive_stream_ends_at_eof_rather_than_hanging() {
 //   * `a_send_against_a_shut_down_connection_errors_that_the_writer_survives` —
 //     `ConnectionWriter::shutdown` closes the WRITE direction while the read
 //     half lives (the daemon's teardown contract, T4 D3).
-//   * `send_frame_after_split_writer_fails_not_drops` — the convenience
-//     delegator and the split are mutually exclusive: once the writer is taken,
-//     a send on the reader half FAILS, it does not silently eat the frame.
+//
+// T4b deleted the sixth pin this block used to list,
+// `send_frame_after_split_writer_fails_not_drops`, together with the transient
+// `Connection::send_frame` delegator it tested. That deletion is what makes the
+// exclusivity absolute rather than merely signalled: after `split_writer` the reader
+// half has no write method to call, so "a `Connection` and a `ConnectionWriter` alive
+// at once, both able to reach `pending`" is no longer a state a caller can be in — it
+// does not compile. The mutual exclusion the deleted test pinned is now enforced by
+// the absence of the method, and `a_second_split_writer_panics` remains as the
+// runtime pin on the one mistake that is still expressible.
 // ---------------------------------------------------------------------------
 
 /// Two frames from the sole writer arrive as two clean lines, in order — and
@@ -1009,65 +1016,6 @@ async fn a_send_against_a_shut_down_connection_errors_that_the_writer_survives()
     assert!(
         eof.is_none(),
         "the peer's last handle closing ends this side's stream, got {eof:?}"
-    );
-}
-
-/// After `split_writer`, `Connection::send_frame` ERRORS — it does not drop the
-/// frame on the floor.
-///
-/// The convenience delegator exists only while the split lands in two commits
-/// (T4a frame split, T4b serve split), and `Option`-is-`None` is what makes it
-/// and the split mutually exclusive: a `Connection` that has been split has no
-/// write path at all. Failing loudly is the load-bearing part — a silent
-/// `Ok(())` would hand the caller a frame that never went out AND leave a later
-/// writer free to glue onto a stream nobody wrote to.
-///
-/// DELETED together with the delegator in T4b (a test of a method that no longer
-/// exists is not a test).
-#[tokio::test]
-async fn send_frame_after_split_writer_fails_not_drops() {
-    let (_keepalive, endpoint) = test_endpoint();
-    let listener = bind(endpoint.clone()).expect("bind");
-    // Accept on a task, then dial (the file's pattern — see
-    // `a_send_against_a_shut_down_connection_errors_that_the_writer_survives`).
-    let peer = tokio::spawn(async move { accept_one(&listener).await });
-    let client = dial(endpoint).await;
-    let mut server = peer
-        .await
-        .expect("the listener accepted the dial it was waiting for");
-
-    let (mut reader, _writer) = client.split_writer();
-
-    let err = reader
-        .send_frame(&json!({ "never": "sent" }))
-        .await
-        .expect_err("the reader half has no write path once the writer was taken");
-    let io = match err {
-        TransportError::Io(io) => io,
-        other => panic!("the refusal is `TransportError::Io(..)`, got {other:?}"),
-    };
-    assert_eq!(
-        io.kind(),
-        std::io::ErrorKind::NotConnected,
-        "the refusal names the reason: this half is not connected to a writer \
-         any more, got {io:?}"
-    );
-    assert!(
-        io.to_string()
-            .contains("the writer was taken by split_writer"),
-        "and the message says so, got {io}"
-    );
-
-    // The other half of the claim: NOTHING reached the peer. `_writer` and the
-    // reader both drop here, which is the socket's full close, so the peer's
-    // stream ends — had the frame been written, it would have arrived first.
-    drop(reader);
-    drop(_writer);
-    let peer_saw = recv_checked(&mut server).await;
-    assert!(
-        peer_saw.is_none(),
-        "the refused frame is not on the wire — the peer sees EOF, not a frame, \
-         got {peer_saw:?}"
     );
 }
 
