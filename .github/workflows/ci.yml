@@ -102,10 +102,17 @@ jobs:
       # On macOS a candidate whose provenance cannot be read makes the step exit 2 —
       # a leg that passes because it could not look is the failure class that rule
       # makes impossible.
+      # `shell: bash` is not decoration: on windows-latest GitHub's default shell is
+      # pwsh, and without it these steps invoke `bash.exe` from PATH as a pwsh command
+      # line — the very Git-for-Windows bash the census header reasons about, reached
+      # by an assumption the step never states. Same explicit shell as the guard steps
+      # in schema-drift.yml.
       - name: Prove the stray-process census can fail
+        shell: bash
         run: bash scripts/check-no-stray-processes.sh --self-test
 
       - name: Check for stray daemon/worker processes from this run
+        shell: bash
         run: bash scripts/check-no-stray-processes.sh
 
       # The guard on the real build graph. WHY A CHECK AND NOT A TEST: a dependency

@@ -163,8 +163,11 @@ removed column, or a lost index, is.
 
 Enforcement: here, `the_pinned_schema_fingerprint_matches_the_shipped_file` in
 `fulcrum/tests/db.rs` (so a daemon DDL change reddens `cargo test` in its own commit)
-plus `scripts/check-schema-drift.sh` in `.github/workflows/schema-drift.yml`; in the
-desktop, the same comparator against the fingerprint of the fulcrum rev it pins.
+plus `scripts/check-schema-drift.sh` in `.github/workflows/schema-drift.yml`. The
+desktop half is the requirement that closes the contract — the same comparator there,
+against the fingerprint of the fulcrum rev it pins — and it is **NOT YET WIRED**: the
+desktop has no such workflow step today, so this paragraph states design intent, not
+current behaviour.
 **Update path:** change both repos' DDL in lockstep and update `schema-sha.txt` in the
 SAME commit, so the pin diff and the DDL diff are reviewed together.
 

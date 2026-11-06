@@ -17,15 +17,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # No version named on purpose — the repo-root rust-toolchain.toml is the pin
-      # (same rationale as ci.yml's Install-the-toolchain step).
-      - name: Install the pinned Rust toolchain
-        shell: bash
-        run: |
-          rustup toolchain install
-          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
-          rustc --version
-
+      # No Rust toolchain step, and do not re-add one "for consistency" with ci.yml:
+      # this job is pure text tooling (grep/awk/diff) and runs no cargo at all.
       # ORDER IS LOAD-BEARING (the same pairing ci.yml uses for its guard steps):
       # the self-test runs BEFORE the live check, so a guard that has lost the
       # ability to fail reddens the run instead of printing a green nobody earned.
