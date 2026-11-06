@@ -1,0 +1,46 @@
+# Schema-shape pin for the fulcrum↔desktop contract (issue #6).
+# Five sections. A section is a header line naming a table (or `idx_messages_session`
+# for the index) followed by one `name:type` line per column, in declaration order.
+# `name:type` is exactly what the daemon pins in `db/schema.rs`'s `TABLE_SHAPES`;
+# NOTHING else is pinned here: not NULL/DEFAULT/PRIMARY KEY flags, not the UNIQUE
+# constraints or cascades (pinned elsewhere by DB-asking probes: Db::table_has_unique,
+# the cascade tests), not migration history, not the SELECT-list subsets
+# (SESSION_COLUMNS / SPACE_COLUMNS are subsets and deliberately absent). Whitespace
+# is not drift (lines are trimmed, blanks dropped); a renamed/retyped/reordered/
+# added/removed column or a lost index IS. Keep this file's diff reviewable next to
+# the DDL diff: change it in the same PR that changes both repos' DDL in lockstep,
+# then re-run `bash scripts/check-schema-drift.sh --self-test` and `cargo test -p fulcrum`.
+sessions
+id:TEXT
+cwd:TEXT
+created_at:INTEGER
+title:TEXT
+capabilities_json:TEXT
+archived:INTEGER
+context_usage_json:TEXT
+is_subagent:INTEGER
+todos_json:TEXT
+cost_usd:REAL
+sort_order:INTEGER
+title_stage:INTEGER
+messages
+id:INTEGER
+session_id:TEXT
+kind:TEXT
+message_key:TEXT
+payload_json:TEXT
+created_at:INTEGER
+native_messages
+session_id:TEXT
+seq:INTEGER
+role:TEXT
+content_json:TEXT
+created_at:INTEGER
+spaces
+path:TEXT
+created_at:INTEGER
+last_opened_at:INTEGER
+trusted:INTEGER
+sort_order:INTEGER
+idx_messages_session
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);

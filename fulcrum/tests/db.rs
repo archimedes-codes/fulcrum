@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use fulcrum::db::schema::{SCHEMA, SCHEMA_VERSION};
+use fulcrum::db::schema::{schema_shape_fingerprint, SCHEMA, SCHEMA_VERSION};
 use fulcrum::db::{Db, DbError};
 use fulcrum_core::persist::TranscriptPersister;
 use fulcrum_core::seams::FulcrumPersistence;
@@ -1081,4 +1081,97 @@ fn open_creates_the_parent_directory() {
     let db = Db::open(&nested).expect("open must create the parent dirs");
     assert!(nested.exists());
     assert_eq!(db.journal_mode().expect("mode").to_lowercase(), "wal");
+}
+
+/// The shipped schema-shape pin equals the shapes this build pins — the check that
+/// reddens the moment a daemon DDL change lands without the matching pin update.
+///
+/// `schema-sha.txt` is the artifact the desktop compares its own DDL against, so
+/// it must not be allowed to become a hopeful transcription of a DDL that has
+/// since moved. The canonical form strips the file's comment lines (which carry
+/// the contract's prose, not its data) and any blank lines, trims trailing
+/// whitespace, and re-terminates every line — the same normalisation
+/// `scripts/check-schema-drift.sh` applies, so `cargo test` and CI ask one
+/// question in two places rather than two subtly different ones.
+///
+/// The path is built from `CARGO_MANIFEST_DIR` (which for this member is
+/// `<repo-root>/fulcrum`), never the process CWD — an integration test's CWD is
+/// not guaranteed to be the manifest dir, and a level-counting `.parent()` is the
+/// pattern `AGENTS.md` forbids.
+#[test]
+fn the_pinned_schema_fingerprint_matches_the_shipped_file() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("schema-sha.txt");
+    let file = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read the repo-root schema-sha.txt ({path:?}): {e}"));
+    let canonical: String = file
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| format!("{}\n", line.trim_end()))
+        .collect();
+    assert_eq!(
+        canonical,
+        schema_shape_fingerprint(),
+        "`schema-sha.txt` no longer matches the shapes `TABLE_SHAPES` pins — update \
+         the pin in the SAME commit as the DDL change, or this repo has drifted from \
+         its own contract"
+    );
+}
+
+/// The pin names all five keys — the vacuity floor on the fingerprint itself.
+///
+/// A pin that dropped a section would compare equal to a DDL that dropped the
+/// same one, which is a check that passes because it stopped looking. So the five
+/// headers are pinned here independently of the body comparison above: the file
+/// must name `sessions`, `messages`, `native_messages`, `spaces` and
+/// `idx_messages_session`, each exactly once, and no other header line may exist.
+#[test]
+fn the_schema_fingerprint_covers_all_four_tables_and_the_index() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("schema-sha.txt");
+    let file = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read the repo-root schema-sha.txt ({path:?}): {e}"));
+
+    const WANT: [&str; 5] = [
+        "sessions",
+        "messages",
+        "native_messages",
+        "spaces",
+        "idx_messages_session",
+    ];
+
+    // A header line is a line `schema_shape_fingerprint()` would emit as a bare
+    // name: no `:` (so not a `name:type` column line) and not the index
+    // statement (the only other payload line the pin carries).
+    let mut headers: Vec<String> = Vec::new();
+    for line in file.lines() {
+        let line = line.trim_end();
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if !line.contains(':') && !line.starts_with("CREATE INDEX ") {
+            headers.push(line.to_string());
+        }
+    }
+
+    for key in WANT {
+        let hits = headers.iter().filter(|h| h == &&key.to_string()).count();
+        assert_eq!(
+            hits, 1,
+            "the pin must name `{key}` exactly once — a fingerprint that cannot \
+             name every table is not a comparison"
+        );
+    }
+    let mut sorted = headers.clone();
+    sorted.sort();
+    let mut want = WANT.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    want.sort();
+    assert_eq!(
+        sorted, want,
+        "the pin names {headers:?}; it must name exactly {WANT:?} — an extra \
+         header means the pin describes a table this build does not ship, and a \
+         missing one means a table escaped the contract"
+    );
 }

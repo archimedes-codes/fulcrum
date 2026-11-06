@@ -1,0 +1,46 @@
+name: Schema drift
+
+on:
+  push:
+    # The repo's merge bar — see ci.yml: feature/*, not a named branch.
+    branches: [main, feature/*]
+  pull_request:
+
+jobs:
+  schema-drift:
+    name: schema-shape pin vs the shipped DDL
+    # Single OS on purpose: the check is text-only (grep/awk/diff). ci.yml's 3-OS
+    # matrix exists for the cfg(unix)/cfg(windows) process hygiene, which nothing
+    # here touches; this guard's portability is proven by its own --self-test.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No version named on purpose — the repo-root rust-toolchain.toml is the pin
+      # (same rationale as ci.yml's Install-the-toolchain step).
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup default "$(rustup show active-toolchain | cut -d' ' -f1)"
+          rustc --version
+
+      # ORDER IS LOAD-BEARING (the same pairing ci.yml uses for its guard steps):
+      # the self-test runs BEFORE the live check, so a guard that has lost the
+      # ability to fail reddens the run instead of printing a green nobody earned.
+      # A live-only run cannot demonstrate the failure at all — both repos' DDLs
+      # agree byte-for-byte today, so the real check has nothing to complain about.
+      - name: Prove the schema-drift guard can fail
+        shell: bash
+        run: bash scripts/check-schema-drift.sh --self-test
+
+      - name: Check the schema-shape pin against the shipped DDL
+        shell: bash
+        run: bash scripts/check-schema-drift.sh
+
+      # And no `cargo build --all-targets` step anywhere, per the repo rule (see
+      # AGENTS.md's validation bar): this workflow runs NO cargo at all. The Rust
+      # half of the contract — `the_pinned_schema_fingerprint_matches_the_shipped_file`
+      # in fulcrum/tests/db.rs, which reddens the moment a daemon DDL change lands
+      # without its pin — lives in the ordinary `cargo test` suite, where it belongs.
