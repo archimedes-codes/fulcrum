@@ -399,6 +399,40 @@ fn socket_path(endpoint: &Endpoint) -> &Path {
     }
 }
 
+/// `ERROR_PIPE_BUSY` (231) — "every instance of this pipe name is connected".
+///
+/// **Re-hardcoded, deliberately.** The transport already owns this predicate:
+/// `transport::windows::is_pipe_busy` (`fulcrum/src/transport/windows.rs`, the
+/// `fn` next to its `raw_os_error() == Some(231)` body, reached from `connect`
+/// and from `is_pipe_busy_err`). It is a PRIVATE `fn` — the module is `pub`, the
+/// function is not — so a test target cannot name it, and the task forbids
+/// widening a `src/` API for a test's convenience. So the constant lives twice,
+/// and the cost of that drift is checked by the Windows leg of CI rather than by
+/// the compiler: if the transport's code ever changed, this arm would retry the
+/// wrong error and the malformed-line test would go red again with a 231 in its
+/// output, which is a loud failure and not a silent one.
+///
+/// `231` and not a `windows_sys` constant, for the reason the transport gives
+/// for the same choice: a literal is cheaper than a dependency.
+#[cfg(windows)]
+fn is_pipe_busy(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(231)
+}
+
+/// How long [`raw_dial`] waits out a busy pipe before calling it a failure.
+///
+/// The transport's `connect` retries this error unbounded; a test may not — a
+/// wait with no ceiling is the hung-test failure mode this file's deadline rule
+/// exists to prevent, and it would also be the "retry until it passes" lie in
+/// its slowest form. 2 s matches the transport's own `BIND_BUSY_BUDGET` for the
+/// same code, and it is generous by three orders of magnitude for what it is
+/// actually waiting for: an armed instance is refilled the moment `accept`
+/// swaps it, so the window this clears is a single `CreateFileW` + handoff, not
+/// a queue drain. A dial that exhausts this budget is not transient — it means
+/// no instance ever became free, and the panic says so rather than looping.
+#[cfg(windows)]
+const PIPE_BUSY_BUDGET: Duration = Duration::from_secs(2);
+
 /// The platform's own duplex stream, dialed at the daemon, WITHOUT the framing
 /// layer on top — for the tests that must write bytes the framer would refuse to
 /// produce (a malformed line) or read a reply the framer would consume.
@@ -412,6 +446,21 @@ fn socket_path(endpoint: &Endpoint) -> &Path {
 /// Deliberately NOT `transport::connect`: that returns a `Connection`, which
 /// owns a reader task that would take the reply bytes this test needs to read
 /// itself.
+///
+/// # Why only the Windows arm retries
+///
+/// `raw_dial` is a second dial path that bypasses the transport, and with it
+/// the transport's `ERROR_PIPE_BUSY` retry — the Windows arm below explains the
+/// failure that produced. The unix arm needs no twin and has deliberately not
+/// been given one: `AF_UNIX` `connect` has no "every instance is busy" answer.
+/// Its failure shapes are `ENOENT` (the socket file is not there yet — already
+/// retried, by `Daemon::wait_until_listening`) and `ECONNREFUSED` (a stale
+/// socket file with nothing listening behind it) — and both of those mean the
+/// dial should FAIL, loudly, because there is no daemon worth waiting for.
+/// Retrying them here would turn "nothing is listening" into a two-second stall
+/// ending in a vaguer message, and would paper over exactly the class of bug
+/// the `ENOENT` note above exists to surface. The asymmetry is the OS's, not an
+/// inconsistency in this file.
 async fn raw_dial(endpoint: &Endpoint) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite {
     #[cfg(unix)]
     {
@@ -421,8 +470,8 @@ async fn raw_dial(endpoint: &Endpoint) -> impl tokio::io::AsyncRead + tokio::io:
     }
     #[cfg(windows)]
     {
-        // `open` is synchronous in tokio's named-pipe wrapper (a `CreateFileW`),
-        // and the daemon is already listening by the time a test gets here —
+        // `open` is synchronous in tokio's wrapper (a `CreateFileW`), and the
+        // daemon is already listening by the time a test gets here —
         // `Daemon::start` probed before returning.
         //
         // The FULL name, prefix and all — the same thing
@@ -434,11 +483,74 @@ async fn raw_dial(endpoint: &Endpoint) -> impl tokio::io::AsyncRead + tokio::io:
         // file specified.") on the Windows leg; the transport's own `connect`,
         // passing the full name, is the control that says which of the two was
         // wrong.
-        tokio::net::windows::named_pipe::ClientOptions::new()
-            .read(true)
-            .write(true)
-            .open(pipe_name(endpoint))
-            .expect("dial raw (windows)")
+        //
+        // # The busy retry, and the line it must not cross
+        //
+        // Bypassing the transport also bypassed the one thing in it that makes
+        // dialing a live daemon reliable: `transport::windows::connect` retries
+        // `ERROR_PIPE_BUSY` (231) because "every instance of this name is
+        // currently connected" is a momentary condition, not a refusal. The
+        // first version of this arm had no retry and CI proved what that costs:
+        // `a_malformed_line_gets_an_error_and_the_stream_continues` died with
+        // `Os { code: 231, …"All pipe instances are busy." }` on both Windows
+        // jobs, reproducibly, because it is the one test that dials raw WHILE
+        // the daemon is already servicing another connection (it needs a live
+        // daemon to hand garbage to, and holds a framed client open to prove
+        // the stream survives) — so it is the one that can land in the
+        // all-instances-busy window. The raw dial in
+        // `a_client_that_never_reads_is_throttled…` has no competing client and
+        // never landed there, and the tests that dial through the transport are
+        // immune because it retries — which is why exactly one of 37 failed.
+        //
+        // Retry 231 and NOTHING ELSE. That distinction is the whole content of
+        // this arm: a wrong pipe name answers `NotFound`/`ERROR_FILE_NOT_FOUND`,
+        // and the previous round's bug was precisely a dial at a name that
+        // resolved to nothing (the stripped prefix). That failure was CORRECT —
+        // the fix was to dial the right name, not to wait longer for a pipe that
+        // will never appear. A retry keyed on "any error", or on a plain
+        // not-found, would have swallowed it and re-hidden that bug behind a
+        // timeout, converting a red test that named the cause into a red test
+        // that names only its own budget. So the guard below matches one error
+        // code; every other error leaves the loop on the first turn and panics
+        // with the OS's own rendering.
+        //
+        // And the loop is BOUNDED, unlike the transport's (whose unbounded retry
+        // is right for a client that wants to reach a daemon a second daemon is
+        // still binding, and wrong for a test, where an unbounded wait on a
+        // genuinely occupied pipe is the hung-test failure mode this file's
+        // deadline rule exists to prevent). See [`PIPE_BUSY_BUDGET`] for the
+        // number and for what exceeding it means.
+        let deadline = Instant::now() + PIPE_BUSY_BUDGET;
+        let mut attempts = 0u32;
+        let client = loop {
+            attempts += 1;
+            match tokio::net::windows::named_pipe::ClientOptions::new()
+                .read(true)
+                .write(true)
+                .open(pipe_name(endpoint))
+            {
+                Ok(client) => break client,
+                Err(e) if is_pipe_busy(&e) && Instant::now() < deadline => {
+                    // Async sleep: unlike the transport's sync `bind`, this arm
+                    // runs inside the test's runtime, so it can yield instead of
+                    // parking a worker thread — the same thing
+                    // `transport::windows::connect` does for the same code.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                // Busy, and the budget is gone: no instance ever came free.
+                Err(e) if is_pipe_busy(&e) => panic!(
+                    "dial raw (windows) at {} still busy after {PIPE_BUSY_BUDGET:?} \
+                     ({attempts} attempts): {e:?} — no pipe instance ever came free",
+                    pipe_name(endpoint)
+                ),
+                // Everything else — `NotFound` above all — fails on the FIRST
+                // attempt, with the OS's own error, no waiting.
+                Err(e) => {
+                    panic!("dial raw (windows) at {}: {e:?}", pipe_name(endpoint))
+                }
+            }
+        };
+        client
     }
 }
 
