@@ -89,9 +89,18 @@ that is a stale artifact from a moved checkout, NOT a defect: recompile the `ful
 measured 48 s. **Do not reach for `cargo clean`** — one recompile of the affected target is enough, and the full cost
 of a clean rebuild has never been measured here.
 
-`cargo check --target x86_64-pc-windows-gnu` is part of the repo's documented bar but was NOT measured here: the
-cross-target is not installed in this environment. Record it as unmeasured rather than passing or failing it, and
-rely on the CI Windows leg.
+**CORRECTION (found at wave 2, after three waves of trusting it): the baseline child's claim that the Windows
+cross-target "is not installed locally" was FALSE.** `rustup target list --installed` shows
+`x86_64-pc-windows-gnu`, `x86_64-pc-windows-msvc` AND `aarch64-apple-darwin`. Measured since:
+`cargo check --target x86_64-pc-windows-gnu --all-targets` → **exit 0**, both members. It is a runnable gate and
+every wave record before this point said "unmeasured" for it — the waves were still green, but the record was wrong.
+
+`aarch64-apple-darwin` is installed but **cannot be checked here**: it fails inside `ring`'s C build because the
+host `cc` has no macOS SDK (`-arch arm64 … curve25519.c` → `cc-rs` exit 1). That is a toolchain boundary, not a
+defect, and it is the documented bar's own omission — AGENTS.md names the Windows cross-check as "the only local
+Windows proof available" and offers no macOS equivalent. **Consequence that matters for this feature: T3 added
+`#[cfg(target_os = "macos")]` / BSD `getpeereid` code that has NO local compile proof at all.** CI's macOS leg is
+the sole witness for it. Do not record macOS as verified; record it as unmeasurable here.
 
 ## Dependency graph / waves
 
@@ -146,7 +155,7 @@ desktop's half must work in that checkout, which is a DIFFERENT REPO — see Blo
 | T1 | CI process census: fail the run when a daemon or worker outlives the suite (issue #5) | ci-verification | `docs/roadmap/daemon-hardening-task01-stray-process-census.md` | 1 | `scripts/check-no-stray-processes.sh` (new), `.github/workflows/ci.yml` | `done` `491bb99` |
 | T2 | Cross-repo schema drift fingerprint + comparison workflow (issue #6) | daemon-store | `docs/roadmap/daemon-hardening-task02-schema-drift-fingerprint.md` | 1 | `fulcrum/src/db/schema.rs`, `fulcrum/tests/db.rs`, `schema-sha.txt` (new), `scripts/check-schema-drift.sh` (new), `.github/workflows/schema-drift.yml` (new), `README.md`, `AGENTS.md` | `done` `0c9c27e` |
 | T3 | Peer-credential check + rate/session limits + required `hello` handshake (issue #4) | transport-serve | `docs/roadmap/daemon-hardening-task03-socket-hardening.md` | 1 | `fulcrum/src/transport/unix.rs`, `fulcrum/src/transport/windows.rs`, `fulcrum/src/transport/mod.rs`, `fulcrum/src/serve.rs`, `fulcrum/src/main.rs`, `fulcrum/tests/serve.rs`, `fulcrum/tests/transport.rs` | `done` `6d6887a` |
-| T4 | Split `Connection` and `serve_client` so a slow attach cannot stall that client's event relay (issue #3) | transport-serve | `docs/roadmap/daemon-hardening-task04-split-serve-client.md` | 2 | `fulcrum/src/transport/frame.rs`, `fulcrum/src/transport/mod.rs`, `fulcrum/src/transport/unix.rs`, `fulcrum/src/transport/windows.rs`, `fulcrum/src/serve.rs`, `fulcrum/tests/serve.rs`, `fulcrum/tests/transport.rs`, `fulcrum/tests/worker_mode.rs`, `src/fixtures/worker.rs` | `vetted` |
+| T4 | Split `Connection` and `serve_client` so a slow attach cannot stall that client's event relay (issue #3) | transport-serve | `docs/roadmap/daemon-hardening-task04-split-serve-client.md` | 2 | `fulcrum/src/transport/frame.rs`, `fulcrum/src/transport/mod.rs`, `fulcrum/src/transport/unix.rs`, `fulcrum/src/transport/windows.rs`, `fulcrum/src/serve.rs`, `fulcrum/tests/serve.rs`, `fulcrum/tests/transport.rs`, `fulcrum/tests/worker_mode.rs`, `src/fixtures/worker.rs` | `done` `6b6a07a` + `6b149c4` |
 
 T3 and T4 overlap in five files by design — that overlap IS the wave-2 edge, recorded above. T1∥T2∥T3 share nothing.
 
@@ -217,12 +226,54 @@ T3 and T4 overlap in five files by design — that overlap IS the wave-2 edge, r
 
 One line per task: hash, what shipped, gate numbers at that moment. Figures below are historical.
 
+### Wave 2 — implemented and gated (Step 5–6), split into two commits
+
+Width 1, so no worktree: ran in the primary checkout on `feature/daemon-hardening`. The plan's own
+two-commit split (T4a frame / T4b serve) was used as the **dispatch boundary** — 11 steps / 9 files /
+3 test trees was over the child ceiling, so each half got its own implementer rather than one child
+compacting mid-task on the most delicate change in the run. `BASE` for the wave was `ad72744`.
+
+- **T4a `6b6a07a`** — `ConnectionWriter` owns `pending`; `split_writer`; the delegator; 6 new frame tests;
+  `tests/transport.rs` + `tests/worker_mode.rs` conversions. Gate at this commit: `cargo check -p fulcrum`
+  exit 0 (the lib compiles because the delegator survives), member tests green, Windows cross-target exit 0.
+- **T4b `6b149c4`** — `serve_client` → `reader_loop` + `writer_loop` with the **relay in the writer**, refusal
+  `oneshot`+ack, `writer_task.abort()` teardown, delegator deleted, `Client` harness split, the ready-gated
+  slow-start test, the fixture gate.
+
+**Issue #3's proof was DEMONSTRATED, not inferred.** The implementer ran the final test against the real
+committed old design (worktree at `6b6a07a`, `serve.rs` byte-identical to HEAD, only test-side changes
+copied in): **old → RED** (`absorb saw 0 chunk(s), quiet = true; probe waited 1.5006 s → relayed = false`),
+**new → GREEN** (`absorb saw 7 chunk(s), quiet = false; probe waited 0ns → relayed = true`). 40 of 41 serve
+tests pass on the old design and only the relay test fails, so the harness changes are inert and the test
+isolates the bug. The orchestrator re-ran it independently: `park observed after 11.4 ms; absorb 701 ms saw
+7 chunk(s) and reached quiet = false; probe waited 0ns → relayed while parked = true`.
+
+**Wave 2 gate on the integrated tree (measured):** `cargo test` **exit 0 — 1589 passed / 0 failed / 3 ignored**
+· `cargo fmt --all -- --check` 0 · `cargo clippy --all-targets -D warnings` 0 ·
+`cargo check --target x86_64-pc-windows-gnu --all-targets` **0** · allocator guard 0 · schema guard 0.
+Then the real-world check: full suite with `FULCRUM_CI_RUN_MARKER` exported (13 test binaries green),
+`scripts/check-no-stray-processes.sh` → **exit 0, "0 candidate(s) of the watched images"** — T4 spawns two
+tasks per connection and its teardown claim ("no task outlives `serve_client`") is witnessed by T1's census
+on the same tree, which is the only mechanism that could have caught a leak.
+
+**Four plan defects the T4b implementer found and fixed in the CAUSE, not the test:**
+1. The plan's `watching` as a lock-across-await does not compile (`MutexGuard` is `!Send` in a spawned
+   future) — and had it compiled it would have re-stalled the relay for 5 s, recreating the bug.
+2. **D6's central claim was false.** The inbound throttle was *causally produced* by the single task's
+   blocked `send_frame` pausing its own `recv`; decoupled, the throttle test's peer drove 679,060 frames in
+   5 s and the daemon silently dropped replies. Fixed by making replies `send().await` (a reader that drops
+   never stops reading) while the relay keeps drop-and-count-and-`gap`.
+3. The `dropped` epilogue had to move to `serve_client`, because `abort()` drops a task's future without
+   polling it — so code after the loop never runs on exactly the parked-writer path that needs the notice.
+4. The plan's writer exit (2) is unreachable (the writer's own `tx` clone keeps the `mpsc` open); documented
+   rather than shipped as a dead arm.
+
 ### Vet rounds (Step 4) — these lines are what make the rows above read `vetted`
 
 - **T1** planned → vet R1 **FAIL** (3 🔴) → refined → vet R2 **PASS**, 1 🟡 (prose: say "basename of the FIRST argv element of `args=`", so a `--worker-exe <path>` tail can't be mistaken for the image).
 - **T2** planned → vet R1 **PASS**, no 🔴, no 🟠. One implementation-time note: run the added fixtures once to retire the extraction-vacuity gap before merge.
 - **T3** planned → vet R1 **PASS**, no 🔴. Stale dirty-tree claim removed from the plan by the orchestrator (see Decisions).
-- **T4** planned → vet R1 **pass-with-issues + 3 🔴** → refined → vet R2 **pass-with-issues + 1 new 🔴** (writer can outlive `serve_client`) → refined → vet R3 **PASS**.
+- **T4** planned → vet R1 **pass-with-issues + 3 🔴** → refined → vet R2 **pass-with-issues + 1 new 🔴** (writer can outlive `serve_client`) → refined → vet R3 **PASS**. Then, because T3 landed underneath it, a DEVIATION-rule **re-plan against `6d6887a`** → vet R4 **pass + 1 new 🔴** (the slow-start proof could false-green on the unsplit design: `sleep + BUDGET` must close before `attach` returns) → refined to a test-gated `ready` → **2 further 🔴 found by the orchestrator, not by any vet**: (a) the gate budgets summed to 6.7 s against `attach`'s 5 s `wait_ready` ceiling, which un-parks the reader via timeout and manufactures the exact false green the test exists to rule out; (b) **commit 1 could not compile at all** — it deleted `Connection::send_frame`, which the `fulcrum` LIB calls at four `serve.rs` sites converted only in commit 2, so commit 1's own stated verification command could not run. Fixed by re-homing the method as a delegator in commit 1 and deleting it in commit 2. **Six review passes, and the two worst defects were caught by re-deriving constraints (a ceiling, a build graph) rather than by reviewing the prose.**
 
 ### Wave 1 — implemented and gated (Step 5–6)
 
