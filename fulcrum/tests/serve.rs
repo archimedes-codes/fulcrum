@@ -1,0 +1,1553 @@
+//! T9 Task 5 — the daemon's accept loop, the client↔session multiplex, and the
+//! one claim the whole roadmap's `done-when` rests on.
+//!
+//! # These tests drive the real binary
+//!
+//! `fulcrum serve` is spawned as a process, a real socket is dialed, a real
+//! child Worker is spawned, and `fulcrum.db` is read back through a SECOND
+//! connection while the daemon still holds it open. Nothing is stubbed. A daemon
+//! tested against a stubbed store cannot make the durability claim, and a daemon
+//! tested by calling `serve_client` directly cannot make the disconnect claim —
+//! both hazards are about processes and sockets, not about a function's return
+//! value.
+//!
+//! # Why `--worker-exe` is the fixture and not `fulcrum --worker`
+//!
+//! A real Worker needs an LLM provider: `fulcrum --worker` with the fake model
+//! this test must use would `start` and then fail its first provider call,
+//! producing no transcript rows — so the durability test would be asserting that
+//! nothing happened. The engine's `fake_worker_core` bin exists for exactly this
+//! seam (`worker/manager/mod.rs` documents it as the spawn seam's fixture) and
+//! emits canned store frames with no network.
+//!
+//! It is a bin of the OTHER package, so `env!("CARGO_BIN_EXE_…")` cannot name it
+//! and cargo need not build it for `cargo test -p fulcrum --test serve`. Measured
+//! both ways: a workspace-wide `cargo test` does materialise it (both default
+//! members, all targets), and `cargo test -p fulcrum --test serve` on a target
+//! dir that has never seen it does not. So [`worker_fixture`] resolves it, and
+//! only builds it when it is genuinely absent.
+//!
+//! ⚠ That fallback MUST NOT write into `target/debug/`, and the reason is the
+//! one `ci.yml:60` gives for forbidding a `cargo build --all-targets` step: it
+//! would keep the suite green after someone deleted `tests/fixture_bins.rs`,
+//! the target whose job is to force the fixture bins to exist. A fallback that
+//! populated the shared target dir would be that same step wearing a test's
+//! clothes — and the inherited version of this file WAS exactly that, measured:
+//! with `tests/fixture_bins.rs` removed, the engine's own suite went from 66
+//! failures to 32 because this file had rebuilt the binary. [`worker_fixture`]
+//! therefore builds into an isolated `--target-dir` under `target/`, which only
+//! this file can find. See its doc for the numbers and the cost.
+//!
+//! # The deadline rule
+//!
+//! Every wait here has one, per `tests/fixture_bins.rs`: a hung test is worse
+//! than a red one, because it prints nothing and takes the suite's output with
+//! it.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use fulcrum::transport::{connect, Connection, Endpoint};
+use fulcrum_core::worker::protocol::{StartEnv, StartMode, PROTOCOL_VERSION};
+
+/// The daemon binary under test (this member's own bin — the route cargo
+/// guarantees for an integration test of the package that declares it).
+const BIN: &str = env!("CARGO_BIN_EXE_fulcrum");
+
+/// The engine's Worker fixture, as `worker_fixture` resolves it.
+const WORKER_FIXTURE: &str = "fake_worker_core";
+
+/// How long a frame is allowed to take to cross the socket.
+///
+/// The work is a local `write`, but the frame may be queued behind a child
+/// Worker's spawn + `ready` handshake (the engine's own bound for that is 5 s),
+/// so the budget has to cover the slowest legitimate start.
+const FRAME_BUDGET: Duration = Duration::from_secs(30);
+
+/// How long the durability test is allowed to take to see a row appear.
+///
+/// The fixture's slowest mid-turn scenario is ~3 s of streaming, so this is a
+/// 5× margin on real sleeps. It is a DEADLINE, not a sleep: the test proceeds as
+/// soon as the row lands.
+const ROW_BUDGET: Duration = Duration::from_secs(20);
+
+/// The `fake_worker_core` path, materialised if this cargo invocation did not
+/// build it (see the module header).
+///
+/// # Why the fallback builds into an ISOLATED `--target-dir`
+///
+/// The obvious fallback — `cargo build -p fulcrum-core --bin fake_worker_core`,
+/// which drops the binary in `target/debug/` — is WRONG here, and subtly so.
+/// `ci.yml` forbids a `cargo build --all-targets` step because it would keep the
+/// suite green after someone deleted `tests/fixture_bins.rs`, the target whose
+/// only job is to force the fixture bins to exist. A fallback that populates
+/// `target/debug/` is that same step wearing a test's clothes. Measured, with
+/// `tests/fixture_bins.rs` removed and both fixture bins deleted:
+///
+/// * `cargo test -p fulcrum-core --lib` alone → **66 failed** (loud, as designed)
+/// * the same workspace `cargo test` WITH this file's shared-target fallback →
+///   **32 failed** — this file rebuilt `target/debug/fake_worker_core` at test
+///   time and silently rescued 34 of the engine's own tests.
+///
+/// Building into `target/fulcrum-serve-fixture/` instead means this fallback can
+/// only ever produce a binary THIS file knows the path of. `target/debug/` stays
+/// empty of it, so deleting `tests/fixture_bins.rs` still reddens every engine
+/// test that spawns the fixture by path. That directory is under the repo's
+/// gitignored `/target`, and it is a CARGO TARGET DIRECTORY, not a scratch dir —
+/// `check-temp-dir-census.sh` counts `TempDir`s, and a build cache is not one.
+///
+/// The isolation costs ~57 s on a cold cache, and it is paid only when
+/// `target/debug/` has no fixture — which is never in CI, where a workspace-wide
+/// `cargo test` builds every bin of every default member before the first test
+/// runs and the fast path below returns immediately.
+fn worker_fixture() -> PathBuf {
+    let exe = std::env::current_exe().expect("a test binary has a path");
+    // `target/debug/deps/<test>-<hash>` → `target/debug/`, the directory cargo
+    // writes a package's bins into. Two `parent()`s off the RUNNING binary, not a
+    // level count off `CARGO_MANIFEST_DIR` — the reason `test_support` and
+    // `tests/fixture_bins.rs` both give for preferring `current_exe`.
+    let target_debug = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("the test binary lives in target/debug/deps")
+        .to_path_buf();
+    let name = format!("{WORKER_FIXTURE}{}", std::env::consts::EXE_SUFFIX);
+    let shared = target_debug.join(&name);
+    if shared.is_file() {
+        return shared;
+    }
+
+    // Not built for this invocation. Build the ONE bin, into the isolated dir
+    // above, from the workspace root (`CARGO_MANIFEST_DIR` is this member; its
+    // parent is the root that owns the `[workspace]` table `-p` resolves
+    // against). Concurrent callers serialize on cargo's own build-directory
+    // lock, which is why no test-level mutex is needed here.
+    let root = target_debug
+        .parent()
+        .expect("target/debug sits in the workspace's target dir")
+        .join("fulcrum-serve-fixture");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the member sits inside the workspace root");
+    let out = Command::new(&cargo)
+        .args([
+            "build",
+            "-p",
+            "fulcrum-core",
+            "--bin",
+            WORKER_FIXTURE,
+            "--target-dir",
+        ])
+        .arg(&root)
+        .current_dir(manifest)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn `{cargo} build --bin {WORKER_FIXTURE}`: {e}"));
+    let built = root.join("debug").join(&name);
+    assert!(
+        out.status.success(),
+        "building the `{WORKER_FIXTURE}` fixture failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        built.is_file(),
+        "`{WORKER_FIXTURE}` was built but is not at {} — the nested build put it \
+         somewhere this test cannot resolve.",
+        built.display()
+    );
+    // The assertion that keeps the whole point of the isolated dir true: this
+    // fallback must NOT have created the shared-target binary, because that is
+    // the file whose absence `tests/fixture_bins.rs` exists to make loud.
+    assert!(
+        !shared.exists(),
+        "the fixture fallback wrote {shared:?}; it must build ONLY into \
+         {root:?} — populating `target/debug/` from a test is the \
+         `cargo build --all-targets` step `ci.yml` forbids, and it would hide \
+         the deletion of `tests/fixture_bins.rs`"
+    );
+    built
+}
+
+/// The daemon, its temp dir, and the two paths it was told to use.
+///
+/// The `TempDir` is a FIELD and not a local: dropping it deletes the socket file
+/// and the database under a live daemon, which turns a clean-up race into a
+/// store failure that reads as a bug in the code under test (the same reason
+/// `tests/transport.rs` hands the keepalive back).
+struct Daemon {
+    child: Child,
+    db_path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl Daemon {
+    /// Boot the daemon on a fresh socket + a fresh database, and do not return
+    /// until something is listening.
+    ///
+    /// `async` because the readiness probe is the transport's own `connect`: the
+    /// platform-neutral dial is async, and a blocking
+    /// `std::os::unix::net::UnixStream::connect` — what this did before — is both
+    /// a unix-only item (so the Windows leg of CI could not compile this file)
+    /// and a second dial implementation the file did not need.
+    async fn start() -> Self {
+        let dir = tempfile::tempdir().expect("temp dir for the daemon");
+        let endpoint = Self::endpoint_in(dir.path());
+        let db_path = dir.path().join("fulcrum.db");
+        let worker = worker_fixture();
+
+        let mut cmd = Command::new(BIN);
+        cmd.arg("serve");
+        // The endpoint flag is the only platform-dependent part; `worker_mode.rs`
+        // covers the CLI's parsing of both spellings, so this one leg is enough
+        // here and keeps the tests identical on both OSes.
+        #[cfg(unix)]
+        cmd.args(["--socket"]);
+        #[cfg(windows)]
+        cmd.args(["--pipe"]);
+        cmd.arg(endpoint_path_str(&endpoint))
+            .arg("--db")
+            .arg(&db_path)
+            // Explicit, so the test is not accidentally testing the
+            // `current_exe()` fallback (that default has its own test, in
+            // `worker_factory`'s unit tests, where it can be asserted directly).
+            .arg("--worker-exe")
+            .arg(&worker)
+            .stdin(Stdio::null())
+            // The daemon's stderr is the operator's console (see `main.rs`: no
+            // `windows_subsystem` attribute, deliberately). Inherited, so a
+            // `--nocapture` run shows the accept loop's own reporting — including
+            // the "client disconnected" line the disconnect tests are about.
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let child = cmd.spawn().expect("spawn the daemon");
+
+        let daemon = Self {
+            child,
+            db_path,
+            _dir: dir,
+        };
+        daemon.wait_until_listening(&endpoint).await;
+        daemon
+    }
+
+    /// Dial with retries until the daemon answers, or fail.
+    ///
+    /// The retry is on the ERROR, not on a sleep: on unix a `connect` to a socket
+    /// file that does not exist yet is `ENOENT`, and a fixed sleep before the
+    /// first dial is what turns a fast machine's test into a slow one and a slow
+    /// machine's test into a flake.
+    ///
+    /// The dial is `transport::connect`, so it is the SAME code path a test
+    /// client takes and it compiles on both platforms. Dropping the returned
+    /// `Connection` immediately is deliberate — this is a liveness probe, and it
+    /// also means the daemon's very first accepted connection is one that
+    /// EOFs with no frame, which is the shape hazard (b) is about.
+    async fn wait_until_listening(&self, endpoint: &Endpoint) {
+        let deadline = Instant::now() + FRAME_BUDGET;
+        loop {
+            match connect(endpoint.clone()).await {
+                Ok(_probe) => return,
+                Err(e) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _ = e;
+                }
+                Err(e) => panic!("the daemon never listened on {endpoint}: {e}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn endpoint_in(dir: &Path) -> Endpoint {
+        Endpoint::socket(dir.join("daemon.sock"))
+    }
+
+    #[cfg(windows)]
+    fn endpoint_in(dir: &Path) -> Endpoint {
+        Endpoint::pipe(format!(
+            r"\\.\pipe\fulcrum-serve-{}",
+            dir.file_name()
+                .expect("a temp dir has a final component")
+                .to_string_lossy()
+        ))
+    }
+
+    /// A SECOND connection to the same file, while the daemon still holds it.
+    ///
+    /// This is the whole point of WAL: the durability claim is that rows the
+    /// daemon wrote are visible to another reader without the daemon's
+    /// cooperation, and a test that read them through the daemon's own handle
+    /// would prove nothing about what is on disk.
+    fn read(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(&self.db_path).expect("open the daemon's db for reading")
+    }
+
+    /// `SELECT COUNT(*)` on one of the daemon's tables.
+    fn count(&self, table: &str) -> i64 {
+        self.read()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_else(|e| panic!("count {table}: {e}"))
+    }
+
+    /// How many sessions the daemon has recorded — one row per `start`, so this
+    /// is "how many sessions did the daemon actually take responsibility for",
+    /// read from the FILE rather than from the daemon's own memory.
+    fn spawn_count(&self) -> i64 {
+        self.count("sessions")
+    }
+
+    /// Ask the daemon to stop (there is no shutdown frame in T9), and reap it.
+    fn shutdown(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // Kill the daemon before the temp dir goes away, so the socket unlink
+        // does not race a live listener.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The address string the CLI takes for an endpoint (the flag value is the bare
+/// path on unix and the bare name on Windows — `serve::parse_serve_options` adds
+/// the `\\.\pipe\` prefix, so the test must not).
+#[cfg(unix)]
+fn endpoint_path_str(endpoint: &Endpoint) -> String {
+    socket_path(endpoint).display().to_string()
+}
+
+#[cfg(windows)]
+fn endpoint_path_str(endpoint: &Endpoint) -> String {
+    endpoint
+        .to_string()
+        .trim_start_matches(r"\\.\pipe\")
+        .to_string()
+}
+
+#[cfg(unix)]
+fn socket_path(endpoint: &Endpoint) -> &Path {
+    match endpoint {
+        Endpoint::Socket(path) => path,
+        Endpoint::Pipe(name) => panic!("a pipe endpoint on unix: {name}"),
+    }
+}
+
+/// The platform's own duplex stream, dialed at the daemon, WITHOUT the framing
+/// layer on top — for the tests that must write bytes the framer would refuse to
+/// produce (a malformed line) or read a reply the framer would consume.
+///
+/// Two `cfg` legs, both compiled on their own platform, because that is the only
+/// way the Windows leg gets any type-checked coverage of the raw-byte path at
+/// all: a `#[cfg(unix)] fn` with no Windows twin means the property it tests is
+/// simply unclaimed over there, silently. This is the same reason `transport`
+/// gates its `mod`s rather than using `if cfg!(…)`.
+///
+/// Deliberately NOT `transport::connect`: that returns a `Connection`, which
+/// owns a reader task that would take the reply bytes this test needs to read
+/// itself.
+async fn raw_dial(endpoint: &Endpoint) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(socket_path(endpoint))
+            .await
+            .expect("dial raw (unix)")
+    }
+    #[cfg(windows)]
+    {
+        // `open` is synchronous in tokio's named-pipe wrapper (a `CreateFileW`),
+        // and the daemon is already listening by the time a test gets here —
+        // `Daemon::start` probed before returning.
+        tokio::net::windows::named_pipe::ClientOptions::new()
+            .read(true)
+            .write(true)
+            .open(endpoint.to_string().trim_start_matches(r"\\.\pipe\"))
+            .expect("dial raw (windows)")
+    }
+}
+
+/// A live client, with the frames it has been sent already drained into a queue
+/// so a test can wait for one specific frame without losing the ones before it.
+struct Client {
+    conn: Connection,
+    /// Frames that arrived but that no matcher has claimed yet, in arrival
+    /// order. `recv_until*` scans this BEFORE reading the socket, so "wait for
+    /// the `start-result`" never swallows the `hello` reply that came first —
+    /// and it REMOVES what it returns, so the next call sees the next frame.
+    ///
+    /// The removal is the load-bearing half. A queue that is scanned but not
+    /// drained makes every repeated wait return the same first frame forever:
+    /// `while !settled { wait for the next event }` loops on `turn_start` until
+    /// its deadline, and "wait for the second `start-result`" re-reads the
+    /// first one and reports `ok: true`. Both failure shapes were live in this
+    /// file until the queue became consuming — see the note on
+    /// [`Client::recv_until_matching`].
+    pending: std::collections::VecDeque<serde_json::Value>,
+    /// EVERY frame ever received, never drained. `pending` cannot serve the
+    /// "was this frame relayed to the socket at all?" assertions once a matcher
+    /// has consumed it, and those assertions are exactly the ones that must
+    /// survive a matcher that ran earlier in the same test.
+    delivered: Vec<serde_json::Value>,
+}
+
+impl Client {
+    async fn dial(endpoint: &Endpoint) -> Self {
+        let conn = connect(endpoint.clone())
+            .await
+            .expect("dial the daemon (if this fails, the daemon is not listening)");
+        Self {
+            conn,
+            pending: std::collections::VecDeque::new(),
+            delivered: Vec::new(),
+        }
+    }
+
+    async fn send(&mut self, frame: serde_json::Value) {
+        self.conn.send_frame(&frame).await.expect("write the frame");
+    }
+
+    /// Wait for the first frame whose `type` is `kind`, failing after
+    /// [`FRAME_BUDGET`] with everything else that DID arrive.
+    ///
+    /// The "everything else" is the point of the failure message: a missing
+    /// `start-result` because the envelope was malformed looks identical to a
+    /// missing `start-result` because the daemon never replied, unless you can
+    /// see what it said instead.
+    async fn recv_until(&mut self, kind: &str) -> serde_json::Value {
+        self.recv_until_matching(kind, |_| true).await
+    }
+
+    /// Wait for the next frame matching `kind` + `extra`, CONSUMING it.
+    ///
+    /// Consuming is what makes "the next X" mean the next one. The version this
+    /// replaced scanned `pending` and cloned the match without removing it, so a
+    /// test that waited twice for the same frame type got the same frame twice —
+    /// which does not look like a broken harness, it looks like the daemon
+    /// replaying, or like a duplicate `start` that was accepted when it was
+    /// actually refused. A harness that manufactures a wrong answer is worse than
+    /// one that fails.
+    async fn recv_until_matching(
+        &mut self,
+        kind: &str,
+        extra: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let matched = |frame: &serde_json::Value| {
+            frame.get("type").and_then(serde_json::Value::as_str) == Some(kind) && extra(frame)
+        };
+        let deadline = Instant::now() + FRAME_BUDGET;
+        loop {
+            // `VecDeque::extract_if` is unstable on the pinned toolchain, so the
+            // scan is an index loop that can `remove` the position it found.
+            if let Some(at) = self.pending.iter().position(&matched) {
+                return self.pending.remove(at).expect("the index just found");
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                panic!(
+                    "no `{kind}` frame within {FRAME_BUDGET:?}; received so far: {}",
+                    serde_json::to_string(&self.delivered).unwrap_or_default()
+                );
+            }
+            let next = tokio::time::timeout(left, self.conn.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "no `{kind}` frame within {FRAME_BUDGET:?}; received so far: {}",
+                        serde_json::to_string(&self.delivered).unwrap_or_default()
+                    )
+                });
+            match next {
+                Some(Ok(frame)) => {
+                    self.delivered.push(frame.clone());
+                    self.pending.push_back(frame);
+                }
+                Some(Err(e)) => panic!("the stream errored while waiting for `{kind}`: {e}"),
+                // EOF before the frame: the daemon closed the connection, which
+                // is a bug in the daemon for every frame this file waits on.
+                None => panic!(
+                    "the daemon closed the connection while waiting for `{kind}`; \
+                     received so far: {}",
+                    serde_json::to_string(&self.delivered).unwrap_or_default()
+                ),
+            }
+        }
+    }
+
+    /// The next `event` frame for one session (the multiplex's unit of work).
+    async fn recv_event_for(&mut self, session_id: &str) -> serde_json::Value {
+        self.recv_until_matching("event", |frame| {
+            frame.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id)
+        })
+        .await
+    }
+
+    /// Any frame, with a budget (the probe tests need "nothing arrived").
+    ///
+    /// Takes from the FRONT of `pending`, matching socket order — `pop()` takes
+    /// the back, which would report the newest frame as the oldest.
+    async fn try_recv(&mut self, budget: Duration) -> Option<serde_json::Value> {
+        if let Some(frame) = self.pending.pop_front() {
+            return Some(frame);
+        }
+        match tokio::time::timeout(budget, self.conn.recv()).await {
+            Ok(Some(Ok(frame))) => {
+                self.delivered.push(frame.clone());
+                Some(frame)
+            }
+            Ok(Some(Err(e))) => panic!("a malformed frame arrived: {e}"),
+            Ok(None) => None,
+            Err(_) => None,
+        }
+    }
+
+    /// Every frame still unclaimed, plus whatever arrives within `window`.
+    ///
+    /// Drains `pending` first: a test that asserted on the socket alone would
+    /// miss frames a previous matcher had already pulled off it, and the
+    /// cross-session-leak assertions are only sound if they look at EVERY frame
+    /// this client was sent.
+    async fn drain(&mut self, window: Duration) -> Vec<serde_json::Value> {
+        let mut out = self.pending.drain(..).collect::<Vec<_>>();
+        let deadline = Instant::now() + window;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return out;
+            }
+            match tokio::time::timeout(left, self.conn.recv()).await {
+                Ok(Some(Ok(frame))) => {
+                    self.delivered.push(frame.clone());
+                    out.push(frame);
+                }
+                Ok(Some(Err(e))) => panic!("a malformed frame arrived: {e}"),
+                Ok(None) => return out,
+                Err(_) => return out,
+            }
+        }
+    }
+}
+
+/// Is this daemon `event` frame the worker's `RpcEvent` named `name`?
+///
+/// The path is four keys deep and each level is called `type`, which is how this
+/// file got it wrong once: `frame["frame"]["event"]` is the SERIALIZED
+/// [`fulcrum_core::events::RpcEvent`], and that enum is internally tagged
+/// (`#[serde(tag = "type")]`), so it is an OBJECT `{"type": "agent_settled"}` —
+/// not the string a first reading suggests. It is a string only on the OTHER
+/// event-bearing variant, `SinkFrame`, whose `event` is a bare name like
+/// `"session-update"`. Comparing the `RpcEvent` path to a string silently never
+/// matches, and the symptom is a 30 s timeout that looks like a stalled stream.
+///
+/// Naming it once is the fix; the two call sites below are the two spellings the
+/// mistake came in.
+fn rpc_event_is(frame: &serde_json::Value, name: &str) -> bool {
+    frame["type"] == "event"
+        && frame["frame"]["type"] == "event"
+        && frame["frame"]["event"]["type"] == name
+}
+
+/// Is this daemon `event` frame the streamed `agent_message_chunk` for `session`?
+///
+/// The specificity is the point. The FIRST event a session ever emits is the
+/// fixture's `session_info` `sink-frame`, sent in response to `start` — and it
+/// is a `sink-frame` too, so an assertion as loose as "the first mid-turn frame
+/// is a sink-frame" is satisfied by a frame produced BEFORE the prompt and
+/// proves nothing about the turn being in flight. This matches the chunk's own
+/// `sessionUpdate` discriminator and its session, so it can only be satisfied
+/// by the turn actually streaming.
+fn agent_message_chunk_for(session: &str) -> impl Fn(&serde_json::Value) -> bool {
+    let session = session.to_string();
+    move |frame: &serde_json::Value| {
+        frame["type"] == "event"
+            && frame["sessionId"] == session.as_str()
+            && frame["frame"]["type"] == "sink-frame"
+            && frame["frame"]["payload"]["update"]["sessionUpdate"] == "agent_message_chunk"
+    }
+}
+
+/// The `StartEnv` a test starts a session with.
+///
+/// A fake provider with a fake key on purpose: the fixture never calls it, and
+/// `StartEnv` requires a `Model`, so the envelope has to carry one. This is the
+/// same shape `client.rs`'s own `test_env` builds.
+fn start_env(session_id: &str, cwd: &str) -> StartEnv {
+    fn model(id: &str) -> fulcrum_core::harness::catalog::Model {
+        fulcrum_core::harness::catalog::Model {
+            id: id.to_string(),
+            provider: "fake".to_string(),
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            api_key: "k".to_string(),
+            context_window: 100_000,
+            cost_per_mtok_in: 0.0,
+            cost_per_mtok_out: 0.0,
+            supports_tools: true,
+            supports_thinking: false,
+            thinking_levels: Vec::new(),
+            api: Some("openai-completions".to_string()),
+        }
+    }
+    let m = model("m1");
+    StartEnv::from_parts(
+        session_id.to_string(),
+        cwd.to_string(),
+        StartMode::Fresh,
+        None,
+        m.clone(),
+        fulcrum_core::harness::catalog::ModelCatalog {
+            models: vec![m],
+            ..Default::default()
+        },
+        None,
+        true,
+        None,
+        // The daemon never reads `config_dir` (the five desktop-config fields ride
+        // the envelope), and the fixture ignores it — but it is a REQUIRED field
+        // of the wire type, so the envelope carries the temp dir.
+        std::env::temp_dir().display().to_string(),
+        false,
+        None,
+        None,
+    )
+}
+
+/// The `start` frame: the `StartEnv` verbatim plus the daemon's routing key.
+fn start_frame(env: &StartEnv) -> serde_json::Value {
+    let mut frame = serde_json::to_value(env).expect("a StartEnv is encodable");
+    frame
+        .as_object_mut()
+        .expect("an object")
+        .insert("type".to_string(), serde_json::json!("start"));
+    frame
+}
+
+/// Is `pid` a live process?
+///
+/// Unix: `kill(pid, 0)`, the only portable-within-unix way to ask (Linux has
+/// `/proc`, macOS does not, and this suite runs on both). A signal-0 send checks
+/// existence and permissions without touching the process.
+///
+/// ⚠ A ZOMBIE answers "alive" here — which is exactly the trap the task warns
+/// about ("the pid check alone would pass if the worker were merely slow to
+/// die"). Two things keep that from making the durability test vacuous: the
+/// caller polls this over a SUSTAINED window rather than once (a reaped child
+/// goes `ESRCH` within the window), and the row-count half is a separate,
+/// independent assertion.
+///
+/// Windows: `tasklist` filtered on the pid. **Compile-checked here, never run by
+/// this suite on this machine** — see the report; the Windows leg of CI is the
+/// first thing that will exercise it.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // 0 = "the process exists and we may signal it". `ESRCH` (gone) and
+        // `EPERM` (exists, not ours — cannot happen for our own child) are the
+        // only other answers, and `EPERM` is treated as alive because that is
+        // what it means.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output();
+        match out {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                // `tasklist` prints "INFO: No tasks are running which match the
+                // search criteria." when the pid is gone, and a CSV row naming
+                // the image when it is not.
+                text.lines().any(|line| line.contains(&format!(",{pid},")))
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// The engine's graceful-reap grace, plus its margin, as the floor for a
+/// "the child survived" observation window.
+///
+/// `WorkerManager::detach` does not SIGKILL — it runs `reap_worker`, which is
+/// `send_close` + a **2 s** grace + `kill` (`manager/registry.rs`). So a daemon
+/// that wrongly tears a session down when its client vanishes does not make the
+/// pid disappear at t≈0; it makes it disappear at **t≈2 s**.
+///
+/// This is the number a survival window has to clear. A window of 1.2 s — the
+/// value this file shipped with — sits entirely INSIDE that grace, so the
+/// plant experiment passed half (a) and only half (b) went red: the pid check
+/// was green for exactly the reason the task warns about, "the worker is merely
+/// slow to die". 5 s is 2.5× the grace, and it stays well inside the child's
+/// natural lifetime (the fixture loops back to reading stdin after a turn and
+/// only exits on `close` or EOF, and a dropped client socket does not close the
+/// child's stdin).
+///
+/// If the engine ever changes that grace, this constant and the plant
+/// experiment have to be re-measured together — a survival window shorter than
+/// the reap grace makes half (a) decorative.
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Poll `pid_is_alive` every `gap` until it reports dead, or the budget runs out.
+///
+/// Returns `true` only if the process was alive for the WHOLE window and still
+/// is at the end — the sustained form, because a single sample proves the child
+/// had not died YET, which is not the claim.
+async fn alive_throughout(pid: u32, window: Duration, gap: Duration) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        if !pid_is_alive(pid) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        // `tokio::time::sleep`, capped at the remaining budget. (There is no
+        // `tokio::stream_idle` — the name that was here described nothing.)
+        tokio::time::sleep(gap.min(left)).await;
+    }
+}
+
+/// `close` ends a session: the child exits.
+///
+/// This is the test that makes the durability test's pid assertion MEANINGFUL.
+/// Without it, "the pid was still alive after the disconnect" could be a
+/// property of a pid check that never reports false — the same way a detector
+/// that always fires and a detector that never fires both score 100% on one
+/// class. Here the same helper, on the same kind of process, reports dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_ends_the_session_and_the_child_exits() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let mut client = Client::dial(&endpoint).await;
+
+    client.send(serde_json::json!({"type": "hello"})).await;
+    let hello = client.recv_until("hello").await;
+    assert_eq!(
+        hello["protocolVersion"], PROTOCOL_VERSION,
+        "the daemon negotiates the worker protocol's version: {hello}"
+    );
+
+    let env = start_env("close-me", daemon._dir.path().to_str().unwrap());
+    client.send(start_frame(&env)).await;
+    let started = client.recv_until("start-result").await;
+    assert_eq!(
+        started["ok"], true,
+        "the session must start before it can be closed: {started}"
+    );
+    let pid = started["workerPid"]
+        .as_u64()
+        .expect("a started session reports its worker pid") as u32;
+    assert!(
+        pid_is_alive(pid),
+        "the child is alive right after `start-result`"
+    );
+
+    client
+        .send(serde_json::json!({"type": "close", "sessionId": "close-me"}))
+        .await;
+    let closed = client.recv_until("closed").await;
+    assert_eq!(closed["ok"], true, "closing a live session is ok: {closed}");
+
+    // The graceful reap is `close` + a 2 s grace + `kill`, so the bound is the
+    // engine's, plus the process-exit margin.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_is_alive(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !pid_is_alive(pid),
+        "a `close`d session's worker must exit (pid {pid} still alive) — if this \
+         fails, `close` is not reaching the Worker, and every pid-based \
+         assertion in this file is vacuous"
+    );
+
+    daemon.shutdown();
+}
+
+/// The daemon runs a session in a child process, streams its events to the
+/// socket, and persists it to `fulcrum.db`.
+///
+/// Three claims in one test because they are one mechanism: the frames that
+/// reach the socket are the frames the pump feeds to the persister, so a test
+/// that saw events without rows (or the reverse) would be describing a daemon
+/// that half-works. The row assertions are made through a SECOND connection to
+/// the file, so they are claims about the disk and not about a cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_streams_events_and_persists_to_the_database() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let mut client = Client::dial(&endpoint).await;
+
+    client.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(client.recv_until("hello").await["type"], "hello");
+
+    let env = start_env("persisted", daemon._dir.path().to_str().unwrap());
+    client.send(start_frame(&env)).await;
+    let started = client.recv_until("start-result").await;
+    assert_eq!(
+        started,
+        serde_json::json!({
+            "type": "start-result",
+            "sessionId": "persisted",
+            "ok": true,
+            // The pid is asserted separately (it is a live number, and the
+            // assertion that matters about it is `pid_is_alive`, below).
+            "workerPid": started["workerPid"],
+            "error": null,
+        }),
+        "`start` must answer with a well-formed result"
+    );
+    let pid = started["workerPid"].as_u64().expect("a pid") as u32;
+    assert!(
+        pid_is_alive(pid),
+        "the session runs in a CHILD process (pid {pid}), not in the daemon"
+    );
+
+    // A row for the session, before a single prompt: the daemon records it at
+    // `start`, so a session that spawned and then failed is still on disk.
+    let sessions = daemon
+        .read()
+        .prepare("SELECT id, cwd, is_subagent FROM sessions WHERE id = 'persisted'")
+        .expect("prepare")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .expect("query")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sessions,
+        vec![(
+            "persisted".to_string(),
+            daemon._dir.path().to_str().unwrap().to_string(),
+            0
+        )],
+        "the `sessions` row carries the cwd the client asked for and is a MAIN \
+         session row (is_subagent = 0)"
+    );
+
+    client
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": "persisted", "text": "hello world",
+        }))
+        .await;
+    let delivered = client.recv_until("prompt-result").await;
+    assert_eq!(
+        delivered["ok"], true,
+        "the prompt was relayed to the Worker: {delivered}"
+    );
+
+    // The event stream. The fixture's canned turn is
+    // `turn_start` → `message_start` → … → `display-upsert` → `turn_end` →
+    // `agent_settled`, so waiting for the settle proves the relay carried a
+    // whole turn and not just the first frame. The matcher CONSUMES every frame
+    // it scans past, so this walks the stream forward instead of re-reading its
+    // own first frame (which is what made this assertion time out before the
+    // harness was fixed).
+    let settled = client
+        .recv_until_matching("event", |frame| rpc_event_is(frame, "agent_settled"))
+        .await;
+    assert_eq!(
+        settled["isSubagent"], false,
+        "a client-started session is a main session: {settled}"
+    );
+
+    // The transcript rows. The fixture emits two `transcript-insert` frames per
+    // turn (the user row and the assistant row), and the persister is the only
+    // thing that writes this table — so two rows here is the pump → persister →
+    // SQLite path, end to end.
+    let rows: i64 = daemon
+        .read()
+        .query_row(
+            "SELECT COUNT(*) FROM native_messages WHERE session_id = 'persisted'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count native_messages");
+    assert!(
+        rows >= 2,
+        "the turn's two transcript rows must be on disk, got {rows} — an empty \
+         table means the pump's frames never reached the persister"
+    );
+    let display: i64 = daemon
+        .read()
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = 'persisted'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count messages");
+    assert!(
+        display >= 1,
+        "the `display-upsert` frame must land a display row, got {display}"
+    );
+
+    // The store frames reached the socket too (the client's own view of what was
+    // written — the desktop's renderer consumes these, and a daemon that only
+    // persisted them would leave a client unable to show the answer).
+    assert!(
+        client.delivered.iter().any(|frame| {
+            frame["type"] == "event"
+                && frame["frame"]["type"] == "store"
+                && frame["frame"]["frame"]["type"] == "transcript-insert"
+        }),
+        "the transcript frames must be relayed to the client, not only persisted"
+    );
+
+    daemon.shutdown();
+}
+
+/// THE durability test — the roadmap's `done-when`.
+///
+/// A client that vanishes mid-turn does not stop the session. Proven two ways,
+/// and BOTH are load-bearing:
+///
+/// * **The child is still alive.** Without this half, "rows kept growing" could
+///   be a session that had already finished normally before the socket closed.
+/// * **`native_messages` grew after the drop.** Without this half, "the pid is
+///   alive" could be a process that survived and then produced nothing — which
+///   is what a session that was merely slow to die looks like.
+///
+/// The mid-turn-ness is real, not asserted: the fixture's `__long_stream__`
+/// scenario streams for ~3 s and only writes its transcript rows at the END, so
+/// a drop taken after the first streamed chunk lands while the turn is
+/// demonstrably unfinished.
+///
+/// Deliberately absent: any claim that a SECOND connection can rejoin the
+/// stream. There is no wire frame for that (`WorkerManager::attach` is
+/// in-process, not a protocol frame) and T10 owns its design.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_vanishes_mid_turn_leaves_the_session_running_and_persisting() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let mut client = Client::dial(&endpoint).await;
+
+    client.send(serde_json::json!({"type": "hello"})).await;
+    client.recv_until("hello").await;
+
+    let env = start_env("survives-the-socket", daemon._dir.path().to_str().unwrap());
+    client.send(start_frame(&env)).await;
+    let started = client.recv_until("start-result").await;
+    assert_eq!(started["ok"], true, "the session starts: {started}");
+    let pid = started["workerPid"].as_u64().expect("a pid") as u32;
+
+    // The long turn: ~3 s of chunks, and the transcript rows only at the end.
+    client
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": "survives-the-socket", "text": "__long_stream__",
+        }))
+        .await;
+    client.recv_until("prompt-result").await;
+
+    // Wait for proof the turn is IN FLIGHT — a real streamed chunk, NOT merely
+    // "the first event". The fixture answers `start` with a `session_info`
+    // sink-frame, so the first event for a session exists whether or not a turn
+    // ever ran; matching on "is a sink-frame" is satisfied by that frame and
+    // would make this whole mid-turn claim vacuous. See
+    // [`agent_message_chunk_for`].
+    let first_chunk = client
+        .recv_until_matching("event", agent_message_chunk_for("survives-the-socket"))
+        .await;
+    assert_eq!(
+        first_chunk["isSubagent"], false,
+        "the streamed chunk belongs to the main session: {first_chunk}"
+    );
+    let rows_at_drop = daemon.count("native_messages");
+    assert_eq!(
+        rows_at_drop, 0,
+        "the fixture writes its transcript rows at the END of the stream, so a \
+         non-zero count here means the turn was already over when the socket was \
+         dropped and the durability claim would be vacuous"
+    );
+
+    // ── The disconnect. No `close`, no goodbye: the socket just goes. ────────
+    drop(client);
+
+    // (a) The child is alive, and stays alive for longer than a wrong teardown
+    // would take to look like death. A daemon that detaches on disconnect does
+    // not kill the child immediately — `reap_worker` waits out a 2 s grace — so
+    // a window shorter than that grace cannot see the bug. See [`REAP_GRACE`].
+    assert!(
+        alive_throughout(pid, REAP_GRACE, Duration::from_millis(100)).await,
+        "the worker child (pid {pid}) must still be running {REAP_GRACE:?} after \
+         its client's socket dropped — a client disconnect is not a session \
+         teardown, and this window must outlast the engine's 2 s reap grace or \
+         the assertion cannot tell 'survived' from 'slow to die'"
+    );
+
+    // (b) And it is not merely alive: it is still WORKING, which is observable as
+    // rows appearing in the file the daemon owns and nobody else can write.
+    let deadline = Instant::now() + ROW_BUDGET;
+    let mut rows = daemon.count("native_messages");
+    while rows <= rows_at_drop && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rows = daemon.count("native_messages");
+    }
+    assert!(
+        rows > rows_at_drop,
+        "`native_messages` must keep growing after the client vanished \
+         ({} rows at the drop, {rows} after {ROW_BUDGET:?}) — execution \
+         continued and persisted, which is the whole claim",
+        rows_at_drop
+    );
+    assert!(
+        pid_is_alive(pid),
+        "and the child is still alive at the end of it (pid {pid})"
+    );
+
+    // The session is still addressable, not a zombie the registry lost track of:
+    // a second client can `close` it, and the child goes.
+    let mut second = Client::dial(&endpoint).await;
+    second.send(serde_json::json!({"type": "hello"})).await;
+    second.recv_until("hello").await;
+    second
+        .send(serde_json::json!({
+            "type": "close", "sessionId": "survives-the-socket",
+        }))
+        .await;
+    let closed = second.recv_until("closed").await;
+    assert_eq!(
+        closed["ok"], true,
+        "the orphaned session is still registered with the manager, so it can \
+         still be closed deliberately: {closed}"
+    );
+
+    daemon.shutdown();
+}
+
+/// The multiplex: each client sees its own session and not the other's.
+///
+/// This is the one test that would fail if the fan-out filtered on nothing (the
+/// shape a single broadcast tempts you into), and it is the reason the fan-out is
+/// not simply "send everything to everyone".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sessions_on_two_sockets_do_not_see_each_others_events() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    let mut a = Client::dial(&endpoint).await;
+    let mut b = Client::dial(&endpoint).await;
+    for client in [&mut a, &mut b] {
+        client.send(serde_json::json!({"type": "hello"})).await;
+        client.recv_until("hello").await;
+    }
+
+    a.send(start_frame(&start_env("session-a", cwd))).await;
+    assert_eq!(a.recv_until("start-result").await["ok"], true, "a starts");
+    b.send(start_frame(&start_env("session-b", cwd))).await;
+    assert_eq!(b.recv_until("start-result").await["ok"], true, "b starts");
+
+    // `__long_stream__` so there is a stream to leak: 30 frames over ~3 s.
+    for (client, id) in [(&mut a, "session-a"), (&mut b, "session-b")] {
+        client
+            .send(serde_json::json!({
+                "type": "prompt", "sessionId": id, "text": "__long_stream__",
+            }))
+            .await;
+        client.recv_until("prompt-result").await;
+    }
+
+    // Each client's first event is its own session's…
+    let a_event = a.recv_event_for("session-a").await;
+    let b_event = b.recv_event_for("session-b").await;
+    assert_eq!(a_event["sessionId"], "session-a");
+    assert_eq!(b_event["sessionId"], "session-b");
+
+    // …and neither receives the other's, over a window long enough to catch a
+    // leak (the fixture streams every 100 ms, so 1 s is ~10 frames' worth of
+    // opportunity for a mis-filtered frame to show up).
+    let leak_window = Duration::from_millis(1000);
+    let a_extra = a.drain(leak_window).await;
+    let b_extra = b.drain(leak_window).await;
+    for (label, frames, own) in [
+        ("session-a's socket", &a_extra, "session-a"),
+        ("session-b's socket", &b_extra, "session-b"),
+    ] {
+        // Only frames that NAME a session can be another session's. The daemon's
+        // connection-addressed frames (`hello`, the `gap` notice) carry no
+        // `sessionId` and are legitimately present on every socket — treating
+        // them as leaks would make this assertion fire on correct behaviour.
+        if let Some(foreign) = frames.iter().find(|frame| {
+            frame
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id != own)
+        }) {
+            panic!(
+                "{label} received a frame for another session: {foreign} — the \
+                 fan-out filters on the TOP-LEVEL sessionId, and this is the \
+                 test that catches that filter being removed"
+            );
+        }
+    }
+
+    // One database, two sessions — the `Arc<Db>` shared by both client tasks
+    // rather than a handle each. Both rows are visible from one read.
+    let ids: Vec<String> = daemon
+        .read()
+        .prepare("SELECT id FROM sessions ORDER BY id")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["session-a".to_string(), "session-b".to_string()],
+        "both sessions are recorded in the ONE database"
+    );
+
+    daemon.shutdown();
+}
+
+/// Task 3's hazard, on the accept loop's side.
+///
+/// `transport::unix::reclaim_stale_socket` probes a live daemon's socket by
+/// CONNECTING to it, and that probe connection lands in the daemon's `accept()`
+/// backlog and EOFs with no frame — so every accidental second `fulcrum serve`
+/// (and every `curl`-style liveness check) hands the accept loop a connection
+/// that dies immediately. The loop must skip it and keep serving; a version that
+/// logged an error and returned from `run` would take the daemon down because
+/// somebody typed the command twice.
+///
+/// NOT unix-gated any more. The probe's SHAPE — connect, then hang up without a
+/// byte — is produced by `transport::connect` plus a `drop`, which is the
+/// platform-neutral dial, so the hazard is testable on both legs. It was
+/// `#[cfg(unix)]` only because it reached for `UnixStream` to build a socket the
+/// transport could already build; keeping it that way would have left the accept
+/// loop's most important survival property unexercised on Windows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_connection_that_sends_nothing_does_not_disturb_the_daemon() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+
+    // Three probe-shaped connections: connect, then hang up without a byte.
+    for _ in 0..3 {
+        let probe = connect(endpoint.clone()).await.expect("probe connects");
+        drop(probe);
+    }
+
+    // A real client, after the probes: full handshake, session, prompt, event.
+    let mut client = Client::dial(&endpoint).await;
+    client.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(
+        client.recv_until("hello").await["type"],
+        "hello",
+        "the accept loop must still be serving after empty connections"
+    );
+
+    let env = start_env("after-probes", daemon._dir.path().to_str().unwrap());
+    client.send(start_frame(&env)).await;
+    let started = client.recv_until("start-result").await;
+    assert_eq!(
+        started["ok"], true,
+        "a session after three probe connections must start: {started}"
+    );
+    client
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": "after-probes", "text": "hi",
+        }))
+        .await;
+    assert_eq!(
+        client.recv_until("prompt-result").await["ok"],
+        true,
+        "and relay a prompt"
+    );
+    client.recv_event_for("after-probes").await;
+
+    daemon.shutdown();
+}
+
+/// A second `serve` on the same endpoint must fail LOUDLY, and must not disturb
+/// the first.
+///
+/// This is the other half of the same interaction: Task 3 chose to refuse rather
+/// than steal a live daemon's socket, and the refusal arrives at the accept loop
+/// as the probe connection the test above covers. The daemon that keeps running
+/// is the claim; the exit code is how the operator learns they typed it twice.
+///
+/// Split by platform on PURPOSE, and only for the wording. The two claims that
+/// hold on both legs — "the second daemon refuses" and "the first is
+/// undisturbed" — are asserted unconditionally. The refusal's TEXT is platform
+/// vocabulary: unix refuses with the `EADDRINUSE` / "a live daemon is answering"
+/// path (`transport::unix::reclaim_stale_socket`), Windows with
+/// `CreateNamedPipeW`'s `PermissionDenied` from `first_pipe_instance(true)`
+/// (`transport::windows::Listener::bind`). Asserting unix's string on Windows
+/// would be asserting a message this machine has never seen, so the substring
+/// check is gated and the Windows leg is left with the claims that are actually
+/// platform-neutral.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_daemon_on_the_same_endpoint_exits_non_zero_and_leaves_the_first_running() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+
+    let mut second = Command::new(BIN);
+    second.arg("serve");
+    #[cfg(unix)]
+    second.arg("--socket");
+    #[cfg(windows)]
+    second.arg("--pipe");
+    let out = second
+        .arg(endpoint_path_str(&endpoint))
+        .arg("--db")
+        .arg(daemon._dir.path().join("other.db"))
+        .arg("--worker-exe")
+        .arg(worker_fixture())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // Piped, not inherited: this test WANTS to read the refusal, and the
+        // first daemon's stderr is the one the operator would otherwise see.
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the second daemon");
+    assert!(
+        !out.status.success(),
+        "a second daemon on a live endpoint must not start quietly: {}",
+        out.status
+    );
+    let message = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !message.trim().is_empty(),
+        "and must say SOMETHING on stderr — a silent refusal is how an operator \
+         concludes the command worked: {message:?}"
+    );
+    #[cfg(unix)]
+    assert!(
+        message.contains("in use"),
+        "on unix it must name the collision (the operator needs to know a daemon \
+         is already there): {message:?}"
+    );
+
+    // The first daemon is undisturbed.
+    let mut client = Client::dial(&endpoint).await;
+    client.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(
+        client.recv_until("hello").await["type"],
+        "hello",
+        "the surviving daemon must still serve"
+    );
+    daemon.shutdown();
+}
+
+/// A frame the daemon does not understand is answered, not fatal.
+///
+/// The daemon's surface will grow (T10 adds `attach`), and a newer client will
+/// outpace an older daemon. Permissive about the CONNECTION, precise about the
+/// FRAME — the same rule the worker protocol's decoder runs by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_frame_is_answered_and_the_connection_survives() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let mut client = Client::dial(&endpoint).await;
+
+    client.send(serde_json::json!({"type": "hello"})).await;
+    client.recv_until("hello").await;
+
+    client
+        .send(serde_json::json!({"type": "attach", "sessionId": "nope"}))
+        .await;
+    let error = client.recv_until("error").await;
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("attach")),
+        "the error must name the frame it rejected: {error}"
+    );
+
+    // Still usable: a real session starts on the same connection.
+    let env = start_env("still-here", daemon._dir.path().to_str().unwrap());
+    client.send(start_frame(&env)).await;
+    assert_eq!(
+        client.recv_until("start-result").await["ok"],
+        true,
+        "the connection must survive an unknown frame"
+    );
+    daemon.shutdown();
+}
+
+/// A malformed line is an error item, not a closed stream (`transport::frame`'s
+/// rule, asserted at the daemon end rather than the transport end).
+///
+/// The garbage has to be written RAW — through `Connection::send_frame` it would
+/// be serialized and therefore always valid — so this reaches past the framing
+/// layer to the platform's own stream, which is what `tests/transport.rs` does
+/// for the same reason ("widening the public API with a `send_raw` for test
+/// convenience would be the dishonest way"). It goes through [`raw_dial`] rather
+/// than `UnixStream` directly so the Windows leg compiles the same probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_line_gets_an_error_and_the_stream_continues() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let mut client = Client::dial(&endpoint).await;
+
+    let (read_half, mut write_half) = tokio::io::split(raw_dial(&endpoint).await);
+    write_half
+        .write_all(b"this is not json\n")
+        .await
+        .expect("write garbage");
+    write_half.flush().await.expect("flush");
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).await.expect("read the reply");
+    assert!(read > 0, "the daemon must answer garbage, not hang up");
+    let reply: serde_json::Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("the reply must be a JSON error frame: {line:?} ({e})"));
+    assert_eq!(reply["type"], "error", "garbage gets an error: {reply}");
+
+    // And the daemon still serves a framed client afterwards.
+    client.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(
+        client.recv_until("hello").await["type"],
+        "hello",
+        "one malformed line must not cost the daemon its next client"
+    );
+    daemon.shutdown();
+}
+
+/// A client that starts a session and then goes away does NOT leave the daemon
+/// unable to serve the next client — the "resource cleanup" half of the same
+/// design decision the durability test covers from the other side.
+///
+/// Two full start/prompt/disconnect/reconnect cycles, in sequence, on one
+/// daemon. A per-connection task that leaked its session's subscription would
+/// still pass the durability test; it fails this one if the leak is a deadlock
+/// or a blocked fan-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_disconnects_do_not_degrade_the_daemon() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    for round in 0..3 {
+        let id = format!("round-{round}");
+        let mut client = Client::dial(&endpoint).await;
+        client.send(serde_json::json!({"type": "hello"})).await;
+        client.recv_until("hello").await;
+        client.send(start_frame(&start_env(&id, cwd))).await;
+        let started = client.recv_until("start-result").await;
+        assert_eq!(started["ok"], true, "round {round} starts: {started}");
+        client
+            .send(serde_json::json!({
+                "type": "prompt", "sessionId": id, "text": "hi",
+            }))
+            .await;
+        client.recv_until("prompt-result").await;
+        client.recv_event_for(&id).await;
+        // Gone, mid-everything.
+        drop(client);
+
+        // The next round's `hello` must still be answered promptly. The budget
+        // is short on purpose: a fan-out or accept loop degraded by a leak shows
+        // up as SLOWNESS first, and a 30 s budget would absorb it.
+        let mut next = Client::dial(&endpoint).await;
+        let dialed = Instant::now();
+        next.send(serde_json::json!({"type": "hello"})).await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), next.conn.recv())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the daemon stopped answering"))
+            .expect("not EOF")
+            .expect("valid JSON");
+        assert_eq!(reply["type"], "hello");
+        assert!(
+            dialed.elapsed() < Duration::from_secs(5),
+            "round {round}: the daemon answered in {:?}, which is not 'promptly'",
+            dialed.elapsed()
+        );
+        // Close the round's session so the fixture children do not pile up for
+        // the next round (this is what `close` is FOR).
+        next.send(serde_json::json!({"type": "close", "sessionId": id}))
+            .await;
+        next.recv_until("closed").await;
+    }
+
+    assert_eq!(
+        daemon.spawn_count(),
+        3,
+        "three rounds, three session rows in the one database"
+    );
+    daemon.shutdown();
+}
+
+/// The daemon does not buffer forever for a client that stopped reading.
+///
+/// A stalled client is normal (a laptop asleep); the fan-out is bounded, and the
+/// shape a bounded ring produces is a `gap` notice, not an unbounded allocation
+/// and not a stalled pump. This test asserts the DAEMON survives it, which is the
+/// claim; the exact lag count is timing-dependent and deliberately not asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_never_reads_does_not_stall_the_daemon() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    // The stalled client: starts a session, then never calls `recv` again.
+    let mut stalled = Client::dial(&endpoint).await;
+    stalled.send(serde_json::json!({"type": "hello"})).await;
+    stalled.recv_until("hello").await;
+    stalled.send(start_frame(&start_env("stalled", cwd))).await;
+    assert_eq!(stalled.recv_until("start-result").await["ok"], true);
+    stalled
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": "stalled", "text": "__long_stream__",
+        }))
+        .await;
+    stalled.recv_until("prompt-result").await;
+    // …and now it reads nothing at all, while the session streams.
+
+    // A healthy client, on a second session, gets its whole turn while the first
+    // client is stalled. This is the claim: one slow consumer cannot starve the
+    // fan-out.
+    let mut healthy = Client::dial(&endpoint).await;
+    healthy.send(serde_json::json!({"type": "hello"})).await;
+    healthy.recv_until("hello").await;
+    healthy.send(start_frame(&start_env("healthy", cwd))).await;
+    assert_eq!(healthy.recv_until("start-result").await["ok"], true);
+    healthy
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": "healthy", "text": "hi",
+        }))
+        .await;
+    healthy.recv_until("prompt-result").await;
+
+    // One wait, not a poll loop: `recv_until_matching` already carries the
+    // deadline and consumes every frame it scans past, so the loop this replaces
+    // was both a second timeout stacked on the helper's and a matcher that could
+    // never fire (see [`rpc_event_is`]).
+    let settled = healthy
+        .recv_until_matching("event", |frame| rpc_event_is(frame, "agent_settled"))
+        .await;
+    assert!(
+        settled["sessionId"] == "healthy",
+        "a stalled client must not stop another session's stream from arriving: {settled}"
+    );
+
+    // And the stalled session persisted its own turn regardless.
+    let rows: i64 = daemon
+        .read()
+        .query_row(
+            "SELECT COUNT(*) FROM native_messages WHERE session_id = 'stalled'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    let deadline = Instant::now() + ROW_BUDGET;
+    let mut rows = rows;
+    while rows < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rows = daemon
+            .read()
+            .query_row(
+                "SELECT COUNT(*) FROM native_messages WHERE session_id = 'stalled'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+    }
+    assert!(
+        rows >= 2,
+        "the stalled session's rows must land anyway ({rows}) — persistence is \
+         not gated on a client keeping up"
+    );
+
+    daemon.shutdown();
+}
+
+/// A `prompt` for a session nothing runs is answered, and the daemon keeps
+/// serving. The client's error path needs a frame to react to; a silent drop or
+/// a closed socket would be indistinguishable from a network fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prompt_for_an_unknown_session_is_answered_not_dropped() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let mut client = Client::dial(&endpoint).await;
+    client.send(serde_json::json!({"type": "hello"})).await;
+    client.recv_until("hello").await;
+
+    client
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": "never-started", "text": "hi",
+        }))
+        .await;
+    let reply = client.recv_until("prompt-result").await;
+    assert_eq!(reply["ok"], false, "an unknown session is not ok: {reply}");
+    assert!(reply["error"].is_string(), "and it says why: {reply}");
+
+    // Nothing was written for a session that never ran.
+    assert_eq!(
+        daemon.count("sessions"),
+        0,
+        "a prompt alone must not create a session row"
+    );
+
+    // A second `start` for a session that is ALREADY running is refused rather
+    // than silently re-attached (a second `attach` on one id would replace the
+    // registry entry and orphan the first child process — the one real way to
+    // leak a Worker).
+    let env = start_env("once", daemon._dir.path().to_str().unwrap());
+    client.send(start_frame(&env)).await;
+    assert_eq!(client.recv_until("start-result").await["ok"], true);
+    client.send(start_frame(&env)).await;
+    let second = client.recv_until("start-result").await;
+    assert_eq!(
+        second["ok"], false,
+        "a duplicate `start` must be refused, not re-attached: {second}"
+    );
+    assert!(
+        second["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("already")),
+        "and must say so: {second}"
+    );
+
+    daemon.shutdown();
+}
+
+/// `try_recv` exists so a test can assert silence; this pins that it actually
+/// observes the absence of a frame, so the "no leak" assertions above are not
+/// vacuously passing on a helper that always returns `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_client_receives_nothing_before_it_starts_anything() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    // One client with a running session, streaming.
+    let mut busy = Client::dial(&endpoint).await;
+    busy.send(serde_json::json!({"type": "hello"})).await;
+    busy.recv_until("hello").await;
+    busy.send(start_frame(&start_env("busy", cwd))).await;
+    busy.recv_until("start-result").await;
+    busy.send(serde_json::json!({
+        "type": "prompt", "sessionId": "busy", "text": "__long_stream__",
+    }))
+    .await;
+    busy.recv_until("prompt-result").await;
+    busy.recv_event_for("busy").await;
+
+    // A second client that has only said `hello`: it must see NOTHING, while the
+    // first session is actively streaming. If this ever returns a frame, the
+    // "no leak" assertions elsewhere in this file are testing a helper that
+    // cannot see one.
+    let mut idle = Client::dial(&endpoint).await;
+    idle.send(serde_json::json!({"type": "hello"})).await;
+    let hello = idle.recv_until("hello").await;
+    assert_eq!(hello["type"], "hello");
+    let silence = idle.try_recv(Duration::from_millis(1500)).await;
+    assert!(
+        silence.is_none(),
+        "a client that started nothing must receive nothing, got {silence:?}"
+    );
+
+    daemon.shutdown();
+}
