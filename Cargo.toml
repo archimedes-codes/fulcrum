@@ -22,27 +22,53 @@
 # today only because the walk never reaches the manifest dir. Write the form that
 # is true, not the form that happens not to be read.
 #
-# ⚠ MEASURED CONSEQUENCE OF KEEPING `[package]` HERE (T9 Task 1, measured, not
-# reasoned about): because the workspace root IS also a package, cargo resolves
-# `workspace_default_members` to `fulcrum-core` ALONE — `cargo metadata` reports
-# exactly one default member. So the BARE forms of the gates, which is what
-# `ci.yml` runs (`cargo test`, `cargo clippy --all-targets -- -D warnings`) and
-# what `scripts/check-rquickjs-allocator.sh` runs (`cargo tree -e features`), are
-# PACKAGE-scoped to the engine and do NOT reach this workspace's other member.
-# Measured: with a planted `E0308` in `fulcrum/src/transport/frame.rs`, bare
-# `cargo clippy --all-targets -- -D warnings` exits 0; `cargo tree -e features`
-# prints `fulcrum-core` only and zero `rusqlite` lines, while the `--workspace`
-# form prints the member and 6. The member IS covered by the `--workspace` forms
-# (both clippy gates and `cargo test --workspace` compile and lint `fulcrum`, and
-# the census is unaffected — it reads manifests, not cargo's default set). This is
-# a CONSEQUENCE OF THE FORCED LAYOUT, not a mistake in it: the alternative is
-# Layout B, which the census panics on. Widening `ci.yml` to `--workspace` is the
-# fix and is deliberately NOT taken here — Task 1 converts the layout and nothing
-# else, and changing what CI gates is the orchestrator's call, not a side effect
-# of a conversion commit.
+# `default-members` lists BOTH packages, and it is load-bearing: it is what makes
+# the BARE forms of the gates reach the daemon member. Left to itself, a root that
+# is also a package makes cargo resolve `workspace_default_members` to
+# `fulcrum-core` ALONE (`cargo metadata` reported exactly one default member), so
+# every command that does not name a package — `ci.yml`'s `cargo test` and
+# `cargo clippy --all-targets -- -D warnings`,
+# `scripts/check-rquickjs-allocator.sh`'s `cargo tree -e features`, and whatever a
+# developer types locally — was PACKAGE-scoped to the engine and compiled the
+# daemon not at all. Measured both ways, with a planted
+# `E0308` in `fulcrum/src/transport/frame.rs` (a module `main.rs` never
+# references): before, bare clippy exited 0 while `--workspace` exited 101; after,
+# bare clippy exits 101 on the same error and exits 0 once the stub is restored,
+# and a bare `cargo test` runs `fulcrum`'s lib target and fails on a planted
+# `#[test]` there. Dropping this line therefore does not fail anything — it
+# silently UN-GATES the member, producing exactly the green-that-checked-nothing
+# this repo refuses elsewhere (`check-rquickjs-allocator.sh`'s vacuous `-p` form,
+# `childproc.rs`'s blind-census witnesses).
+#
+# Fixing it here rather than by adding `--workspace` to `ci.yml` is
+# deliberate: the manifest fixes every bare invocation at once, CI's steps
+# included, while widening only CI leaves the developer's local `cargo test`
+# blind — the exact trap that caught us. Do NOT "also" add `--workspace` to CI on
+# top of this; two mechanisms for one guarantee leaves a reader unable to tell
+# which is load-bearing.
+#
+# `"."` is the form used above, and it is accepted: `cargo metadata` resolves it
+# to the root package, giving two default members. Unlike `members`, where a root
+# `[package]` is pulled in implicitly and `"."` buys nothing, `default-members`
+# contains no implicit anything — a package absent from it is simply not built by
+# a bare command — so the root has to be spelled out, and `"."` is the path form
+# that reads as obviously-intentional. Note the `"."` ban above is NOT a cargo
+# syntax rule: measured, cargo accepts `"."` in `members` as well and dedupes it
+# against the implicit root member, leaving the member list unchanged. The ban
+# there is the census reason above, nothing more. And `default-members` IS
+# validated — a name there that is not a member is a hard cargo error, not a
+# silent no-op — so this line cannot rot into naming nothing.
+#
+# The census is unaffected by any of this: it reads manifests, not cargo's default
+# set, and `declaring_workspace_root` walks ancestors only — it never opens THIS
+# manifest at all. Verified, not reasoned: the census stays at 10 passed / 1392
+# filtered with `the_two_layout_witnesses_agree` green, and all 9 `boundary_pins`
+# pass with `default-members` present (the manifest pin matches key NAMES against
+# forbidden crate names, so a workspace key cannot trip it).
 [workspace]
 resolver = "2"
 members = ["fulcrum"]
+default-members = [".", "fulcrum"]
 
 [package]
 name = "fulcrum-core"
