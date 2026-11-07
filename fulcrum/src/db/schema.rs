@@ -417,11 +417,15 @@ pub(crate) fn schema_shape_sections() -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// The full pin text: [`schema_shape_sections`], one line per entry, each line
+/// The full pin text: `schema_shape_sections()`, one line per entry, each line
 /// `\n`-terminated. Byte-identical to `schema-sha.txt` with comment lines and blank
 /// lines stripped (the integration test
 /// `the_pinned_schema_fingerprint_matches_the_shipped_file` in `fulcrum/tests/db.rs`
 /// asserts exactly that).
+///
+/// The link above is deliberately NOT an intra-doc link: `schema_shape_sections` is
+/// `pub(crate)` — nothing outside this module calls it — and `rustdoc` warns on a
+/// public item linking to a private one.
 pub fn schema_shape_fingerprint() -> String {
     let mut out = String::new();
     for (name, lines) in schema_shape_sections() {
