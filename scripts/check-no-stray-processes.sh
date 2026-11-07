@@ -132,26 +132,50 @@
 # than report clean.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# macOS RUN-SCOPING IS UNVERIFIED ON THE MACHINE THAT WROTE THIS — SO THE RULE IS
-# "REFUSE, NEVER CERTIFY"
+# macOS ENV READS WORK. THE SECTION THAT USED TO SAY OTHERWISE WAS DESCRIBING A
+# BUG IN THIS SCRIPT'S OWN PARSER, AND THE BUG IS NOW FIXED.
 # ─────────────────────────────────────────────────────────────────────────────
-# This script was written on Linux; no macOS behaviour was measured here. What it
-# does on macOS: it attempts the BSD env read `ps eww -o pid=,args= -p <pid>` (the
-# `pid=`-only spelling is broken on EVERY platform — with no args/comm column there
-# is no env in the output at all), and before trusting any "no marker here" answer
-# it runs a CONTROL PROBE on its own pid, which is marker-bearing by construction:
-# if the census cannot read ITS OWN environment then this platform blocks env reads,
-# and the census EXITS 2 rather than certify a table it could not read. A candidate
-# whose env cannot be read is `unreadable` and also exits 2 — "could not look" is
-# never "clean".
-# UNVERIFIED here, wants a macOS spot-check: whether `ps eww` prints another
-# user-process's env at all under SIP / proc_security; whether BSD `ps` accepts `-e`
-# as "all processes"; whether the env suffix is truncated for large environments.
-# Reserved fallback spelling: `ps e -o pid=,args=`. The failure class these rules
-# exist to make impossible is a macOS leg that PASSES because it could not look.
+# This section used to say macOS run-scoping was UNVERIFIED and that `ps eww`
+# probably cannot read another process's environment under SIP / proc_security. That
+# is now KNOWN FALSE and the claim has been removed rather than softened. Measured on
+# macos-latest, for the census's own marker-bearing pid:
+#     ps eww -o pid=,args= -p <pid>   exit=0  bytes=5443  marker PRESENT in raw output
+#     single-match extracted 1 var; multi-match found the marker (109 vars)
+# The platform answered the read on the first try. What failed was the extraction:
+# BSD `ps` prints argv AND THE ENTIRE ENVIRONMENT ON ONE LINE (5443 chars, ZERO
+# newlines), and `env_from_ps_eww` ran ONE `[[ =~ ]]` per line, so BASH_REMATCH held
+# the first env-shaped token (`GITHUB_JOB=probe`) and never reached the marker ~100
+# vars later. See `ps_eww_env_vars` for the fix and Case S for the pin. Linux never
+# showed it because env_from_procfs reads /proc/<pid>/environ NUL-split — one var per
+# line, no regex at all — and that asymmetry is exactly why it shipped green locally.
+#
+# WHAT IS STILL TRUE, AND IS THE PART THAT MATTERS: the refusal posture is unchanged.
+# The control probe still runs on the census's own pid before any "no marker here"
+# answer is trusted, a candidate whose provenance cannot be read is still `unreadable`
+# and still exits 2, and a macOS leg still cannot certify a table it could not read.
+# What changed is only that "extraction found nothing" and "the platform refused the
+# read" are now DIFFERENT states with different messages — the old code printed the
+# SIP speech for both, which meant the one failure macOS actually hit was blamed on a
+# security policy that was never involved. Fixing a misdiagnosis must not buy a
+# weaker guard, so every branch added here still ends in exit 2.
+#
+# INVOCATION NOTES, MEASURED (do not "simplify" these):
+#   * `ps eww -o pid=,args= -p <pid>` — the per-pid form — WORKS on macOS (exit 0)
+#     and on Linux. This is the census's spelling and it stays.
+#   * `ps eww -eo pid=,args=` (whole table) EXITS 1 with 0 BYTES on macOS: BSD `e`
+#     means "all USERS", not "environment". There the env flag is `-E`, which Linux
+#     rejects as `unsupported SysV option`. So there is no single whole-table spelling
+#     that reads env on both platforms; per-pid is the only shared one.
+#   * `ps eww -o pid= -p <pid>` (no `args=`) prints the number and NOTHING else on
+#     every platform: no args column, no env in the output at all.
+#   * whether the env suffix is TRUNCATED for very large environments is still
+#     unmeasured; the extraction bound above turns that into a refusal
+#     (`env-truncated`) rather than a silent short answer.
+# The failure class these rules exist to make impossible is still a macOS leg that
+# PASSES because it could not look.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# macOS LINEAGE AND ZOMBIE REAPING: IMPLEMENTED, AND STILL THE WEAKER PROOF
+# macOS LINEAGE AND ZOMBIE REAPING: IMPLEMENTED ON BOTH ARMS, AND PROVEN ON BOTH
 # ─────────────────────────────────────────────────────────────────────────────
 # Two mechanisms here used to be Linux-only in disguise. `resolve_lineage` read
 # `/proc/<pid>/status`, which does not exist on macOS, so on Darwin the ancestor loop
@@ -164,11 +188,16 @@
 # (--lineage-arm-ps) and re-runs Case L's shape through it, so the arm macOS takes is
 # proven somewhere rather than asserted about a platform nobody measured.
 # WHICH PROOF IS REAL, PLAINLY: every case in this harness except the ones that probe
-# `ps eww` ran on Linux. The lineage/zombie MECHANISM is now proven on both arms; the
-# macOS ENV READ is still unverified (see the section above), so a macOS leg can still
-# only refuse, never certify. What changed is that macOS can no longer silently lose
-# the parent-protection and zombie-reaping behaviour — it either works or Case R is
-# red.
+# the LIVE `ps eww` read ran on Linux — but the macOS env read is no longer one of the
+# unproven things (see the section above: it was measured working on macos-latest, and
+# the failure there was this script's parser, not the platform). Case S now feeds the
+# SHIPPED parser a captured one-line macOS-shaped read on any box, so the arm macOS
+# takes is exercised in CI rather than asserted about a platform nobody tested. The
+# lineage/zombie MECHANISM is proven on both arms via Case R. What genuinely remains
+# unmeasured is narrower than what this file used to claim: whether a huge environment
+# gets TRUNCATED by BSD ps, which the extraction bound turns into a refusal. What
+# changed with the parent_of split is that macOS can no longer silently lose the
+# parent-protection and zombie-reaping behaviour — it either works or Case R is red.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # EXIT-CODE CONTRACT
@@ -186,6 +215,17 @@
 #      (CENSUS_MODE / CENSUS_FIXTURE_DIR / CENSUS_INPUT / CENSUS_PLATFORM) — which
 #      would otherwise let it read a mock and report clean. Refusing is never the
 #      same as clean.
+#      "PROVENANCE COULD NOT BE READ" now names FOUR states, so a refusal can be
+#      diagnosed from the log without guessing: `unreadable` (the read itself failed —
+#      the only one a blocked platform produces), `gone` (the pid vanished mid-read),
+#      `no-env-in-output` (ps answered, and its output held no NAME=VALUE at all —
+#      almost always a missing `args=` column, i.e. a bug HERE, not a policy THERE),
+#      and `env-truncated` (the read was larger than the extraction bound, so the list
+#      is incomplete and the marker could be past the cut). All four refuse; the
+#      exit code is identical and has NOT been extended — only the reason printed
+#      alongside it got honest. And the macOS control probe's own failure carries the
+#      fifth state, `no-marker-in-own-env`, which after the parser fix means what it
+#      literally says: the environment was read in full and did not carry the marker.
 # Anything else is the tool's own failure.
 #
 # The seam split in two directions, deliberately: a self-test-only FLAG on the live
@@ -208,11 +248,24 @@
 #                    never a second implementation of the matching logic)
 #   --keep-temp-dir  leave the self-test's scratch directory in place to inspect
 #
+# THE SELF-TEST SKIPS, AND WHAT A SKIP COSTS. Four cases plant real processes and so
+# need real tooling: I (ps -eo, a copyable sleep, setsid), M (the same, plus python3),
+# L (a renamable bash), R (L's plant, plus /proc). Where a dependency is missing the
+# case records itself in the skip ledger and says so on STDERR; it does NOT fail (a
+# missing tool is not a census defect) and it does NOT pass (an unproven case is not a
+# behaved one). Under CI=true a skip is exit 1 — on a runner an unproven case is
+# indistinguishable from a deleted one. Off CI it stays a loud note. The summary line
+# `skip summary: N case(s) …` prints EVERY run, including N=0, so "which cases did not
+# run" is answerable from any log. Cases are gated INDIVIDUALLY: macOS has no setsid,
+# so I and M skip there while L and R still run, and a blanket guard would have thrown
+# away the lineage coverage that macOS genuinely can provide.
+#
 # The live census takes no input options at all. `--input`/`--fixture-dir`/
-# `--platform`/`--census`/`--enumerate-only`/`--meta-skip`/`--lineage-arm-ps` exist
-# ONLY inside `--self-test` and are rejected otherwise (exit 1): the live path must
-# never read a mock instead of the real process table. That is the flag half of the
-# vacuity floor, and self-test Case H pins it.
+# `--platform`/`--census`/`--enumerate-only`/`--meta-skip`/`--lineage-arm-ps`/
+# `--ps-env-parse` exist ONLY inside `--self-test` and are rejected otherwise (exit 1):
+# the live path must never read a mock instead of the real process table. That is the
+# flag half of the vacuity floor, and self-test Case H pins it (Case S pins the same
+# floor for `--ps-env-parse`, which reads a file too).
 # The ENVIRONMENT half is the same floor, and it used to be missing: CENSUS_MODE /
 # CENSUS_FIXTURE_DIR / CENSUS_INPUT / CENSUS_PLATFORM reach the same fixture seam from
 # the environment, and were ungated on the live path — so
@@ -481,10 +534,15 @@ is_self_pid() {
 #   CENSUS_MODE=live      Linux: /proc/<pid>/environ (readable by a same-user
 #                         sibling when ptrace_scope=0; FAILS with ENOENT for a
 #                         zombie, which ps still lists — measured).
-#                         macOS: `ps eww -o pid=,args= -p <pid>` (UNVERIFIED here —
-#                         see the header). A read that yields no NAME=VALUE text at
-#                         all is treated as UNREADABLE, i.e. the conservative
-#                         direction: refuse, never certify.
+#                         macOS: `ps eww -o pid=,args= -p <pid>` — MEASURED WORKING on
+#                         macos-latest (exit 0, 5443 bytes, marker present); BSD puts
+#                         argv AND the whole environment on ONE line, which is what
+#                         `ps_eww_env_vars` exists to parse. A read that yields no
+#                         NAME=VALUE text at all is `no-env-in-output` and a read past
+#                         the extraction bound is `env-truncated`; both are REFUSALS,
+#                         i.e. the conservative direction — refuse, never certify —
+#                         but neither is reported as a blocked platform any more,
+#                         because neither one is.
 ENV_LINES=()
 ENV_STATE="unreadable"
 
@@ -496,6 +554,18 @@ env_from_fixture() {
   # outright without one). CENSUS_FIXTURE_CONTROL_UNREADABLE=1 emulates a platform
   # that will not let the census read even itself — the macOS failure shape Case K
   # pins. The LIVE control probe (no fixture) reads the real /proc/<pid>/environ.
+  #
+  # CENSUS_FIXTURE_CONTROL_STATE=<state> pins a SPECIFIC control-probe failure
+  # instead of the one generic `unreadable`. It exists because the refusal MESSAGE now
+  # branches on the state, and each branch carries a different diagnosis: the old text
+  # blamed SIP / proc_security for every one of them, including the branch the macOS
+  # runner actually hit (`no-marker-in-own-env`, where nothing was blocked). Without
+  # this knob no case can reach those branches — the live macOS reader cannot run on
+  # Linux — and a message nobody can test is a message that rots.
+  if [[ -n "${CENSUS_FIXTURE_CONTROL_STATE:-}" && "$pid" == "$CENSUS_PID" ]]; then
+    ENV_STATE="$CENSUS_FIXTURE_CONTROL_STATE"
+    return 1
+  fi
   if [[ -n "${CENSUS_FIXTURE_CONTROL_UNREADABLE:-}" && "$pid" == "$CENSUS_PID" ]]; then
     ENV_STATE="unreadable"
     return 1
@@ -562,13 +632,121 @@ env_from_procfs() {
   return 0
 }
 
+# How many NAME=VALUE fields one `ps eww` read may yield before the extraction gives
+# up. A defensive bound ONLY: a real CI environment is ~100 vars (measured on
+# macos-latest: 109). The bound exists so a pathological line cannot occupy the census,
+# which runs at the END of a CI job where a hang is worse than a refusal.
+# Reaching it is a REFUSAL (`env-truncated`), never a shorter answer — a list that was
+# cut off could have held the marker further along, and reporting "not this run's" from
+# a truncated list is the same false clean this cap exists to prevent.
+ENV_PS_MAX_VARS=4096
+
+# ps_eww_env_vars <text> — pull every `NAME=VALUE` field out of one `ps eww` read.
+# Result lands in ENV_PS_VARS (one `NAME=VALUE` per line) and, if the bound was hit
+# while fields were still unread, ENV_PS_TRUNCATED=1. Both are GLOBALS on purpose: a
+# function cannot return a list and a status at once, and reading the list through
+# `$(…)` would run it in a subshell, where the truncation flag could not reach the
+# caller — a refusal that silently fails to propagate is the worst kind of lie.
+#
+# WHY THIS IS A LOOP AND NOT ONE MATCH (the bug this replaces). macOS/BSD `ps` prints
+# argv AND THE ENTIRE ENVIRONMENT ON ONE LINE — measured on macos-latest: 5443 chars,
+# ZERO newlines, marker present in the raw output. The old body ran a single
+# `if [[ "$line" =~ … ]]` per line and read BASH_REMATCH, which holds only the FIRST
+# match, so on a 5 KB single-line read it captured `GITHUB_JOB=probe` (the first
+# env-shaped token) and never reached the marker ~100 vars later. The census then
+# reported `no-marker-in-own-env` for its OWN marker-bearing pid and refused, blaming
+# SIP. Linux never showed this because env_from_procfs reads
+# `/proc/<pid>/environ` NUL-split — one var per line, no regex at all — and that
+# asymmetry is exactly why this shipped green locally.
+#
+# WHY THE LOOP SPLITS ON WHITESPACE INSTEAD OF RE-MATCHING THE REST. The obvious
+# exhaustion loop is `rest="${rest#*"$match"}"` — and NOT `rest="${rest#"$match"}"`,
+# which strips only a PREFIX: the match sits mid-line, `rest` never shrinks, and the
+# loop spins forever (that is the draft that had to be killed at a 120s timeout). The
+# `#*` form is CORRECT — it returns the identical 109-var list — but it is quadratic
+# here, because an unanchored `[[:space:]]NAME=` match re-scans the whole remainder on
+# every single extraction. Measured on a 52 KB single line, both spellings, same 4096
+# bound: strip-with-`#*` 14s, split-then-anchored-test 0.23s. Both agree on the real
+# 6.1 KB macOS fixture (109 vars, marker found, 15ms vs 42ms), so this is purely about
+# what happens when the bound is the thing being tested — and a bound that costs
+# seconds-to-minutes to reach is not the hang-proof it was added to be, on a script
+# that runs at the END of a CI job.
+#
+# THE ARGV HALF OF THE RULE IS PRESERVED, AND IT IS LOAD-BEARING. Field 0 is `ps`'s pid
+# column, so the scan starts at 1, and a field only counts when it starts with
+# `[A-Za-z_]` and then has its `=`: `--worker`, `--session=deadbeef`, `--exe=/bin/true`
+# and `--flag=notenv` all start with `-` and are therefore NOT env, so multi-extraction
+# cannot invent environment out of argv. Self-test Case S pins that (an argv-only read
+# must yield ZERO vars); a parser that dropped the leading-character rule would start
+# reading the daemon's `--worker-exe` argument as an environment entry.
+#
+# TWO LIMITS THIS SHARES WITH THE CODE IT REPLACES (neither is new, both are worth
+# naming rather than discovering later):
+#   * a VALUE containing whitespace is cut at the whitespace — `PATH=/a b:/c` yields
+#     `PATH=/a`. The old `([^[:space:]]*)` stopped at whitespace too, so this is not a
+#     regression, and the marker's value (`run_id` + `run_attempt`) has none.
+#   * an argv token that really does look like `NAME=value` (a `make FOO=bar` style
+#     command line) is picked up as an env entry, exactly as the old single-match form
+#     picked it up when that token came first. So multi-extraction does not widen THIS
+#     risk — it widens the list, not the rule. The one way it could matter is a process
+#     whose argv spells out `FULCRUM_CI_RUN_MARKER=<this run's exact value>`: it would
+#     be treated as ours. That was already true whenever such a token came first, and a
+#     process holding this run's marker value in its command line is not obviously
+#     somebody else's — but if a spawn path ever builds such a command line, the census
+#     would call it a leak, and that is the case to look at first.
+ps_eww_env_vars() {
+  local text="$1"
+  # `ps` may hand back several lines (Linux does; macOS does not — see below). Fold
+  # newlines to spaces so ONE split covers both shapes, keeping the tolerance the old
+  # line-by-line loop had. `read -ra` stops at the first newline, so this fold is what
+  # makes the multi-line (Linux-shaped) read work at all, not a cosmetic normalisation.
+  text="${text//$'\n'/ }"
+  # `local -a x=()` is a known bash 3.1 wart (the () can be taken as a word); the
+  # file's own idiom everywhere else is a plain `local x=()`, which is what macOS's
+  # bash 3.2 accepts too.
+  local fields=()
+  local out=()
+  local field
+  local guard=0
+  local i=1
+  local n
+  ENV_PS_VARS=""
+  ENV_PS_TRUNCATED=0
+  IFS=$' \t' read -ra fields <<<"$text"
+  n=${#fields[@]}
+  while ((i < n)); do
+    field="${fields[$i]}"
+    if [[ "$field" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      out+=("${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
+      guard=$((guard + 1))
+      if ((guard >= ENV_PS_MAX_VARS)); then
+        # Stop, but only call it TRUNCATED if there were still fields after this one
+        # to read. Exactly-at-the-bound-with-nothing-left is a complete answer.
+        ((i + 1 < n)) && ENV_PS_TRUNCATED=1
+        break
+      fi
+    fi
+    i=$((i + 1))
+  done
+  ENV_PS_VARS="$(printf '%s\n' ${out[@]+"${out[@]}"})"
+}
+ENV_PS_VARS=""
+ENV_PS_TRUNCATED=0
+
 env_from_ps_eww() {
   local pid="$1" raw
   ENV_LINES=()
+  ENV_PS_TRUNCATED=0
   # The `args=` column is what makes the env visible: `ps eww -o pid= -p <pid>`
   # prints the number and nothing else on every platform (measured on Linux), so a
   # census written with that spelling would find no marker anywhere and certify
   # clean on a look it never took.
+  #
+  # DO NOT "fix" this invocation. `ps eww -eo pid=,args=` (the whole table) exits 1
+  # with ZERO bytes on macOS, because BSD `e` means "all USERS", not "environment" —
+  # there the env flag is `-E`, which Linux rejects as `unsupported SysV option`. The
+  # per-pid form below is the spelling that works on BOTH (measured on macOS: exit 0,
+  # 5443 bytes, marker present). The bug was in the parsing, never in the call.
   if ! raw="$(ps eww -o pid=,args= -p "$pid" 2>/dev/null)"; then
     if ! ps -p "$pid" >/dev/null 2>&1; then
       ENV_STATE="gone"
@@ -577,23 +755,31 @@ env_from_ps_eww() {
     fi
     return 1
   fi
-  local lines=()
-  while IFS= read -r line; do
-    # Only NAME=VALUE-shaped fields count as environment: an argv token such as
-    # `--worker-exe` must never be mistaken for an env entry.
-    if [[ "$line" =~ [[:space:]]([A-Za-z_][A-Za-z0-9_]*)=([^[:space:]]*) ]]; then
-      lines+=("${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
-    fi
-  done <<<"$raw"
-  if ((${#lines[@]} == 0)); then
-    # Nothing env-shaped came back. On macOS that most likely means the platform
-    # refused the read (SIP / proc_security) — so this is UNREADABLE, not "empty
-    # environment, not ours". Refusing is the honest direction; a census that read
-    # nothing must never report clean.
-    ENV_STATE="unreadable"
+  local extracted
+  ps_eww_env_vars "$raw"
+  extracted="$ENV_PS_VARS"
+  if ((ENV_PS_TRUNCATED == 1)); then
+    # The read was bigger than the bound, so the list we hold is INCOMPLETE and the
+    # marker could be past the cut. Refuse: "we stopped looking" is not "it was not
+    # there", and a census that calls a process not-this-run on a truncated read is
+    # reporting clean about a look it did not finish.
+    ENV_STATE="env-truncated"
     return 1
   fi
-  ENV_LINES=("${lines[@]}")
+  if [[ -z "$extracted" ]]; then
+    # `ps` ANSWERED, and what it answered with held no NAME=VALUE text at all. That is
+    # NOT the same event as the platform refusing the read, and saying so matters: the
+    # usual cause is the invocation losing the `args=` column (no args column, no env
+    # in the output), which is a bug in THIS script, not a macOS security policy. The
+    # direction is unchanged — still a refusal, still exit 2 upstream — only the reason
+    # it names is now the reason it can act on.
+    ENV_STATE="no-env-in-output"
+    return 1
+  fi
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && ENV_LINES+=("$line")
+  done <<<"$extracted"
   ENV_STATE="ok"
   return 0
 }
@@ -731,14 +917,59 @@ parse_candidate_stream() {
     # its OWN environment cannot answer "is this one ours?" for anybody else.
     if [[ "$platform" == "macos" ]]; then
       if ! control_probe "$marker"; then
+        # The reason is spelled OUT per state, and that distinction is a bug fix, not
+        # decoration. Every failure of this probe used to print the same SIP /
+        # proc_security speech, including the one case where SIP was innocent: the
+        # single-match extractor (see ps_eww_env_vars) could only ever see the FIRST
+        # NAME=VALUE on BSD's one-line read, so the census's own marker — ~100 vars in
+        # — was invisible and the probe answered `no-marker-in-own-env` about an
+        # environment it had read perfectly well. Measured on macos-latest: exit 0,
+        # 5443 bytes, marker PRESENT in the raw output, 1 var extracted. macOS was
+        # never blocking anything, and the message blamed it confidently. "The platform
+        # refused the read" and "the read came back and extraction found nothing" are
+        # now different sentences with different fixes.
         {
-          echo "error: this census cannot read process environments on macOS, so it REFUSES (exit 2) rather than certify clean"
-          echo "  control probe on the census's own pid ($CENSUS_PID, which must carry $MARKER_NAME) returned:"
-          printf '    %s\n' "$CONTROL_STATE"
-          echo "  run-scope on macOS is UNVERIFIED from the machine that wrote this; the census reads env with"
-          echo "  'ps eww -o pid=,args= -p <pid>' (fallback: 'ps e -o pid=,args='). If the platform blocks that"
-          echo "  read (SIP / proc_security), every 'not this run's process' answer would be a guess, and a"
-          echo "  census that passes because it could not look is the exact failure this guard exists to prevent."
+          echo "error: the macOS control probe failed, so this census REFUSES (exit 2) rather than certify clean"
+          echo "  it read its OWN pid ($CENSUS_PID, which must carry $MARKER_NAME) and could not confirm the marker."
+          echo "  control probe state: $CONTROL_STATE"
+          case "$CONTROL_STATE" in
+            unreadable)
+              echo "  MEANING: the env READ itself failed — 'ps eww -o pid=,args= -p <pid>' exited non-zero while"
+              echo "  the pid was still alive. THAT is the shape a blocked read takes (SIP / proc_security is one"
+              echo "  candidate cause). Check the invocation before suspecting the OS: 'ps eww -eo pid=,args=' (the"
+              echo "  whole-table form) exits 1 with 0 bytes on macOS, because BSD 'e' means ALL USERS, not"
+              echo "  environment; the per-pid form is the one that works there."
+              ;;
+            gone)
+              echo "  MEANING: the census's own pid was not in the table at all — the read raced its own process."
+              echo "  Nothing was blocked; the census just could not look at itself."
+              ;;
+            no-env-in-output)
+              echo "  MEANING: 'ps' ANSWERED (exit 0) and its output held NO NAME=VALUE text at all. This is NOT a"
+              echo "  platform block — it is almost always the invocation losing the 'args=' column, since with no"
+              echo "  args column BSD/Linux ps puts NO environment in the output whatsoever. Fix the read; do not"
+              echo "  go looking for a security policy that was never involved."
+              ;;
+            env-truncated)
+              echo "  MEANING: the read came back LARGER than the extraction bound ($ENV_PS_MAX_VARS NAME=VALUE"
+              echo "  fields) and the scan stopped early, so the marker could sit past the cut. The census will not"
+              echo "  call a process not-this-run on a read it did not finish. Raise ENV_PS_MAX_VARS if a real CI"
+              echo "  environment ever exceeds it (measured normal size: 109 vars)."
+              ;;
+            no-marker-in-own-env)
+              echo "  MEANING: the environment WAS read, every NAME=VALUE in it was extracted, and none of them was"
+              echo "  this run's $MARKER_NAME. With the multi-extraction fix in ps_eww_env_vars this is no longer"
+              echo "  what a large macOS environment looks like — it now means the census process genuinely does not"
+              echo "  carry the marker it was started with, i.e. the marker was not exported into this step's"
+              echo "  environment, or something between the step and this process cleared it."
+              ;;
+            *)
+              echo "  MEANING: unrecognised probe state — treat the whole macOS leg as unproven."
+              ;;
+          esac
+          echo "  either way the direction is unchanged: a census that cannot confirm its OWN marker would be"
+          echo "  guessing on every candidate, and a census that passes because it could not look is the exact"
+          echo "  failure this guard exists to prevent."
         } >&2
         return 2
       fi
@@ -1241,6 +1472,59 @@ self_test_verdict() {
   return 0
 }
 
+# plant_was_alive <pid> — has this pid been OBSERVED in the process table?
+#
+# This exists because of a vacuous pass, not for style. The old Case I asserted "the
+# planted process was killed by the census" with `ps -p <pid>` failing — and `ps -p`
+# fails just as hard for a pid that NEVER EXISTED. On macOS `setsid` is not installed,
+# so the plant never started, `ps -p` failed immediately, and the case reported the
+# census had successfully killed the process it had failed to start. A case that never
+# started its subject must not be able to grade the subject's death, so every
+# "it was killed / it was untouched" assertion below is gated on having seen the thing
+# alive FIRST. Same standard Case M's arrival stamp holds: observe the precondition,
+# do not infer it from absence.
+#
+# Polls rather than probing once, because the plant is a fork+exec racing this shell —
+# a single probe can miss a process that is genuinely coming.
+plant_was_alive() {
+  local pid="$1" attempt=0
+  [[ -n "$pid" ]] || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  while ((attempt < 30)); do
+    if ps -p "$pid" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+# unix_enumeration_works — does the exact `ps` spelling enumerate_unix uses actually
+# answer HERE? This is a CAPABILITY probe, not an opinion about the platform: the
+# live-census cases (I, L, R, M) are all unix-shaped, and on Git-Bash/MSYS the cygwin
+# `ps` exists but `ps -eo …` EXITS 1, so `command -v ps` alone would let every one of
+# them run against an empty table and grade a look that was never taken.
+unix_enumeration_works() {
+  ps -eo pid=,ppid=,stat=,comm=,args= >/dev/null 2>&1
+}
+
+# live_census_can_answer — can the LIVE census actually reach a verdict HERE?
+# The lineage cases (L, R) assert the census EXITS 0 and names what it skipped. That
+# assertion is only gradeable on a platform where the census can read provenance at
+# all: on a macOS leg whose env reads really are blocked the census exits 2 — correct
+# behaviour for the census, but it would make L red for a reason L has nothing to do
+# with, which is exactly the misattribution this branch just fixed for the message.
+# So probe it with a throwaway marker (nothing in the table can carry it, so the
+# answer is 0 or 2 and never 1) and skip rather than fail when the census cannot look.
+live_census_can_answer() {
+  local probe_marker="selftest-capability-$$-$RANDOM"
+  local rc=0
+  env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+    FULCRUM_CI_RUN_MARKER="$probe_marker" bash "$script" >/dev/null 2>&1 || rc=$?
+  ((rc == 0))
+}
+
 self_test_cleanup() {
   local pid
   for pid in ${self_test_planted[@]+"${self_test_planted[@]}"}; do
@@ -1351,6 +1635,49 @@ run_self_test() {
 
   local marker="selftest-run-$$-$RANDOM"
   export FULCRUM_CI_RUN_MARKER="$marker"
+
+  # ── CAPABILITY PROBES, run FIRST, before any case ──────────────────────────
+  # These are hoisted above every case because the need is not limited to the live
+  # plant cases. Case H2 asserts `CENSUS_MODE=live` exits 0 — an assertion about what
+  # the census ACHIEVES, not about which reader it picked — and on a `ps` that cannot
+  # enumerate (Git-Bash) the honest answer is 2, so H2 went red for the machine's
+  # limitation. Same vacuity class this branch fixes everywhere else: a case may only
+  # assert an OUTCOME on a platform that can produce one.
+  local live="$self_test_root/live" bin
+  mkdir -p "$live"
+  for bin in fake_worker_core fulcrum; do
+    if cp "$(command -v sleep 2>/dev/null || echo /nonexistent)" "$live/$bin" 2>/dev/null; then
+      chmod +x "$live/$bin"
+    fi
+  done
+  local cap_ps=1 cap_setsid=1 cap_plant=1 cap_live_env=1 cap_proc_env=1 cap_python3=1
+  unix_enumeration_works || cap_ps=0
+  command -v setsid >/dev/null 2>&1 || cap_setsid=0
+  command -v python3 >/dev/null 2>&1 || cap_python3=0
+  [[ -x "$live/fake_worker_core" ]] || cap_plant=0
+  # Can the LIVE census read provenance here at all? Where it cannot, the live cases
+  # must SKIP (the census is right to refuse; the case is just not gradeable) rather
+  # than FAIL — see live_census_can_answer.
+  live_census_can_answer || cap_live_env=0
+  # Case R forces `--platform linux`, so its census reads /proc/<pid>/environ whatever
+  # the host really is — a DIFFERENT dependency from cap_live_env (which asks about the
+  # host's own reader). With Bug A fixed a macOS leg can now answer for itself, so
+  # without this probe R would run its linux-shaped census on a machine with no /proc
+  # and go red for having no Linux procfs.
+  [[ -r "/proc/$$/environ" ]] || cap_proc_env=0
+  # Whether `$live/fulcrum` ends up being a real BASH (Case L's parent) — Case R
+  # depends on L's plant, and `-x` alone cannot tell a bash copy from the sleep copy
+  # the loop above left there, so L sets this itself.
+  local live_fulcrum_is_bash=0
+  # A `ps` that cannot enumerate makes every live case ungradeable by construction: the
+  # plant is unobservable and the census reads nothing. This is the Windows/Git-Bash
+  # shape — cygwin's `ps` EXISTS, so `command -v ps` passes, and `ps -eo …` exits 1.
+  local cap_enumerable=1
+  ((cap_ps == 0)) && cap_enumerable=0
+  ((cap_live_env == 0)) && cap_enumerable=0
+  local cap_why=""
+  ((cap_ps == 0)) && cap_why="ps -eo pid=,ppid=,stat=,comm=,args= does not answer here (the cygwin ps on Git-Bash exits 1)"
+  ((cap_live_env == 0)) && cap_why="${cap_why:+$cap_why; }the live census cannot read process provenance on this platform (it refuses, exit 2), which is correct for the census and ungradeable for a case that asserts a verdict"
 
   local d
   # ---- Case A: a table with nothing of ours in it -----------------------------
@@ -1489,9 +1816,42 @@ run_self_test() {
     expect_output_has "H2 the refusal explains that only --self-test may use $seam" "--self-test"
     expect_output_lacks "H2 $seam never produces a fabricated clean" "clean: the process table was read"
   done
-  # CENSUS_MODE=live is the honest spelling and must NOT be refused for existing.
-  expect_exit "H2 CENSUS_MODE=live on the live path is accepted (it asks for the real table)" 0 \
-    env CENSUS_MODE=live bash "$script"
+  # CENSUS_MODE=live is the honest spelling and must NOT be refused FOR EXISTING. The
+  # claim is "not refused as a seam", not "exits 0": on a machine whose `ps` cannot
+  # enumerate, exit 2 is the census being correct, and asserting 0 here punished the
+  # platform for H2's own overreach. So the platform-independent half is asserted
+  # always (CENSUS_MODE must not appear in the refusal's offender list, and no
+  # fabricated clean), and the outcome half only where a census can actually reach one.
+  local h2_live_out h2_live_rc=0
+  h2_live_out="$(env CENSUS_MODE=live bash "$script" 2>&1)" || h2_live_rc=$?
+  LAST_OUTPUT="$h2_live_out"
+  # Match the seam-refusal's own signature, not the bare variable name: an unrelated
+  # message that merely mentions CENSUS_MODE must not fail this.
+  if [[ "$h2_live_out" == *"sets a harness seam"* ]]; then
+    printf 'FAIL H2 CENSUS_MODE=live was refused as a harness seam (it is the honest spelling)\n'
+    printf '       output: %s\n' "$(printf '%s' "$h2_live_out" | tr '\n' '|')"
+    self_test_failures=$((self_test_failures + 1))
+  else
+    printf 'ok   H2 CENSUS_MODE=live on the live path is accepted (never refused for being a seam)\n'
+  fi
+  # NOTE: no "never prints clean" assertion belongs here, and the case deliberately
+  # does not have one. CENSUS_MODE=live is the REAL census, so on a clean machine it
+  # SHOULD print "clean: the process table was read" — that sentence is the honest
+  # verdict, not a fabricated one. The fabrications H2 hunts are the fixture seams
+  # (CENSUS_MODE=fixture and friends), which the loop above pins one variable at a
+  # time; conflating the two would mean this case could only pass by refusing to run a
+  # census it is asking for by name.
+  if ((cap_enumerable == 1)); then
+    if [[ "$h2_live_rc" == 0 ]]; then
+      printf 'ok   H2 CENSUS_MODE=live reaches a real verdict on a platform that can read the table (exit 0)\n'
+    else
+      printf 'FAIL H2 CENSUS_MODE=live should have completed here, got exit %s\n' "$h2_live_rc"
+      printf '       output: %s\n' "$(printf '%s' "$h2_live_out" | tr '\n' '|')"
+      self_test_failures=$((self_test_failures + 1))
+    fi
+  else
+    printf 'NOTE H2 the exit-code half of CENSUS_MODE=live is UNPROVEN here (%s)\n' "$cap_why"
+  fi
   # Anything else the harness reads is refused too — a typo'd mode must not fall
   # through to a census that reads nothing.
   expect_exit "H2 CENSUS_MODE=something-else is refused, not silently treated as live" 2 \
@@ -1531,14 +1891,54 @@ run_self_test() {
   # `fake_worker_core`, with the marker in its real environment, and the census must
   # find it through `ps`, classify it through /proc/<pid>/environ, report it, and
   # kill it. If the enumeration were `--input`-only, or matched on comm, this fails.
-  local live="$self_test_root/live" bin
-  mkdir -p "$live"
-  for bin in fake_worker_core fulcrum; do
-    if cp "$(command -v sleep)" "$live/$bin" 2>/dev/null; then
-      chmod +x "$live/$bin"
+  #
+  # THREE THINGS THIS CASE NEEDS, and it used to assume all three: a `ps` whose
+  # `-eo` spelling answers (cygwin's `ps` exists on Git-Bash and EXITS 1 on `-eo`),
+  # a copyable `sleep` to plant, and `setsid` to detach the plant. `setsid` is not
+  # installed on macOS OR on Windows Git-Bash — measured — so on both legs the plant
+  # never started, every downstream assertion ran against an empty table, 7
+  # assertions went red on a machine that had nothing wrong with its census, and one
+  # of them went GREEN for the wrong reason ("the census killed it", from a pid that
+  # had never existed). Missing tooling is not a census defect, so it is now a
+  # recorded SKIP (loud, and fatal under CI via self_test_verdict); a plant that
+  # starts but cannot be observed alive is a FAILURE, because that one IS the
+  # enumerator's business.
+  # Per-case skip decisions, made ONCE each and in one place (the probes themselves
+  # ran at the top of run_self_test). Independent checks rather than one if/elif over
+  # capabilities, because an elif chain hides a second missing tool behind the first
+  # and the ledger then UNDERSTATES what this machine failed to prove; but exactly one
+  # entry per case, because two entries for the same case would double-count one gap
+  # as two. Each live case is gated on what IT needs:
+  #   I  ps -eo, a copyable sleep, setsid, and a census that can read provenance
+  #   M  the same four, plus python3
+  #   L  a renamable bash + a census that can read provenance (NOT setsid, NOT sleep)
+  #   R  whatever L managed to plant, plus /proc (it forces the linux-shaped reader)
+  if ((cap_enumerable == 0)); then
+    self_test_skip "I" "$cap_why — the live planted-process path is UNPROVEN"
+    self_test_skip "L" "$cap_why — the lineage skip is UNPROVEN"
+    self_test_skip "R" "$cap_why — the portable lineage arm is UNPROVEN"
+    self_test_skip "M" "$cap_why — the zombie path is UNPROVEN"
+  else
+    if ((cap_plant == 0)) || ((cap_setsid == 0)); then
+      local missing=""
+      ((cap_plant == 0)) && missing="no sleep binary to copy as fake_worker_core"
+      ((cap_setsid == 0)) && missing="${missing:+$missing, }setsid is not installed (absent on macOS and on Git-Bash)"
+      self_test_skip "I" "$missing — the live planted-process path is UNPROVEN"
     fi
-  done
-  if [[ -x "$live/fake_worker_core" ]]; then
+    local m_missing=""
+    ((cap_plant == 0)) && m_missing="no sleep binary to name as the zombie's parent"
+    ((cap_setsid == 0)) && m_missing="${m_missing:+$m_missing, }setsid is not installed (absent on macOS and on Git-Bash)"
+    ((cap_python3 == 0)) && m_missing="${m_missing:+$m_missing, }no python3 to act as a non-reaping parent"
+    [[ -n "$m_missing" ]] && self_test_skip "M" "$m_missing — the zombie path is UNPROVEN"
+    # L and R need neither setsid nor sleep nor python3 — they plant through
+    # `env … "$live/fulcrum" -c …` — so on a macOS leg, where Case I cannot run, they
+    # still can. Their own guards are at the bottom of each case.
+  fi
+
+  # Case I runs only when every one of its dependencies is present; a missing one is
+  # already in the ledger above, so the case stays SILENT rather than adding a FAIL
+  # that would double-count the same gap as a census defect.
+  if ((cap_ps == 1)) && ((cap_plant == 1)) && ((cap_setsid == 1)) && ((cap_live_env == 1)); then
     local live_marker="selftest-live-$$-$RANDOM"
     # setsid + full stdio redirection: the planted process must not hold the
     # self-test's output pipe, and must not die with the census's process group.
@@ -1548,36 +1948,47 @@ run_self_test() {
     local planted=""
     [[ -r "$live/planted.pid" ]] && planted="$(cat "$live/planted.pid")"
     [[ -n "$planted" ]] && self_test_planted+=("$planted")
-    sleep 0.4
 
-    local enum_out="$self_test_root/enumerated.txt"
-    expect_exit "I  the live ps enumeration FINDS the planted fake_worker_core" 0 \
-      env CENSUS_DUMP_ENUM="$enum_out" CENSUS_PLATFORM=linux bash "$script" --self-test --enumerate-only
-    # The enumeration must carry BOTH the planted pid and the full path — the pid
-    # proves it saw THIS process, the path proves it read the untruncated argv.
-    if [[ -r "$enum_out" ]] && awk -v p="$planted" -v b="$live/fake_worker_core" \
-        '$1==p && index($0, b) {found=1} END{exit !found}' "$enum_out"; then
-      printf 'ok   I  the enumerated line carries the planted pid %s and its full argv\n' "$planted"
-    else
-      printf 'FAIL I  the enumerated stream does not contain the planted pid %s\n' "$planted"
-      printf '       enumerated: %s\n' "$(tr '\n' '|' <"$enum_out" 2>/dev/null || echo '<missing>')"
-      self_test_failures=$((self_test_failures + 1))
-    fi
-
-    # NOTE: these three invoke the LIVE census, so they must set NO seam variable —
-    # not even CENSUS_PLATFORM, which the live path now derives from `uname` alone
-    # (see refuse_self_test_only_env_seams). The marker is the only thing a live run
-    # is allowed to be told.
-    expect_exit "I  the LIVE census reports the planted process as a leak" 1 \
-      env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-      FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
-    expect_output_has "I  the live leak line names the pid and the image" "leak: $planted fake_worker_core"
-
-    if ps -p "$planted" >/dev/null 2>&1; then
-      printf 'FAIL I  the census did not kill the planted process (pid %s is still alive)\n' "$planted"
+    # PRECONDITION, OBSERVED: the plant is in the table before any assertion about it.
+    # Everything below is gated on this, so a plant that never started can only be a
+    # FAILURE of this line — never a green "it was killed" three lines later.
+    if ! plant_was_alive "$planted"; then
+      printf 'FAIL I  the planted process was never OBSERVED alive (pid %s) — nothing below this line can be graded\n' "${planted:-<no pid>}"
       self_test_failures=$((self_test_failures + 1))
     else
-      printf 'ok   I  the planted process was killed by the census\n'
+      printf 'ok   I  the planted process %s was OBSERVED alive before any verdict about it\n' "$planted"
+
+      local enum_out="$self_test_root/enumerated.txt"
+      expect_exit "I  the live ps enumeration FINDS the planted fake_worker_core" 0 \
+        env CENSUS_DUMP_ENUM="$enum_out" CENSUS_PLATFORM=linux bash "$script" --self-test --enumerate-only
+      # The enumeration must carry BOTH the planted pid and the full path — the pid
+      # proves it saw THIS process, the path proves it read the untruncated argv.
+      if [[ -r "$enum_out" ]] && awk -v p="$planted" -v b="$live/fake_worker_core" \
+          '$1==p && index($0, b) {found=1} END{exit !found}' "$enum_out"; then
+        printf 'ok   I  the enumerated line carries the planted pid %s and its full argv\n' "$planted"
+      else
+        printf 'FAIL I  the enumerated stream does not contain the planted pid %s\n' "$planted"
+        printf '       enumerated: %s\n' "$(tr '\n' '|' <"$enum_out" 2>/dev/null || echo '<missing>')"
+        self_test_failures=$((self_test_failures + 1))
+      fi
+
+      # NOTE: these three invoke the LIVE census, so they must set NO seam variable —
+      # not even CENSUS_PLATFORM, which the live path now derives from `uname` alone
+      # (see refuse_self_test_only_env_seams). The marker is the only thing a live run
+      # is allowed to be told.
+      expect_exit "I  the LIVE census reports the planted process as a leak" 1 \
+        env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+        FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
+      expect_output_has "I  the live leak line names the pid and the image" "leak: $planted fake_worker_core"
+
+      # Reachable ONLY from the observed-alive branch above, which is what makes the
+      # negative `ps -p` below evidence of a KILL rather than evidence of a typo.
+      if ps -p "$planted" >/dev/null 2>&1; then
+        printf 'FAIL I  the census did not kill the planted process (pid %s is still alive)\n' "$planted"
+        self_test_failures=$((self_test_failures + 1))
+      else
+        printf 'ok   I  the planted process %s was alive, and is gone after the census\n' "$planted"
+      fi
     fi
 
     # And the discriminator, live: a DIFFERENT run's marker must not be touched.
@@ -1586,17 +1997,22 @@ run_self_test() {
     local other=""
     [[ -r "$live/other.pid" ]] && other="$(cat "$live/other.pid")"
     [[ -n "$other" ]] && self_test_planted+=("$other")
-    sleep 0.4
-    expect_exit "I  a live process with ANOTHER run's marker is left alone" 0 \
-      env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-      FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
-    if ps -p "$other" >/dev/null 2>&1; then
-      printf 'ok   I  the other-run process is still alive (untouched)\n'
-      kill -KILL "$other" 2>/dev/null || true
-      wait "$other" 2>/dev/null || true
+    if plant_was_alive "$other"; then
+      expect_exit "I  a live process with ANOTHER run's marker is left alone" 0 \
+        env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+        FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
+      if ps -p "$other" >/dev/null 2>&1; then
+        printf 'ok   I  the other-run process %s is still alive (untouched)\n' "$other"
+        kill -KILL "$other" 2>/dev/null || true
+        wait "$other" 2>/dev/null || true
+        self_test_planted=("${self_test_planted[@]/$other/}")
+      else
+        printf "FAIL I  the census killed a process that was NOT this run's (pid %s)\n" "$other"
+        self_test_planted=("${self_test_planted[@]/$other/}")
+        self_test_failures=$((self_test_failures + 1))
+      fi
     else
-      printf "FAIL I  the census killed a process that was NOT this run's (pid %s)\n" "$other"
-      self_test_planted=("${self_test_planted[@]/$other/}")
+      printf 'FAIL I  the OTHER-run plant was never observed alive (pid %s) — the discriminator is UNPROVEN\n' "${other:-<no pid>}"
       self_test_failures=$((self_test_failures + 1))
     fi
 
@@ -1606,9 +2022,6 @@ run_self_test() {
       env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
       FULCRUM_CI_RUN_MARKER="selftest-clean-$$-$RANDOM" bash "$script"
     expect_output_has "I  the clean census reports the candidate count it looked at" "the process table was read"
-  else
-    printf 'FAIL I  could not plant a live fake_worker_core (no sleep binary to copy?)\n'
-    self_test_failures=$((self_test_failures + 1))
   fi
 
   # ---- Case P: gone-before-read is DECLINED, never silently dropped -----------
@@ -1686,7 +2099,120 @@ run_self_test() {
   # before it can call anything clean.
   expect_exit "K  macOS refuses when it cannot read even its OWN env (no certification on a look it could not take)" 2 \
     env CENSUS_MODE=fixture CENSUS_PLATFORM=macos CENSUS_FIXTURE_CONTROL_UNREADABLE=1 CENSUS_FIXTURE_DIR="$d" bash "$script" --self-test --census
-  expect_output_has "K  the refusal names the platform limit" "cannot read process environments on macOS"
+  expect_output_has "K  the refusal names the platform limit" "control probe state: unreadable"
+  expect_output_has "K  a BLOCKED READ is the only state allowed to mention SIP" "SIP / proc_security"
+
+  # ---- Case K2: the refusal must blame the RIGHT thing -----------------------
+  # The macOS leg refused with a message about SIP / proc_security on a platform that
+  # was never blocking anything: the single-match extractor could only ever see the
+  # first NAME=VALUE on BSD's one-line read, so the census's own marker (~100 vars in)
+  # was invisible and the probe answered `no-marker-in-own-env` about an environment it
+  # had read FINE (measured: exit 0, 5443 bytes, marker present in the raw output). A
+  # confident misattribution costs a day of chasing a security policy that does not
+  # exist, so each probe state now carries its own diagnosis — and each branch is
+  # pinned here, because the live macOS reader cannot run on this Linux box.
+  d="$(new_fixture control-no-marker)"
+  printf '%s\n' '5010 1 S /tmp/build/fulcrum serve --socket /tmp/s.sock' >"$d/stream.txt"
+  printf '%s\n' "5010 $MARKER_NAME=$marker" >"$d/env.txt"
+  expect_exit "K2 the read SUCCEEDED and the marker genuinely was not in it still refuses" 2 \
+    env CENSUS_MODE=fixture CENSUS_PLATFORM=macos CENSUS_FIXTURE_CONTROL_STATE=no-marker-in-own-env CENSUS_FIXTURE_DIR="$d" bash "$script" --self-test --census
+  expect_output_has "K2 that state says the environment WAS read" "the environment WAS read"
+  # The whole point: SIP is innocent here and the message must not say otherwise.
+  expect_output_lacks "K2 a successful read does NOT get blamed on SIP" "SIP / proc_security"
+  expect_output_has "K2 it points at the real cause (the marker was not exported)" "not exported into this step"
+
+  d="$(new_fixture control-no-env)"
+  printf '%s\n' '5020 1 S /tmp/build/fulcrum serve --socket /tmp/s.sock' >"$d/stream.txt"
+  printf '%s\n' "5020 $MARKER_NAME=$marker" >"$d/env.txt"
+  expect_exit "K2 a read that came back with NO env text at all refuses" 2 \
+    env CENSUS_MODE=fixture CENSUS_PLATFORM=macos CENSUS_FIXTURE_CONTROL_STATE=no-env-in-output CENSUS_FIXTURE_DIR="$d" bash "$script" --self-test --census
+  expect_output_has "K2 that state names the real cause: a missing args= column" "losing the 'args=' column"
+  expect_output_lacks "K2 a broken invocation is NOT blamed on the platform" "SIP / proc_security"
+
+  d="$(new_fixture control-truncated)"
+  printf '%s\n' '5030 1 S /tmp/build/fulcrum serve --socket /tmp/s.sock' >"$d/stream.txt"
+  printf '%s\n' "5030 $MARKER_NAME=$marker" >"$d/env.txt"
+  expect_exit "K2 an extraction that hit its bound refuses rather than answer from a partial list" 2 \
+    env CENSUS_MODE=fixture CENSUS_PLATFORM=macos CENSUS_FIXTURE_CONTROL_STATE=env-truncated CENSUS_FIXTURE_DIR="$d" bash "$script" --self-test --census
+  expect_output_has "K2 that state says the scan STOPPED EARLY rather than found nothing" "stopped early"
+
+  # ---- Case S: the macOS ONE-LINE env read must be parsed to exhaustion ------
+  # BSD `ps eww -o pid=,args= -p <pid>` prints argv AND THE ENTIRE ENVIRONMENT ON ONE
+  # LINE. Measured on macos-latest: 5443 chars, ZERO newlines, marker present in the
+  # raw bytes, and the old single-match extractor pulled out exactly ONE variable —
+  # `GITHUB_JOB=probe`, the first env-shaped token — so the marker ~100 vars later was
+  # never seen and the census refused its own platform. Linux could not show this:
+  # env_from_procfs reads /proc/<pid>/environ NUL-split, one var per line, no regex.
+  #
+  # The live macOS reader cannot run here, so --ps-env-parse feeds the SHIPPED parser a
+  # captured read (the same trick Case R plays on the lineage arm). Three claims:
+  #   1. the marker IS found on a one-line read holding ~109 vars;
+  #   2. the count really is ~109, i.e. extraction ran to exhaustion and not to the
+  #      first match — asserting the marker alone would pass by luck if the marker
+  #      happened to sit first, so the COUNT is the load-bearing half;
+  #   3. an ARGV-ONLY read yields ZERO vars. Multi-extraction widens the surface that
+  #      could invent environment out of a command line, and the daemon's argv ends in
+  #      `--worker-exe /path/to/fake_worker_core`; if a `--flag=value` token ever read
+  #      as an env entry, the census would be matching argv it has no business matching.
+  local s_line="$self_test_root/ps_eww_macos.txt"
+  local s_argv="$self_test_root/ps_eww_argv_only.txt"
+  {
+    printf ' 12345 /tmp/build/fake_worker_core --worker --session=deadbeef --exe=/bin/true'
+    printf ' GITHUB_JOB=probe'
+    local s_i=1
+    while ((s_i <= 108)); do
+      if ((s_i == 42)); then
+        printf ' %s=%s' "$MARKER_NAME" "$marker"
+      else
+        printf ' CI_VAR_%s=value-%s-padding-padding-padding' "$s_i" "$s_i"
+      fi
+      s_i=$((s_i + 1))
+    done
+  } >"$s_line"
+  printf ' 2222 /tmp/build/fake_worker_core --worker --session=deadbeef --exe=/bin/true -x --flag=notenv' \
+    >"$s_argv"
+
+  expect_exit "S  the macOS one-line ps eww read parses to its FULL environment" 0 \
+    bash "$script" --self-test --ps-env-parse --input "$s_line"
+  # THE MARKER (the thing the census needs).
+  expect_output_has "S  the marker IS extracted from a one-line read" "$MARKER_NAME=$marker"
+  # THE EXHAUSTION: 109 vars, not 1. `1 var` is precisely what shipped green locally
+  # and red on the Mac, so the count is asserted, not just the marker.
+  expect_output_has "S  extraction ran to exhaustion (109 vars, not the first match)" "parsed-vars: 109"
+  # The first var is still the one the OLD code returned — proof the fixture keeps the
+  # shape that broke it (GITHUB_JOB=probe first, marker ~100 in).
+  expect_output_has "S  the fixture keeps the shape that broke the old parser" "GITHUB_JOB=probe"
+  # And the bound is not what produced that answer.
+  expect_output_has "S  a normal-sized environment is NOT reported as truncated" "parsed-truncated: 0"
+
+  expect_exit "S  an ARGV-ONLY ps eww read yields ZERO env vars (argv is not environment)" 0 \
+    bash "$script" --self-test --ps-env-parse --input "$s_argv"
+  expect_output_has "S  --worker / --session=… / --exe=… / --flag=… are NOT environment" "parsed-vars: 0"
+  expect_output_has "S  and therefore nothing was truncated either" "parsed-truncated: 0"
+
+  # The bound is a REFUSAL, not a shorter answer. A parser that quietly returned the
+  # first ENV_PS_MAX_VARS vars would let the census call a process "not this run's" on
+  # a read it never finished — the same false clean the bound exists to prevent, so
+  # hitting it has to be visible to the caller.
+  local s_fat="$self_test_root/ps_eww_fat.txt"
+  {
+    printf ' 3333 /bin/true'
+    local s_f=1
+    while ((s_f <= 4200)); do
+      printf ' Z%s=v' "$s_f"
+      s_f=$((s_f + 1))
+    done
+  } >"$s_fat"
+  expect_exit "S  a read past the extraction bound is reported as TRUNCATED, not as a complete answer" 0 \
+    bash "$script" --self-test --ps-env-parse --input "$s_fat"
+  expect_output_has "S  the bound was hit and says so" "parsed-truncated: 1"
+  expect_output_has "S  and it stopped AT the bound rather than running away" "parsed-vars: $ENV_PS_MAX_VARS"
+
+  # The seam is a --self-test door and nothing else: --ps-env-parse reads a FILE, so on
+  # the live path it is exactly the mock-in-front-of-the-census shape Case H refuses.
+  expect_exit "S  --ps-env-parse outside --self-test is rejected" 1 \
+    bash "$script" --ps-env-parse --input "$s_argv"
+  expect_output_has "S  the rejection explains that the live census reads the real table" "self-test"
 
   # ---- Case L: the census must never kill its own lineage -------------------
   # LIVE, and it reproduces the one shape the self-skip exists for: the census is
@@ -1696,8 +2222,16 @@ run_self_test() {
   # the lineage skip the census classifies its own parent as a leak and KILLS IT —
   # a guard that kills the step running it. With the skip it names the skip and
   # passes. This case fails (red) if is_self_pid is removed.
-  if cp "$(command -v bash)" "$live/fulcrum" 2>/dev/null; then
+  # A REAL SKIP GUARD, not a Linux-only assumption. Case L needs exactly two things: a
+  # bash this harness may copy and rename to `fulcrum`, and a census that can read
+  # provenance (see cap_live_env — on a macOS leg whose env reads are blocked the
+  # census exits 2, which is correct for the census and ungradeable for a case that
+  # asserts exit 0). It does NOT need setsid or sleep, so it keeps running on the
+  # legs where Case I cannot. The old branch printed FAIL when the copy failed, which
+  # punished the census for a missing tool.
+  if ((cap_ps == 1)) && ((cap_live_env == 1)) && cp "$(command -v bash 2>/dev/null || echo /nonexistent)" "$live/fulcrum" 2>/dev/null; then
     chmod +x "$live/fulcrum"
+    live_fulcrum_is_bash=1
     local lineage_marker="selftest-lineage-$$-$RANDOM"
     local lineage_out="$self_test_root/lineage.txt"
     local lineage_rc=0
@@ -1719,8 +2253,12 @@ run_self_test() {
     # census that KILLED it would have reported it as a leak, which the check above
     # catches by the absence of the skip line).
   else
-    printf 'FAIL L  could not plant a fulcrum-named bash (no bash to copy?)\n'
-    self_test_failures=$((self_test_failures + 1))
+    # Not a census failure: one of L's own dependencies is missing. Record it, loudly.
+    if ((cap_ps == 0)) || ((cap_live_env == 0)); then
+      : # already recorded in the ledger above — do not double-count it
+    else
+      self_test_skip "L" "no bash available to copy as a fulcrum-named parent — the lineage skip is UNPROVEN"
+    fi
   fi
 
   # ---- Case R: the PORTABLE parent lookup must hold Case L's guarantee --------
@@ -1736,7 +2274,7 @@ run_self_test() {
   # spelling BSD and procps share. This case forces that arm (--lineage-arm-ps,
   # self-test-only) and re-runs Case L's shape through it, so the macOS arm is proven
   # here rather than asserted about a platform nobody tested on this box.
-  if [[ -x "$live/fulcrum" ]]; then
+  if [[ $live_fulcrum_is_bash == 1 ]] && ((cap_ps == 1)) && ((cap_proc_env == 1)); then
     local r_marker="selftest-lineage-ps-$$-$RANDOM"
     local r_out="$self_test_root/lineage-ps.txt"
     local r_rc=0
@@ -1751,12 +2289,25 @@ run_self_test() {
       printf '       output: %s\n' "$(tr '\n' '|' <"$r_out" 2>/dev/null || echo '<missing>')"
       self_test_failures=$((self_test_failures + 1))
     fi
-    # And the flag itself is not a live-path door.
-    expect_exit "R  --lineage-arm-ps outside --self-test is rejected" 1 \
-      bash "$script" --lineage-arm-ps
   else
-    self_test_skip "R" "no bash available to copy as a fulcrum-named parent (the portable lineage arm is UNPROVEN)"
+    # R's own dependencies, named individually: it inherits Case L's bash plant, and it
+    # needs /proc/<pid>/environ because it forces the linux-shaped reader. Note that R
+    # does NOT need setsid, sleep, or the host's own env reader — so on a macOS leg it
+    # still cannot run (no /proc), while on a Linux box without setsid it still can.
+    if ((cap_ps == 0)) || ((cap_live_env == 0)); then
+      : # already recorded in the ledger above — do not double-count the same gap
+    elif [[ $live_fulcrum_is_bash != 1 ]]; then
+      self_test_skip "R" "Case L's fulcrum-named bash parent was never planted, so there is no lineage to protect — the portable lineage arm is UNPROVEN"
+    else
+      self_test_skip "R" "no readable /proc/<pid>/environ on this platform (R forces the linux-shaped reader) — the portable lineage arm is UNPROVEN"
+    fi
   fi
+
+  # The flag gate is a CLI-wiring assertion, not a live-planted one: it holds on every
+  # platform and must not be skipped along with the plant, or a regression that opens
+  # --lineage-arm-ps to the live path could hide behind a skipped case.
+  expect_exit "R  --lineage-arm-ps outside --self-test is rejected (runs even when the plant is skipped)" 1 \
+    bash "$script" --lineage-arm-ps
 
   # ---- Case M: a LIVE zombie of a watched image is caught --------------------
   # Fixture mode cannot express this: a synthetic pid has no parent, and `ps` only
@@ -1766,7 +2317,11 @@ run_self_test() {
   # catch cannot come from the name, because `ps` truncates the zombie's bracketed
   # name to 15 chars (`fake_worker_cor`), which the exact rule must refuse. It comes
   # from the PARENT's marker, which is what this case really pins.
-  if command -v python3 >/dev/null 2>&1; then
+  # M's dependency set is decided once, in the capability block above (python3, setsid,
+  # a copyable image, a census that can read provenance). The python3 guard already
+  # existed there; the others did not, so on macOS M planted nothing and then reported
+  # "could not plant" as a CENSUS failure — a missing tool graded as a defect.
+  if ((cap_enumerable == 1)) && ((cap_plant == 1)) && ((cap_setsid == 1)) && ((cap_python3 == 1)); then
     cat >"$live/mkzombie.py" <<'PYEOF'
 import os, sys, time
 exe, secs = sys.argv[1], float(sys.argv[2])
@@ -1793,8 +2348,12 @@ PYEOF
       self_test_planted+=("$z_parent_pid")
       z_pid="$(ps -eo pid=,ppid=,stat= | awk -v p="$z_parent_pid" '$2==p && $3 ~ /^Z/ {print $1; exit}')"
     fi
+    # OBSERVE THE SUBJECT FIRST. `z_pid` came out of `ps`, so everything below is
+    # asserting about a zombie the harness actually saw. The old shape could reach the
+    # "reaping the parent removed the zombie" line with z_pid EMPTY on some paths and
+    # with the plant never started on others — the same vacuity Case I had.
     if [[ -n "$z_pid" ]]; then
-      printf 'ok   M  planted a real zombie (pid %s, parent %s)\n' "$z_pid" "$z_parent_pid"
+      printf 'ok   M  planted a real zombie (pid %s, parent %s) and OBSERVED it in the table\n' "$z_pid" "$z_parent_pid"
       expect_exit "M  the census catches the ZOMBIE of a watched image via its parent's marker" 1 \
         env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
         FULCRUM_CI_RUN_MARKER="$z_marker" bash "$script"
@@ -1808,14 +2367,14 @@ PYEOF
         printf 'FAIL M  the zombie %s is still listed after its parent was killed\n' "$z_pid"
         self_test_failures=$((self_test_failures + 1))
       else
-        printf 'ok   M  reaping the parent removed the zombie\n'
+        printf 'ok   M  reaping the parent removed the zombie %s (it was listed before, and is not now)\n' "$z_pid"
       fi
     else
-      printf 'FAIL M  could not plant a zombie (python3 fork/exec failed?)\n'
+      # Dependencies were all present and the plant still produced nothing: that IS a
+      # finding, and it stays a failure.
+      printf 'FAIL M  could not plant a zombie with python3+setsid present (fork/exec failed?)\n'
       self_test_failures=$((self_test_failures + 1))
     fi
-  else
-    self_test_skip "M" "no python3 available to plant a non-reaping parent (the zombie path is UNPROVEN)"
   fi
 
   # ---- Case O: a SKIPPED case can never be reported as "all cases behaved" ----
@@ -1868,6 +2427,7 @@ want_census=0
 want_enumerate_only=0
 want_meta_skip=0
 want_lineage_arm_ps=0
+want_ps_env_parse=0
 fixture_dir=""
 platform_override=""
 input_file=""
@@ -1902,6 +2462,15 @@ while [[ $# -gt 0 ]]; do
     # to use, since that lookup is what stops it killing its own parent.
     --lineage-arm-ps)
       want_lineage_arm_ps=1
+      shift
+      ;;
+    # INTERNAL to --self-test Case S: run ps_eww_env_vars over --input and report what
+    # the extractor made of it, so the macOS one-line env shape can be proven on a
+    # Linux box (the same trick Case R plays for the lineage arm). A FLAG, not an env
+    # var, and it never reaches the live census: it reads a file, so like --input it is
+    # refused outside --self-test.
+    --ps-env-parse)
+      want_ps_env_parse=1
       shift
       ;;
     # INTERNAL to --self-test Case O: register a synthetic skip and print the verdict
@@ -1967,9 +2536,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if ((want_self_test == 0)); then
-  if [[ -n "$input_file$fixture_dir$platform_override" || $want_census == 1 || $want_enumerate_only == 1 || $want_meta_skip == 1 || $want_lineage_arm_ps == 1 ]]; then
+  if [[ -n "$input_file$fixture_dir$platform_override" || $want_census == 1 || $want_enumerate_only == 1 || $want_meta_skip == 1 || $want_lineage_arm_ps == 1 || $want_ps_env_parse == 1 ]]; then
     {
-      echo "error: --input / --fixture-dir / --platform / --census / --enumerate-only / --meta-skip / --lineage-arm-ps are for the --self-test harness only"
+      echo "error: --input / --fixture-dir / --platform / --census / --enumerate-only / --meta-skip / --lineage-arm-ps / --ps-env-parse are for the --self-test harness only"
       echo "  the live census must read the REAL process table. A mock fed to the live path"
       echo "  would let this guard report 'clean' about a table it never looked at — the exact"
       echo "  vacuous green this family of guards exists to refuse."
@@ -2005,6 +2574,29 @@ if ((want_self_test == 1)); then
     resolve_lineage "$CENSUS_PID"
     enumerate_unix >"${CENSUS_DUMP_ENUM:-/dev/stdout}"
     exit $?
+  fi
+  if ((want_ps_env_parse == 1)); then
+    # Case S's probe: parse a captured `ps eww` read with the REAL extractor. Emits
+    # one NAME=VALUE per line plus a trailer stating the count and whether the bound
+    # was hit, so the case can assert all three properties (marker found, ~109 vars,
+    # zero vars from argv-only) against the shipped parser rather than a copy.
+    if [[ -z "$input_file" ]]; then
+      echo "error: --ps-env-parse needs --input <a captured ps eww read> (self-test only)" >&2
+      exit 2
+    fi
+    if [[ ! -r "$input_file" ]]; then
+      printf 'error: --ps-env-parse cannot read --input %s\n' "$input_file" >&2
+      exit 2
+    fi
+    ps_eww_env_vars "$(cat "$input_file")"
+    parsed_count=0
+    if [[ -n "$ENV_PS_VARS" ]]; then
+      parsed_count="$(printf '%s\n' "$ENV_PS_VARS" | grep -c .)"
+      printf '%s\n' "$ENV_PS_VARS"
+    fi
+    printf 'parsed-vars: %s\n' "$parsed_count"
+    printf 'parsed-truncated: %s\n' "$ENV_PS_TRUNCATED"
+    exit 0
   fi
   if ((want_meta_skip == 1)); then
     # Case O's probe: one synthetic skip through the REAL verdict path. Nothing else
