@@ -73,7 +73,7 @@ pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
-pub use frame::Connection;
+pub use frame::{Connection, ConnectionWriter};
 
 #[cfg(unix)]
 pub use unix::{connect, default_endpoint, Listener};
@@ -174,6 +174,32 @@ pub enum TransportError {
         platform: &'static str,
         /// The endpoint that was rejected.
         endpoint: Endpoint,
+    },
+    /// A unix peer whose uid is not the daemon's own (issue #4).
+    ///
+    /// The ONLY thing the local transport can refuse a peer for on its own
+    /// account: `serve` has no authentication (deferred to T13), so before this
+    /// variant existed the transport had no vocabulary for "I know who you are
+    /// and you are not who I am". The peer's uid comes from the kernel
+    /// (`SO_PEERCRED` on Linux, `getpeereid` on the BSDs) and is not forgeable by
+    /// the peer, so this is a real refusal rather than a hint.
+    ///
+    /// Both uids are fields rather than prose because the accept loop reports
+    /// rejections on a COUNTED schedule (a hostile local process can connect
+    /// repeatedly, and its attempts must not be able to flood the operator's
+    /// stderr), and because `serve::run` matches on the variant to pick that path
+    /// instead of the generic accept-failure log line.
+    ///
+    /// What this does NOT claim: that a peer under the daemon's own uid is
+    /// trusted. Same-uid peers pass, and that residual is exactly what the
+    /// socket's 0600 mode cannot close either — see `unix.rs`'s module header,
+    /// and T13 for the protocol-layer answer.
+    #[error("peer uid {peer_uid} is not the daemon's uid {expected_uid}")]
+    PeerIdentity {
+        /// The uid the kernel reported for the connecting process.
+        peer_uid: u32,
+        /// The uid the daemon demanded — its own effective uid.
+        expected_uid: u32,
     },
     /// `default_endpoint` had nowhere to put the socket.
     #[error("no platform data directory available (dirs::data_dir() returned None)")]

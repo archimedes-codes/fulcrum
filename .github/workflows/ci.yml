@@ -16,10 +16,27 @@ jobs:
     # so far (a hand-escaped JSON fixture path; `Path::is_file()` not appending
     # `EXE_SUFFIX`) were invisible on Linux and caught on the Windows leg.
     runs-on: ${{ matrix.os }}
+    # 25 min: ubuntu's whole job is ~1.5 min and `main`'s Windows leg was 4.3 min, so
+    # this is ~5x the slowest observed leg with room for a cold dependency cache and
+    # for a suite that spawns real worker processes — while a hang dies in minutes
+    # instead of the 3h35m the unbounded Windows leg ran before a human cancelled it
+    # (GitHub's default is 360, and no job here used to set this at all).
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+    # The stray-process census's run-scoping discriminator, exported BEFORE `cargo
+    # test` so every process the suite spawns inherits it and the census steps (same
+    # job, so the same value) can prove which survivors belong to this run. Job-level
+    # rather than per-step: a value set on one step's `env:` cannot reach a later
+    # step, and the census is a later step. `run_attempt` increments on a rerun, so a
+    # rerun on a self-hosted machine re-scopes cleanly instead of inheriting the
+    # previous attempt's processes. The `|| 'unset'` guard keeps the value
+    # non-empty where a context is absent; the census refuses (exit 2) rather than
+    # certify a table it cannot attribute, so a missing marker is red, not green.
+    env:
+      FULCRUM_CI_RUN_MARKER: ${{ (github.run_id != '') && format('{0}-{1}', github.run_id, github.run_attempt) || 'unset' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -70,6 +87,69 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+      # Detect daemon/worker processes this run lost track of. WHY A CHECK AND NOT A
+      # TEST: per-test guards ask only "is the pid I spawned gone?"; nobody asks
+      # "are there leftover daemon/worker processes from THIS run nobody is
+      # tracking?" — a test that crashes before recording a pid, or spawns a
+      # grandchild it never tracked, passes every existing assertion and still leaks.
+      # The env marker (exported on every leg) is the discriminator: the census kills
+      # processes proven to share this run's secret and refuses to certify a table it
+      # could not read. The ps enumerator (not pgrep -x) is used because comm is
+      # truncated to 15 chars: pgrep -x cannot match the 19-char fake_mcp_stdio_core
+      # at all, and the truncated 15-char form is prefix-ambiguous
+      # (fake_worker_corruptor and fake_worker_core share it), so the census matches
+      # the FULL image basename against ps's untruncated argv instead.
+      #
+      # The Windows leg is ADVISORY: it reports every live match and kills nothing,
+      # because no bash-accessible mechanism there can read another process's
+      # environment to attribute it to this run. Issue #5's "fail the run" criterion
+      # is therefore ENFORCED ON UNIX ONLY, and the step says so in its own output.
+      # On macOS a candidate whose provenance cannot be read makes the step exit 2 —
+      # a leg that passes because it could not look is the failure class that rule
+      # makes impossible.
+      # `shell: bash` is not decoration: on windows-latest GitHub's default shell is
+      # pwsh, and without it these steps invoke `bash.exe` from PATH as a pwsh command
+      # line — the very Git-for-Windows bash the census header reasons about, reached
+      # by an assumption the step never states. Same explicit shell as the guard steps
+      # in schema-drift.yml.
+      #
+      # The census's own self-test, split by leg ON PURPOSE. Do not "helpfully"
+      # collapse these two steps into one, and do not add `--allow-skips` to the
+      # ubuntu one.
+      #
+      # WHY THE ASYMMETRY: `setsid` is absent BY PLATFORM DESIGN on macOS and on
+      # Git-for-Windows bash (measured on real runners: macOS has /bin/ps and no
+      # setsid; Windows has neither setsid nor pgrep). Cases I and M plant processes
+      # through it, so on those two legs they can only ever skip — and 0df40b9 made
+      # any skip fatal under CI=true. Left alone, that rule would have reddened macOS
+      # and Windows PERMANENTLY over a gap that is not a defect, by conflating "the
+      # harness is misconfigured" (always red) with "this platform cannot host this
+      # case by design, and another leg in the matrix proves it" (loud, tolerated).
+      # `--allow-skips <reason>` is the second claim, stated out loud: the skips are
+      # still printed, still counted UNPROVEN, and the run still never prints "all
+      # cases behaved". It is a FLAG with a mandatory reason so the tolerance is
+      # visible in the log — never an env var, which is the bug class 5d08d2c fixed.
+      #
+      # UBUNTU IS WHERE THE TEETH ARE PROVEN. It runs with NO flag, so on that leg
+      # every case must actually run and any skip at all — including one a future case
+      # introduces — goes red. That is what stops this guard from being disarmed by
+      # someone adding the flag everywhere: the ubuntu leg is the one that grades the
+      # census's ability to fail, and the other two legs only prove their own
+      # platform-specific arms (L/R lineage on macOS, the tasklist shape on Windows).
+      - name: Prove the stray-process census can fail (ubuntu, no skip tolerated)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/check-no-stray-processes.sh --self-test
+
+      - name: Prove the stray-process census can fail (macOS and Windows, expected skips tolerated loudly)
+        if: matrix.os != 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/check-no-stray-processes.sh --self-test --allow-skips "setsid absent on macOS and on Git-for-Windows bash, so self-test cases I and M cannot plant a process here; the ubuntu leg runs this same self-test WITHOUT the flag and proves those paths"
+
+      - name: Check for stray daemon/worker processes from this run
+        shell: bash
+        run: bash scripts/check-no-stray-processes.sh
 
       # The guard on the real build graph. WHY A CHECK AND NOT A TEST: a dependency
       # turning on rquickjs's `rust-alloc`/`allocator` makes `set_memory_limit` a

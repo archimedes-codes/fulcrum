@@ -112,17 +112,33 @@ pub const MAX_INBOUND_LINE_BYTES: usize = 1024 * 1024;
 /// side).
 ///
 /// Bidirectional, and the two directions are deliberately DECOUPLED: the read
-/// half lives on its own task, the write half is driven in place. See
-/// [`Connection::new`] for why the reader cannot be a future inside this struct.
+/// half lives on its own task, the write half is a [`ConnectionWriter`] — this
+/// type's dormant writer slot until [`Connection::split_writer`] hands it out.
+/// See [`Connection::new`] for why the reader cannot be a future inside this
+/// struct.
 ///
-/// Dropping it closes the socket/pipe and stops the reader task.
+/// Dropping it closes the socket/pipe and stops the reader task. Note that
+/// dropping ONE half of a split pair does not: `tokio::io::split`'s halves share
+/// an `Arc` over the stream, so the socket's full close rides the drop of the
+/// LAST handle — the reader here plus the peer's `ConnectionWriter`.
 pub struct Connection {
-    /// The write half, plus the bytes of the current frame the OS has not taken
-    /// yet (see [`Connection::send_frame`]).
-    writer: tokio::io::WriteHalf<DuplexBox>,
-    /// The tail of a frame whose `write` was only partially accepted. Kept here
-    /// so an abandoned `send_frame` cannot desync the stream.
-    pending: Vec<u8>,
+    /// The write half, held ONLY so [`Connection::split_writer`] can hand it out
+    /// once. `None` after `split_writer`, and `Connection` has NO write method.
+    ///
+    /// `Option` rather than a plain field because `split_writer` consumes `self`
+    /// and must still be able to take the writer out: taking it from a `Some` and
+    /// leaving a `None` behind is what makes a second `split_writer` panic instead
+    /// of handing out a second handle to `pending`.
+    ///
+    /// It holds the whole [`ConnectionWriter`] and not a bare `WriteHalf` so that
+    /// `pending` moves out with it in one piece — there is no code path in this
+    /// type that can reach `pending` at all, which is the point: an unsplit
+    /// `Connection` cannot write, and a split one cannot write twice. (While the
+    /// split landed in two commits there was a transient `Connection::send_frame`
+    /// delegator that borrowed this slot; T4b deleted it, because a `Connection`
+    /// that can write alongside a live `ConnectionWriter` is exactly the two-handles
+    /// hazard this type exists to prevent.)
+    writer: Option<ConnectionWriter>,
     /// Decoded inbound lines, in order. `None` (i.e. the channel closing) is
     /// EOF.
     ///
@@ -133,6 +149,25 @@ pub struct Connection {
     /// The reader task. Held so `Drop` can abort it — otherwise a dropped
     /// `Connection` would leave a task parked on a dead socket forever.
     reader: tokio::task::JoinHandle<()>,
+}
+
+/// The WRITE half of a framed connection, with the unwritten tail of a
+/// partially-accepted frame. Owns `pending` EXCLUSIVELY — it is the only
+/// type whose methods can reach the bytes of a half-sent frame. See
+/// [`Connection::split_writer`] for why the two writers may never be
+/// shared.
+///
+/// The exclusivity is the reason this type exists. A JSONL stream cannot
+/// resynchronise once two writers interleave a half-written line, so the tail of
+/// a frame the OS only partly took must have exactly one owner; making that a
+/// field of a type nobody can clone, share, or reach twice is what turns "two
+/// tasks must not both send" from a comment into a structure.
+pub struct ConnectionWriter {
+    /// The write half of the shared duplex (see [`Connection::new`]'s split).
+    writer: tokio::io::WriteHalf<DuplexBox>,
+    /// The tail of a frame whose `write` was only partially accepted. Kept here
+    /// so an abandoned `send_frame` cannot desync the stream.
+    pending: Vec<u8>,
 }
 
 /// Manual, not `derive`: the write half wraps a `dyn` object, which has no
@@ -154,7 +189,9 @@ impl Connection {
     {
         let stream: DuplexBox = Box::new(stream);
         // `split` gives two handles over one stream, so the reader task and the
-        // caller's `send_frame` never fight over a single `&mut`.
+        // writer never fight over a single `&mut`. The write half is NOT spawned
+        // anywhere and is NOT written from the reader side: it is kept in this
+        // struct's slot, ready for [`Connection::split_writer`] to hand out once.
         let (read_half, write_half) = tokio::io::split(stream);
         // BOUNDED, and the reader waits for room — see [`MAX_QUEUED_INBOUND_FRAMES`]
         // for the measurement that made this a correctness issue rather than
@@ -236,19 +273,69 @@ impl Connection {
         });
 
         Self {
-            writer: write_half,
-            pending: Vec::new(),
+            // The write half waits here, whole, for `split_writer`. Keeping the
+            // `ConnectionWriter` (and not just the `WriteHalf`) is what lets
+            // `pending` leave with it in one piece: nothing in this type reads
+            // either field.
+            writer: Some(ConnectionWriter {
+                writer: write_half,
+                pending: Vec::new(),
+            }),
             lines,
             reader,
         }
     }
 
+    /// Return the connection's write half (and its exclusive `pending`),
+    /// leaving this `Connection` owning only the reader.
+    ///
+    /// May be called at most ONCE. The returned [`ConnectionWriter`] is the ONLY
+    /// way to send frames on this connection, full stop: `Connection` has no write
+    /// method, so a second call is not a lesser evil but the only remaining mistake,
+    /// and it panics (this is the same trust `tokio::io::split` gives).
+    ///
+    /// # Why both halves come back
+    ///
+    /// The caller keeps the reader (its `recv` is the connection's inbound) and
+    /// hands the writer wherever the writes belong — for the daemon, to a writer
+    /// task. Returning `(Self, ConnectionWriter)` rather than taking `&mut` is
+    /// what makes the exclusivity mechanical: the original `Connection` cannot be
+    /// used to ask twice, and the half that comes back has no writer slot left to
+    /// take.
+    ///
+    /// # Panics
+    ///
+    /// If the writer has already been taken. That panic IS the two-writer hazard
+    /// surfacing at the mistake rather than as a corrupted frame later; pinned by
+    /// `a_second_split_writer_panics` in `tests/transport.rs`.
+    pub fn split_writer(mut self) -> (Self, ConnectionWriter) {
+        let writer = self.writer.take().expect("the writer was already taken");
+        (self, writer)
+    }
+
+    /// The next inbound frame.
+    ///
+    /// `None` is EOF — the peer closed. A line that is not valid JSON arrives as
+    /// `Some(Err(Decode(..)))` and the stream CONTINUES: one malformed line is a
+    /// peer bug, not a reason to lose the connection. That mirrors
+    /// `protocol::decode_inbound`, which is permissive for the same reason.
+    pub async fn recv(&mut self) -> Option<Result<serde_json::Value, TransportError>> {
+        self.lines.recv().await
+    }
+}
+
+impl ConnectionWriter {
     /// Serialize `frame` as one JSON object and write it as one `\n`-terminated
     /// line.
     ///
+    /// This is the ONLY method in the transport that can reach `pending`, and
+    /// taking `&mut self` is what makes it the only WRITER: two tasks cannot both
+    /// be inside it on one handle, and there is no second handle
+    /// ([`Connection::split_writer`] hands out the only one).
+    ///
     /// Cancellation-safe in the sense that matters for a framing layer: the
     /// bytes of a frame already handed to `send_frame` are buffered in
-    /// `self.pending` and drained on the next call, so abandoning this future
+    /// `pending` and drained on the next call, so abandoning this future
     /// mid-write cannot leave the stream holding half a frame (which every
     /// later frame would then be glued onto). It is still NOT a good idea to
     /// `select!` over a send — the frame you started may still go out.
@@ -287,14 +374,43 @@ impl Connection {
         Ok(())
     }
 
-    /// The next inbound frame.
+    /// Ask the OS to close the write direction of the whole duplex, even while
+    /// the read half is still alive. `tokio::io::split`'s `WriteHalf` holds a
+    /// SHARED `Arc<Inner<T>>` and has NO `Drop` impl, so dropping it does NOT
+    /// close a socket while any other half's `Arc` is alive (verified in tokio
+    /// 1.54 `src/io/split.rs`); a writer parked inside `send_frame`'s write loop
+    /// would stall there forever. `poll_shutdown` on the shared stream is what
+    /// makes FUTURE `write`s on this direction fail and tells the peer that this
+    /// direction is over (EOF) — it does NOT reliably un-park a `write` already
+    /// blocked inside the OS (shutdown(2) semantics: the wake latency of a parked
+    /// send is kernel-dependent), so this method is the direction-closer + the
+    /// peer-EOF signal, NOT a guaranteed parked-write breaker. For the daemon's
+    /// connections the writer's parked `write` is broken by the PEER'S CLOSE or —
+    /// on the reader-first path — by the socket's full close when the last `Arc`
+    /// (the reader's `Connection` and the writer task's future) drops.
     ///
-    /// `None` is EOF — the peer closed. A line that is not valid JSON arrives as
-    /// `Some(Err(Decode(..)))` and the stream CONTINUES: one malformed line is a
-    /// peer bug, not a reason to lose the connection. That mirrors
-    /// `protocol::decode_inbound`, which is permissive for the same reason.
-    pub async fn recv(&mut self) -> Option<Result<serde_json::Value, TransportError>> {
-        self.lines.recv().await
+    /// MUST be called by the exiting writer AFTER `send_frame` returns (never
+    /// from inside a `select!`). It is a best-effort close: an `Err` is ignored,
+    /// the callers exit on their own schedules regardless.
+    ///
+    /// This is the ONLY place the transport reaches `poll_shutdown` on the shared
+    /// duplex.
+    ///
+    /// # Why this takes `&mut self` and not `self`
+    ///
+    /// The plan (A1b) spells it `shutdown(mut self)`, which makes the direction
+    /// close unobservable from the handle that asked for it — and the acceptance
+    /// criterion for this split is a test named
+    /// `a_send_against_a_shut_down_connection_errors_that_the_writer_survives`,
+    /// whose first claim is that a send AFTER the shutdown errors. A consuming
+    /// receiver cannot express that claim at all (there is no writer left to send
+    /// on), so the signature is the one that keeps the plan's own test writable.
+    /// It costs nothing at the call site: the daemon's writer calls
+    /// `writer.shutdown().await` and the handle drops with the task either way.
+    /// It does mean a caller MAY try to write again — and that write fails, which
+    /// is the behaviour the test pins.
+    pub async fn shutdown(&mut self) {
+        let _ = self.writer.shutdown().await;
     }
 }
 

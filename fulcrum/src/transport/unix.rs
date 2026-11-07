@@ -4,6 +4,47 @@
 //! `tokio::net::UnixListener` fails the Windows target with `E0433: cannot find
 //! 'UnixListener' in 'net'`. The Windows twin is `windows.rs`, and `mod.rs`
 //! re-exports one of the two, so callers see one `Listener`.
+//!
+//! # What this platform can prove about a peer (issue #4)
+//!
+//! `serve` has no authentication (T13), so the socket has carried the whole
+//! access-control decision. Two layers now, and they close different holes:
+//!
+//! 1. **The file mode** (`bind_private`: umask tightened, then `chmod 0600`,
+//!    before the first `accept`). Proves the connecting process was allowed by the
+//!    filesystem — i.e. it is the owner, or root, or in a group/world the owner
+//!    explicitly widened.
+//! 2. **The peer credential** (`Listener::accept` → `peer_uid` →
+//!    `verify_peer_uid`). Proves the kernel's answer for the peer's REAL uid
+//!    equals the daemon's own effective uid, and refuses the connection if not.
+//!
+//! Layer 2 is defense in depth, not a replacement: anything that passes layer 1
+//! also passes layer 2 in a normal deployment, and that is the point — layer 2
+//! still refuses a peer that reached the socket some other way (a widened parent
+//! directory, an `AF_UNIX` abstract-namespace or `SCM_CREDENTIALS`-adjacent path,
+//! a filesystem whose mode the daemon could not set, a misconfigured `--socket` in
+//! a shared directory). Both layers are stated as "the socket is the credential,
+//! AND the credential check is the second check" rather than one or the other.
+//!
+//! The per-platform mechanisms, what each proves, and why one call is not enough:
+//!
+//! | Platform | Mechanism | Proves | Does not prove |
+//! |---|---|---|---|
+//! | Linux, Android | `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &mut libc::ucred)` | the peer's real uid/gid/pid at connect time, assigned by the kernel and unforgeable by the peer | anything about a process under the SAME uid — every process under your account passes |
+//! | macOS | `getpeereid(fd, &mut euid, &mut egid)` | the peer's effective uid/gid | the pid (`LOCAL_PEERCRED` + `libc::xucred` would give it; see `peer_uid` below) |
+//! | FreeBSD / NetBSD / OpenBSD / DragonFly | `getpeereid` | the peer's effective uid/gid | the pid |
+//!
+//! `SO_PEERCRED` is Linux-only at the `SOL_SOCKET` level, so a single
+//! `#[cfg(unix)]` implementation of it would not compile on the macOS leg of CI.
+//! `getpeereid` is the one call the whole BSD family has, so this file carries two
+//! `#[cfg]`-gated arms of `peer_uid` rather than one unix-wide one — and the
+//! gating is at item level, never `if cfg!(…)`, for the reason `transport/mod.rs`
+//! documents (an `if cfg!` arm still compiles, and then trips `-D warnings`).
+//!
+//! **The residual, named:** a same-uid process is indistinguishable from the
+//! client you meant to allow. No credential check on any unix closes that — it is
+//! the same-uid case, and the only real answer is authenticating at the protocol
+//! layer, which is T13.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -104,8 +145,33 @@ impl Listener {
     ///
     /// The `Listener` is taken by `&self`, so one accept loop can serve many
     /// connections; each returned [`Connection`] owns its own reader task.
+    ///
+    /// # The peer is identified before it is served (issue #4)
+    ///
+    /// The credential check happens HERE, while the accepted stream is still in
+    /// this function's hands, rather than inside `Connection` or in `serve`'s
+    /// accept arm: this is the one place the platform's peer-credential call has
+    /// the accepted fd, and a refused peer should cost nothing — no `Connection`,
+    /// no reader task, no client task spawned for a process we are about to hang
+    /// up on. (The alternative, accept-then-close, hands the attacker a task per
+    /// connection attempt for no benefit.)
+    ///
+    /// A refusal is an `Err`, and `serve::run`'s accept arm treats `Err` as a
+    /// per-connection condition and keeps looping — so a hostile local process
+    /// that connects in a loop is refused in a loop, cheaply.
+    ///
+    /// What this proves, and what it does not, is in this module's header table.
+    /// The short form: the peer's uid is the kernel's answer and cannot be forged,
+    /// and a peer under the daemon's own uid still passes.
     pub async fn accept(&self) -> Result<Connection, TransportError> {
         let (stream, _addr) = self.listener.accept().await?;
+        // Resolved on the raw fd before the stream moves into the `Connection`.
+        // `as_raw_fd` is safe (the fd is alive for the whole statement, and this
+        // call does not take ownership of it).
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
+        let my_uid = unsafe { libc::geteuid() };
+        let peer = peer_uid(fd)?;
+        verify_peer_uid(peer, my_uid)?;
         Ok(Connection::new(stream))
     }
 }
@@ -272,6 +338,112 @@ fn reclaim_stale_socket(path: &Path) -> Result<(), TransportError> {
     Ok(())
 }
 
+/// What the peer's uid is, as the KERNEL reported it, for an accepted connection.
+///
+/// Resolved at ACCEPT time, in [`Listener::accept`], while the accepted stream is
+/// still in this module's hands — deliberately not stored in [`Connection`]
+/// (`Connection::new`'s signature is the seam a later task splits, and a
+/// connection that carries an identity invites the reader to trust it downstream).
+///
+/// Two mechanisms, because the two unix families expose different calls, and a
+/// CI matrix that compiles ubuntu, macos and windows will not forgive an arm that
+/// only exists on one of them:
+///
+/// | Platform | Call | Proves | Does not prove |
+/// |---|---|---|---|
+/// | Linux, Android | `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &mut ucred)` | the peer's real uid, gid AND pid, assigned by the kernel at connect time | anything about the peer beyond that — a same-uid process passes |
+/// | macOS, FreeBSD, NetBSD, OpenBSD, DragonFly | `getpeereid(fd, &mut euid, &mut egid)` | the peer's effective uid and gid | the pid |
+///
+/// `SO_PEERCRED` is NOT a portable option: macOS has no `SO_PEERCRED` at the
+/// `SOL_SOCKET` level at all. It does have `LOCAL_PEERCRED`, which fills a
+/// `libc::xucred` and DOES carry the connecting pid — but `xucred`'s version-field
+/// semantics and layout are platform-specific, and the daemon's requirement here
+/// is uid identity, not pid. So `getpeereid` is the arm every BSD compiles, and
+/// `LOCAL_PEERCRED`/`xucred` is the documented hook for a future task that
+/// actually needs the pid on macOS.
+///
+/// The pid `SO_PEERCRED` also reports is deliberately NOT returned: a pid
+/// identifies a process only until that process is reaped and the number is
+/// reused, and nothing at accept time wants one — the refusal the caller raises
+/// names the uid, which is the thing the operator can act on. `ucred`'s `pid` is
+/// therefore read and dropped.
+///
+/// Returns [`TransportError::Io`] when the syscall fails. That is the honest
+/// answer, not a fallback to "accept anyway": a socket the kernel will not
+/// describe is a socket this daemon cannot account for, and refusing it costs the
+/// peer a reconnect, not the daemon anything.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<u32, TransportError> {
+    // `MaybeUninit` because the kernel writes this struct; `assume_init` below is
+    // reached only on the `rc == 0` path, where `getsockopt` filled it.
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // `pid` is read and dropped — see the note above. Returned as-is rather than
+    // `as u32`: `libc::uid_t` IS `u32` on every target this repo compiles (Linux,
+    // Android, macOS, the BSDs), so a cast would be a no-op clippy's
+    // `-D warnings` rightly rejects. If a platform ever turns up whose `uid_t` is
+    // not `u32`, this line is the compile error that says so — which beats a
+    // silent narrowing.
+    Ok(unsafe { cred.assume_init() }.uid)
+}
+
+/// The BSD shape of [`peer_uid`] — see that function's table for why this is the
+/// arm macOS and the BSDs get and Linux does not.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<u32, TransportError> {
+    let mut euid: libc::uid_t = 0;
+    // The gid is not what this check is about (the daemon's credential model is
+    // uid identity), but `getpeereid` requires both out-params.
+    let mut egid: libc::gid_t = 0;
+    // `getpeereid` is the ONE call every BSD (and macOS) documents for this;
+    // it is `libc`'s own binding under `unix/bsd`, so no per-OS arm is needed.
+    let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // No pid: `getpeereid` does not return one, and `LOCAL_PEERCRED` (which does)
+    // is the documented alternative — see [`peer_uid`]'s note.
+    Ok(euid as u32)
+}
+
+/// Does the peer's uid equal the daemon's?
+///
+/// Extracted from [`Listener::accept`] so the comparison — the whole content of
+/// the check — is unit-testable. A live foreign-uid peer cannot be manufactured
+/// by a test: `setuid` to another uid needs root, CI's runners are unprivileged,
+/// and a test target cannot name a private function of this module to drive it
+/// directly. So the arithmetic is pinned here, the real-socket SAME-uid path is
+/// pinned by `tests/transport.rs::same_uid_peer_is_accepted`, and the reject path
+/// is pinned by the `#[ignore]`d root-only test next to it.
+///
+/// Deliberately a plain equality, not a capability check: what `SO_PEERCRED` /
+/// `getpeereid` proves is the peer's REAL uid, which the kernel assigned and the
+/// peer cannot forge. It does not prove anything about a process running under
+/// the same account — that residual is the socket's file mode's residual too, and
+/// it is what T13's protocol-layer auth exists to close.
+fn verify_peer_uid(peer_uid: u32, expected_uid: u32) -> Result<(), TransportError> {
+    if peer_uid == expected_uid {
+        Ok(())
+    } else {
+        Err(TransportError::PeerIdentity {
+            peer_uid,
+            expected_uid,
+        })
+    }
+}
+
 /// Dial the daemon at `endpoint`.
 ///
 /// The client side lives here (not in `frame`) for the same reason the listener
@@ -284,4 +456,55 @@ pub async fn connect(endpoint: Endpoint) -> Result<Connection, TransportError> {
     check_socket_path_len(&path)?;
     let stream = UnixStream::connect(&path).await?;
     Ok(Connection::new(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_peer_uid;
+    use crate::transport::TransportError;
+
+    /// The peer whose uid is the daemon's own is accepted.
+    ///
+    /// This is the path every legitimate client takes, and the one the real
+    /// socket tests can only reach from the inside: `tests/transport.rs` can
+    /// prove a same-uid dial SUCCEEDS, but it cannot manufacture a peer with a
+    /// different uid without root. So the equality itself is pinned here.
+    #[test]
+    fn a_peer_with_the_daemons_uid_is_accepted() {
+        assert!(
+            verify_peer_uid(1000, 1000).is_ok(),
+            "the daemon's own uid must be accepted"
+        );
+        // uid 0 is a uid like any other: a root daemon accepts a root peer and
+        // (by the arm below) refuses everyone else.
+        assert!(
+            verify_peer_uid(0, 0).is_ok(),
+            "a root daemon must accept a root peer"
+        );
+    }
+
+    /// A peer under another account is refused, and the refusal carries BOTH uids.
+    ///
+    /// The numbers have to ride in the error, not only in its prose: `serve`'s
+    /// accept loop logs rejections on a counted schedule, and an operator
+    /// debugging "my client keeps getting dropped" needs to see which uid the
+    /// kernel reported. Structured fields are also what keeps the accept arm
+    /// matching on a VARIANT rather than on an error string.
+    #[test]
+    fn a_peer_with_a_different_uid_is_refused_naming_both_uids() {
+        let err = verify_peer_uid(999, 1000).expect_err("a foreign uid must not pass");
+        match err {
+            TransportError::PeerIdentity {
+                peer_uid,
+                expected_uid,
+            } => {
+                assert_eq!(peer_uid, 999, "the error must report the peer's uid");
+                assert_eq!(
+                    expected_uid, 1000,
+                    "the error must report the uid the daemon demanded"
+                );
+            }
+            other => panic!("a foreign peer must be refused as PeerIdentity, got {other:?}"),
+        }
+    }
 }

@@ -1,15 +1,42 @@
 //! The daemon's schema + migrations (T9 Task 4).
 //!
-//! # Where this DDL comes from, and why it is verbatim
+//! # Where this DDL comes from, and how the copy is kept honest
 //!
-//! These four tables are the DESKTOP's. They are transcribed from
-//! `archimedes-desktop/src-tauri/src/storage/db.rs:1565-1604` (verified against
-//! that tree at `4f9b99dc`), column for column, constraint for constraint. The
-//! daemon opens a DIFFERENT file (`fulcrum.db`, not `archimedes.db`), so it is
-//! free of the desktop's migration chain — but it is NOT free of its shape: the
-//! day this store's `sessions` row stops being readable as the desktop's
-//! `SessionRow`, the "the daemon owns the same disk the desktop owns" premise of
-//! ADR 0091 quietly stops being true. So the DDL is copied, not re-derived.
+//! These four tables are the DESKTOP's. They were transcribed from
+//! `archimedes-desktop/src-tauri/src/storage/db.rs:1565-1604` (the
+//! `archimedes-desktop` path is the pre-rename name of what is now checked out as
+//! `archimedes-codes/desktop`, whose file is `src-tauri/src/storage/db.rs`), column
+//! for column, constraint for constraint. The daemon opens a DIFFERENT file
+//! (`fulcrum.db`, not `archimedes.db`), so it is free of the desktop's migration
+//! chain — but it is NOT free of its shape: the day this store's `sessions` row
+//! stops being readable as the desktop's `SessionRow`, the "the daemon owns the same
+//! disk the desktop owns" premise of ADR 0091 quietly stops being true. So the DDL
+//! is copied, not re-derived.
+//!
+//! A one-time inspection of that transcription is worth nothing, and this module
+//! used to claim it was worth something ("verified against that tree at
+//! `4f9b99dc`"). It is not: a copy verified once at a commit nobody is building
+//! drifts the day either repo edits a column, and nothing downstream notices. What
+//! keeps the copy honest now is a **shape-pin contract**, and it is mechanical:
+//!
+//! - [`schema_shape_fingerprint`] serialises [`TABLE_SHAPES`] (plus the index) into
+//!   the canonical text checked in at the repo root as `schema-sha.txt`. That file
+//!   IS the fingerprint — no hash, so a mismatch names the drifted table instead of
+//!   reporting two digests that differ.
+//! - `the_pinned_schema_fingerprint_matches_the_shipped_file` in
+//!   `fulcrum/tests/db.rs` diffs that file against the shapes this build pins, so a
+//!   DDL change HERE reddens `cargo test -p fulcrum` in the same commit that made it.
+//! - `scripts/check-schema-drift.sh` is the reusable comparator, run on every
+//!   `main`/`feature/*` push and every PR by
+//!   `.github/workflows/schema-drift.yml`, preceded by its own `--self-test` so a
+//!   guard that can no longer fail reddens the run instead of printing a green nobody
+//!   earned.
+//! - The desktop runs the SAME comparator in its own CI against the fingerprint of
+//!   the fulcrum rev it pins, so a DDL change THERE reddens the desktop.
+//!
+//! Both DDLs are byte-identical today, so this is a tripwire being installed, not a
+//! fire being fought. See `README.md`'s *Schema-shape contract with the desktop* for
+//! the update path.
 //!
 //! Two things here are deliberately load-bearing and must not be "simplified":
 //!
@@ -55,15 +82,42 @@
 //! the file on any mismatch — added column included, because a fork is a fork
 //! and the daemon must not silently ignore data it does not read.
 //!
-//! **The honest limit, stated where someone will over-read it:** that check runs
-//! against the daemon's OWN file. It detects a `fulcrum.db` that does not match
-//! the build reading it — a file written by a daemon built against a forked
-//! DDL, a restore from the wrong file, a hand-edited table. It does NOT and
-//! cannot detect the desktop forking `archimedes.db`, which this process never
-//! opens. Real cross-repo schema versioning (a version the desktop and the
-//! daemon negotiate) is a follow-up ticket; no amount of a reader checking a
-//! file against its own expectations substitutes for the two owners agreeing on
-//! a number.
+//! **The honest limit, and what replaced it:** that check runs against the
+//! daemon's OWN file. It detects a `fulcrum.db` that does not match the build
+//! reading it — a file written by a daemon built against a forked DDL, a restore
+//! from the wrong file, a hand-edited table. It does NOT and cannot detect the
+//! desktop forking `archimedes.db`, which this process never opens. Checking a file
+//! against its own expectations was never going to be the answer, so the two owners
+//! now agree on something else instead: not a version NUMBER, but an explicit,
+//! reviewed **schema-shape contract**.
+//!
+//! - What it pins: per table, every column's name and declared type in declaration
+//!   order, plus the `idx_messages_session` index statement. Order is part of it
+//!   because the positional mappers above read by index.
+//! - What it does NOT pin: the `NOT NULL` / `DEFAULT` / `PRIMARY KEY` flags (see
+//!   [`ColumnShape`] for why), the two `UNIQUE` upsert keys and both `ON DELETE
+//!   CASCADE`s (pinned by probes that ask the database, not the text:
+//!   `Db::table_has_unique` and the cascade tests in `fulcrum/tests/db.rs`), the
+//!   migration history, and the SELECT-list subsets — `Db::SESSION_COLUMNS` is 10 of
+//!   `sessions`' 12 columns and the desktop's `SPACE_COLUMNS` is 4 of `spaces`' 5, so
+//!   comparing those would FALSE-POSITIVE on `spaces.sort_order`.
+//! - Where the daemon side is enforced: `cargo test -p fulcrum` (the pin-vs-shapes
+//!   test) and `.github/workflows/schema-drift.yml` on every push and PR.
+//! - Where the desktop side is enforced: the same `scripts/check-schema-drift.sh`
+//!   comparator in the desktop's own CI, against the fingerprint of the fulcrum rev
+//!   that repo pins.
+//!
+//! And the degraded state is stated here because it is the state that ships today:
+//! the desktop pins fulcrum at `78e595436ac5612d8ef87f692bee61f48f6e58e7`, a rev
+//! whose tree carries no `fulcrum` member and therefore no `schema-sha.txt` at all.
+//! So the desktop half of the comparison cannot pass yet, and it must not pretend
+//! to — the comparator REFUSES with a named reason (`exit 2`: the pinned rev
+//! publishes no fingerprint) rather than passing because it found nothing to
+//! compare. A check that reports green on an empty comparison is worse than no
+//! check, because it launders the absence of a contract into the appearance of one.
+//! Until the desktop both publishes its own fingerprint and re-pins fulcrum to a rev
+//! that has one, the cross-repo leg is red by design — and that red is the honest
+//! answer.
 
 use rusqlite::Connection;
 
@@ -132,7 +186,7 @@ CREATE TABLE IF NOT EXISTS spaces (
 ///   it is "column 7 is not the column my mapper reads out of slot 7". The
 ///   constraints that actually matter here (both `UNIQUE` upsert keys, both
 ///   `ON DELETE CASCADE`s) are pinned by `Db::table_has_unique` and the cascade
-///   tests in `tests/db.rs`, which ask the database rather than the DDL text.
+///   tests in `fulcrum/tests/db.rs`, which ask the database rather than the DDL text.
 /// * The declared TYPE is pinned even though the mappers do not name it, because
 ///   SQLite's dynamic typing means a `TEXT` `cost_usd` does not fail loudly — it
 ///   coerces, and the daemon stores a value class it did not ask for.
@@ -332,6 +386,55 @@ pub const TABLE_SHAPES: [TableShape; 4] = [
     },
 ];
 
+/// Serialise [`TABLE_SHAPES`] — plus the index — into the schema-shape pin sections.
+///
+/// One section per table: the table's name on its own line, then a `name:type` line
+/// per column in declaration order; then a final `idx_messages_session` section
+/// carrying the trimmed `CREATE INDEX` statement. The text is produced directly
+/// from [`TABLE_SHAPES`] (the single source of truth; [`ColumnShape`] pins exactly
+/// name + declared type), parsed from [`SCHEMA`] only for the index line, which the
+/// shape constants do not carry. This is the serialisation of the same fact
+/// `the_pinned_shapes_match_the_ddl_they_claim_to_describe` proves against `SCHEMA`,
+/// not a second representation.
+pub(crate) fn schema_shape_sections() -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for shape in TABLE_SHAPES {
+        out.push((
+            shape.name.to_string(),
+            shape
+                .columns
+                .iter()
+                .map(|c| format!("{}:{}", c.name, c.decl_type))
+                .collect(),
+        ));
+    }
+    let index = SCHEMA
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("CREATE INDEX "))
+        .expect("SCHEMA declares the idx_messages_session index");
+    out.push(("idx_messages_session".to_string(), vec![index.to_string()]));
+    out
+}
+
+/// The full pin text: [`schema_shape_sections`], one line per entry, each line
+/// `\n`-terminated. Byte-identical to `schema-sha.txt` with comment lines and blank
+/// lines stripped (the integration test
+/// `the_pinned_schema_fingerprint_matches_the_shipped_file` in `fulcrum/tests/db.rs`
+/// asserts exactly that).
+pub fn schema_shape_fingerprint() -> String {
+    let mut out = String::new();
+    for (name, lines) in schema_shape_sections() {
+        out.push_str(&name);
+        out.push('\n');
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Bring a database from `from` (its stored `user_version`) to
 /// [`SCHEMA_VERSION`], and report the version it reached.
 ///
@@ -420,6 +523,78 @@ mod tests {
             declared, pinned,
             "`SCHEMA` and `TABLE_SHAPES` must name the same tables — a table with \
              no pinned shape is a table `Db::verify_shapes` never looks at"
+        );
+    }
+
+    /// The pin's sections name every table and carry its FULL column list.
+    ///
+    /// `schema-sha.txt` is the contract the desktop compares against, so the
+    /// shape of its sections is itself pinned: five sections, the exact arity of
+    /// each, and every line equal to the `name:type` pair the `*_TABLE` consts
+    /// declare. A section that silently lost a column would compare equal to a
+    /// desktop that had lost the same one — the vacuity this refuses.
+    #[test]
+    fn the_shape_sections_name_each_table_and_its_full_column_list() {
+        let sections = schema_shape_sections();
+        let names: Vec<&str> = sections.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "sessions",
+                "messages",
+                "native_messages",
+                "spaces",
+                "idx_messages_session",
+            ],
+            "the pin's sections must be the four tables in `TABLE_SHAPES` order \
+             plus the index, and nothing else"
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|(_, lines)| lines.len())
+                .collect::<Vec<_>>(),
+            vec![12, 6, 5, 5, 1],
+            "each section's line count is the column count its shape constant pins \
+             (the index section carries the one `CREATE INDEX` line)"
+        );
+
+        for (shape, (name, lines)) in TABLE_SHAPES.iter().zip(sections.iter()) {
+            let want: Vec<String> = shape
+                .columns
+                .iter()
+                .map(|c| format!("{}:{}", c.name, c.decl_type))
+                .collect();
+            assert_eq!(
+                *lines, want,
+                "`{name}`: the pin's sections must be `TABLE_SHAPES` serialised — \
+                 name + declared type, in declaration order"
+            );
+            assert_eq!(name, shape.name);
+        }
+    }
+
+    /// The index section is the shipped index statement, trimmed.
+    ///
+    /// The index is in the contract because `idx_messages_session` is the only
+    /// thing in the DDL the shape constants do not carry, and a lost index is a
+    /// full-table scan on the transcript read — drift the desktop would not see
+    /// in its own column lists.
+    #[test]
+    fn the_index_section_is_the_shipped_index_line() {
+        let sections = schema_shape_sections();
+        let index = sections
+            .iter()
+            .find(|(name, _)| name == "idx_messages_session")
+            .expect("the pin carries an idx_messages_session section");
+        assert_eq!(
+            index.1,
+            vec![
+                "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);"
+                    .to_string()
+            ],
+            "the index section must be the exact trimmed `CREATE INDEX` line from \
+             `SCHEMA` — the desktop compares this text verbatim"
         );
     }
 

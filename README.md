@@ -135,6 +135,48 @@ guards are worth knowing about before you trip them:
   workspace member and as a standalone package, and it **fails loudly** rather than
   quietly policing less when it cannot resolve a root. Being layout-aware, it is the
   reason this repo's layout is fixed — `AGENTS.md` has the finding.
+- **The schema-drift guard pair** —
+  `bash scripts/check-schema-drift.sh --self-test` (plants a retyped column, an
+  added column, a missing table, a dropped index and an unpinned fifth table, and
+  insists each one reddens the guard *and names the table*; plus the refusals: a
+  missing pin or a fingerprint that cannot name all five keys exits 2 rather than
+  passing) and `bash scripts/check-schema-drift.sh` (the live check: the shipped
+  DDL against the `schema-sha.txt` pin). Run the self-test first — a guard that has
+  lost the ability to fail prints a green nobody earned. Both run in
+  `.github/workflows/schema-drift.yml`; see *Schema-shape contract with the
+  desktop* below for what they actually compare.
+
+## Schema-shape contract with the desktop
+
+The daemon's four tables (`fulcrum/src/db/schema.rs`) are a transcription of the
+desktop's, and the daemon opens a different file — so nothing at runtime notices the
+two owners drifting apart, and the mappers read columns BY INDEX. `schema-sha.txt` at
+this repo root is the canonical **shape pin** that fixes that: five sections — the
+four tables plus `idx_messages_session` — each a header line and one `name:type` line
+per column in declaration order. It pins names, declared types and order, and NOTHING
+else: not NULL/DEFAULT/PRIMARY KEY flags, not the two `UNIQUE` upsert keys or the two
+`ON DELETE CASCADE`s (pinned by probes that ask the database: `Db::table_has_unique`,
+the cascade tests), not migration history, not the SELECT-list subsets
+(`SESSION_COLUMNS` / `SPACE_COLUMNS` are subsets — comparing them false-positives on
+`spaces.sort_order`). Whitespace is not drift; a renamed, retyped, reordered, added or
+removed column, or a lost index, is.
+
+Enforcement: here, `the_pinned_schema_fingerprint_matches_the_shipped_file` in
+`fulcrum/tests/db.rs` (so a daemon DDL change reddens `cargo test` in its own commit)
+plus `scripts/check-schema-drift.sh` in `.github/workflows/schema-drift.yml`. The
+desktop half is the requirement that closes the contract — the same comparator there,
+against the fingerprint of the fulcrum rev it pins — and it is **NOT YET WIRED**: the
+desktop has no such workflow step today, so this paragraph states design intent, not
+current behaviour.
+**Update path:** change both repos' DDL in lockstep and update `schema-sha.txt` in the
+SAME commit, so the pin diff and the DDL diff are reviewed together.
+
+The honest degraded state, stated rather than hidden: the desktop pins fulcrum at
+`78e59543`, a rev whose tree contains no `fulcrum` member and so publishes no
+fingerprint. The desktop-side comparison therefore REFUSES with a named reason (exit
+2) instead of passing on an empty comparison, and it stays red by design until the
+desktop publishes its own fingerprint and re-pins fulcrum. Silence there is a bug,
+never a green.
 
 ## Consuming it
 
