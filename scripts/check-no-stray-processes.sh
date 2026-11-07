@@ -204,10 +204,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #   0  clean — the table WAS read and no live process of THIS run was left; or
 #      candidates were found, proven NOT to be this run's, and left alone (the
-#      count is reported to stderr and the run still passes)
+#      count is reported to stderr and the run still passes); or a self-test whose
+#      only gap is a skip its `--allow-skips <reason>` was given a stated reason for
 #   1  leak — a daemon/worker of THIS run outlived the suite (unix: reported AND
 #      killed; windows: reported only, advisory) — or a self-test case misbehaved,
-#      or a self-test-only FLAG was used outside `--self-test`
+#      or a self-test-only FLAG was used outside `--self-test` (which includes
+#      `--allow-skips`, and `--allow-skips` with an empty reason), or a self-test
+#      under CI=true recorded a skip that `--allow-skips <reason>` did not tolerate
 #   2  the census could not answer honestly: no FULCRUM_CI_RUN_MARKER, no `ps` / no
 #      `tasklist`, an enumeration it could not parse, a candidate whose PROVENANCE
 #      COULD NOT BE READ, a table whose candidates ALL vanished before they could be
@@ -247,6 +250,12 @@
 #                    THIS guard can still fail (the cases re-invoke this same script —
 #                    never a second implementation of the matching logic)
 #   --keep-temp-dir  leave the self-test's scratch directory in place to inspect
+#   --allow-skips <reason>
+#                    INSIDE --self-test ONLY: an expected skip is reported loudly and
+#                    still counted UNPROVEN, but exits 0 instead of failing under
+#                    CI=true. <reason> is REQUIRED and is printed, so the CI log always
+#                    says why the gap is tolerated. See the skip section below for why
+#                    this is a flag and never an env var.
 #
 # THE SELF-TEST SKIPS, AND WHAT A SKIP COSTS. Four cases plant real processes and so
 # need real tooling: I (ps -eo, a copyable sleep, setsid), M (the same, plus python3),
@@ -260,9 +269,27 @@
 # so I and M skip there while L and R still run, and a blanket guard would have thrown
 # away the lineage coverage that macOS genuinely can provide.
 #
+# WHY `--allow-skips` EXISTS, AND WHY IT IS A FLAG. `setsid` is absent BY PLATFORM
+# DESIGN on macOS and on Git-for-Windows bash (measured on real runners: macOS has
+# /bin/ps and no setsid; Windows has neither setsid nor pgrep). So the CI=true rule
+# above would redden the macOS and Windows legs PERMANENTLY, over a gap that is not a
+# defect and that the ubuntu leg already covers. That conflates two different claims:
+# "the harness is misconfigured" (red, always) and "this platform cannot host this
+# case by design, and another leg in the matrix proves it" (loud, tolerated). The
+# ubuntu leg is where the census's teeth are proven and runs WITHOUT the flag; the
+# other two legs prove their own platform-specific arms.
+# It is a FLAG with a mandatory reason, not an environment variable, on purpose: the
+# live-path fixture-seam bug this branch fixed (5d08d2c) was exactly a
+# behaviour-selecting env var letting a guard fabricate its own verdict, and a var set
+# at workflow level is no more auditable than that was. A flag appears in the step's
+# own command line, so the CI log shows the tolerance was granted and by what
+# argument. Tolerating a gap never proves it: the ledger, the UNPROVEN summary and the
+# refusal to print "all cases behaved" are all unchanged. Case T pins both postures.
+#
 # The live census takes no input options at all. `--input`/`--fixture-dir`/
 # `--platform`/`--census`/`--enumerate-only`/`--meta-skip`/`--lineage-arm-ps`/
-# `--ps-env-parse` exist ONLY inside `--self-test` and are rejected otherwise (exit 1):
+# `--ps-env-parse`/`--allow-skips` exist ONLY inside `--self-test` and are rejected
+# otherwise (exit 1):
 # the live path must never read a mock instead of the real process table. That is the
 # flag half of the vacuity floor, and self-test Case H pins it (Case S pins the same
 # floor for `--ps-env-parse`, which reads a file too).
@@ -288,6 +315,7 @@ INHERITED_CENSUS_PLATFORM="${CENSUS_PLATFORM:-}"
 
 usage() {
   echo "usage: $(basename "$0") [--self-test] [--keep-temp-dir]" >&2
+  echo "       $(basename "$0") --self-test [--allow-skips <reason>]   (harness only)" >&2
 }
 
 # ---------------------------------------------------------------------------
@@ -1427,6 +1455,10 @@ self_test_skip() {
 # on a runner, an unproven case is indistinguishable from a case that was deleted,
 # and the whole point of this harness is that it cannot be quietly disarmed. Off CI it
 # stays a loud note so a developer without the tool a case needs can still run it.
+# The ONE exception is `--allow-skips <reason>`: a skip the caller has stated a reason
+# for under CI exits 0 while still printing the ledger, the UNPROVEN count and the
+# reason, and still never printing the all-clear. Tolerated is not proven — see the
+# header's WHY `--allow-skips` EXISTS section and Case T.
 # Returns the exit code the self-test must have.
 self_test_verdict() {
   local skip_count=0 case_name why names=""
@@ -1456,12 +1488,26 @@ self_test_verdict() {
   fi
 
   if ((skip_count > 0)); then
-    if is_ci; then
+    if is_ci && [[ -z "$allow_skips_reason" ]]; then
       printf '\nself-test: %s case(s) SKIPPED and therefore UNPROVEN — FAILING under CI=true\n' "$skip_count" >&2
       printf '  a skipped case is not a passed case: on a runner this is exactly how a disarmed\n' >&2
       printf '  guard looks — the suite is green because the case that could have gone red did\n' >&2
       printf '  not run. Install what the skipped case needs, or run it where it can run.\n' >&2
+      printf '  if this platform genuinely CANNOT host the case named above and another matrix\n' >&2
+      printf '  leg proves that path, say so out loud: pass --allow-skips "<why>" to the\n' >&2
+      printf '  --self-test invocation. It stays in the log; an env var would not.\n' >&2
       return 1
+    fi
+    if is_ci; then
+      # Reached only via --allow-skips. The gap is TOLERATED, never forgiven: the
+      # ledger above already printed every skip and the summary above already called
+      # them UNPROVEN, and the all-clear line below is still unreachable.
+      printf '\nself-test: %s case(s) SKIPPED and therefore UNPROVEN — tolerated by --allow-skips\n' "$skip_count" >&2
+      printf '  reason given: %s\n' "$allow_skips_reason" >&2
+      printf '  tolerated is NOT proven: the paths named above were not exercised on THIS leg.\n' >&2
+      printf '  they must be proven by whichever matrix leg CAN host them; if this is that leg,\n' >&2
+      printf '  the flag is wrong here and the guard has just been weakened silently.\n' >&2
+      return 0
     fi
     printf '\nself-test: %s case(s) SKIPPED — those paths are UNPROVEN (not a pass; not failing off CI)\n' "$skip_count" >&2
     printf '  the census was NOT shown to be able to fail on the skipped path(s) named above.\n' >&2
@@ -2416,6 +2462,72 @@ PYEOF
   expect_file_lacks "O  the old silent stdout skip note is gone from the script" \
     "$script" "$old_skip_note"
 
+  # ---- Case T: an EXPECTED skip may be tolerated, but only by an auditable flag ----
+  # Case O's rule (a skip cannot be an all-clear) is right where a case CAN run, and
+  # wrong where it structurally cannot: `setsid` is absent BY PLATFORM DESIGN on macOS
+  # and on Git-for-Windows bash — measured on real runners — so the macOS and Windows
+  # legs would be permanently red over a gap that another matrix leg already covers.
+  # That conflates "the harness is misconfigured" with "this platform cannot host this
+  # case". `--allow-skips <reason>` separates them: skips stay LOUD and stay counted
+  # as UNPROVEN, but exit 0. It is a FLAG whose value lands in the CI log, not an env
+  # var — the live-path env-seam bug this branch just fixed (5d08d2c) was exactly a
+  # behaviour-selecting env var letting a guard fabricate its own verdict, and a
+  # workflow-level env var is no more auditable than that was. A reason string is
+  # REQUIRED so the log always says why the gap is tolerated.
+  local t_reason="setsid absent on macOS and Git-Bash"
+
+  # WITH the flag, under CI: loud, still UNPROVEN, but not fatal.
+  expect_exit "T  --allow-skips tolerates a skip under CI=true (exit 0, not 1)" 0 \
+    env CI=true bash "$script" --self-test --meta-skip --allow-skips "$t_reason"
+  expect_output_has "T  the tolerated skip still names the skipped case" "META-SKIP"
+  expect_output_has "T  the tolerated skip still calls the case UNPROVEN" "UNPROVEN"
+  expect_output_has "T  the tolerated skip still counts it in the summary" "1 case(s) skipped"
+  # The REASON, not just the exit code: a tolerance that does not say why is as
+  # unauditable as the env var this flag deliberately is not (Case J's lesson).
+  expect_output_has "T  the tolerance prints the REASON the skip is allowed" "$t_reason"
+  expect_output_has "T  the tolerance names the flag it came from" "--allow-skips"
+  # Tolerating a gap is NOT passing it. The all-clear sentence must stay absent.
+  expect_output_lacks "T  a tolerated skip issues NO all-clear verdict" "all cases behaved"
+
+  # WITHOUT the flag the CI rule is UNCHANGED — this is the ubuntu leg's posture, and
+  # the contrast is the whole point of the flag: it must be possible to see, from the
+  # log, that the tolerance was granted rather than assumed.
+  expect_exit "T  without --allow-skips a skip under CI=true is STILL fatal (ubuntu's posture)" 1 \
+    env CI=true bash "$script" --self-test --meta-skip
+  expect_output_has "T  the fatal path names the UNPROVEN case it refuses to forgive" "META-SKIP"
+  expect_output_has "T  the fatal path says it is failing because of CI" "FAILING under CI=true"
+  # The fatal path may MENTION the flag as a hint, but it must not talk as if a
+  # tolerance had been granted — asserting the absence of the tolerance's own wording
+  # is what distinguishes "here is an opt-in you did not take" from "you are covered".
+  expect_output_lacks "T  the fatal path claims NO tolerance it was not given" "tolerated by --allow-skips"
+  expect_output_lacks "T  the fatal path prints no reason line (none was given)" "reason given:"
+
+  # A reason is mandatory: `--allow-skips ""` would be a tolerance with no audit trail.
+  expect_exit "T  --allow-skips with an EMPTY reason is refused (a reason is the audit trail)" 1 \
+    env CI=true bash "$script" --self-test --meta-skip --allow-skips ""
+  expect_output_has "T  the empty-reason refusal says a reason is required" "requires a non-empty reason"
+
+  # The `=` form is the same flag and the same rule.
+  expect_exit "T  --allow-skips=<reason> behaves identically to the two-word form" 0 \
+    env CI=true bash "$script" --self-test --meta-skip --allow-skips="$t_reason"
+  expect_output_has "T  the = form prints its reason too" "$t_reason"
+
+  # And the flag is a --self-test-only door, like every other harness seam (Case H).
+  # It selects verdict BEHAVIOUR, so on the live path it would let a census grade its
+  # own gap away — the same misuse class, so the same refusal and the same exit 1.
+  expect_exit "T  --allow-skips outside --self-test is rejected" 1 \
+    bash "$script" --allow-skips "$t_reason"
+  expect_output_has "T  the rejection names the flag" "--allow-skips"
+  expect_output_has "T  the rejection explains that only --self-test may use it" "--self-test"
+  expect_output_lacks "T  the rejected live path runs NO census" "clean: the process table was read"
+
+  # Wiring pin, for the half a subprocess cannot show on a box that has setsid: the
+  # cases that skip on macOS/Windows must register with the ledger, so the flag has
+  # something to tolerate. Case O pins this for M; the flag makes it load-bearing for
+  # I as well, because a silently-disarmed plant case would now exit 0 on two legs.
+  expect_file_has "T  Case I registers its skip with the ledger (nothing can skip quietly)" \
+    "$script" 'self_test_skip "I"'
+
   self_test_verdict
 }
 
@@ -2428,6 +2540,7 @@ want_enumerate_only=0
 want_meta_skip=0
 want_lineage_arm_ps=0
 want_ps_env_parse=0
+allow_skips_reason=""
 fixture_dir=""
 platform_override=""
 input_file=""
@@ -2523,6 +2636,30 @@ while [[ $# -gt 0 ]]; do
       platform_override="${1#--platform=}"
       shift
       ;;
+    # Tolerate an EXPECTED skip instead of failing under CI=true. A flag, not an env
+    # var, and it REQUIRES a reason: the whole point is that the tolerance is visible
+    # and attributable in the CI log. An env var set at workflow level would be the
+    # same mistake this branch just fixed on the live path (5d08d2c), where a
+    # behaviour-selecting env var let a guard fabricate its own verdict. Refused
+    # outside --self-test, like every other harness-only flag (Case H).
+    --allow-skips)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "error: --allow-skips requires a non-empty reason (say WHY the skip is tolerated; self-test only)" >&2
+        usage
+        exit 1
+      fi
+      allow_skips_reason="$2"
+      shift 2
+      ;;
+    --allow-skips=*)
+      allow_skips_reason="${1#--allow-skips=}"
+      if [[ -z "$allow_skips_reason" ]]; then
+        echo "error: --allow-skips requires a non-empty reason (say WHY the skip is tolerated; self-test only)" >&2
+        usage
+        exit 1
+      fi
+      shift
+      ;;
     --keep-temp-dir)
       self_test_keep_temp_dir=1
       shift
@@ -2536,12 +2673,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if ((want_self_test == 0)); then
-  if [[ -n "$input_file$fixture_dir$platform_override" || $want_census == 1 || $want_enumerate_only == 1 || $want_meta_skip == 1 || $want_lineage_arm_ps == 1 || $want_ps_env_parse == 1 ]]; then
+  if [[ -n "$input_file$fixture_dir$platform_override$allow_skips_reason" || $want_census == 1 || $want_enumerate_only == 1 || $want_meta_skip == 1 || $want_lineage_arm_ps == 1 || $want_ps_env_parse == 1 ]]; then
     {
-      echo "error: --input / --fixture-dir / --platform / --census / --enumerate-only / --meta-skip / --lineage-arm-ps / --ps-env-parse are for the --self-test harness only"
+      echo "error: --input / --fixture-dir / --platform / --census / --enumerate-only / --meta-skip / --lineage-arm-ps / --ps-env-parse / --allow-skips are for the --self-test harness only"
       echo "  the live census must read the REAL process table. A mock fed to the live path"
       echo "  would let this guard report 'clean' about a table it never looked at — the exact"
       echo "  vacuous green this family of guards exists to refuse."
+      echo "  --allow-skips is refused for the same reason from the other side: it chooses how a"
+      echo "  VERDICT is graded, so on the live path a guard could forgive its own gap."
     } >&2
     usage
     exit 1
