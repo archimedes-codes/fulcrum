@@ -38,7 +38,20 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo check --target x86_64-pc-windows-gnu --all-targets   # the only local Windows proof available
 bash scripts/check-rquickjs-allocator.sh                   # + --self-test to prove it has teeth
+bash scripts/check-schema-drift.sh                         # + --self-test: neither repo's tests can see the other's DDL
+bash scripts/check-no-stray-processes.sh                   # + --self-test: leak guards ask per-pid, never whole-table
 ```
+
+Both new guards run in CI, and neither is a full-strength gate yet, so do not read the
+bar as one: `check-schema-drift.sh` runs in `.github/workflows/schema-drift.yml`, where
+the **cross-repo half is not yet wired** — the desktop has no comparator step, so only
+the fulcrum-side leg runs, and the desktop leg REFUSES with a named reason (exit 2)
+rather than passing on an empty comparison. `check-no-stray-processes.sh` runs in
+`ci.yml` after `cargo test` and is **enforced on unix only; the Windows leg is
+advisory** — it reports every live match and kills nothing, because no bash-accessible
+mechanism there reads another process's environment to attribute it to this run. In both
+workflows the `--self-test` step runs BEFORE the live check, so a guard that has lost the
+ability to fail reddens the run instead of printing a green nobody earned.
 
 No `cargo build --all-targets` line, and that is not an oversight: `--all-targets` on the clippy and Windows checks
 already builds the whole graph, and CI deliberately has **no** build step before its test step (see the
@@ -63,7 +76,8 @@ green after the file was gone — re-arming the exact thing the file exists to p
 line 60 and forbids the step. Nothing here argues for cold-target fragility: measured on this branch, a `target/` that
 had never existed and no build step at all gives **1406 passed / 0 failed / 1 ignored** — the same total from
 `cargo test -p fulcrum-core` (1401 lib + the 5 in `fixture_bins.rs`) and from bare `cargo test`, which additionally
-builds and runs the `fulcrum` member's targets (0 tests there today).
+builds and runs the `fulcrum` member's targets — its totals are whatever the `test result:`
+lines of that run print, and this file does not copy them.
 
 **The two fixture bins are `fake_worker_core` and `fake_mcp_stdio_core`.** The bodies live in `src/fixtures/` as
 ordinary lib code; each bin is a three-line `main`.
@@ -131,6 +145,19 @@ intended, and nothing in this repo notices. That is a known gap, not a bug to cl
 to walk the sibling, because it would then fail on the daemon's legitimate `rusqlite` and the fix for that would be an
 allowlist that weakens the engine's pin. T9 Task 6 adds the daemon's own pins over its own tree. Until then, a daemon
 that reaches for a desktop module is caught by review and nothing else.
+
+**The schema-shape pin is the fulcrum↔desktop contract — `schema-sha.txt` is an artifact, not a build output.** The
+daemon's four tables are a transcription of the desktop's and the daemon opens a different file, so a DDL change on
+either side is invisible to the other at runtime; `schema-sha.txt` (five sections: four tables + `idx_messages_session`,
+per-column `name:type` in declaration order) is what makes that drift loud, via `the_pinned_schema_fingerprint_matches_the_shipped_file`
+in `fulcrum/tests/db.rs` and `scripts/check-schema-drift.sh` in `.github/workflows/schema-drift.yml`. Update it in the
+SAME commit as a lockstep DDL change so the two diffs are reviewed together, and do **not** regenerate it from a fork
+or a local experiment — both the guard and the tests refuse a comparison that cannot name all five keys, so a
+hand-tuned pin reddens the contract rather than blessing the fork. Note what it deliberately does not pin (flags,
+the `UNIQUE` keys, the cascades, the SELECT-list subsets — the desktop's `SPACE_COLUMNS` is 4 of `spaces`' 5 columns,
+and comparing subsets false-positives on `spaces.sort_order`) and that the cross-repo leg is **red by design** today: the desktop pins fulcrum at `78e59543`, a
+rev with no schema to fingerprint, so the comparator exits 2 with a named reason instead of passing vacuously. None of
+this widens `boundary_pins` — the daemon's `rusqlite` is legal and the engine's pin stays exactly where it is.
 
 ## The census (`childproc`)
 

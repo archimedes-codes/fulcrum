@@ -18,7 +18,9 @@
 //! (`fulcrum_core::worker::protocol::stamp_outbound`) stays unconsumed until
 //! then — see the module docs on `transport`.
 
-use fulcrum::transport::{connect, Connection, Endpoint, Listener, TransportError};
+use fulcrum::transport::{
+    connect, Connection, ConnectionWriter, Endpoint, Listener, TransportError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -288,22 +290,36 @@ async fn recv_checked(conn: &mut Connection) -> Option<Result<serde_json::Value,
 }
 
 /// The server half of the loopback: accept one peer, echo its first frame back
-/// under `{"echoed": …}`, and hand the `Connection` back so the caller controls
-/// when it closes.
+/// under `{"echoed": …}`, and hand the writer half back so the caller controls
+/// when the socket's write direction goes away.
 ///
 /// Takes the `Listener` by value (the task owns it), which is what lets this be
 /// `spawn`ed without a borrow — the accept task outlives the caller's borrow
 /// scope.
-async fn accept_one_and_echo(listener: Listener) -> Connection {
+///
+/// # Why it returns a `ConnectionWriter` and not a `Connection`
+///
+/// Since T4a the write half is a separate type, and this helper is the one place
+/// the file's shared loopback writes. It reads its one frame on the reader half
+/// FIRST (the reader is intact until `split_writer`), then splits and sends. The
+/// reader half it no longer needs drops at the end of the helper — the same
+/// moment the old `Connection` used to drop for the write direction's purposes,
+/// and the caller keeps the writer alive exactly as long as it kept the
+/// `Connection`, so the socket's lifetime is unchanged.
+async fn accept_one_and_echo(listener: Listener) -> ConnectionWriter {
     let mut conn = tokio::time::timeout(FRAME_BUDGET, listener.accept())
         .await
         .expect("a client connects (no connection means the listener is broken)")
         .expect("accept: the peer connects");
     let frame = recv_one(&mut conn).await;
-    conn.send_frame(&json!({ "echoed": frame }))
+    let (conn, mut writer) = conn.split_writer();
+    writer
+        .send_frame(&json!({ "echoed": frame }))
         .await
         .expect("send: the peer is still reading");
-    conn
+    // The server task is done reading; dropping the reader half aborts its task.
+    drop(conn);
+    writer
 }
 
 #[tokio::test]
@@ -314,15 +330,19 @@ async fn a_jsonl_frame_round_trips_in_both_directions() {
 
     let server = tokio::spawn(accept_one_and_echo(listener));
 
-    let mut client = tokio::time::timeout(FRAME_BUDGET, connect(endpoint))
+    let client = tokio::time::timeout(FRAME_BUDGET, connect(endpoint))
         .await
         .expect("connect resolves")
         .expect("connect to the listener");
+    // The split pattern every client-side send in this file now uses: the writer
+    // does the sending, the reader does the receiving, and BOTH stay alive for
+    // the exchange (dropping the writer would close the socket under the reply).
+    let (mut client, mut client_writer) = client.split_writer();
     let hello = Greeting {
         kind: "hello".to_string(),
         seq: 1,
     };
-    client
+    client_writer
         .send_frame(&hello)
         .await
         .expect("send: the listener is accepting");
@@ -359,18 +379,682 @@ async fn the_receive_stream_ends_at_eof_rather_than_hanging() {
         assert!(eof.is_none(), "a closed peer ends the stream with None");
     });
 
-    let mut client = dial(endpoint).await;
-    client
+    let client = dial(endpoint).await;
+    let (client_reader, mut client_writer) = client.split_writer();
+    client_writer
         .send_frame(&json!({ "kind": "bye" }))
         .await
         .expect("send before disconnecting");
-    // Dropping the connection closes both directions of the socket, which is
-    // what the server side must observe as EOF.
-    drop(client);
+    // Dropping BOTH halves closes the socket, which is what the server side must
+    // observe as EOF. One half alone would not: `tokio::io::split`'s halves share
+    // the stream's `Arc`, so the socket closes when the last one goes.
+    drop(client_reader);
+    drop(client_writer);
 
     server
         .await
         .expect("the server task saw the frame and then EOF");
+}
+
+// ---------------------------------------------------------------------------
+// The writer half (T4a, issue #3).
+//
+// `Connection::pending` — the tail of a frame the OS has only partly taken —
+// must be reachable by exactly ONE writer, because a JSONL stream cannot
+// resynchronise once two writers interleave a half-written line. That rule used
+// to be a comment ("Two tasks may not call `send_frame` on one `Connection`",
+// `serve.rs`) and nothing else: there was NO test in this repo that failed when
+// it was broken. These tests are that missing pin.
+//
+// What each one is FOR, stated honestly:
+//   * `two_frames_from_the_sole_writer_arrive_as_two_clean_lines` — the serial
+//     `pending`-drain path, and proof `split_writer` hands back a pair whose
+//     reader half still reads.
+//   * `a_second_split_writer_panics` — the structural pin: the writer may be
+//     handed out ONCE.
+//   * `a_partially_accepted_frame_is_drained_before_any_new_bytes` — the hazard
+//     as it appears in production: a frame the OS took only part of, followed by
+//     a second frame.
+//   * `a_shared_writer_under_a_mutex_never_interleaves_frames` — the only
+//     behavioural pin here that can see interleaving at all, and only the
+//     UNSERIALISED kind: two tasks reaching one `pending` with no lock spanning
+//     the write loop (a guard dropped before the await, or `pending` hoisted onto
+//     a `Clone`/`Sync` handle). It CANNOT see the serialising shape — a
+//     `Mutex<ConnectionWriter>` + re-added `Connection::send_frame` whose lock
+//     covers each send end to end — because that design produces exactly the
+//     whole-send serialisation this test itself implements, and its frames arrive
+//     clean. Nothing behavioural guards that shape and nothing needs to: it is
+//     unreachable in these types (`ConnectionWriter` is neither `Clone` nor
+//     shareable, `send_frame` takes `&mut self`, `Connection` has no write
+//     method), with `a_second_split_writer_panics` as the runtime pin on the one
+//     mistake that IS still expressible. This test is a regression pin against a
+//     POSSIBLE future design, not a proof about the current one — and no
+//     behavioural test can prove structural impossibility. The three pins above
+//     it all stay GREEN under a mutex-shared design — the mutex serialises them.
+//   * `a_send_against_a_shut_down_connection_errors_that_the_writer_survives` —
+//     `ConnectionWriter::shutdown` closes the WRITE direction while the read
+//     half lives (the daemon's teardown contract, T4 D3).
+//
+// T4b deleted the sixth pin this block used to list,
+// `send_frame_after_split_writer_fails_not_drops`, together with the transient
+// `Connection::send_frame` delegator it tested. That deletion is what makes the
+// exclusivity absolute rather than merely signalled: after `split_writer` the reader
+// half has no write method to call, so "a `Connection` and a `ConnectionWriter` alive
+// at once, both able to reach `pending`" is no longer a state a caller can be in — it
+// does not compile. The mutual exclusion the deleted test pinned is now enforced by
+// the absence of the method, and `a_second_split_writer_panics` remains as the
+// runtime pin on the one mistake that is still expressible.
+// ---------------------------------------------------------------------------
+
+/// Two frames from the sole writer arrive as two clean lines, in order — and
+/// the pair `split_writer` returns is a working reader AND a working writer.
+///
+/// This is the behaviour the whole framing layer exists to protect, exercised
+/// through the `pending` drain path serially. It stays green through the split
+/// and through a serialised (mutex-shared) regression; the concurrent driver
+/// below is the one that reddens an interleaving design — the unserialised kind,
+/// as its own doc spells out.
+#[tokio::test]
+async fn two_frames_from_the_sole_writer_arrive_as_two_clean_lines() {
+    let (_keepalive, endpoint) = test_endpoint();
+    let listener = bind(endpoint.clone()).expect("bind");
+
+    let server = tokio::spawn(async move {
+        let conn = accept_one(&listener).await;
+        // The server splits too, so this exercises the pair on both ends.
+        let (mut conn, mut writer) = conn.split_writer();
+        let first = recv_one(&mut conn).await;
+        let second = recv_one(&mut conn).await;
+        writer
+            .send_frame(&json!({ "got": 2 }))
+            .await
+            .expect("send the ack: the peer is still reading");
+        (first, second)
+    });
+
+    let client = dial(endpoint).await;
+    // The split: this task keeps the reader half, `writer` is the ONLY handle on
+    // `pending`. BOTH halves stay alive for the whole exchange — dropping the
+    // writer would close the socket under the frames still to be sent.
+    let (mut reader, mut writer) = client.split_writer();
+    writer
+        .send_frame(&json!({ "n": 1 }))
+        .await
+        .expect("send the first frame");
+    writer
+        .send_frame(&json!({ "n": 2 }))
+        .await
+        .expect("send the second frame");
+
+    let (first, second) = server.await.expect("the server read both frames");
+    assert_eq!(
+        first,
+        json!({ "n": 1 }),
+        "the first frame is the first line"
+    );
+    assert_eq!(
+        second,
+        json!({ "n": 2 }),
+        "the second frame is the second line, glued to nothing"
+    );
+
+    // The reader half of the pair is still a reader after the split: the ack
+    // travels the other direction on the same socket.
+    assert_eq!(
+        recv_one(&mut reader).await["got"],
+        json!(2),
+        "the reader half of a split connection still receives"
+    );
+}
+
+/// Asking for the writer twice is a caller bug and PANICS.
+///
+/// The second call would hand out a second handle on `pending`, which is exactly
+/// issue #3's hazard, so it is refused loudly at the point of the mistake rather
+/// than surfacing later as a corrupted frame on a production socket. Cheap
+/// structural pin — note it stays GREEN under a `Mutex<ConnectionWriter>`
+/// regression (that design never calls `split_writer` twice), which is why
+/// [`a_shared_writer_under_a_mutex_never_interleaves_frames`] exists beside it —
+/// that one is the behavioural pin, and its doc states exactly which shapes of
+/// that regression it can and cannot see.
+#[tokio::test]
+#[should_panic(expected = "the writer was already taken")]
+async fn a_second_split_writer_panics() {
+    let (_keepalive, endpoint) = test_endpoint();
+    let _listener = bind(endpoint.clone()).expect("bind");
+    // Dialling without accepting is enough here, and it is the shape that works
+    // on BOTH platforms: on unix the connection completes into the listener's
+    // backlog, and on Windows an instance of the name is armed from `bind` onward
+    // (that is `windows.rs`'s one-instance-always invariant), so `CreateFileW`
+    // succeeds. Nothing is read or written — `split_writer` is a struct
+    // operation — so no peer is needed, and no accept task can be left stranded
+    // by the panic.
+    let client = dial(endpoint).await;
+    let (reader, _writer) = client.split_writer();
+    // The panic IS the assertion.
+    let (_second_reader, _second_writer) = reader.split_writer();
+}
+
+/// A frame the OS accepted only PART of is fully drained before a single byte of
+/// the next frame — the `pending` drain exactly as it appears in production.
+///
+/// # How the partial write is forced without a fake transport
+///
+/// No mock stream exists in this repo (see the file header), so both halves of
+/// the setup come from the real thing. The peer stops reading for the production
+/// reason: `MAX_QUEUED_INBOUND_FRAMES` (frame.rs, finding 7) bounds its inbound
+/// channel at 1024 and the reader task WAITS for room, so a peer that never calls
+/// `recv` stops draining the socket once its channel is full. The test fills
+/// exactly that many slots with tiny frames, then writes more bytes than the
+/// buffers on the path can swallow — so `send_frame`'s write loop stops with a
+/// tail in `pending`.
+///
+/// When the peer finally drains, the frames arrive in the order they were handed
+/// to `send_frame`, each one whole. That is the whole assertion: a design that
+/// let a second writer slip bytes in ahead of `pending` produces one glued line,
+/// and a glued line does not decode.
+///
+/// The accept happens BEFORE the writes on purpose. On unix it could be deferred
+/// (a `connect` completes into the backlog), but on Windows it cannot: `connect`
+/// retries `ERROR_PIPE_BUSY` until an instance of the name calls
+/// `ConnectNamedPipe`, so a dial with no `accept` in flight is a stall, not an
+/// unattended socket. Parking the peer's READ (by never calling `recv`) is the
+/// shape both platforms agree on.
+///
+/// # Why THREE big frames, and what the sizes are
+///
+/// One big frame is not enough, and that is worth stating because it is the thing
+/// a reader of this test will trip on: the peer's reader task does not stop at
+/// the socket, it assembles a line in its own buffer up to
+/// `MAX_INBOUND_LINE_BYTES` before it needs channel room. So the bytes one
+/// connection can swallow before its writer notices are roughly the receive queue
+/// (~208 KiB on Linux AF_UNIX; the BSDs cap a unix socket buffer at 256 KiB;
+/// tokio's named-pipe instances get 64 KiB each — `in_buffer_size`/
+/// `out_buffer_size`, tokio 1.54 `named_pipe.rs`) plus `BufReader`'s 8 KiB plus
+/// that 1 MiB line buffer — about 1.3 MiB — and a single 900 KiB frame rides
+/// straight through it (an earlier draft of this test asserted a partial write at
+/// 512 KiB and measured exactly that). Hence `BIG_FRAMES` × `OVERWHELM` =
+/// 2.7 MiB, more than double what can be swallowed, which makes the park a fact
+/// rather than a hope. Each frame stays under the 1 MiB inbound cap, because the
+/// reader must ACCEPT these frames, not refuse the connection.
+///
+/// The park is CHECKED, not assumed: the `is_finished` assert below fails loudly,
+/// with this paragraph in its message, if a platform ever buffers more than
+/// that — the test would then be asserting nothing about the drain path.
+#[tokio::test]
+async fn a_partially_accepted_frame_is_drained_before_any_new_bytes() {
+    /// Mirror of frame.rs's private `MAX_QUEUED_INBOUND_FRAMES` — a `tests/`
+    /// crate cannot name a private const, so the number is stated here and the
+    /// test below parks the peer's reader by filling exactly that many slots.
+    const INBOUND_QUEUE_DEPTH: usize = 1024;
+    /// A few extra fillers, so the park does not depend on the channel's
+    /// off-by-one (capacity vs "blocks at capacity"). They are tiny and they sit
+    /// in the socket buffer, which the big frame then has to overshoot anyway.
+    const SPARE: usize = 8;
+    const FILLERS: usize = INBOUND_QUEUE_DEPTH + SPARE;
+    /// Under `MAX_INBOUND_LINE_BYTES` (1 MiB) so the frame is ACCEPTED, not
+    /// refused for length.
+    const OVERWHELM: usize = 900 * 1024;
+    /// Enough of them that the total beats every buffer on the path (see the doc
+    /// above): 3 × 900 KiB against a ~1.3 MiB swallow budget, so the park is a
+    /// fact and not a hope.
+    const BIG_FRAMES: usize = 3;
+
+    let (_keepalive, endpoint) = test_endpoint();
+    let listener = bind(endpoint.clone()).expect("bind");
+    // The gate that holds the peer's reader. `accept` runs immediately (the
+    // platform requirement above), the READ does not.
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        let mut conn = accept_one(&listener).await;
+        start_rx
+            .await
+            .expect("the test releases the drain when the write is parked");
+        // Everything the client queued, in order, sorted by shape.
+        let mut fillers = 0usize;
+        let mut bigs: Vec<String> = Vec::new();
+        let mut marker = None;
+        while marker.is_none() {
+            let frame = recv_one(&mut conn).await;
+            if let Some(payload) = frame.get("payload").and_then(|v| v.as_str()) {
+                bigs.push(payload.to_string());
+            } else if frame.get("marker").is_some() {
+                marker = Some(frame);
+            } else if frame.get("filler").is_some() {
+                fillers += 1;
+            } else {
+                panic!("a frame with none of the three shapes arrived: {frame}");
+            }
+        }
+        (fillers, bigs, marker.expect("the marker frame arrives"))
+    });
+
+    let client = dial(endpoint).await;
+    let (_reader, mut writer) = client.split_writer();
+
+    let big = json!({ "payload": "a".repeat(OVERWHELM) });
+    let small = json!({ "marker": "last" });
+    // The assertion compares against a COPY: the frames the sender moves into the
+    // task are the ones that go on the wire, and `Value` is not `Copy`.
+    let expected_marker = small.clone();
+    let sender = tokio::spawn(async move {
+        for i in 0..FILLERS {
+            writer
+                .send_frame(&json!({ "filler": i }))
+                .await
+                .expect("queue a filler (the peer's channel is not full yet)");
+        }
+        for _ in 0..BIG_FRAMES {
+            writer
+                .send_frame(&big)
+                .await
+                .expect("a big frame drains once the peer reads again");
+        }
+        writer
+            .send_frame(&small)
+            .await
+            .expect("the marker follows them, it does not overtake them");
+    });
+
+    // Let the write loop park with a tail in `pending`. The park is then
+    // CHECKED, not assumed: a send that already finished means nothing was
+    // partial and the test would be vacuous.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !sender.is_finished(),
+        "the writer should still be PARKED inside `send_frame`'s write loop with \
+         a tail in `pending`: the peer accepted but never called `recv`, its \
+         {INBOUND_QUEUE_DEPTH}-slot inbound channel is full, and \
+         {BIG_FRAMES}x{OVERWHELM} bytes is more than this platform can swallow \
+         unread. It finished, which means the drain path was never exercised — \
+         raise BIG_FRAMES/OVERWHELM or the test asserts nothing."
+    );
+
+    // NOW somebody reads. Every frame must land, whole, in the order it was
+    // handed to `send_frame`.
+    start_tx
+        .send(())
+        .expect("release the drain (the peer task is alive)");
+    let (fillers, bigs, marker) = server
+        .await
+        .expect("the peer read every frame without a decode error");
+    assert_eq!(
+        fillers, FILLERS,
+        "the fillers that parked the peer's reader all arrive first, so the \
+         queue order the drain is asserted against is the real one"
+    );
+    assert_eq!(
+        bigs.len(),
+        BIG_FRAMES,
+        "every big frame arrives as its OWN frame — a line glued to another \
+         frame's bytes would not decode, and would show up here as a missing one"
+    );
+    for (at, payload) in bigs.iter().enumerate() {
+        assert_eq!(
+            payload.len(),
+            OVERWHELM,
+            "big frame #{at} arrives COMPLETE, not truncated and not glued to a \
+             neighbour (a glued line would not decode at all)"
+        );
+        assert!(
+            payload.bytes().all(|byte| byte == b'a'),
+            "and every byte of big frame #{at} is its own payload"
+        );
+    }
+    assert_eq!(
+        marker, expected_marker,
+        "the marker is a SEPARATE line, after the last big frame's tail"
+    );
+
+    sender
+        .await
+        .expect("every send completed once the peer started reading");
+}
+
+/// Two tasks driving ONE writer never interleave a frame.
+///
+/// # Exactly which regression shapes this reddens — and which it cannot see
+///
+/// This body holds the mutex guard across the WHOLE of `send_frame`'s await, so
+/// the two sends are fully serialised — which means the design this file worries
+/// about most is the one it CANNOT fail on: a `Mutex<ConnectionWriter>` plus a
+/// re-added `Connection::send_frame`, whose lock covers each send end to end,
+/// produces precisely the whole-send serialisation this test already implements.
+/// Its 40 frames arrive clean and this test stays GREEN under that regression.
+///
+/// What it does redden is a change that lets two tasks reach one `pending`
+/// WITHOUT whole-send serialisation, because then two `write` calls are live on
+/// one stream at once, each may take only part of its frame, and the peer's line
+/// reader glues the halves into one non-JSON line:
+///   * a guard dropped before the await (or the lock re-acquired per `write`), so
+///     the lock no longer spans the write loop;
+///   * `pending` hoisted onto a `Clone`/`Sync` handle, so each writer holds its
+///     OWN view of the tail and no lock serialises them at all.
+///
+/// The serialising shape is kept out of reach by the types, not by a behavioural
+/// test, and that is the right division of labour: `ConnectionWriter` is neither
+/// `Clone` nor otherwise shareable and is handed out only by
+/// `Connection::split_writer`; `send_frame` takes `&mut self`, so two tasks
+/// cannot both be inside it on one handle; and `Connection` has no write method
+/// left to reach `pending` with (T4b deleted the delegator). A
+/// `Mutex<ConnectionWriter>` + `Connection::send_frame` is therefore not a change
+/// this crate can be edited into while keeping those types — it requires
+/// re-widening them, and the type-level guarantee is what stops it.
+/// `a_second_split_writer_panics` is the runtime pin on the one mistake that
+/// remains expressible — asking for the writer twice — and it stays GREEN under
+/// the mutex design, which never calls `split_writer` twice.
+///
+/// So: this test pins the frame-whole property of the mutex-shared shape a future
+/// change might reach for; its GREEN says nothing about the current design's
+/// exclusivity, which no behavioural test can prove. The three serial pins above
+/// it stay green under any mutex-shared design too — the mutex serialises them.
+/// This is the only behavioural test here that can see interleaving at all, and
+/// it can see only the UNSERIALISED kind.
+///
+/// # Why it is driven with `tokio::join!` and not two `spawn`s
+///
+/// `std::sync::MutexGuard` is `!Send`, so a guard held across an `.await` cannot
+/// live inside `tokio::spawn` (whose future must be `Send`); a `#[tokio::test]`
+/// future carries no such bound, so two `async move` blocks joined in the test
+/// body compile and still run CONCURRENTLY on the same writer.
+///
+/// # The honest weakness of that shape, stated rather than hidden
+///
+/// Holding a `std` guard across `send_frame`'s write-loop `.await` can DEADLOCK:
+/// if the peer stops draining mid-frame, the first task parks inside `write`
+/// while it owns the lock and the second task can never acquire it. That is the
+/// backpressure case, and this test deliberately stays out of it — the frames
+/// are small and the peer drains continuously with its own reader, so each send
+/// completes in a few iterations. The assertion to watch is therefore "40 whole
+/// lines in the right per-writer order", not throughput under backpressure.
+#[tokio::test]
+// The lint this test deliberately trips, and why it stays tripped.
+//
+// `clippy::await_holding_lock` is right in production code, and the production
+// design agrees with it (which is why `ConnectionWriter` is not shareable at all
+// — see `frame.rs`). Here the guard-across-`await` IS the thing under test: this
+// is the `Mutex<ConnectionWriter>` shape a future change might reach for instead
+// of the exclusive writer, and the question the test asks is whether that shape
+// keeps a frame whole. Serialising the whole `send_frame` — guard held across the
+// write loop — is the ONLY version of that shape that can be correct, so pinning
+// the shape means pinning the guard across the await. The honest weakness of that
+// choice (the deadlock it can deadlock into when the peer stops draining) is in
+// the doc below, and the test stays out of it by keeping frames small and the
+// peer draining.
+#[allow(clippy::await_holding_lock)]
+async fn a_shared_writer_under_a_mutex_never_interleaves_frames() {
+    /// Frames per task. Small on purpose (see the deadlock note above); 20×2 is
+    /// still 40 chances to glue a line.
+    const ROUNDS: usize = 20;
+
+    let (_keepalive, endpoint) = test_endpoint();
+    let listener = bind(endpoint.clone()).expect("bind");
+
+    let server = tokio::spawn(async move {
+        let mut conn = accept_one(&listener).await;
+        let mut got = Vec::with_capacity(2 * ROUNDS);
+        for _ in 0..(2 * ROUNDS) {
+            let item = recv_checked(&mut conn)
+                .await
+                .expect("a line arrives (EOF means the writer died mid-run)");
+            got.push(item.expect(
+                "every line is a whole frame: a half-frame glued to another \
+                 frame's bytes is not valid JSON, and that is the interleave",
+            ));
+        }
+        got
+    });
+
+    let client = dial(endpoint).await;
+    let (_reader, writer) = client.split_writer();
+    // The shared handle. NOTE this is the SHAPE the design forbids — it is
+    // built here precisely so the forbidden shape is exercised, not certified.
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(writer));
+
+    let task_a = {
+        let shared = std::sync::Arc::clone(&shared);
+        async move {
+            for i in 0..ROUNDS {
+                // The guard is bound so it visibly OUTLIVES the `await`: whole-
+                // send serialisation is the property, and dropping the guard
+                // before the await would test nothing.
+                let mut guard = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard
+                    .send_frame(&json!({ "writer": "a", "i": i }))
+                    .await
+                    .expect("send from task a");
+            }
+        }
+    };
+    let task_b = {
+        let shared = std::sync::Arc::clone(&shared);
+        async move {
+            for i in 0..ROUNDS {
+                let mut guard = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard
+                    .send_frame(&json!({ "writer": "b", "i": i }))
+                    .await
+                    .expect("send from task b");
+            }
+        }
+    };
+    // Both loops run CONCURRENTLY against the one writer.
+    tokio::join!(task_a, task_b);
+    // The writer goes away with the last task's guard; the server has already
+    // taken all 40 lines by the time it returns.
+    drop(shared);
+
+    let got = server
+        .await
+        .expect("the peer read 40 frames without a decode error");
+    assert_eq!(
+        got.len(),
+        2 * ROUNDS,
+        "exactly 40 frames arrive — a glued pair would have arrived as 39 lines \
+         (and one of them would not have decoded)"
+    );
+
+    // Per writer, the sequence is complete and in order. The INTERLEAVING of
+    // `a` and `b` is a schedule and is deliberately not asserted: what this test
+    // pins is that every frame is a whole line, whichever order they land in.
+    for writer_name in ["a", "b"] {
+        let seen: Vec<u64> = got
+            .iter()
+            .filter(|frame| frame["writer"] == json!(writer_name))
+            .map(|frame| {
+                frame["i"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("`{writer_name}`'s frame index is a number: {frame}"))
+            })
+            .collect();
+        let expected: Vec<u64> = (0..ROUNDS as u64).collect();
+        assert_eq!(
+            seen, expected,
+            "writer `{writer_name}`'s frames all arrive, whole, in order"
+        );
+    }
+}
+
+/// The direction close (A1b) on a UNIX socket: a send against the shut-down
+/// connection ERRORS, the peer sees EOF, and the connection's own reader
+/// SURVIVES it.
+///
+/// This is the load-bearing half of the daemon's teardown contract (T4 D3): the
+/// writer's exit tells the peer "this direction is over" without taking the
+/// socket down under the reader, and it is the only place the split reaches
+/// `poll_shutdown`.
+///
+/// It also pins what shutdown is NOT: it does not close the socket (the read
+/// direction still delivers), which is why `tokio::io::split`'s shared-`Arc`
+/// semantics — dropping a half closes nothing — are not something the daemon may
+/// lean on for teardown.
+///
+/// # Why this is `#[cfg(unix)]`, with the Windows twin below
+///
+/// `shutdown(2)` on a unix socket closes ONE direction of a duplex fd, which is
+/// the entire mechanism A1b claims. On Windows the duplex is a named pipe, and
+/// tokio 1.54 implements `poll_shutdown` for both `NamedPipeClient` and
+/// `NamedPipeServer` as `poll_flush` (`net/windows/named_pipe.rs:926` and
+/// `:1717`) — a pipe has no per-direction close at all. Asserting the unix
+/// semantics there would be asserting a fiction, and CI RUNS this binary on
+/// Windows, so it would fail. The Windows twin states what is true instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_send_against_a_shut_down_connection_errors_that_the_writer_survives() {
+    let (_keepalive, endpoint) = test_endpoint();
+    let listener = bind(endpoint.clone()).expect("bind");
+    // The accept runs on a task BEFORE the dial (the file's pattern): a
+    // single-threaded test runtime cannot await an accept that only completes
+    // once this same task dials.
+    let peer = tokio::spawn(async move { accept_one(&listener).await });
+    let client = dial(endpoint).await;
+    let server = peer
+        .await
+        .expect("the listener accepted the dial it was waiting for");
+
+    let (mut client_reader, mut client_writer) = client.split_writer();
+    let (mut server_reader, mut server_writer) = server.split_writer();
+
+    // Setup first: a frame crosses while BOTH directions are live, so a later
+    // failure below cannot be blamed on a connection that never worked.
+    client_writer
+        .send_frame(&json!({ "before": "shutdown" }))
+        .await
+        .expect("the write direction is open at the start");
+    assert_eq!(
+        recv_one(&mut server_reader).await["before"],
+        json!("shutdown"),
+        "and the peer reads it"
+    );
+
+    // The direction close (A1b).
+    client_writer.shutdown().await;
+
+    // CLAIM 1: a FUTURE write on this direction fails. On a socket the OS
+    // answers `EPIPE`; the exact kind is platform detail, so the claim is the
+    // `Err` and the fact that it is an I/O error rather than a framing one.
+    let err = client_writer
+        .send_frame(&json!({ "after": "shutdown" }))
+        .await
+        .expect_err("a write on a shut-down write direction must fail, not silently vanish");
+    assert!(
+        matches!(err, TransportError::Io(_)),
+        "the refusal is the OS refusing the direction: {err}"
+    );
+
+    // CLAIM 1b: the PEER sees that direction as EOF — the other half of the same
+    // fact, and the reason the daemon's writer can use shutdown as a goodbye.
+    // (`recv_checked` already applies the budget and hands back the stream's own
+    // `Option`, so `None` here IS the EOF answer.)
+    let peer_view = recv_checked(&mut server_reader).await;
+    assert!(
+        peer_view.is_none(),
+        "the peer sees EOF on the direction the writer shut down, got {peer_view:?}"
+    );
+
+    // CLAIM 2: the READ half survives it. The peer's write direction is still
+    // open, so a frame it sends still arrives.
+    server_writer
+        .send_frame(&json!({ "still": "readable" }))
+        .await
+        .expect("the peer's write direction was not shut down");
+    assert_eq!(
+        recv_one(&mut client_reader).await["still"],
+        json!("readable"),
+        "shutting the write direction must not close the read direction"
+    );
+
+    // And the socket's full close is the LAST HANDLE dropping, not the shutdown:
+    // with the server's halves gone, the client's still-live reader sees EOF.
+    drop(server_reader);
+    drop(server_writer);
+    let eof = recv_checked(&mut client_reader).await;
+    assert!(
+        eof.is_none(),
+        "the peer's last handle closing ends this side's stream, got {eof:?}"
+    );
+}
+
+/// The Windows twin of
+/// [`a_send_against_a_shut_down_connection_errors_that_the_writer_survives`],
+/// stating what a named pipe actually guarantees.
+///
+/// A named pipe has no per-direction close: tokio 1.54 implements
+/// `poll_shutdown` on both `NamedPipeClient` and `NamedPipeServer` as
+/// `poll_flush` (`net/windows/named_pipe.rs:926`, `:1717`), so
+/// `ConnectionWriter::shutdown` on this platform FLUSHES and nothing more. That
+/// is not a bug to paper over here — it is the reason the daemon's teardown must
+/// NOT depend on shutdown to end a connection (T4 D3: the writer's parked write
+/// is broken by the PEER'S CLOSE, and the socket's full close rides the drop of
+/// the last handle; the reader-first path is closed by `serve_client`'s
+/// `writer_task.abort()` plus that drop). What IS asserted is the half the
+/// Windows design does rely on: shutdown is harmless (it does not tear the
+/// connection down), and both directions still work after it.
+///
+/// Compile-and-run on the Windows CI leg; this file's platform-neutral framing
+/// tests stay the main proof for the codec itself.
+#[cfg(not(unix))]
+#[tokio::test]
+async fn a_send_against_a_shut_down_connection_errors_that_the_writer_survives() {
+    let (_keepalive, endpoint) = test_endpoint();
+    let listener = bind(endpoint.clone()).expect("bind");
+    let peer = tokio::spawn(async move { accept_one(&listener).await });
+    let client = dial(endpoint).await;
+    let server = peer
+        .await
+        .expect("the listener accepted the dial it was waiting for");
+
+    let (mut client_reader, mut client_writer) = client.split_writer();
+    let (mut server_reader, mut server_writer) = server.split_writer();
+
+    client_writer
+        .send_frame(&json!({ "before": "shutdown" }))
+        .await
+        .expect("the write direction is open at the start");
+    assert_eq!(
+        recv_one(&mut server_reader).await["before"],
+        json!("shutdown"),
+        "and the peer reads it"
+    );
+
+    client_writer.shutdown().await;
+
+    // What shutdown means on a pipe: a flush. The write direction is NOT closed,
+    // so writes keep working — the honest statement of the platform's limit, and
+    // the reason the daemon's teardown rides the peer's close and the final
+    // handle drop instead (see the doc above).
+    client_writer
+        .send_frame(&json!({ "after": "shutdown" }))
+        .await
+        .expect("a named pipe has no per-direction close, so the write still works");
+    server_writer
+        .send_frame(&json!({ "still": "readable" }))
+        .await
+        .expect("the peer's direction is unaffected either");
+    assert_eq!(
+        recv_one(&mut server_reader).await["after"],
+        json!("shutdown"),
+        "the post-shutdown write arrives"
+    );
+    assert_eq!(
+        recv_one(&mut client_reader).await["still"],
+        json!("readable"),
+        "and so does the peer's"
+    );
+
+    // The full close still rides the last handle, on both platforms.
+    drop(server_reader);
+    drop(server_writer);
+    let eof = recv_checked(&mut client_reader).await;
+    assert!(
+        eof.is_none(),
+        "the peer's last handle closing ends this side's stream, got {eof:?}"
+    );
 }
 
 /// Handing a platform the OTHER platform's address is an ordinary error, on
@@ -458,8 +1142,9 @@ mod unix_specific {
         // And the tightening must not have broken the thing it wraps: the owner
         // still connects, and frames still cross.
         let server = tokio::spawn(super::accept_one_and_echo(listener));
-        let mut client = dial(endpoint).await;
-        client
+        let client = dial(endpoint).await;
+        let (mut client, mut client_writer) = client.split_writer();
+        client_writer
             .send_frame(&json!({"probe": "after the chmod"}))
             .await
             .expect("the owner can still dial a 0600 socket");
@@ -468,7 +1153,7 @@ mod unix_specific {
             echoed["echoed"]["probe"], "after the chmod",
             "a 0600 socket must still serve its owner"
         );
-        // Hold the server's `Connection` alive until the exchange is done, then
+        // Hold the server's writer half alive until the exchange is done, then
         // drop it, or the task's peer vanishes mid-read.
         let _server_conn = server.await.expect("the echo task runs");
         drop(dir);
@@ -940,8 +1625,9 @@ mod unix_specific {
                 }
             }
         });
-        let mut client = dial(endpoint.clone()).await;
-        client
+        let client = dial(endpoint.clone()).await;
+        let (_client_reader, mut client_writer) = client.split_writer();
+        client_writer
             .send_frame(&json!({ "still": "alive" }))
             .await
             .expect("send to the first daemon");
@@ -1135,5 +1821,389 @@ mod unix_specific {
             .expect("the connect resolves on its own")
             .expect_err("nothing is listening, so this cannot succeed");
         assert!(matches!(err, TransportError::Io(_)), "got: {err}");
+    }
+
+    /// The peer-credential check does not break the client it is meant to allow.
+    ///
+    /// The real socket, through `Listener::accept`'s guard, with the uid the
+    /// kernel actually reported: bind, dial, accept. This is the positive half of
+    /// the check — the half testable unprivileged, because the test process IS the
+    /// daemon's uid by definition. Without it, a guard with an inverted comparison
+    /// (`!=` where it should be `==`) would pass every other test in this file and
+    /// then refuse every client in production.
+    ///
+    /// # What this cannot prove, stated rather than implied
+    ///
+    /// It cannot prove the REJECT path: a peer with a different uid cannot be
+    /// manufactured without root. That half is pinned two ways — the comparison
+    /// itself by `unix.rs`'s own `#[cfg(test)]` mod (which can name the private
+    /// `verify_peer_uid`), and the end-to-end refusal by
+    /// [`foreign_uid_peer_is_rejected_under_root`], `#[ignore]`d and root-only.
+    #[tokio::test]
+    async fn same_uid_peer_is_accepted() {
+        let (_keepalive, endpoint) = super::test_endpoint();
+        let listener = bind(endpoint.clone()).expect("bind the test socket");
+
+        let server = tokio::spawn(async move {
+            // `accept_one` fails the test if `accept` returns `Err`, and that IS
+            // the assertion: the guard let the daemon's own uid through.
+            let mut conn = accept_one(&listener).await;
+            let frame = recv_one(&mut conn).await;
+            // Read on the whole connection FIRST, then split — the same order
+            // `accept_one_and_echo` uses, and required: `split_writer` consumes
+            // the `Connection`. The reader half drops here (its reader task with
+            // it); the writer half goes back to the caller, so the socket stays
+            // open for the echo until the caller drops it.
+            let (conn, mut writer) = conn.split_writer();
+            writer
+                .send_frame(&json!({"echoed": frame}))
+                .await
+                .expect("send: the peer is still reading");
+            drop(conn);
+            writer
+        });
+
+        let client = dial(endpoint).await;
+        let (mut client, mut client_writer) = client.split_writer();
+        client_writer
+            .send_frame(&json!({"probe": "same uid"}))
+            .await
+            .expect("the owner can dial a socket whose accept path checks credentials");
+        let echoed = recv_one(&mut client).await;
+        assert_eq!(
+            echoed["echoed"]["probe"], "same uid",
+            "a same-uid peer must be served, not refused"
+        );
+        drop(server.await.expect("the echo task ran"));
+    }
+
+    /// A peer under ANOTHER uid is refused at `accept` — end to end, over a real
+    /// socket, with a real foreign uid the kernel reported.
+    ///
+    /// `#[ignore]`d, because it needs root: the only way to get a process whose
+    /// REAL uid differs from the daemon's is to start as root and drop it. CI's
+    /// runners are all unprivileged, so on every automated run this is SKIPPED and
+    /// the automated proof of the reject path is the unit test of the comparison in
+    /// `unix.rs`. An operator who wants the end-to-end half runs
+    /// `sudo cargo test -p fulcrum --test transport -- --ignored`.
+    ///
+    /// # Why the socket's mode is WIDENED first, and why that is not cheating
+    ///
+    /// `bind_private` puts the socket at 0600 under a 0700 directory — layer 1 of
+    /// this daemon's access control. A foreign-uid peer cannot reach the inode past
+    /// layer 1 at all: its `connect` fails `EACCES`. So a test that asserted "the
+    /// foreign peer got refused" against the real mode would pass with the
+    /// credential check DELETED, because it would be measuring the filesystem.
+    ///
+    /// This test therefore removes layer 1 deliberately (socket 0777, directory
+    /// 0755), leaving exactly one thing between that peer and a `Connection`: the
+    /// credential check. Delete the guard and this goes red. Layer 1 has its own
+    /// pin — [`a_bound_socket_is_owner_only`] — and in a real deployment it refuses
+    /// this peer long before the credential check is consulted.
+    ///
+    /// # Why the CHILD dials and the PARENT asserts
+    ///
+    /// The claim is about what `accept` RETURNS — `Err(PeerIdentity)`, and no
+    /// `Connection`. The child cannot observe the refusal usefully: `connect(2)` on
+    /// an `AF_UNIX` stream socket succeeds the moment the listener queues it,
+    /// whether or not the daemon is about to hang up.
+    ///
+    /// The child is this same test binary, re-executed with `--ignored --exact`
+    /// naming [`child_dials_as_a_foreign_uid`] plus three env vars it reads —
+    /// which keeps the proof inside one binary instead of reaching for `setpriv`,
+    /// `sudo -u nobody`, `socat` or a shell that can dial a unix socket, none of
+    /// which a CI image is obliged to provide.
+    ///
+    /// # Why the child's success is a SENTINEL and not an exit code
+    ///
+    /// `--exact` selects the child by NAME, and libtest exits 0 when a filter
+    /// matches nothing. So a re-exec whose name no longer resolves — the child
+    /// entry point renamed, moved to another module, or deleted — runs ZERO
+    /// tests, reports success, and an exit-code-only parent would be satisfied by
+    /// a child that did nothing at all: the reject-path proof would evaporate
+    /// while this test stayed green. That is the same vacuity the file's bind
+    /// guard argues about from the other side (an absence-check whose needle
+    /// matches nothing asserts nothing).
+    ///
+    /// So the child's success is an OBSERVED fact instead: after a successful dial
+    /// it prints a line naming the nonce this run handed it, the uid it dialed as
+    /// and the descriptor it dialed on (see [`PEER_DIAL_SENTINEL`]), and the parent
+    /// requires that line in the child's captured stdout. "Ran nothing" cannot
+    /// produce it, and neither can "ran as the wrong uid" — the uid in the needle is
+    /// the one this test chose. The exit code is still asserted too (a child that
+    /// could not dial at all says so by failing), it is simply no longer
+    /// load-bearing on its own.
+    ///
+    /// # What it does NOT cover
+    ///
+    /// Linux only (`#[cfg(target_os = "linux")]`), because `SO_PEERCRED` is the
+    /// Linux arm of `peer_uid`. The `getpeereid` arm that macOS and the BSDs
+    /// compile is the same two-line shape and is type-checked by CI's macOS leg; it
+    /// is not executed here and this test does not claim otherwise.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root: only root can drop to a different uid and still dial"]
+    async fn foreign_uid_peer_is_rejected_under_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if unsafe { libc::geteuid() } != 0 {
+            panic!(
+                "this test is `#[ignore]`d precisely because it needs root, and it is \
+                 running as uid {} — run it via `sudo cargo test -p fulcrum --test \
+                 transport -- --ignored`, or do not select it at all",
+                unsafe { libc::geteuid() }
+            );
+        }
+        // A uid that exists here and is not ours. Read from `/etc/passwd` rather
+        // than hardcoded to `65534`: `nobody` is absent on some images, and a child
+        // whose `setresuid` then failed would dial as ROOT and make this pass on a
+        // same-uid accept — the wrong-reason green this file's header refuses.
+        let target = first_foreign_uid().expect(
+            "no non-root uid in /etc/passwd to drop the child to — this test cannot \
+             build a foreign peer here",
+        );
+
+        let (keepalive, endpoint) = super::test_endpoint();
+        let listener = bind(endpoint.clone()).expect("bind the test socket");
+        let path = match &endpoint {
+            Endpoint::Socket(path) => path.clone(),
+            Endpoint::Pipe(name) => panic!("a pipe endpoint on unix: {name}"),
+        };
+        // Strip layer 1 — see the doc above. BOTH are needed: the directory is 0700
+        // (tempfile's own mode) and it must be traversable to reach the inode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))
+            .expect("widen the socket so the filesystem is not what refuses");
+        std::fs::set_permissions(keepalive.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("open the socket's directory for traversal");
+
+        // Per-run nonce, so the sentinel the parent hunts for cannot be a stale
+        // line from an earlier run or a coincidental match in libtest's summary —
+        // only a child spawned by THIS run knows it.
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a wall clock past the epoch")
+                .as_nanos()
+        );
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                // Without this the sentinel never arrives: libtest CAPTURES a
+                // passing test's stdout and prints it only on failure, so the
+                // child's green run — the only run whose output is the proof —
+                // would print nothing and this test would fail for the wrong
+                // reason.
+                "--nocapture",
+                concat!("unix_specific::", "child_dials_as_a_foreign_uid"),
+            ])
+            .env("FULCRUM_PEER_DIAL_SOCKET", &path)
+            .env("FULCRUM_PEER_DIAL_UID", target.to_string())
+            .env("FULCRUM_PEER_DIAL_NONCE", &nonce)
+            // The child's stdout is captured rather than nulled OR inherited: it
+            // carries the sentinel that proves the child ran at all (see
+            // [`PEER_DIAL_SENTINEL`]). Its libtest summary lands here too, which is
+            // fine — the parent scans it for one line, and the summary only shows
+            // up in a failure message. Its FAILURE, which is the thing worth seeing
+            // as it happens, still goes to stderr unbuffered.
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("re-exec the test binary as the dialing child");
+
+        // Bounded, per this file's deadline rule: a child that never dials (its
+        // `setresuid` failed, the mode change did not take) must read as a named
+        // timeout, not as the hang that rule exists to prevent.
+        let accepted = tokio::time::timeout(FRAME_BUDGET, listener.accept())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "`accept` never returned within {FRAME_BUDGET:?}: the child never \
+                     dialed. Its stderr says why — a failed `setresuid` or an \
+                     unreadable socket path both land here, and either one means this \
+                     test proved nothing about credentials"
+                )
+            });
+        let accepted = accepted.expect_err(
+            "a peer whose uid is not the daemon's must be refused at `accept`, and \
+             `accept` must NOT hand back a `Connection` for it — no `Connection` means \
+             no reader task and no client task spawned for a peer we are refusing",
+        );
+
+        // Reap the child BEFORE asserting: a child outliving the suite is exactly
+        // what the stray-process census fails the run for. `wait_with_output` both
+        // reaps and takes the pipe, and doing it in this order (rather than
+        // reading the pipe while the child still runs) is what keeps a parent from
+        // waiting on output a dead child will never send. It relies on the child's
+        // whole stdout fitting the OS pipe buffer — true for one libtest summary
+        // plus one sentinel line, and if this child ever grew a chatty stdout the
+        // read would have to move before the reap.
+        let output = child
+            .wait_with_output()
+            .expect("reap the dialing child and take its stdout");
+        let child_ok = output.status.success();
+        let child_stdout = String::from_utf8_lossy(&output.stdout);
+        // The exit code FIRST, because it is the specific diagnosis when the child
+        // ran and failed; the sentinel below is what the exit code CANNOT say.
+        assert!(
+            child_ok,
+            "the child reported it could NOT dial — the mode widening above did not \
+             take effect, so nothing ever reached the credential check"
+        );
+        // The expected line is built from the SAME helper family the child calls,
+        // so the parent's needle cannot drift from the child's print. The fd VALUE
+        // is the child's fact, so the needle ends at `fd=` — and the fd must still
+        // be there, and still be a number the child actually named.
+        let needle = peer_dial_sentinel_prefix(&nonce, target);
+        let dialed = child_stdout.lines().map(str::trim_end).any(|line| {
+            line.strip_prefix(needle.as_str())
+                .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|byte| byte.is_ascii_digit()))
+        });
+
+        assert!(
+            dialed,
+            "the child never printed its dial sentinel `{needle}<fd>` — `{child_stdout}` \
+             has no such line. An exit code of 0 without it means the `--exact` filter \
+             matched ZERO tests (the child entry point was renamed, moved or deleted), \
+             so nothing dialed, so the refusal asserted below came from somewhere other \
+             than a foreign-uid peer and this test proved nothing."
+        );
+
+        match accepted {
+            TransportError::PeerIdentity {
+                peer_uid,
+                expected_uid,
+            } => {
+                assert_eq!(
+                    peer_uid, target,
+                    "the refusal must name the uid the kernel reported"
+                );
+                assert_eq!(expected_uid, 0, "running as root, the daemon demands 0");
+            }
+            other => panic!(
+                "a foreign peer must be refused as `PeerIdentity`, not as {other:?} — \
+                 `serve::run` matches on the VARIANT to log it on the counted \
+                 schedule instead of once per attempt"
+            ),
+        }
+    }
+
+    /// Every sentinel line starts with this: the marker [`child_dials_as_a_foreign_uid`]
+    /// prints once it has genuinely dialed, and which
+    /// [`foreign_uid_peer_is_rejected_under_root`] requires in the captured stdout.
+    ///
+    /// It exists because the parent selects the child by NAME, as a STRING
+    /// (`--exact unix_specific::child_dials_as_a_foreign_uid`). A rename, a move
+    /// to another module, or a deletion of the child therefore cannot be caught at
+    /// compile time, and libtest exits 0 when a filter matches ZERO tests — so an
+    /// exit code alone lets "ran nothing" look exactly like "ran and succeeded",
+    /// and the reject-path proof would evaporate silently. Requiring a line only
+    /// the running child can write makes its success an observed fact instead.
+    /// `nonce=` carries a per-run value so the line cannot be another run's
+    /// leftover or a coincidental match in libtest's own summary, `uid=` pins that
+    /// it dialed as the uid THIS run chose, and `fd=` names the descriptor it
+    /// dialed on.
+    #[cfg(target_os = "linux")]
+    const PEER_DIAL_SENTINEL: &str = "FULCRUM-PEER-DIAL-SENTINEL";
+
+    /// The one place the sentinel's shape is written — the pair
+    /// [`peer_dial_sentinel`] / [`peer_dial_sentinel_prefix`]. The child prints the
+    /// first, the parent hunts for the second, so the two sides cannot drift into a
+    /// parent that accepts a line no child ever prints.
+    ///
+    /// [`peer_dial_sentinel`] is what the child prints;
+    /// [`peer_dial_sentinel_prefix`] is what the parent hunts for — the same line
+    /// up to the `fd=` VALUE, which is the child's own fact (whichever descriptor
+    /// its `connect` got) and is not the parent's to guess. Requiring `fd=` to be
+    /// present still forces the child to name the descriptor it dialed on.
+    #[cfg(target_os = "linux")]
+    fn peer_dial_sentinel(nonce: &str, uid: u32, fd: i32) -> String {
+        format!("{}fd={fd}", peer_dial_sentinel_prefix(nonce, uid))
+    }
+
+    /// The parent's needle — see [`peer_dial_sentinel`].
+    #[cfg(target_os = "linux")]
+    fn peer_dial_sentinel_prefix(nonce: &str, uid: u32) -> String {
+        format!("{PEER_DIAL_SENTINEL} nonce={nonce} uid={uid} fd=")
+    }
+
+    /// The child half of [`foreign_uid_peer_is_rejected_under_root`]: drop to the
+    /// uid the parent named, dial, hang up.
+    ///
+    /// `#[ignore]`d so a normal pass never runs it — alone it tests nothing, and
+    /// panicking for want of its env vars is the honest failure rather than a
+    /// silent skip. The parent reaches it through `--ignored --exact`, and reads
+    /// [`peer_dial_sentinel`] on its stdout as the proof this entry point actually
+    /// ran (see that constant for why an exit code is not the proof).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child entry point: only the peer-credential test spawns it"]
+    fn child_dials_as_a_foreign_uid() {
+        use std::os::unix::io::AsRawFd as _;
+
+        let path = std::env::var("FULCRUM_PEER_DIAL_SOCKET")
+            .expect("the parent must name the socket to dial");
+        let target: u32 = std::env::var("FULCRUM_PEER_DIAL_UID")
+            .expect("the parent must name the uid to drop to")
+            .parse()
+            .expect("the target uid is a number");
+        // Echoed back in the sentinel, so the parent's needle cannot be satisfied
+        // by a line an earlier run left behind.
+        let nonce = std::env::var("FULCRUM_PEER_DIAL_NONCE")
+            .expect("the parent must name the sentinel nonce to echo");
+
+        // Drop real, effective AND saved-set uid. `SO_PEERCRED` reports the REAL
+        // uid, and a process that keeps a root saved set can climb back — so
+        // `setuid` alone is not enough to make the child genuinely foreign.
+        let dropped = target;
+        if unsafe { libc::setresuid(dropped, dropped, dropped) } != 0 {
+            panic!(
+                "setresuid({target}) failed: {}; refusing to dial as root and call \
+                 that a foreign peer",
+                std::io::Error::last_os_error()
+            );
+        }
+        assert_eq!(
+            unsafe { libc::getuid() },
+            target,
+            "the child still reports uid {}, not the {target} it dropped to",
+            unsafe { libc::getuid() }
+        );
+
+        // Blocking `std` connect, deliberately: this child has no runtime, and a
+        // unix `connect` either succeeds or fails immediately.
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(peer) => {
+                // The proof-of-life, printed AFTER the dial so a child that
+                // dropped its uid but never reached the socket cannot print it.
+                // Names the uid it dialed as and the descriptor it dialed on, plus
+                // the parent's nonce. `println!` reaches the parent's pipe because
+                // the parent passes `--nocapture` — without that flag libtest
+                // captures a PASSING test's stdout and the sentinel would be
+                // swallowed by exactly the green run this test is meant to observe.
+                println!("{}", peer_dial_sentinel(&nonce, target, peer.as_raw_fd()));
+                // Dropping the stream closes it. The parent was already woken when
+                // the connection was queued, and the parent asserts the refusal;
+                // success here means only "I got as far as dialing".
+                drop(peer);
+            }
+            Err(e) => panic!("the foreign peer could not dial {path}: {e}"),
+        }
+    }
+
+    /// The first uid in `/etc/passwd` that is not this process's, if any.
+    #[cfg(target_os = "linux")]
+    fn first_foreign_uid() -> Option<u32> {
+        let mine = unsafe { libc::geteuid() };
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        passwd.lines().find_map(|line| {
+            let mut fields = line.split(':');
+            let (_name, _password, uid) = (fields.next()?, fields.next()?, fields.next()?);
+            let uid: u32 = uid.trim().parse().ok()?;
+            (uid != mine).then_some(uid)
+        })
     }
 }

@@ -80,7 +80,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use fulcrum::transport::{connect, Connection, Endpoint};
+use fulcrum::transport::{connect, Connection, ConnectionWriter, Endpoint};
 use fulcrum_core::worker::protocol::{StartEnv, StartMode, PROTOCOL_VERSION};
 
 /// The shared process-table probe, whose own header explains why it is one module
@@ -108,6 +108,206 @@ const FRAME_BUDGET: Duration = Duration::from_secs(30);
 /// 5× margin on real sleeps. It is a DEADLINE, not a sleep: the test proceeds as
 /// soon as the row lands.
 const ROW_BUDGET: Duration = Duration::from_secs(20);
+
+// ── The `ready`-gate budgets for the slow-start relay test ───────────────────
+//
+// One test reads these:
+// `a_slow_start_does_not_stall_that_clients_own_event_relay`. It holds a worker
+// fixture's `ready` frame (see `src/fixtures/worker.rs`'s
+// `hold_ready_until_released`) so the daemon's reader is PARKED inside
+// `WorkerManager::attach` for a span the test chooses, and it takes its verdict on
+// the socket while that hold still stands.
+//
+// The three real budgets below are DERIVED from the engine's own `ready` ceiling,
+// not chosen freely, and the const assert at the end of this block is what makes
+// that derivation hold rather than merely documented.
+
+/// The ceiling the test's park span must clear: the engine's OWN `ready` bound
+/// inside `attach` — `handle.wait_ready(Duration::from_secs(5))`, at
+/// `src/worker/manager/mod.rs` (in `WorkerManager::attach`).
+///
+/// # Why this const exists, and why the budgets must sum below it
+///
+/// The whole proof rests on the daemon's reader staying PARKED inside `attach`
+/// until the test has taken its verdict, and `wait_ready` implements that park. It
+/// is BOUNDED: at this duration it gives up, `handle_frame` returns an error
+/// instead of a `start-result`, and a single-task `serve_client` would then RESUME
+/// its `select!` — whose drain arm pours the frames it buffered onto the socket in
+/// one go. A probe running after that point sees a chunk arrive and reports that
+/// the relay works, ON CODE THAT HAS THE BUG. Exceeding this ceiling therefore does
+/// not produce a red, it produces the exact false green this test exists to rule
+/// out — which is why the sum of the three budgets is asserted at compile time
+/// rather than trusted to the reader of a comment.
+const ATTACH_READY_CEILING: Duration = Duration::from_secs(5);
+
+/// Mirror of the fixture's `__long_stream__` cadence (`LONG_STREAM_GAP` in
+/// `src/fixtures/worker.rs`).
+///
+/// A mirror and not an import: the fixture's constants are private to
+/// `fulcrum-core`'s fixture module, which a `tests/` crate of the OTHER package
+/// cannot name. If the fixture's cadence ever changes, this number and
+/// [`CHUNK_SILENCE`] have to be re-derived from it — the slow-start test would fail
+/// LOUDLY (its silence detector would fire while the stream is still flowing), not
+/// silently weaken, so the drift cost is a red here rather than a wrong answer.
+const LONG_STREAM_GAP_MS: u64 = 100;
+
+/// Mirror of the fixture's `__long_stream__` chunk count (`LONG_STREAM_CHUNKS`).
+///
+/// Same mirror-not-import caveat as [`LONG_STREAM_GAP_MS`]. Drift is loud in both
+/// directions: if the fixture grows the stream, this mirror UNDER-states the window
+/// and the asserts below get stricter than they need to be (cost: headroom); if the
+/// fixture shrinks it, this mirror OVER-states the window, the budgets can outrun the
+/// real end of stream, and the slow-start test reports a TEST-INSTRUMENT failure
+/// naming this exact mismatch — not a relay-stall claim.
+const LONG_STREAM_CHUNKS: u64 = 30;
+
+/// How long the fixture's `__long_stream__` scenario PRODUCES: 30 × 100 ms =
+/// **3.0 s of chunks**, and the LAST chunk lands at ~2.9 s.
+///
+/// This is the second ceiling the slow-start test's park span must fit under, and
+/// it is a FLOOR, not an estimate: the fixture sleeps for real, so production can
+/// be LATER than this on a loaded runner but never earlier. It exists because the
+/// probe's `try_recv` reports `None` for BOTH "no chunk arrived while the reader
+/// was parked" and "the stream is over" — and the second one is not a relay stall,
+/// it is the fixture running out of chunks. The test tells them apart (the
+/// settle frame, see `a_slow_start_does_not_stall_that_clients_own_event_relay`),
+/// but telling them apart only turns a false red into an honest one; fitting under
+/// this window is what keeps either verdict from being needed. Hence the
+/// [`PARK_PRELUDE_ALLOWANCE`]-qualified compile-time assert below.
+const LONG_STREAM_WINDOW: Duration = Duration::from_millis(LONG_STREAM_CHUNKS * LONG_STREAM_GAP_MS);
+
+/// Everything the slow-start test does BEFORE its three budgets start, charged
+/// against [`LONG_STREAM_WINDOW`]: the first-chunk barrier (chunk 0 is emitted the
+/// moment the prompt lands, so this is one socket hop), arming the gate (one file
+/// write), and writing session B's `start`.
+///
+/// Deliberately NOT one of the measured budgets — it is not a wait the test
+/// performs, it is the elapsed time the budgets do not own. 200 ms against a real
+/// cost of a few socket hops plus one small file write is the same kind of
+/// panic-timer generosity as [`READY_GATE_STAMP_BUDGET`] (the worker spawn it races
+/// is charged to that timer, not to this one). It is in the assert because leaving
+/// it out would let the three budgets consume the WHOLE stream window and leave
+/// nothing for the steps that come first.
+const PARK_PRELUDE_ALLOWANCE: Duration = Duration::from_millis(200);
+
+/// How long no chunk has to arrive for to count as "the stream went quiet" — three
+/// cadences, so one late chunk on a loaded runner is not read as the end of the
+/// stream.
+const CHUNK_SILENCE: Duration = Duration::from_millis(3 * LONG_STREAM_GAP_MS);
+
+/// How long the slow-start test waits for a held fixture to write its arrival
+/// stamp.
+///
+/// The stamp is written by the FIXTURE at its own startup, in milliseconds, so this
+/// budget is a broken-fixture PANIC timer and not an expected wait — which is why it
+/// can be generous inside the ceiling without touching the proof. If the stamp never
+/// appears within it then the gate is not working, and the test panics rather than
+/// falling through to a verdict: a missing stamp is a broken instrument, not a red
+/// on the code under test.
+///
+/// It was 1500 ms, and that is what put this test's worst case PAST the fixture's
+/// 3.0 s of production (see [`LONG_STREAM_WINDOW`]) — a stream that had already run
+/// dry looked exactly like a stalled relay. 500 ms still covers what this timer
+/// actually waits for, which is one `fork`+`exec` of a small binary plus one
+/// `fs::write`; a runner slow enough to exceed that is a runner this test cannot
+/// instrument, and the panic says so.
+const READY_GATE_STAMP_BUDGET: Duration = Duration::from_millis(500);
+
+/// The FORWARD bound on a session-A chunk arriving while session B's reader is
+/// provably parked: ~100 ms cadence, so this is ~15× the real latency.
+///
+/// It is a FORWARD bound on the good outcome and NOT a window the bad design races:
+/// once the absorb step has drained the pre-park residue, the single-task design has
+/// no writer at all during the held park, so its silence there does not depend on
+/// this number.
+///
+/// This is the one budget in the block that was NOT cut to fit [`LONG_STREAM_WINDOW`],
+/// and deliberately: shrinking it buys stream headroom by weakening the margin the
+/// FIXED design is measured against, i.e. it converts a rare false red on the buggy
+/// design into a false red on the good one. The two timers that are pure
+/// broken-instrument allowances — [`READY_GATE_STAMP_BUDGET`] and
+/// [`ABSORB_BUDGET`] — are the ones that gave.
+const RELAY_ARRIVAL_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Upper bound on the absorb step (drain the pre-park residue until quiet).
+/// ≈ 5 cadences: the residue is a FINITE set of bytes already written to the socket
+/// before the park, so it drains in milliseconds; the bound is a ceiling for a
+/// loaded CI runner, not a margin the old design can win. It cannot go below
+/// [`CHUNK_SILENCE`] (300 ms) — the step cannot declare quiet without spending one
+/// full silence window — which is where the floor is, and why 500 ms is the last
+/// value that still leaves the absorb meaningful.
+const ABSORB_BUDGET: Duration = Duration::from_millis(500);
+
+/// The proof's hard invariant, checked at COMPILE TIME (the same class of guard as
+/// `serve.rs`'s `CLIENT_QUEUE_CAPACITY > 0` / `< FAN_OUT_CAPACITY` asserts):
+///
+/// ```text
+/// READY_GATE_STAMP_BUDGET + ABSORB_BUDGET + RELAY_ARRIVAL_BUDGET < ATTACH_READY_CEILING
+///       500 ms            +    500 ms      +      1500 ms         <      5 000 ms
+/// ```
+///
+/// 2.5 s against a 5 s ceiling, ~2.5 s of headroom. WHY IT MUST HOLD: all three
+/// steps run while the reader is parked, and if their sum reached the ceiling then
+/// `wait_ready`'s own timeout would fire FIRST — the reader unparks, the buffered
+/// frames are drained onto the socket, and the probe measures the daemon's backlog
+/// flush instead of its relay. That is a manufactured green on the buggy design, so
+/// the inequality is a compile error rather than a convention: a one-number retune
+/// of any budget can no longer silently outgrow the engine's bound.
+///
+/// The spelling matters: `Duration`'s `Add` is NOT a const trait on this toolchain,
+/// so `STAMP + ABSORB + PROBE < ATTACH_READY_CEILING` does not compile in const
+/// context. `as_millis()` IS const, so the millisecond-sum form is the form that
+/// evaluates here.
+const _: () = assert!(
+    READY_GATE_STAMP_BUDGET.as_millis()
+        + ABSORB_BUDGET.as_millis()
+        + RELAY_ARRIVAL_BUDGET.as_millis()
+        < ATTACH_READY_CEILING.as_millis(),
+    "READY_GATE_STAMP_BUDGET + ABSORB_BUDGET + RELAY_ARRIVAL_BUDGET must stay below \
+     ATTACH_READY_CEILING: that ceiling is `attach`'s own wait_ready(5s) \
+     (src/worker/manager/mod.rs), and a park span longer than it would let that \
+     timeout unpark the reader mid-verdict — the single-task design would then drain \
+     its buffered frames onto the socket and the slow-start test would pass on code \
+     that has the bug"
+);
+
+/// The SECOND invariant of the same proof, for the ceiling nobody asserted:
+///
+/// ```text
+/// PARK_PRELUDE_ALLOWANCE + READY_GATE_STAMP_BUDGET + ABSORB_BUDGET + RELAY_ARRIVAL_BUDGET
+///        200 ms          +        500 ms           +    500 ms      +      1500 ms
+///                                                              <  LONG_STREAM_WINDOW = 3 000 ms
+/// ```
+///
+/// 2.7 s against the fixture's own production window (30 chunks land at t = 0 …
+/// ~2.9 s after the prompt, so 3.0 s is the conservative form of the same fact, and
+/// the 2.7 s sum still ends ~200 ms — two cadences — before the LAST chunk).
+///
+/// `ATTACH_READY_CEILING` is not the only clock that can end this test's park: the
+/// stream it probes ENDS, 30 chunks × 100 ms after the prompt, and the last chunk
+/// lands at ~2.9 s. A probe that starts after that can only see silence, and
+/// `try_recv` cannot tell "the relay stalled" from "there was nothing left to
+/// relay" — the earlier budget sum (1500 + 700 + 1500 = 3.7 s, plus an unbudgeted
+/// prelude) sat PAST that point, so a loaded runner could turn this test red for the
+/// wrong reason: the exact symptom, indistinguishable from, the regression it exists
+/// to catch. The test now also distinguishes the two cases at RUNTIME (the settle
+/// frame), but a discriminator that fires is a test that has already stopped proving
+/// anything — so the numbers fit first and the message is the backstop.
+///
+/// Same `as_millis()` spelling as the assert above, for the same reason.
+const _: () = assert!(
+    PARK_PRELUDE_ALLOWANCE.as_millis()
+        + READY_GATE_STAMP_BUDGET.as_millis()
+        + ABSORB_BUDGET.as_millis()
+        + RELAY_ARRIVAL_BUDGET.as_millis()
+        < LONG_STREAM_WINDOW.as_millis(),
+    "PARK_PRELUDE_ALLOWANCE + READY_GATE_STAMP_BUDGET + ABSORB_BUDGET + \
+     RELAY_ARRIVAL_BUDGET must stay below LONG_STREAM_WINDOW: the fixture's \
+     `__long_stream__` scenario stops producing after LONG_STREAM_CHUNKS × \
+     LONG_STREAM_GAP (src/fixtures/worker.rs), and a probe that runs after the \
+     stream has drained sees silence that is NOT a stalled relay — a red that \
+     reads like the regression this test exists to catch"
+);
 
 /// The `fake_worker_core` path, materialised if this cargo invocation did not
 /// build it (see the module header).
@@ -216,6 +416,9 @@ struct Daemon {
     child: Child,
     db_path: PathBuf,
     _dir: tempfile::TempDir,
+    /// The `ready`-gate marker this daemon's workers were told to watch, when the
+    /// test asked for a gated daemon (see [`Daemon::start_gated`]).
+    gate_marker: Option<PathBuf>,
 }
 
 impl Daemon {
@@ -228,10 +431,50 @@ impl Daemon {
     /// a unix-only item (so the Windows leg of CI could not compile this file)
     /// and a second dial implementation the file did not need.
     async fn start() -> Self {
+        Self::start_inner(None).await
+    }
+
+    /// [`Daemon::start`], but with the fixture's `ready` gate POINTED AT — a
+    /// marker path inside this daemon's own temp dir that does not exist yet
+    /// (T4b's slow-start test).
+    ///
+    /// # Why the marker is a path handed back rather than a file created here
+    ///
+    /// The gate's polarity is PRESENT = hold (`src/fixtures/worker.rs`'s
+    /// `hold_ready_until_released`), so the daemon must BOOT with the marker
+    /// ABSENT — otherwise the very first worker it spawns would be held and the
+    /// test could never start its first session at all. This therefore only tells
+    /// the daemon where to look; the test creates the marker (arm) and removes it
+    /// (release), via [`Daemon::arm_gate`] / [`Daemon::disarm_gate`].
+    ///
+    /// Inside the temp dir is the point: the marker is cleaned up with the daemon
+    /// and no other test — running in parallel, in this process or another — can
+    /// name it. A marker some other test left behind would hold THIS daemon's
+    /// workers' `ready` hostage, which is the cross-test coupling the fixture's
+    /// polarity note is written against.
+    ///
+    /// # Why the variable reaches the worker at all
+    ///
+    /// The test cannot reach a worker process directly: the daemon spawns its own
+    /// workers, and the only control surface into a process the test never spawned
+    /// is its inherited environment plus the filesystem. The `env` set below
+    /// reaches the fixture by plain fork-time inheritance — nothing on either spawn
+    /// step clears or rewrites the env (`Daemon`'s own spawn has no `env_clear`, and
+    /// the engine's `build_command_with` applies only the AppImage scrub, which is
+    /// EMPTY under `cargo test`; see `src/worker/client.rs`).
+    async fn start_gated() -> Self {
+        // The extension is load-bearing: the fixture writes its arrival stamp to
+        // `marker.with_extension("arrived")`, so the marker must carry one (`.hold`)
+        // for the stamp to be a DIFFERENT file rather than an overwrite of itself.
+        Self::start_inner(Some("ready-gate.hold")).await
+    }
+
+    async fn start_inner(gate_marker: Option<&str>) -> Self {
         let dir = tempfile::tempdir().expect("temp dir for the daemon");
         let endpoint = Self::endpoint_in(dir.path());
         let db_path = dir.path().join("fulcrum.db");
         let worker = worker_fixture();
+        let marker_path = gate_marker.map(|name| dir.path().join(name));
 
         let mut cmd = Command::new(BIN);
         cmd.arg("serve");
@@ -257,15 +500,55 @@ impl Daemon {
             // the "client disconnected" line the disconnect tests are about.
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if let Some(marker) = &marker_path {
+            // Inside this daemon's own temp dir, so it is cleaned up with the
+            // daemon and cannot be named by another test running in parallel.
+            cmd.env("FULCRUM_FIXTURE_READY_GATE", marker);
+        }
         let child = cmd.spawn().expect("spawn the daemon");
 
         let daemon = Self {
             child,
             db_path,
             _dir: dir,
+            gate_marker: marker_path,
         };
         daemon.wait_until_listening(&endpoint).await;
         daemon
+    }
+
+    /// Arm the `ready` gate: create the marker, so every worker spawned from now
+    /// on holds its `ready` frame until [`Daemon::disarm_gate`].
+    fn arm_gate(&self) {
+        let marker = self.gate_marker.as_ref().expect("a gated daemon");
+        std::fs::write(marker, b"hold").unwrap_or_else(|e| panic!("create {marker:?}: {e}"));
+    }
+
+    /// Release the `ready` gate: remove the marker, so a held fixture emits `ready`
+    /// on its next 10 ms poll tick and the parked `attach` completes.
+    ///
+    /// Idempotent on purpose: a test that has taken its verdict MUST be able to
+    /// release, and a release that panicked would leave a worker parked until
+    /// `wait_ready`'s own ceiling and turn a verdict into a teardown timeout.
+    fn disarm_gate(&self) {
+        let Some(marker) = self.gate_marker.as_ref() else {
+            return;
+        };
+        match std::fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("remove {marker:?}: {e}"),
+        }
+    }
+
+    /// The fixture's arrival stamp for the current hold (see the fixture's
+    /// `hold_ready_until_released`): the proof that a worker process really REACHED
+    /// the gate and is holding, rather than an inference from having armed it.
+    fn gate_arrived(&self) -> PathBuf {
+        self.gate_marker
+            .as_ref()
+            .expect("a gated daemon")
+            .with_extension("arrived")
     }
 
     /// Dial with retries until the daemon answers, or fail.
@@ -558,6 +841,16 @@ async fn raw_dial(endpoint: &Endpoint) -> impl tokio::io::AsyncRead + tokio::io:
 /// so a test can wait for one specific frame without losing the ones before it.
 struct Client {
     conn: Connection,
+    /// This client's half of the framing split (T4b).
+    ///
+    /// `dial` calls [`Connection::split_writer`] exactly ONCE, which is what lets
+    /// every `client.send(..)` in this file keep working unchanged: the writer
+    /// lives on the struct instead of being taken per call, because `split_writer`
+    /// consumes the `Connection` and may only be called once. Holding both halves
+    /// in ONE struct also means the whole socket closes when a test drops its
+    /// `Client` — the same lifetime a single `Connection` used to have, which the
+    /// disconnect tests depend on.
+    writer: ConnectionWriter,
     /// Frames that arrived but that no matcher has claimed yet, in arrival
     /// order. `recv_until*` scans this BEFORE reading the socket, so "wait for
     /// the `start-result`" never swallows the `hello` reply that came first —
@@ -576,6 +869,15 @@ struct Client {
     /// has consumed it, and those assertions are exactly the ones that must
     /// survive a matcher that ran earlier in the same test.
     delivered: Vec<serde_json::Value>,
+    /// Set the first time a read returns EOF — the daemon closed this connection.
+    ///
+    /// `try_recv` cannot otherwise distinguish its two `None`s: "nothing arrived
+    /// within the budget" and "the stream is over" both surface as `None`, and a
+    /// test that reads the second as the first reports a stall that never happened
+    /// (see the slow-start relay test, whose whole verdict is a silence claim).
+    /// `recv_until*` already treats EOF as a panic, so this flag is only ever read
+    /// by the tests that deliberately probe for silence.
+    stream_ended: bool,
 }
 
 impl Client {
@@ -583,15 +885,39 @@ impl Client {
         let conn = connect(endpoint.clone())
             .await
             .expect("dial the daemon (if this fails, the daemon is not listening)");
+        // Split once, here, so the struct owns both halves (see the field). This
+        // is the ONLY place in this file that reaches for a writer, and it is why
+        // `send` below needs no `split_writer` of its own.
+        let (conn, writer) = conn.split_writer();
         Self {
             conn,
+            writer,
             pending: std::collections::VecDeque::new(),
             delivered: Vec::new(),
+            stream_ended: false,
         }
     }
 
     async fn send(&mut self, frame: serde_json::Value) {
-        self.conn.send_frame(&frame).await.expect("write the frame");
+        // The error path is spelled out rather than a bare `expect`, because after
+        // T4b a `send` can fail for a NEW reason that is not a test bug: the
+        // daemon's writer task exits on its own (its `send_frame` errors on the
+        // peer's close, or `serve_client` `abort()`s it once its reader half is
+        // gone), and on the reader-first path the socket's final `Arc` drops with
+        // that abort — so a test still mid-`send` sees `Err` where the old
+        // single-task design, which dropped the whole `Connection` at once, simply
+        // could not. That is the split's EOF semantics, and a message that only
+        // said "write the frame" would send the next reader to the wrong file.
+        self.writer.send_frame(&frame).await.unwrap_or_else(|e| {
+            panic!(
+                "the daemon accepted the write; it refused it instead ({e}). \
+                     If the frame is well-formed, the connection is already going \
+                     away: the daemon's writer task exits on the peer's close or on \
+                     `serve_client`'s abort, so a `send` that races a teardown sees \
+                     this error — check whether the daemon closed this connection \
+                     (or was refused by the handshake / rate gate) before this frame"
+            )
+        });
     }
 
     /// Wait for the first frame whose `type` is `kind`, failing after
@@ -673,6 +999,11 @@ impl Client {
     ///
     /// Takes from the FRONT of `pending`, matching socket order — `pop()` takes
     /// the back, which would report the newest frame as the oldest.
+    ///
+    /// `None` means EITHER the budget expired OR the stream ended — the two are
+    /// different claims, and a test that has to tell a stall from a finished stream
+    /// reads [`Client::stream_ended`] after it, because this signature cannot carry
+    /// both answers.
     async fn try_recv(&mut self, budget: Duration) -> Option<serde_json::Value> {
         if let Some(frame) = self.pending.pop_front() {
             return Some(frame);
@@ -683,7 +1014,10 @@ impl Client {
                 Some(frame)
             }
             Ok(Some(Err(e))) => panic!("a malformed frame arrived: {e}"),
-            Ok(None) => None,
+            Ok(None) => {
+                self.stream_ended = true;
+                None
+            }
             Err(_) => None,
         }
     }
@@ -708,7 +1042,13 @@ impl Client {
                     out.push(frame);
                 }
                 Ok(Some(Err(e))) => panic!("a malformed frame arrived: {e}"),
-                Ok(None) => return out,
+                // EOF ends the drain AND is recorded — see `stream_ended`: a test
+                // that drains to silence must be able to tell "nothing came" from
+                // "the socket is gone".
+                Ok(None) => {
+                    self.stream_ended = true;
+                    return out;
+                }
                 Err(_) => return out,
             }
         }
@@ -726,8 +1066,9 @@ impl Client {
 /// `"session-update"`. Comparing the `RpcEvent` path to a string silently never
 /// matches, and the symptom is a 30 s timeout that looks like a stalled stream.
 ///
-/// Naming it once is the fix; the two call sites below are the two spellings the
-/// mistake came in.
+/// Naming it once is the fix; the call sites are the two spellings the mistake came
+/// in (the settle waits) plus the slow-start relay test's stream-exhaustion
+/// discriminator, which needs the same path to recognise the fixture's terminal frame.
 fn rpc_event_is(frame: &serde_json::Value, name: &str) -> bool {
     frame["type"] == "event"
         && frame["frame"]["type"] == "event"
@@ -1287,6 +1628,388 @@ async fn two_sessions_on_two_sockets_do_not_see_each_others_events() {
     daemon.shutdown();
 }
 
+/// Issue #3's acceptance criterion: a client that starts a session and streams
+/// sees its OWN event frames arrive **while a second `start` is still in flight**.
+///
+/// # The bug this exists for
+///
+/// `serve_client` used to be ONE task running ONE `select!`, with `handle_frame`
+/// awaited INLINE in the inbound arm. A `start` inside it awaits
+/// `WorkerManager::attach` — the engine's 5 s `ready` bound — so for that window the
+/// task was not in its `select!` at all: this connection's fan-out arm could not
+/// run, and a client that started a session while its other session was streaming
+/// saw its own events only after the start finished. No frame was lost; the delay
+/// was the defect.
+///
+/// # Why the gate makes the old design red BY CONSTRUCTION, not by margin
+///
+/// A fixed fixture delay cannot prove this. `attach` returns on its timer and the
+/// single task then drains everything it buffered in one burst, so any measurement
+/// window placed by a clock guess is one the buggy design can win by being fast.
+///
+/// Instead the fixture's `ready` frame is HELD until this test releases it
+/// (`src/fixtures/worker.rs`'s `hold_ready_until_released`, armed through
+/// [`Daemon::start_gated`] / [`Daemon::arm_gate`]). So:
+///
+/// * session B's `start` parks the daemon's reader inside `attach`, and it CANNOT
+///   return until this test removes the marker;
+/// * the fixture writes an arrival stamp on entering the hold, so "the park
+///   happened" is a fact read off the filesystem rather than an inference;
+/// * the verdict is taken on the socket **while the marker still exists** — and in
+///   the single-task design there is then nothing that can write this socket at all:
+///   the one task is parked in `handle_frame`, its fan-out arm is unpolled, and
+///   there is no second task. Silence there is structural, so a chunk arriving in
+///   that span can only come from a relay that runs independently of the reader —
+///   which is precisely what the reader/writer split delivers.
+///
+/// The budgets that bound this span are in the [`ATTACH_READY_CEILING`] block, and
+/// the two compile-time asserts there are what keep the span inside BOTH clocks that
+/// can end the park: `attach`'s own 5 s timeout — a hold that outlived it would let
+/// the timeout unpark the reader, the backlog would drain, and the probe would
+/// measure a flush instead of a relay, a false green — and the fixture's own
+/// [`LONG_STREAM_WINDOW`], the 3.0 s after which this session has NO MORE CHUNKS to
+/// relay, so a probe that runs later sees silence that is not a stall and the verdict
+/// is a false red.
+///
+/// # The three steps of the verdict, and why all three are needed
+///
+/// 1. **Absorb.** The old design may have written a small RESIDUE before it parked —
+///    the chunks its `select!` relayed between the marker being created and the
+///    reader actually parking. The pre-`start` barrier below (consuming the first
+///    chunk) bounds that to a couple of frames, so the absorb drains it to quiet in
+///    milliseconds. Chunks STILL arriving at the end of [`ABSORB_BUDGET`] (~5
+///    cadences of continuous production) cannot be residue: that is already the
+///    good outcome.
+/// 2. **Probe.** Once quiet, the socket is structurally silent for the old design for
+///    as long as the marker holds, so ONE chunk arriving within
+///    [`RELAY_ARRIVAL_BUDGET`] is conclusive.
+/// 3. **Discriminate the negative.** Silence has three causes and only one of them is
+///    the bug: the relay stalled, the STREAM ended, or the connection died. The
+///    fixture's terminal `agent_settled` (which a WORKING relay carries too, so it
+///    cannot be conjured by a stalled one) separates the second, and
+///    [`Client::stream_ended`] — set on socket EOF — separates the third. A negative
+///    with the stream still live and the socket still open is the stall this test
+///    exists to catch; a negative with the settle already seen is reported as a
+///    TEST-INSTRUMENT failure naming the budget that was too tight, never as a stall
+///    and never as a pass.
+///
+/// # What the teardown half adds
+///
+/// After the release, B's `start-result` must still arrive (the park really ended
+/// rather than timing out), and dropping this test's `Client` must tear the
+/// connection down without wedging the daemon: a fresh dial gets its `hello` reply.
+/// That is the integration-level home of "no task outlives `serve_client`" — the
+/// writer half is `abort()`ed by `serve_client` rather than joined, because joining
+/// a writer parked inside `send_frame` can never resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_start_does_not_stall_that_clients_own_event_relay() {
+    // A gated daemon: the fixture's `ready` is held whenever the marker exists, and
+    // the marker does NOT exist yet — session A must start normally.
+    let mut daemon = Daemon::start_gated().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+    let mut client = Client::dial(&endpoint).await;
+
+    client.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(client.recv_until("hello").await["type"], "hello");
+
+    // ── Session A: started, and streaming of its own accord. ─────────────────
+    let parkable = "relay-parked";
+    let streaming = "relay-streaming";
+    client.send(start_frame(&start_env(streaming, cwd))).await;
+    let started = client.recv_until("start-result").await;
+    assert_eq!(
+        started["ok"], true,
+        "the streaming session starts: {started}"
+    );
+
+    client
+        .send(serde_json::json!({
+            "type": "prompt", "sessionId": streaming, "text": "__long_stream__",
+        }))
+        .await;
+    let delivered = client.recv_until("prompt-result").await;
+    assert_eq!(delivered["ok"], true, "the prompt is relayed: {delivered}");
+
+    // THE BARRIER: consume the first streamed chunk. Without it, chunks that were
+    // already in flight before the park could satisfy the probe and the whole test
+    // would pass on the buggy design. Matching on a real `agent_message_chunk` (and
+    // not merely "an event") is what makes this a claim about a TURN IN FLIGHT —
+    // `start` itself answers with a `session_info` sink-frame.
+    let first_chunk = client
+        .recv_until_matching("event", agent_message_chunk_for(streaming))
+        .await;
+    assert_eq!(
+        first_chunk["sessionId"], streaming,
+        "the barrier chunk belongs to the streaming session: {first_chunk}"
+    );
+
+    // ── Arm the gate, then start B: its `attach` parks the reader. ───────────
+    daemon.arm_gate();
+    let armed = Instant::now();
+    client.send(start_frame(&start_env(parkable, cwd))).await;
+
+    // The park must be OBSERVED, not assumed: the fixture writes the stamp when it
+    // enters the hold. A stamp that never arrives means the gate is broken, and that
+    // is a broken instrument rather than a red on the daemon — so this panics rather
+    // than falling through to a verdict.
+    let stamp_deadline = Instant::now() + READY_GATE_STAMP_BUDGET;
+    let stamp = daemon.gate_arrived();
+    let stamp_at = loop {
+        if stamp.exists() {
+            break Instant::now();
+        }
+        if Instant::now() >= stamp_deadline {
+            panic!(
+                "the second worker never reached the `ready` gate (no {:?} within \
+                 {READY_GATE_STAMP_BUDGET:?}) — the reader is therefore NOT provably \
+                 parked and any verdict below would be meaningless. Is \
+                 FULCRUM_FIXTURE_READY_GATE reaching the worker (see \
+                 `Daemon::start_gated`)?",
+                stamp
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let park_observed_at = stamp_at - armed;
+
+    // The reader is parked now, and stays parked until THIS test releases it.
+    // Everything between here and the release is inside that park.
+    let is_streaming_chunk = agent_message_chunk_for(streaming);
+    // The fixture's TERMINAL frame for the streaming session. `__long_stream__`
+    // emits its canned turn after its last chunk and that turn ends with
+    // `agent_settled` (src/fixtures/worker.rs), so this frame means "there will be
+    // no more chunks" — the one fact that separates a stalled relay from a stream
+    // that simply ran out. `sessionId` is required because a settle from the PARKED
+    // session would mean something else entirely (and cannot arrive anyway while its
+    // `attach` has not returned).
+    let is_streaming_settle = |frame: &serde_json::Value| {
+        frame["sessionId"] == streaming && rpc_event_is(frame, "agent_settled")
+    };
+    // Whether the stream ended before the verdict could be taken. `stream_ended`
+    // covers the OTHER way production stops (the connection died), which is a daemon
+    // bug rather than an instrument failure, so it gets its own verdict below
+    // instead of being folded into this flag.
+    let mut stream_exhausted = false;
+
+    // ── Step 1: absorb the pre-park residue. ─────────────────────────────────
+    let absorb_started = Instant::now();
+    let absorb_deadline = absorb_started + ABSORB_BUDGET;
+    let mut residue = 0usize;
+    let mut quiet = false;
+    loop {
+        let left = absorb_deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break; // still producing at the ceiling → not residue, i.e. the relay
+        }
+        // Only a full `CHUNK_SILENCE` window of silence counts as quiet; a truncated
+        // final window means the absorb ran out of budget, which is the other branch.
+        let window = left.min(CHUNK_SILENCE);
+        match client.try_recv(window).await {
+            Some(frame) if is_streaming_chunk(&frame) => residue += 1,
+            Some(frame) if is_streaming_settle(&frame) => {
+                stream_exhausted = true;
+                break;
+            }
+            Some(_) => {} // a non-chunk frame is not the relay flowing
+            None if window >= CHUNK_SILENCE => {
+                quiet = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    let absorb_elapsed = absorb_started.elapsed();
+
+    // ── Step 2: the probe, in the held park. ─────────────────────────────────
+    let mut probe_elapsed = Duration::ZERO;
+    // The residue shortcut: chunks STILL arriving when `ABSORB_BUDGET` expires cannot
+    // be pre-park residue (that is a couple of frames), so they already are the good
+    // outcome — and it is genuine evidence under BOTH designs, because the absorb step
+    // runs entirely inside the observed park: the single-task design writes NOTHING to
+    // this socket while its reader is parked, so any frame that lands there came from a
+    // relay that runs independently of it.
+    //
+    // `stream_exhausted` VETOES it. A settle seen during the absorb means the whole
+    // stream — chunks AND terminal frame — was already in flight when the park was
+    // taken, so "frames arrived during the park" is no longer something this run
+    // observed: the run would then be reporting the backlog the daemon wrote BEFORE
+    // `start` B, which is precisely the shape that passes on the buggy design. That is
+    // an instrument failure, not a green and not a stall. Reaching it takes a park
+    // taken ~2.4 s into the stream: the absorb window is
+    // `prelude + stamp_wait … + ABSORB_BUDGET`, and the settle lands at ~2.9 s, so the
+    // two only overlap once `prelude + stamp_wait` has eaten 2.4 s of the 3.0 s window
+    // — and since the stamp wait is capped at 500 ms by its own panic timer, that means
+    // ≥ 1.9 s of bare prelude on a runner that cannot complete three socket hops and a
+    // file write in it. Nothing in this test is measurable under that much stall.
+    let mut relayed_while_parked = !quiet && residue > 0 && !stream_exhausted;
+    // A stream that ended during the absorb step is ALREADY accounted for — probing
+    // it further could only produce silence that reads like a stall.
+    if !relayed_while_parked && !stream_exhausted {
+        let probed = Instant::now();
+        let probe_deadline = probed + RELAY_ARRIVAL_BUDGET;
+        relayed_while_parked = loop {
+            let left = probe_deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                // The budget ran out with the stream still unaccounted for: THIS is
+                // the stall the test exists to catch.
+                break false;
+            }
+            match client.try_recv(left).await {
+                Some(frame) if is_streaming_chunk(&frame) => break true,
+                Some(frame) if is_streaming_settle(&frame) => {
+                    // The stream ended inside the park. No chunk arrived, but NOT
+                    // because the relay stalled — there was nothing left to relay —
+                    // so this must not be reported as one.
+                    stream_exhausted = true;
+                    break false;
+                }
+                // Any other frame is not the relay flowing; keep waiting out the
+                // budget so a stall is reported as a stall.
+                Some(_) => {}
+                // `None` here means EITHER the budget expired (the stall) or the
+                // socket reached EOF — `try_recv` cannot carry both answers, so
+                // `client.stream_ended` is what tells them apart below. Spinning on
+                // a closed socket for the rest of the budget would buy nothing.
+                None => break false,
+            }
+        };
+        probe_elapsed = probed.elapsed();
+    }
+    // The negative verdict, if there is one, has exactly three possible causes and
+    // two of them are now OBSERVED rather than inferred. Deriving the third instead
+    // of flagging it inside the loop is what keeps the diagnosis honest: a `None`
+    // from `try_recv` on the budget's final tick must not be reported as a stall if
+    // the socket in fact reached EOF.
+    let relay_stalled = !relayed_while_parked && !stream_exhausted && !client.stream_ended;
+
+    // The verdict's precondition, asserted rather than trusted: the hold that makes
+    // it conclusive must still be in force.
+    assert!(
+        daemon
+            .gate_marker
+            .as_ref()
+            .expect("a gated daemon")
+            .exists(),
+        "the verdict must be taken while the `ready` gate still holds — the marker \
+         vanished before the probe finished, so the reader may have unparked on \
+         `wait_ready`'s timeout and drained its backlog (the false green \
+         ATTACH_READY_CEILING exists to rule out)"
+    );
+
+    // A negative verdict is only a stall claim once the two other reasons for
+    // silence have been ruled out, and both are now OBSERVED rather than assumed:
+    //
+    // * the stream ending (`stream_exhausted`) — the fixture emits its terminal
+    //   `agent_settled` immediately after its last `__long_stream__` chunk, and a
+    //   WORKING relay carries that frame too, so seeing it means "no more chunks are
+    //   coming" and NOT "the relay stalled";
+    // * the connection dying (`client.stream_ended`) — the socket reached EOF, so no
+    //   frame of any kind could have arrived.
+    //
+    // The `__long_stream__` fixture stops producing after `LONG_STREAM_CHUNKS` chunks
+    // (3.0 s), so on a runner slow enough to push the probe past that, silence means
+    // "the fixture finished" — which is why the compile-time assert on
+    // `LONG_STREAM_WINDOW` keeps the park span inside the production window in the
+    // first place, and why the residual case is reported as an instrument failure
+    // rather than a red on the daemon.
+    //
+    // Deliberately NO extra "confirm the stream really ended" read after a timeout:
+    // it would extend the park span past the sum that assert bounds, and it cannot
+    // rescue the buggy design anyway — that design buffers the settle along with the
+    // chunks, so a further read would see the same silence.
+    let socket_eof = client.stream_ended;
+    eprintln!(
+        "slow-start relay: park observed after {park_observed_at:?}; absorb \
+         {absorb_elapsed:?} saw {residue} chunk(s) and reached quiet = {quiet}; \
+         probe waited {probe_elapsed:?} → relayed while parked = {relayed_while_parked} \
+         (stream exhausted = {stream_exhausted}, socket EOF = {socket_eof}, relay \
+         stalled = {relay_stalled})"
+    );
+
+    // A connection the daemon closed mid-park is neither a stall nor an instrument
+    // problem — it is the relay's transport dying, and it must not be laundered into
+    // either message below.
+    assert!(
+        !client.stream_ended || relayed_while_parked,
+        "`{streaming}`'s stream stopped arriving because the DAEMON CLOSED this \
+         connection while `{parkable}`'s `start` was parked in `attach` (park \
+         observed {park_observed_at:?}; absorb {absorb_elapsed:?} drained {residue} \
+         residue chunk(s); probe waited {probe_elapsed:?}). That is not a relay \
+         stall — no frame can arrive on a socket the daemon hung up — so find out \
+         why `reader_loop`/`writer_loop` ended this connection."
+    );
+
+    // Stream-exhaustion is NOT a relay stall, and it must not pass either: a verdict
+    // taken after the fixture's terminal frame proved nothing about the relay.
+    assert!(
+        !stream_exhausted || relayed_while_parked,
+        "TEST INSTRUMENT FAILURE, not a relay stall: `{streaming}`'s \
+         `__long_stream__` stream ENDED before the probe could be conclusive \
+         (the fixture's terminal `agent_settled` arrived inside the park — \
+         absorb {absorb_elapsed:?} drained {residue} residue chunk(s), probe \
+         waited {probe_elapsed:?} of {RELAY_ARRIVAL_BUDGET:?}). Silence after \
+         the last chunk is NOT evidence of a stalled relay, and this test must \
+         not answer \"the relay stalled\" to it. The budget that was too tight \
+         is the park span that outran the fixture: PARK_PRELUDE_ALLOWANCE + \
+         READY_GATE_STAMP_BUDGET ({READY_GATE_STAMP_BUDGET:?}) + ABSORB_BUDGET \
+         ({ABSORB_BUDGET:?}) + RELAY_ARRIVAL_BUDGET ({RELAY_ARRIVAL_BUDGET:?}) \
+         must stay below LONG_STREAM_WINDOW ({LONG_STREAM_WINDOW:?}), and that \
+         sum is asserted at compile time — so if you are reading this the STREAM \
+         got shorter or later instead: `LONG_STREAM_CHUNKS` × `LONG_STREAM_GAP` \
+         in src/fixtures/worker.rs no longer matches the mirrors in this file, \
+         or this runner is slow enough that the prelude alone ate the window."
+    );
+
+    assert!(
+        !relay_stalled,
+        "`{streaming}`'s chunks stopped arriving while `{parkable}`'s `start` was \
+         parked in `attach` (park observed {park_observed_at:?} after the `start` \
+         was written; absorb {absorb_elapsed:?} drained {residue} residue chunk(s) \
+         to quiet = {quiet}; then the probe waited {probe_elapsed:?} for one chunk \
+         and got none within {RELAY_ARRIVAL_BUDGET:?}). Neither of the two other \
+         reasons for that silence was observed: the stream's terminal \
+         `agent_settled` never arrived (so the stream was STILL LIVE — \
+         `__long_stream__` produces for {LONG_STREAM_WINDOW:?}) and the socket never \
+         reached EOF. While the marker held, the daemon's reader could not return, so \
+         this connection's relay must be run by ANOTHER task — that is the \
+         reader/writer split. A single `serve_client` task with the fan-out as one of \
+         its `select!` arms is silent here by construction."
+    );
+
+    // ── Release, and show the parked `start` really completes. ───────────────
+    daemon.disarm_gate();
+    let started_b = client
+        .recv_until_matching("start-result", |frame| frame["sessionId"] == parkable)
+        .await;
+    assert_eq!(
+        started_b["ok"], true,
+        "releasing the gate must let the parked `attach` finish and answer: {started_b}"
+    );
+
+    // ── The teardown half: no task of this connection outlives it. ───────────
+    //
+    // The `Client` owns BOTH halves of its connection (the reader `conn` and the
+    // writer `writer`), so dropping it closes the socket outright — the reader-first
+    // path, the one where the daemon's writer may be parked inside `send_frame` and
+    // where nothing but `serve_client`'s `abort()` ends it. A wedged writer would
+    // not wedge the ACCEPT loop, so this assertion is the cheap smoke test for "the
+    // daemon is still healthy"; the assertion that actually catches a leaked task is
+    // the process census T1 runs on this branch over the whole suite.
+    drop(client);
+    daemon.wait_until_listening(&endpoint).await;
+    let mut after = Client::dial(&endpoint).await;
+    after.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(
+        after.recv_until("hello").await["type"],
+        "hello",
+        "the daemon still answers a fresh client after the parked start and the \
+         abrupt disconnect — the torn-down connection must leave nothing behind"
+    );
+
+    daemon.shutdown();
+}
+
 /// Task 3's hazard, on the accept loop's side.
 ///
 /// `transport::unix::reclaim_stale_socket` probes a live daemon's socket by
@@ -1552,8 +2275,8 @@ async fn an_unknown_frame_is_answered_and_the_connection_survives() {
 /// A malformed line is an error item, not a closed stream (`transport::frame`'s
 /// rule, asserted at the daemon end rather than the transport end).
 ///
-/// The garbage has to be written RAW — through `Connection::send_frame` it would
-/// be serialized and therefore always valid — so this reaches past the framing
+/// The garbage has to be written RAW — through a `ConnectionWriter::send_frame` it
+/// would be serialized and therefore always valid — so this reaches past the framing
 /// layer to the platform's own stream, which is what `tests/transport.rs` does
 /// for the same reason ("widening the public API with a `send_raw` for test
 /// convenience would be the dishonest way"). It goes through [`raw_dial`] rather
@@ -1683,15 +2406,32 @@ async fn repeated_disconnects_do_not_degrade_the_daemon() {
 ///
 /// * **1 168 009 requests absorbed, daemon RSS 15 MB → 895 MB.**
 ///
-/// The outbound queue cannot produce that number, because `serve_client` is ONE
-/// task running one `select!`: while the drain arm's body awaits a blocked
-/// `send_frame`, the `select!` is not re-polled, so the inbound arm cannot run and
-/// cannot enqueue. The queue's depth is therefore ~1 — confirmed by instrumenting
-/// it. The buffer that grew was the transport's: `Connection`'s reader task drains
-/// the socket into an `mpsc::unbounded_channel` that nothing was consuming, so the
-/// kernel's ~200 KB of socket became an unbounded queue in the daemon's heap. The
-/// fix is in `transport::frame` (`MAX_QUEUED_INBOUND_FRAMES`); the outbound queue
-/// is bounded too, for the same reason and to the same budget.
+/// The outbound queue could not produce that number even then, and the reason it
+/// could not is HISTORY now, so it is stated as history: at measurement time
+/// `serve_client` was ONE task running one `select!`, so while the drain arm's body
+/// awaited a blocked `send_frame` the `select!` was not re-polled, the inbound arm
+/// could not run, and could not enqueue — which capped that queue's depth at ~1
+/// (confirmed by instrumenting it). T4b (`6b149c4`) split `serve_client` into
+/// `reader_loop` + `writer_loop`, and that serialisation is gone with the single
+/// task: the queue has TWO producers now (the reader's replies, and the writer's
+/// relayed fan-out frames), so the depth is no longer bounded by the drain blocking
+/// its only producer. What bounds it today is three things, all of them explicit:
+/// `CLIENT_QUEUE_CAPACITY` (1 024) is the channel's real ceiling; a relayed frame
+/// that finds it full is DROPPED, counted, and announced as a `gap` rather than
+/// buffered; and `writer_loop` holds the only `ConnectionWriter`, so exactly one
+/// task can be inside `send_frame` and the queue has one consumer draining to the
+/// socket — no second buffer can silently form downstream of it. The measured peak
+/// of ~353 on the old shape was that shape's number, not this one's: post-split the
+/// queue CAN fill, and 1 024 is what stops it.
+///
+/// The conclusion the measurement was actually establishing is untouched, because
+/// the flood was never limited by the outbound queue in the first place: the buffer
+/// that grew was the transport's — `Connection`'s reader task drained the socket
+/// into an `mpsc::unbounded_channel` that nothing was consuming, so the kernel's
+/// ~200 KB of socket became an unbounded queue in the daemon's heap. The fix is in
+/// `transport::frame` (`MAX_QUEUED_INBOUND_FRAMES`), and the split does not touch
+/// the inbound path at all; the outbound queue is bounded too, for the same reason
+/// and to the same budget.
 ///
 /// # What the bound makes observable
 ///
@@ -2406,6 +3146,481 @@ async fn a_child_killed_by_sigkill_is_reported_and_can_be_started_again() {
         .expect("the restarted session reports its worker pid") as u32;
     assert_ne!(new_pid, dead_pid, "the restart is a NEW child");
     assert!(pid_is_alive(new_pid), "and it is running (pid {new_pid})");
+
+    daemon.shutdown();
+}
+
+/// A connection that sends frames BEFORE saying `hello` is refused, not served
+/// (issue #4 — the required handshake).
+///
+/// The `hello` frame already existed and `handle_frame` already answered it; what
+/// was missing was that NOTHING REQUIRED IT. Any local process that could reach
+/// the socket could go straight to `start` — the greeting was decoration, so a
+/// stray connection was implicitly trusted to know the protocol. This test pins
+/// the opposite: frames before `hello` get no service at all, and after
+/// [`MAX_PRE_HELLO_FRAMES`] of them the peer is told once and hung up on.
+///
+/// # Why the frames are written RAW
+///
+/// Same reason as `a_malformed_line_gets_an_error_and_the_stream_continues`: this
+/// peer must not be a well-behaved `Client`, and it must not read through a
+/// `Connection` whose reader task would consume the very reply this test asserts
+/// on. So: `raw_dial`, split, `write_all` the offending frames, read the raw lines
+/// back.
+///
+/// # What is asserted, in order
+///
+/// 1. NO `start-result` ever arrives — a pre-`hello` `start` is DROPPED, not
+///    answered. This is the load-bearing half: "reject rather than serve" is the
+///    issue's wording, and a daemon that answered the pre-`hello` `start` and THEN
+///    complained would pass an assertion written only on the error frame.
+/// 2. Exactly ONE `error` frame arrives, and it names the handshake requirement.
+///    One, not three: the peer is told once and closed, not lectured per frame.
+/// 3. The stream then EOFs — the daemon closed the connection rather than leaving
+///    a hostile peer's socket open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_sends_frames_before_hello_is_rejected_not_served() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    let (read_half, mut write_half) = tokio::io::split(raw_dial(&endpoint).await);
+    // Three `start` frames and not one `hello`. Written in one write so they are
+    // three queued frames the moment the daemon's reader gets to them — the
+    // pipelined shape, which is the shape a real client that skipped the greeting
+    // would actually produce.
+    let mut flood = String::new();
+    for _ in 0..3 {
+        flood.push_str(&serde_json::to_string(&start_frame(&start_env("pre-hello", cwd))).unwrap());
+        flood.push('\n');
+    }
+    write_half
+        .write_all(flood.as_bytes())
+        .await
+        .expect("write three pre-hello frames");
+    write_half.flush().await.expect("flush");
+
+    // Read whatever the daemon sends, until it hangs up or the budget expires.
+    let mut reader = BufReader::new(read_half);
+    let mut lines: Vec<String> = Vec::new();
+    let saw_eof = {
+        let deadline = Instant::now() + FRAME_BUDGET;
+        let mut hit_eof = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let mut line = String::new();
+            let read = tokio::time::timeout(left, reader.read_line(&mut line))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the daemon neither refused the pre-hello peer nor closed it \
+                         within {FRAME_BUDGET:?} (frames so far: {lines:?}) — a peer \
+                         that never greets must be told once and hung up on, not \
+                         held open"
+                    )
+                })
+                .expect("read a reply line");
+            if read == 0 {
+                hit_eof = true;
+                break;
+            }
+            lines.push(line);
+        }
+        hit_eof
+    };
+
+    let frames: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| {
+            serde_json::from_str(l.trim())
+                .unwrap_or_else(|e| panic!("the reply line is not a JSON frame: {l:?} ({e})"))
+        })
+        .collect();
+
+    // (1) Not one pre-`hello` frame was SERVED. A `start-result` here would mean
+    //     the daemon spawned a child for a peer it is refusing.
+    assert!(
+        frames.iter().all(|f| f["type"] != "start-result"),
+        "a `start` sent before `hello` must be dropped, not answered: {frames:?}"
+    );
+    // (2) One refusal, naming the requirement.
+    let refusals: Vec<&serde_json::Value> =
+        frames.iter().filter(|f| f["type"] == "error").collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the pre-hello peer must be told ONCE and then closed; got {frames:?}"
+    );
+    let message = refusals[0]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal carries a message: {}", refusals[0]));
+    assert!(
+        message.contains("hello"),
+        "the refusal must name what the peer failed to send, so a client with a \
+         wrong first frame knows what to fix; got: {message}"
+    );
+    // (3) And the connection is closed.
+    assert!(
+        saw_eof,
+        "the daemon must CLOSE a peer it refused for skipping the handshake, not \
+         leave its socket open; frames seen: {frames:?}"
+    );
+
+    // The daemon is unharmed for a client that does greet — the same "one bad peer
+    // costs nothing" claim every other hardening test in this file makes.
+    let mut later = Client::dial(&endpoint).await;
+    later.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(
+        later.recv_until("hello").await["type"],
+        "hello",
+        "a refused pre-hello peer must not take the daemon down with it"
+    );
+
+    daemon.shutdown();
+}
+
+/// A peer that floods NON-GREETING frames is refused and closed, and the daemon
+/// stays healthy for the next client (issue #4 — the inbound frame-rate bound).
+///
+/// # Why the flood is `prompt` and not `hello`
+///
+/// The existing flood test,
+/// `a_client_that_never_reads_is_throttled_and_the_daemon_stays_flat`, floods
+/// `hello` and pins the numbers the inbound QUEUE produces (blocked write, RSS
+/// flat). This gate is a different bound on a different axis — the RATE at which
+/// decoded frames are served — and it deliberately counts non-greeting frames
+/// only, because `start`/`prompt` cost the daemon a syscall each while `hello`
+/// costs one `json!`. So this test floods `prompt` and that one keeps flooding
+/// `hello`; neither is a stand-in for the other.
+///
+/// `prompt` for a session that does not exist is answered (`prompt-result` with
+/// `ok: false`) and needs no worker, no fixture, no database row — which makes
+/// this a test of the gate rather than of session machinery.
+///
+/// # Why the writes are INTERLEAVED with the reads
+///
+/// The first version wrote a 5-second flood without reading, and the assertion
+/// then died on `ECONNRESET` instead of seeing the refusal: when a socket is
+/// closed with data still unread in the receive buffer, Linux sends RST, and RST
+/// discards what the daemon had already written. That is the kernel's behaviour,
+/// not a daemon bug — but it makes the refusal frame unobservable, and the
+/// refusal is the contract being pinned.
+///
+/// So the writer stops as soon as the refusal appears, and writes in small chunks
+/// between reads. The daemon's reader keeps up, the buffer is empty at close, and
+/// what the test observes is the daemon's own answer rather than a kernel artefact.
+///
+/// # What is asserted, and what is deliberately NOT
+///
+/// Asserted: ONE `error` frame naming the frame-rate limit, then the connection
+/// ends (clean EOF or a reset — both mean "the daemon closed it"); and a
+/// subsequent healthy client gets the full hello → start → prompt exchange.
+///
+/// NOT asserted: any frame count, and no RSS number. The bucket drains at
+/// [`FRAME_RATE`] tokens/s after a `FRAME_RATE_BURST` burst, so "how many
+/// `prompt-result` frames escaped before the refusal" is a schedule on a loaded CI
+/// box. A test that pinned it would be a flake that reads like a regression. The
+/// BOUNDARY — told once, then closed — is schedule-independent, and that is the
+/// contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_non_greeting_frames_is_refused_and_the_daemon_survives() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+
+    let (read_half, mut write_half) = tokio::io::split(raw_dial(&endpoint).await);
+    // Greet first, so the refusal this test waits for can ONLY be the rate gate.
+    // Without the `hello` the same stream would be refused by the handshake gate
+    // after three frames and this would be testing the wrong bound.
+    write_half
+        .write_all(b"{\"type\":\"hello\"}\n")
+        .await
+        .expect("write the greeting");
+
+    // `prompt` for an id nothing is running: answered cheaply, no child, no row.
+    const FRAME: &[u8] = b"{\"type\":\"prompt\",\"sessionId\":\"nobody\",\"text\":\"x\"}\n";
+    // Small enough that the daemon's reader has drained the socket by the time the
+    // gate fires — see "Why the writes are INTERLEAVED with the reads".
+    const CHUNK: usize = 32;
+
+    let mut reader = BufReader::new(read_half);
+    let mut refusal: Option<serde_json::Value> = None;
+    // How the connection ended, if it did: `true` for a clean EOF, `false` for a
+    // reset, and neither is a failure — see the read arm below.
+    let mut closed = false;
+    let mut written = 0usize;
+    let deadline = Instant::now() + FRAME_BUDGET;
+
+    'flood: while Instant::now() < deadline {
+        // Write a burst-sized chunk. A blocked write means the socket is full,
+        // which is the OTHER bound (the inbound queue) doing its job; stop and
+        // read, because the gate's answer arrives on the read half either way.
+        let mut chunk = Vec::with_capacity(CHUNK * FRAME.len());
+        for _ in 0..CHUNK {
+            chunk.extend_from_slice(FRAME);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // A blocked or failed write is not this loop's business: the first means
+        // the socket is full (the inbound queue's bound doing its job) and the
+        // second means the daemon closed the connection. Either way the answer this
+        // test asserts on arrives on the READ half, which the loop turns to next.
+        if let Ok(Ok(())) = tokio::time::timeout(left, write_half.write_all(&chunk)).await {
+            written += CHUNK;
+        }
+
+        // Then read whatever the daemon has to say about it, with a short budget:
+        // this is a POLL, not a wait. The refusal only appears after the burst is
+        // spent, so most turns of this loop see `prompt-result` frames.
+        loop {
+            let left = Duration::from_millis(20);
+            let mut line = String::new();
+            match tokio::time::timeout(left, reader.read_line(&mut line)).await {
+                Err(_) => continue 'flood, // nothing yet; go flood some more
+                Ok(Ok(0)) => {
+                    closed = true;
+                    break 'flood;
+                }
+                Ok(Ok(_)) => {
+                    let frame: serde_json::Value = serde_json::from_str(line.trim())
+                        .unwrap_or_else(|e| {
+                            panic!("the reply line is not a JSON frame: {line:?} ({e})")
+                        });
+                    if frame["type"] == "error" {
+                        assert!(
+                            refusal.is_none(),
+                            "the peer was refused twice ({refusal:?} and {frame}) — \
+                             the contract is told ONCE and then closed"
+                        );
+                        refusal = Some(frame);
+                    }
+                }
+                // A reset is the daemon closing a socket that still held unread
+                // bytes; Linux turns that into RST. It IS the close this contract
+                // requires, so it ends the loop rather than failing the test — but
+                // it is only acceptable AFTER the refusal, because a reset instead
+                // of a refusal would mean the daemon hung up without saying why.
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    closed = true;
+                    break 'flood;
+                }
+                Ok(Err(e)) => panic!("the stream failed while reading the refusal: {e}"),
+            }
+        }
+    }
+
+    assert!(
+        written > 0,
+        "not one frame reached the daemon, so this test would certify nothing about \
+         the rate gate"
+    );
+    let refusal = refusal.unwrap_or_else(|| {
+        panic!(
+            "a peer that sent {written} non-greeting frames was never refused by the \
+             rate gate (no `error` frame within {FRAME_BUDGET:?}, connection closed \
+             {closed}) — the daemon is still serving a flood at whatever rate it \
+             arrives, which is the unbounded-cost case issue #4 is about"
+        )
+    });
+    let message = refusal["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal carries a message: {refusal}"));
+    assert!(
+        message.contains("rate"),
+        "the refusal must name the limit it hit, so a merely badly-written client \
+         can tell this from the handshake refusal; got: {message}"
+    );
+    assert!(
+        closed,
+        "the daemon told the flooding peer and then left its socket open — the \
+         refusal must be followed by a close, or the peer keeps a daemon-side \
+         connection for free"
+    );
+
+    // And the daemon is unharmed: a healthy client gets the full exchange.
+    let mut healthy = Client::dial(&endpoint).await;
+    healthy.send(serde_json::json!({"type": "hello"})).await;
+    assert_eq!(healthy.recv_until("hello").await["type"], "hello");
+    let cwd = daemon._dir.path().to_str().unwrap();
+    healthy
+        .send(start_frame(&start_env("after-flood", cwd)))
+        .await;
+    assert_eq!(
+        healthy.recv_until("start-result").await["ok"],
+        true,
+        "a rate-limit flood must not cost the daemon its next session"
+    );
+
+    daemon.shutdown();
+}
+
+/// Concurrent sessions are bounded, and the bound RELEASES on `close` (issue #4).
+///
+/// # The hole
+///
+/// Every local process that can reach the socket can `start`, and `start` spawns a
+/// child process. Before this bound the only ceiling on how many children one
+/// daemon would run was the process table — so a buggy client in a retry loop, or
+/// a hostile local one, could take the machine's ability to fork away from
+/// everything else running as this user. The outbound and inbound buffers were
+/// bounded long ago (see `CLIENT_QUEUE_CAPACITY` and `frame::MAX_QUEUED_INBOUND_FRAMES`
+/// for those measurements); the session COUNT was not.
+///
+/// # Why the test loops to the bound instead of hardcoding it
+///
+/// The limit is a private const in `serve.rs` (`SESSION_LIMIT`), and the task
+/// forbids widening `Daemon::new` or adding a test-only setter to make it
+/// injectable. So the test discovers the number the only honest way: start
+/// sessions until one is refused. That makes the test outlive a change to the
+/// constant, which a hardcoded `for i in 0..32` would not — a bumped limit would
+/// turn a hardcoded version green-while-testing-nothing, the failure shape this
+/// file's header exists to refuse.
+///
+/// # The three claims, in order
+///
+/// 1. The refusal happens, and its message names the bound and says what to do
+///    about it (`close` a session).
+/// 2. `close` RELEASES a slot: after closing one session, a NEW id starts fine.
+///    Without this half, a counter that never decrements would pass claim 1
+///    forever and quietly brick the daemon for its whole uptime.
+/// 3. Nothing leaked: after closing every session that was opened, another `start`
+///    still succeeds. This is the counter-faithfulness pin — the same class of
+///    leak `Daemon::dead` used to have, and the reason `close`'s doc calls the
+///    release-everything rule an invariant.
+///
+/// Every session this opens is CLOSED before it returns: the worker children are
+/// real processes, and the post-suite stray-process census fails the run for one
+/// that outlives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_limit_refuses_one_past_the_bound_and_releases_on_close() {
+    let mut daemon = Daemon::start().await;
+    let endpoint = Daemon::endpoint_in(daemon._dir.path());
+    let cwd = daemon._dir.path().to_str().unwrap();
+
+    let mut client = Client::dial(&endpoint).await;
+    client.send(serde_json::json!({"type": "hello"})).await;
+    client.recv_until("hello").await;
+
+    // Start sessions until one is refused, remembering every id that got in.
+    let mut started: Vec<String> = Vec::new();
+    let refusal = loop {
+        let id = format!("bounded-{}", started.len());
+        client.send(start_frame(&start_env(&id, cwd))).await;
+        let result = client.recv_until("start-result").await;
+        if result["ok"] == true {
+            started.push(id);
+            // A ceiling on the loop, so a daemon with NO bound fails this test
+            // instead of filling the process table and taking the runner with it.
+            assert!(
+                started.len() <= 256,
+                "the daemon accepted {} sessions without refusing any — there is no \
+                 session bound, which is the hole issue #4 exists to close",
+                started.len()
+            );
+        } else {
+            break result;
+        }
+    };
+
+    assert!(
+        !started.is_empty(),
+        "the daemon refused its FIRST session, so it is not bounding the count, it \
+         is refusing everything: {refusal}"
+    );
+    // The bound is `serve.rs`'s private `SESSION_LIMIT`; the test discovers it
+    // rather than duplicating it (see the header note), but the NUMBER is part of
+    // the issue's acceptance criteria, so a change to it must be a deliberate one
+    // that lands here too.
+    assert_eq!(
+        started.len(),
+        32,
+        "the daemon accepted {} sessions before refusing — the bound is documented \
+         as 32 in `serve.rs` (`SESSION_LIMIT`); if that constant moved, move this \
+         number and the doc in the same change",
+        started.len()
+    );
+    let message = refusal["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refused `start` says why: {refusal}"));
+    assert!(
+        message.contains("session limit"),
+        "the refusal must name the bound that was hit (not a generic failure) so a \
+         client can tell this from a broken worker exe; got: {message}"
+    );
+
+    // (2) `close` releases a slot — TWO slots, by closing two sessions, so claim
+    // (3) below can spend both and the arithmetic is exact. One `close` frees one
+    // slot; the first draft of this test closed one and started two, and the
+    // failure it produced was the test's bug, not the daemon's.
+    for _ in 0..2 {
+        let released = started
+            .pop()
+            .expect("at least two sessions were started above");
+        client
+            .send(serde_json::json!({"type": "close", "sessionId": released}))
+            .await;
+        let closed = client.recv_until("closed").await;
+        assert_eq!(
+            closed["ok"], true,
+            "the session that was started must be closable: {closed}"
+        );
+    }
+    client
+        .send(start_frame(&start_env("after-release", cwd)))
+        .await;
+    let restarted = client.recv_until("start-result").await;
+    assert_eq!(
+        restarted["ok"], true,
+        "closing one session must free one slot — a counter that only ever grows \
+         would pass the refusal half of this test and then brick the daemon for its \
+         whole uptime: {restarted} (limit message was {message:?})"
+    );
+
+    // (3) Nothing leaked: a SECOND round, spending the other freed slot. One round
+    //     is not enough to tell a faithful counter from one that releases only
+    //     once.
+    client
+        .send(start_frame(&start_env("second-after-release", cwd)))
+        .await;
+    assert_eq!(
+        client.recv_until("start-result").await["ok"],
+        true,
+        "a second start past the bound (after two closes) must also be accepted"
+    );
+
+    for id in started {
+        client
+            .send(serde_json::json!({"type": "close", "sessionId": id}))
+            .await;
+        client.recv_until("closed").await;
+    }
+
+    // Below the bound again, so the census has nothing to find: every child this
+    // test spawned is reaped by its `close`.
+    let mut remaining = 0usize;
+    for id in ["after-release", "second-after-release"] {
+        client
+            .send(serde_json::json!({"type": "close", "sessionId": id}))
+            .await;
+        let frame = client.recv_until("closed").await;
+        if frame["ok"] == true {
+            remaining += 1;
+        }
+    }
+    assert_eq!(
+        remaining, 2,
+        "both sessions started after the release must still be running to be closed \
+         (a `false` here means one died on its own and the count this test measured \
+         was not the count it thought)"
+    );
 
     daemon.shutdown();
 }
