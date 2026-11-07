@@ -1,0 +1,20 @@
+name: ps-env probe (throwaway)
+on:
+  push:
+    branches: [probe/macos-ps-env]
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      FULCRUM_CI_RUN_MARKER: probe-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: probe
+        run: bash probe-macos-ps.sh
