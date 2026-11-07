@@ -754,35 +754,46 @@ async fn a_partially_accepted_frame_is_drained_before_any_new_bytes() {
 ///
 /// # Why it is driven with `tokio::join!` and not two `spawn`s
 ///
-/// `std::sync::MutexGuard` is `!Send`, so a guard held across an `.await` cannot
-/// live inside `tokio::spawn` (whose future must be `Send`); a `#[tokio::test]`
-/// future carries no such bound, so two `async move` blocks joined in the test
-/// body compile and still run CONCURRENTLY on the same writer.
+/// Convenience, and nothing more: two `async move` blocks joined in the test body
+/// share the `Arc` without cloning it into each task and still run CONCURRENTLY on
+/// the same writer. It is NOT a compile constraint any more. When this test held a
+/// `std::sync::Mutex` the guard was `!Send`, so `tokio::spawn` was unavailable and
+/// `join!` was forced; with `tokio::sync::Mutex` the guard is `Send` and two
+/// `spawn`s would compile. See the deadlock note below for why the std lock was
+/// dropped — it was never the right tool for a guard held across an `.await`.
 ///
-/// # The honest weakness of that shape, stated rather than hidden
+/// # The deadlock this test used to claim it had avoided — and had not
 ///
-/// Holding a `std` guard across `send_frame`'s write-loop `.await` can DEADLOCK:
-/// if the peer stops draining mid-frame, the first task parks inside `write`
-/// while it owns the lock and the second task can never acquire it. That is the
-/// backpressure case, and this test deliberately stays out of it — the frames
-/// are small and the peer drains continuously with its own reader, so each send
-/// completes in a few iterations. The assertion to watch is therefore "40 whole
-/// lines in the right per-writer order", not throughput under backpressure.
+/// The previous version of this note said holding a `std` guard across
+/// `send_frame`'s write-loop `.await` "can DEADLOCK" if the peer stops draining,
+/// and that the test "deliberately stays out of it" by keeping the frames small and
+/// the peer draining. That was wrong twice over.
+///
+/// It deadlocks WITHOUT backpressure. `tokio::join!` polls both futures on the one
+/// thread of this task, so the moment task A parks inside `write().await` while
+/// owning a `std` lock, task B's blocking `lock()` parks that same thread — and
+/// task A can only be resumed by that thread. Small frames and a draining peer do
+/// not prevent it; they only make it a race. On `x86_64-pc-windows-gnu` a named
+/// pipe parks a write often enough to lose that race every time: the test hung
+/// there while passing on Linux, which is the asymmetry that exposed the claim.
+/// Switching to `tokio::sync::Mutex` fixes it because a parked task yields a
+/// pending future instead of consuming the thread.
+///
+/// Backpressure is still out of scope, for a DIFFERENT and honest reason: if the
+/// peer stops draining mid-frame, task A legitimately waits for room while holding
+/// the lock and task B legitimately waits for the lock. That is the design working,
+/// not wedging — it unblocks the instant the peer reads. So the assertion to watch
+/// remains "40 whole lines in the right per-writer order", not throughput under
+/// backpressure; it is just no longer defended by a claim that the shape is safe
+/// under it.
 #[tokio::test]
-// The lint this test deliberately trips, and why it stays tripped.
-//
-// `clippy::await_holding_lock` is right in production code, and the production
-// design agrees with it (which is why `ConnectionWriter` is not shareable at all
-// — see `frame.rs`). Here the guard-across-`await` IS the thing under test: this
-// is the `Mutex<ConnectionWriter>` shape a future change might reach for instead
-// of the exclusive writer, and the question the test asks is whether that shape
-// keeps a frame whole. Serialising the whole `send_frame` — guard held across the
-// write loop — is the ONLY version of that shape that can be correct, so pinning
-// the shape means pinning the guard across the await. The honest weakness of that
-// choice (the deadlock it can deadlock into when the peer stops draining) is in
-// the doc below, and the test stays out of it by keeping frames small and the
-// peer draining.
-#[allow(clippy::await_holding_lock)]
+// No `#[allow(clippy::await_holding_lock)]` here, deliberately. The lint exists for
+// non-Send guards (`std::sync::Mutex` and friends) held across an `.await`, which is
+// exactly what this test used to do and what caused the deadlock above. A
+// `tokio::sync::MutexGuard` is designed to be held across an await, so the lint does
+// not fire and an `allow` would be a comment claiming a suppression that is not
+// happening. If this test ever goes back to a std lock, the lint will come back with
+// it — and that is the signal, not an annoyance.
 async fn a_shared_writer_under_a_mutex_never_interleaves_frames() {
     /// Frames per task. Small on purpose (see the deadlock note above); 20×2 is
     /// still 40 chances to glue a line.
@@ -810,7 +821,23 @@ async fn a_shared_writer_under_a_mutex_never_interleaves_frames() {
     let (_reader, writer) = client.split_writer();
     // The shared handle. NOTE this is the SHAPE the design forbids — it is
     // built here precisely so the forbidden shape is exercised, not certified.
-    let shared = std::sync::Arc::new(std::sync::Mutex::new(writer));
+    //
+    // `tokio::sync::Mutex` and NOT `std::sync::Mutex`, and the reason is a
+    // deadlock this file used to claim it had avoided by keeping the frames
+    // small (see the note below). `tokio::join!` polls BOTH futures on the ONE
+    // thread of this task, so a `std` guard held across `send_frame`'s `.await`
+    // parks the writer mid-frame while it owns the lock, and the second task's
+    // BLOCKING `lock()` then parks the same thread that has to poll the first
+    // task to release it. Nothing is left to run. An async lock parks the second
+    // task by RETURNING a pending future instead of consuming the thread, which
+    // is the whole difference.
+    //
+    // Measured, not inferred: on `x86_64-pc-windows-gnu` the `std` shape hangs
+    // this test outright (8 of the 9 transport tests pass, this one never
+    // returns) while this shape finishes in ~10 ms. `flavor = "multi_thread"`
+    // does NOT rescue the `std` shape, because the single `join!` task is
+    // confined to one worker no matter how many workers exist.
+    let shared = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
 
     let task_a = {
         let shared = std::sync::Arc::clone(&shared);
@@ -818,10 +845,9 @@ async fn a_shared_writer_under_a_mutex_never_interleaves_frames() {
             for i in 0..ROUNDS {
                 // The guard is bound so it visibly OUTLIVES the `await`: whole-
                 // send serialisation is the property, and dropping the guard
-                // before the await would test nothing.
-                let mut guard = shared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // before the await would test nothing. ASYNC lock, and it must
+                // stay async — see the deadlock note on this test.
+                let mut guard = shared.lock().await;
                 guard
                     .send_frame(&json!({ "writer": "a", "i": i }))
                     .await
@@ -833,9 +859,7 @@ async fn a_shared_writer_under_a_mutex_never_interleaves_frames() {
         let shared = std::sync::Arc::clone(&shared);
         async move {
             for i in 0..ROUNDS {
-                let mut guard = shared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = shared.lock().await;
                 guard
                     .send_frame(&json!({ "writer": "b", "i": i }))
                     .await
