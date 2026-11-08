@@ -75,9 +75,11 @@ sessions on a provider refresh. That is already solved by finding #1 — the pic
 the live store, so a Settings refresh reaches an open session with no backend push, and ADR 0076
 already propagates the model metadata the loop holds. `refresh_live_models` (`:2418-2463`) copies
 `context_window` / `supports_thinking` / `thinking_levels` and not `supports_tools`, and that
-stays correct: after this plan the ONLY reader of `Model.supports_tools` in either repo is
-`Model::is_selectable()`, which runs on the catalog, never on the loop's copy. Recorded again in
-Task 4's Context so a future reader does not "fix" it.
+stays correct: nothing on the `AgentLoop` side reads `Model.supports_tools`. After this plan the
+field has TWO readers and BOTH run on the catalog, never on the loop's copy:
+`Model::is_selectable()` is the selectability authority, and the `ModelDto` projection reads the
+field directly (`src-tauri/src/commands/settings.rs:130`) as the picker's reason cue. Recorded
+again in Task 4's Context so a future reader does not "fix" it.
 
 ### No fulcrum-side doc task
 
@@ -724,8 +726,10 @@ on Task 3 — so the desktop PR cannot be opened before it (see *The ordering co
 
 - **A mid-session `supports_tools` flip is not pushed to a live session.** `refresh_live_models`
   copies three fields and not `supports_tools` (`src-tauri/src/agent/session/mod.rs:2441-2444`).
-  Correct today — the loop never reads the field — but if a future consumer reads the loop's copy,
-  this becomes a stale-value bug with ADR 0076's exact shape.
+  Correct today — the field's two readers (`Model::is_selectable()` as the selectability authority
+  and the `ModelDto` projection as the reason cue) both run on the catalog, and nothing on the
+  `AgentLoop` side reads the loop's copy — but if a future consumer reads that copy, this becomes a
+  stale-value bug with ADR 0076's exact shape.
 - **The disabled row shows a pointer cursor.** `ModelPickerDialog.tsx:139-157` documents that
   `cursor-pointer` wins the tailwind-merge group by CSS source order and that fixing it is a
   behaviour change no test owns. Out of scope; the note is already in the file.
