@@ -563,7 +563,7 @@ pub struct AgentLoop {
     /// at construction, not constructed here.
     ///
     /// Why this is a field and not a call to `crate::open::desktop_open_requester()`
-    /// at each manager construction site: `harness` moves into `fulcrum-core` in
+    /// at each manager construction site: `harness` moves into `fulcrum-harness` in
     /// S5b, and `open.rs` cannot follow it (`tauri::Url` at `open.rs:26`,
     /// `tauri_plugin_opener` at `:218,221`). S3 landed the `OpenRequester` seam in
     /// the right place — the manager holds a trait object — but wired it from the

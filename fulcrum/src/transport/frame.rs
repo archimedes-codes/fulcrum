@@ -1,7 +1,7 @@
 //! The JSONL frame codec both platforms share (T9 Task 3).
 //!
 //! One frame per `\n`-terminated JSON line — the SAME framing as
-//! `fulcrum_core::worker::protocol`, on purpose (see the module docs on
+//! `fulcrum_harness::worker::protocol`, on purpose (see the module docs on
 //! [`crate::transport`]). Nothing here is platform-specific: `unix.rs` and
 //! `windows.rs` hand me a stream that is `AsyncRead + AsyncWrite`, and this file
 //! turns it into [`Connection`]. That is why the reader-task rule below is

@@ -2,7 +2,7 @@
 //!
 //! (Fulcrum T5/S2) This module used to carry a SECOND `settings.json` reader,
 //! [`WebConfig::from_web_settings`]'s disk-reading sibling `from_settings`. It is
-//! GONE: `fulcrum-core` reads no desktop config file (T3's invariant — the crate
+//! GONE: `fulcrum-harness` reads no desktop config file (T3's invariant — the crate
 //! contains zero `load_settings`), and every call site of `from_settings` was in
 //! this file's own `#[cfg(test)]` block, so no production path lost an entry.
 //! [`WebConfig::from_web_settings`] is the one entry, fed by `StartEnv.web` /

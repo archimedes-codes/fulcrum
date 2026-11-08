@@ -19,7 +19,7 @@
 //! What STAYED DESKTOP: `SessionStore` (`src-tauri/src/agent/harness/store.rs`)
 //! and its `impl Store` — it holds the desktop's `storage::Db`, and a crate
 //! file cannot name one (`rusqlite` is not in this crate's graph; reaching
-//! `storage` would be the `fulcrum-core → archimedes_lib` edge that IS the
+//! `storage` would be the `fulcrum-harness → archimedes_lib` edge that IS the
 //! package cycle). The desktop's impl maps at the boundary with
 //! `.map_err(StoreError::from)` / the `From` impl `storage/db.rs` defines.
 //! `worker/store.rs`'s `impl Store for IpcStore` re-points at the same error

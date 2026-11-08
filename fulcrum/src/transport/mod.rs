@@ -4,7 +4,7 @@
 //! TWO things live here and nowhere else in this workspace: a socket/pipe
 //! listener, and the JSONL framing on top of it. The framing is
 //! **one frame per `\n`-terminated JSON line — identical to the worker protocol
-//! in [`fulcrum_core::worker::protocol`]**. That is deliberate: the daemon
+//! in [`fulcrum_harness::worker::protocol`]**. That is deliberate: the daemon
 //! speaks the worker protocol to its workers AND to its clients, and a second,
 //! different framing on the client side would mean two codecs to keep in step
 //! and two sets of framing bugs. Do not "improve" the client framing.
@@ -61,7 +61,7 @@
 //!
 //! No `attach`, no `afterSeq`, no replay buffer, no session registry. The
 //! protocol already stamps `frameSeq` on outbound frames
-//! (`fulcrum_core::worker::protocol::stamp_outbound` — 1-based, reset per
+//! (`fulcrum_harness::worker::protocol::stamp_outbound` — 1-based, reset per
 //! `Start`) and nothing consumes it yet; this transport deliberately neither
 //! reads nor writes it, so T10 can build replay on the same counter without
 //! reconciling a second numbering the transport invented.

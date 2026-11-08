@@ -17,7 +17,7 @@ pub mod responses;
 pub(crate) mod test_util;
 pub mod transport;
 
-// ── T5/S4 — `types.rs` and `overflow.rs` moved to `fulcrum-core` ──────────────
+// ── T5/S4 — `types.rs` and `overflow.rs` moved to `fulcrum-harness` ──────────────
 //
 // Both moved because `StartEnv.transcript` is an `Option<Vec<ChatMessage>>` and
 // `StoreFrame`'s sibling wire types embed it, so E1 could not be severed without

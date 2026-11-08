@@ -1,6 +1,6 @@
 //! `impl FulcrumPersistence for Db` (T9 Task 4) — the daemon takes the disk.
 //!
-//! This is the point where ADR 0091 changes hands. `fulcrum-core` holds ZERO
+//! This is the point where ADR 0091 changes hands. `fulcrum-harness` holds ZERO
 //! `rusqlite` (`boundary_pins::no_code_names_the_sqlite_driver_or_the_desktop_package`
 //! forbids it, and the engine's `Cargo.toml` declares none), so the engine's
 //! persistence seam has always had exactly one implementation living in the other
@@ -38,8 +38,8 @@
 
 use std::io;
 
-use fulcrum_core::seams::{FulcrumPersistence, StoreError};
-use fulcrum_core::store_rows::{MessageRow, SessionInfo, SessionRow};
+use fulcrum_harness::seams::{FulcrumPersistence, StoreError};
+use fulcrum_harness::store_rows::{MessageRow, SessionInfo, SessionRow};
 
 use super::{Db, DbError};
 
@@ -175,7 +175,7 @@ impl FulcrumPersistence for Db {
     /// the transcript's order would depend on which store answered. `src/clock.rs`
     /// exists precisely to be the only `SystemTime` call in the picture.
     fn now_ms(&self) -> i64 {
-        fulcrum_core::clock::now_ms()
+        fulcrum_harness::clock::now_ms()
     }
 }
 

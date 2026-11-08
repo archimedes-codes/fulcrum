@@ -5,7 +5,7 @@
 //! 23 integration tests keep compiling unchanged:
 //!
 //! ```text
-//! pub use fulcrum_core::<symbol>;
+//! pub use fulcrum_harness::<symbol>;
 //! ```
 //!
 //! (A fenced `text` block, not an indented one: rustdoc compiles an indented block in a
@@ -21,7 +21,7 @@ pub mod events;
 pub mod fs_backend;
 pub mod hostenv;
 pub mod ids;
-// `#[cfg(test)]` for the reason in the module's own docs: `fulcrum-core` has no
+// `#[cfg(test)]` for the reason in the module's own docs: `fulcrum-harness` has no
 // `tests/` directory yet (T5/Step D keeps every integration test in the desktop),
 // so an ungated copy would be `dead_code` in the plain lib build — which the
 // gate's `clippy --all-targets -- -D warnings` rejects.
@@ -138,7 +138,7 @@ pub mod wire;
 pub mod worker_types;
 
 /// The crate's seam traits, re-exported at the root so the desktop can name them
-/// without reaching into the module (`fulcrum_core::{Dispatcher, FulcrumPersistence,
+/// without reaching into the module (`fulcrum_harness::{Dispatcher, FulcrumPersistence,
 /// StoreError}`). `mcp::OpenRequester` is NOT here — it stayed beside its only
 /// consumer in S3, and moving its spelling now would churn three working call
 /// sites for nothing.
@@ -286,7 +286,7 @@ pub mod worker;
 pub mod fixtures;
 
 // S8.4: the crate's Worker-mode entry, re-exported at the root so
-// `fulcrum_core::run_worker()` is the literal spelling. Both parameter types
+// `fulcrum_harness::run_worker()` is the literal spelling. Both parameter types
 // are crate types (`Arc<dyn crate::mcp::OpenRequester>` and
 // `Option<Arc<dyn Fn(PathBuf) + Send + Sync>>`), so the re-export keeps the
 // crate standalone — nothing desktop is named.

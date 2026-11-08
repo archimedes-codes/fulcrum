@@ -807,7 +807,7 @@ pub fn compute_display_rows(
 
 // (T5/S4, Step B-bis) The second private clock is GONE. This was a `pub(crate)`
 // byte-identical copy of `storage/db.rs`'s private `now_ms()`; both now name the
-// ONE definition in `fulcrum_core::clock`, so the `DisplayRow::created_at` stamped
+// ONE definition in `fulcrum_harness::clock`, so the `DisplayRow::created_at` stamped
 // here and the `created_at` the store writes for the same row cannot drift — the
 // "hidden second clock source" the Step B-bis ruling names as the failure mode of
 // leaving the duplicate in place.

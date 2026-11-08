@@ -18,7 +18,7 @@
 //! here with the two injected seams; S8.3 added the Supervisor-side half
 //! (`client` + the whole `manager/` directory); S8.4 added [`run_worker`], the
 //! synchronous `--worker` entry (runtime + `block_on`), re-exported at the crate
-//! root as `fulcrum_core::run_worker`.
+//! root as `fulcrum_harness::run_worker`.
 
 pub mod client;
 pub mod core;

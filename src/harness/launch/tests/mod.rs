@@ -2008,7 +2008,7 @@ fn the_ctx_removes_its_space_cwd_when_it_is_dropped() {
 //
 // `resolve_launch` no longer opens `settings.json`: the ADR 0066 map arrives
 // packaged on the parameter (the Worker process must not read desktop config —
-// the prerequisite for the `fulcrum-core` crate split). These three pins hold
+// the prerequisite for the `fulcrum-harness` crate split). These three pins hold
 // the shape of that change: the packaged map DRIVES the resolve, a file on disk
 // no longer does, and the "layer that cannot speak" identity survives one level
 // up at the seam.

@@ -74,7 +74,7 @@ pub const DEFAULT_SUBAGENT_DEAD_BOUND: std::time::Duration =
 /// `WorkerHandle::spawn(std::env::current_exe().as_path())`; tests are
 /// the `fake_worker` binary (resolved through `test_support::target_debug_dir()`
 /// — the crate's two-levels-up `target/` resolver; since S8.3 this module lives in
-/// `fulcrum-core`, so the manifest-parent convention it used to name is wrong here).
+/// `fulcrum-harness`, so the manifest-parent convention it used to name is wrong here).
 pub trait WorkerFactory: Send + Sync {
     fn spawn(&self) -> Result<WorkerHandle, WorkerError>;
 }
@@ -498,7 +498,7 @@ impl WorkerManager {
 // ── T5/S4 — the crate's subagent-dispatch seam, implemented (plan Step E.2) ───
 //
 // THE SECOND INSTANTIATION PIN OF S4. `crate::seams::Dispatcher` (the crate's
-// own name for `fulcrum_core::seams::Dispatcher` from inside the package) exists
+// own name for `fulcrum_harness::seams::Dispatcher` from inside the package) exists
 // because `SubagentSessionManager` (moving in S5) currently holds an
 // `Arc<WorkerManager>` — edge E2, `subagent.rs:28` — and the crate cannot import
 // `archimedes_lib` to keep holding it. After S5 the manager holds

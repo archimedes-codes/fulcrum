@@ -56,7 +56,7 @@ pub mod store;
 // and `headers` (whose names the desktop shell still re-exports from
 // `provider_headers`). A module re-export is a module path like any other, so
 // the desktop shell re-issues these same names through
-// `fulcrum_core::provider_auth::{…}`.
+// `fulcrum_harness::provider_auth::{…}`.
 pub use budget::{
     classify_status, poll_all, poll_key_info, poll_team_info, poll_user_info, run_budget_tick,
     should_probe, BudgetEndpoint, BudgetFacts, BudgetPoller, DenialMemory, KeyBudget, PollStatus,

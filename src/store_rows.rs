@@ -4,7 +4,7 @@
 //!
 //! `FulcrumPersistence::session` returns `SessionRow` and `messages_for` returns
 //! `Vec<MessageRow>`, but `storage/` STAYS desktop (it is `rusqlite`). A trait in
-//! `fulcrum-core` cannot name a type in `archimedes_lib` — that import is the
+//! `fulcrum-harness` cannot name a type in `archimedes_lib` — that import is the
 //! package cycle Step A exists to sever. So the ROWS move and `storage/db.rs`
 //! imports them back (desktop→crate, the allowed direction).
 //!

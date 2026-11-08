@@ -2,7 +2,7 @@
 ![](https://img.shields.io/badge/rust-1.99-pin?style=flat-square)
 ![](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 
-`fulcrum-core` is the agent harness: the tool loop, the provider clients, the tool
+`fulcrum-harness` is the agent harness: the tool loop, the provider clients, the tool
 implementations, the sandbox, and the MCP client. It is a library, not an
 application — it decides what an agent does, and knows nothing about windows,
 trays, or the UI that shows it.
@@ -19,7 +19,7 @@ session without a GUI.
 
 This repo is a Cargo workspace with two members:
 
-- **`fulcrum-core`** — the engine above. Its `[package]` lives at the **repo root**,
+- **`fulcrum-harness`** — the engine above. Its `[package]` lives at the **repo root**,
   with `src/` and `tests/` beside it. That is not laziness; the shape is forced by
   the `childproc` census and moving it is fatal. `AGENTS.md` carries the finding and
   the reproduction.
@@ -52,7 +52,7 @@ bounds, peer credentials where the platform provides them) is in, and on Windows
 credentials are a documented limitation rather than enforcement —
 [`docs/features/daemon-hardening.md`](docs/features/daemon-hardening.md) §3.
 
-`fulcrum-core`'s rules bind `fulcrum-core` alone: the engine's boundary pins do not
+`fulcrum-harness`'s rules bind `fulcrum-harness` alone: the engine's boundary pins do not
 walk the sibling member. That is no longer an open gap — the daemon has its own pins
 over its own tree (`fulcrum/tests/boundary.rs`, 10 tests); see *Tests* below.
 
@@ -61,7 +61,7 @@ over its own tree (`fulcrum/tests/boundary.rs`, 10 tests); see *Tests* below.
 The desktop is a Tauri app, and the engine spent its whole life inside it. That
 was never a boundary the code respected — until it was made one deliberately.
 
-The rule now enforced by tests, not convention: **`fulcrum-core` has no code path
+The rule now enforced by tests, not convention: **`fulcrum-harness` has no code path
 to a desktop module.** Nine boundary pins assert it, and the main one walks every
 `.rs` file in the crate and fails on a single reference to `tauri::`,
 `rusqlite::`, `crate::config::`, `crate::storage::`, or `archimedes_lib::`
@@ -101,7 +101,7 @@ cargo test          # both members; the engine's suite needs no build step first
 > **A bare `cargo test` passes from a cold target dir — do not build first.**
 > Measured on a `target/` that had never existed, no build step: **1603 passed /
 > 0 failed / 3 ignored**, which is what the bare command prints warm and on CI too.
-> It is *not* the same total as `cargo test -p fulcrum-core` — that is 1420 (1415 lib
+> It is *not* the same total as `cargo test -p fulcrum-harness` — that is 1420 (1415 lib
 > + the 5 in `fixture_bins.rs`), because `-p` leaves the `fulcrum` member's 183 tests
 > unbuilt. The two numbers differ by exactly that member, and a box that claimed they
 > matched would be describing the pre-daemon tree.
@@ -151,14 +151,14 @@ resolve them by that name.
 `cargo test` runs both members (the root package and `fulcrum` — see *Things that
 will bite you* in `AGENTS.md` for why that is not the default). Measured at `v0.1.0`:
 **1603 passed / 0 failed / 3 ignored** for the bare command, which splits 1420
-(`fulcrum-core`: 1415 lib + the 5 in `fixture_bins.rs`) and 183 (`fulcrum`: 45 lib +
+(`fulcrum-harness`: 1415 lib + the 5 in `fixture_bins.rs`) and 183 (`fulcrum`: 45 lib +
 138 across `boundary`, `db`, `serve`, `transport`, `worker_mode`). Two of the engine's
 guards are worth knowing about before you trip them:
 
 - **`boundary_pins`** — the dependency-direction pins described above. It does not
   skip `#[cfg(test)]` code, because a test-only import is still an edge. It walks
   `{CARGO_MANIFEST_DIR}/src` and reads `{CARGO_MANIFEST_DIR}/Cargo.toml`, so it
-  polices `fulcrum-core` **only**: `fulcrum/src/` is outside the walk and
+  polices `fulcrum-harness` **only**: `fulcrum/src/` is outside the walk and
   `fulcrum/Cargo.toml` is never read. That is intended — `rusqlite` is legal in the
   daemon, which owns the disk, and widening the engine's pin to cover the sibling
   would need an allowlist that weakens the engine's own rule. The gap it left is
@@ -224,11 +224,81 @@ moves. Silence there is a bug, never a green.
 **Update path:** change both repos' DDL in lockstep and update `schema-sha.txt` in the
 SAME commit, so the pin diff and the DDL diff are reviewed together.
 
+## The name (and why it changed)
+
+This package was `fulcrum-core` through T5–T9 and is `fulcrum-harness` from the
+rename onward. The daemon sibling follows in its own change as `fulcrum-harness-daemon`
+(its package is still `fulcrum` here), so the family prefix is `fulcrum-harness-` and
+the suffix after it names the thing.
+
+**Why the old name had to go — this half is measured.** `fulcrum-core` is taken on
+crates.io, and not by a squatted empty crate: `fulcrum-core`, `fulcrum-assets`,
+`fulcrum-guard`, `fulcrum-memory`, `fulcrum-messaging`, `fulcrum-providers`,
+`fulcrum-tools` — seven crates described as *"Fulcrum AI agent framework — … module"*,
+all published 2026-02-25, one version each, ~28 downloads. crates.io is
+first-come-first-served, crate deletion is not possible, and the squatting clause in
+its Terms of Use reaches only names held *"without any genuine functionality"*, so
+neither taking it nor waiting it out is available. `-core` had also stopped describing
+the member, which owns the worker, the provider auth flows and the MCP client.
+
+**Why this name, and not a brand prefix — recorded because it was re-litigated once
+already.** Leaving `fulcrum-core` was forced (it is taken, see above). Choosing
+`fulcrum-harness` was not: it was free, **and so was the whole family under it** — all
+14 probes (`fulcrum-harness-{tools,providers,memory,guard,assets,messaging,core,engine,worker,sandbox,auth,web,mcp,codemode}`)
+came back unclaimed, against 6 of 6 TAKEN at the bare `fulcrum-{…}` level. The squat
+bites only at the bare name. So the prefix below was a genuine free choice, and these
+are the measurements behind making it:
+
+- **A `fulcrum-codes-` prefix (matching the `archimedes-codes` org) was tried and
+  reverted.** It rested on owning the `fulcrum.codes` domain, and that domain is **not
+  available to register** — per the project owner's registrar check; it could not be
+  verified independently from this box, since `.codes` is absent from the IANA RDAP
+  bootstrap and port 43 is blocked here.
+- **`-codes` has no precedent as a crate suffix**: 0 crates among the top-100 registry
+  results for "codes", against `-core` 52, `-engine` 18, `-harness` 15. The only crate
+  actually named `codes` is a CBC-XOR cipher, so `fulcrum-codes-tools` reads as a
+  character-encoding toolkit.
+- The API Guidelines' one explicit suffix rule — no `-rs`/`-rust`, *"Every crate is
+  Rust!"* — targets suffixes that restate what the registry already knows. Publisher
+  identity is exactly that: crates.io carries it in `owners` and shows it on the crate
+  page. `fulcrum-harness` says what it does; a publisher prefix says who shipped it.
+- The org analogy inverts. `archimedes.codes` → `archimedes-codes` → repo
+  `archimedes-codes/fulcrum`, and the **artifact** there is `fulcrum` — the org name
+  does not propagate into artifacts in the existing setup. Followed strictly it yields
+  `fulcrum`, which is the profiler crate.
+- The mechanism that would actually give a publisher-enforced family is **RFC 3243
+  namespaces** (`fulcrum::harness`). Accepted in 2022, still unimplemented as of the
+  2026 project goals ("needs contributor"), and it needs the root name — which is taken.
+
+`fulcrum-harness` and the `fulcrum-harness-*` family were all still free at the time of
+writing. Nothing is published, so a future rename is still cheap; it stops being cheap
+the moment `cargo publish` runs.
+
+The daemon member is untouched by this change — its package is still `fulcrum` here, as
+are its bin, lib and directory. `CONTEXT.md` defines **Agent harness** as the model loop
++ tool registry + persistence + provider integration, and lists **Agent** under *Avoid*
+for it — "a harness *runs* the agent; it is not the agent".
+
+**The name is on the wire, so this was not a cosmetic change.** `env!("CARGO_PKG_NAME")`
+is not read anywhere in the tree, but `env!("CARGO_PKG_VERSION")` — which the rename
+left alone — is the daemon's `hello.serverVersion`, the engine's `User-Agent`, and MCP
+`clientInfo.version`. `scripts/check-versions.sh` enumerates members from the root
+manifest rather than naming them, so it followed the rename with no edit and still
+refuses fewer than two version-bearing members.
+
+**What a consumer must do, measured against a scratch two-repo tree:**
+
+| Situation | Result |
+| --- | --- |
+| Existing pin left alone (`fulcrum-core = { tag = "v0.1.0" }`) | **Keeps working.** A tag's manifest is frozen at that commit, so the rename on `main` cannot reach it. `cargo tree -i fulcrum-core` still prints the `git+…?tag=v0.1.0#<sha>` source. |
+| Dep line renamed, tag NOT bumped | **Hard error**, `no matching package named \`fulcrum-harness\` found` — the tag's manifest still declares `fulcrum-core`. Loud, not silent. |
+| Stale local `[patch]` naming `fulcrum-core` | **Hard error**, `patch location … does not contain packages matching \`fulcrum-core\``. This is the one that bites locally rather than in CI, because the live `.cargo/config.toml` is gitignored — fix the key in `<consumer>/.cargo/config.toml` too. |
+
 ## Consuming it
 
 ```toml
 [dependencies]
-fulcrum-core = { git = "https://github.com/archimedes-codes/fulcrum", rev = "<pinned-rev>" }
+fulcrum-harness = { git = "https://github.com/archimedes-codes/fulcrum", rev = "<pinned-rev>" }
 ```
 
 The engine is pre-1.0 and moves with its consumer; pin a `rev`, not a branch.
@@ -240,18 +310,18 @@ does nothing for its consumers):
 ```toml
 # <consumer>/.cargo/config.toml
 [patch."https://github.com/archimedes-codes/fulcrum"]
-fulcrum-core = { path = "../fulcrum" }
+fulcrum-harness = { path = "../fulcrum" }
 ```
 
 ## Layout
 
-The workspace root **is** the `fulcrum-core` package — `[package]`, `src/` and
+The workspace root **is** the `fulcrum-harness` package — `[package]`, `src/` and
 `tests/` all sit here, beside the `[workspace]` table. Do not "tidy" that by moving
-them into a `fulcrum-core/` subdirectory; `AGENTS.md` records what breaks, and how to
+them into a `fulcrum-harness/` subdirectory; `AGENTS.md` records what breaks, and how to
 reproduce it, under *The census (`childproc`)*.
 
 ```
-Cargo.toml        [workspace] + fulcrum-core's [package] (the forced shape)
+Cargo.toml        [workspace] + fulcrum-harness's [package] (the forced shape)
 src/
   harness/     the tool loop, prompts, compaction, subagent dispatch —
                and provider/ inside it: the provider clients and wire adapters

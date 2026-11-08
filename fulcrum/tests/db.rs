@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use fulcrum::db::schema::{schema_shape_fingerprint, SCHEMA, SCHEMA_VERSION};
 use fulcrum::db::{Db, DbError};
-use fulcrum_core::persist::TranscriptPersister;
-use fulcrum_core::seams::FulcrumPersistence;
-use fulcrum_core::store_rows::{DisplayRow, SessionInfo};
-use fulcrum_core::worker_types::StoreFrame;
+use fulcrum_harness::persist::TranscriptPersister;
+use fulcrum_harness::seams::FulcrumPersistence;
+use fulcrum_harness::store_rows::{DisplayRow, SessionInfo};
+use fulcrum_harness::worker_types::StoreFrame;
 
 /// A store open in a fresh temp dir, as the `Arc` both shapes need: the tests
 /// hold `Arc<Db>` so they can reach the inherent introspection helpers AND let it

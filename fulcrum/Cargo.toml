@@ -40,7 +40,7 @@ path = "src/main.rs"
 [dependencies]
 # The engine, by path. This is the whole reason the daemon is a sibling member
 # rather than a consumer of the published rev pin.
-fulcrum-core = { path = ".." }
+fulcrum-harness = { path = ".." }
 # `transport` (the framed stdio/pipe duplex), `serve` (the listener + supervisor
 # loop), and the retry sleeps in `transport::windows`. Feature set mirrors the
 # engine's plus `rt-multi-thread`, which the daemon needs for the worker-pool
@@ -72,7 +72,7 @@ tokio = { version = "1", features = [
 # across the WHOLE workspace graph, since this member became part of it.
 #
 # `rusqlite` here is LEGAL and `rusqlite` in the engine is not: ADR 0091 forbids
-# it in `fulcrum-core` (the engine holds no disk), the daemon owns the disk.
+# it in `fulcrum-harness` (the engine holds no disk), the daemon owns the disk.
 # `boundary_pins` walks `{CARGO_MANIFEST_DIR}/src` and reads only
 # `{CARGO_MANIFEST_DIR}/Cargo.toml`, so it does not police this manifest at all —
 # Task 6 adds the daemon's own pins. Do NOT widen `boundary_pins` to walk this
