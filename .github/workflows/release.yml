@@ -1,0 +1,176 @@
+name: Release
+
+# A tag is the trigger. `workflow_dispatch` rehearses the GATE on a branch: it
+# runs the version check with no tag and creates nothing, so this file can be
+# proved on a branch instead of discovered on a tag.
+#
+# WHAT THIS RELEASES: a GitHub release object and its notes. Nothing else. There
+# is deliberately no build stage — this repo is a library plus the `fulcrum`
+# binary, and today no consumer installs an artifact: the desktop consumes the
+# engine as a git dependency (a rev pin, moving to `tag` + `version`), which
+# compiles from source and reads nothing off the release page. A build stage
+# would invent consumers before they exist, and an unsigned tarball nobody
+# installs is worse than none: it looks like a supported install channel.
+#
+# So the two things this workflow is FOR are (1) refusing to announce a version
+# the tree does not carry, and (2) creating the release. Everything else is a
+# person's judgement, applied after the tag — see AGENTS.md's Releasing section.
+on:
+  push:
+    tags:
+      # Three numeric parts, not `v*`: `v*` also matches `v2`, `vx`, and a tag
+      # someone pushed for a different scheme, and the version gate below parses
+      # the tag as X.Y.Z.
+      - "v*.*.*"
+  workflow_dispatch:
+
+# Queued, not cancelled. A cancel landing between "release created" and
+# "draft flipped off" strands a draft that no later run recognises as finished —
+# the same reasoning the desktop's release workflow records, and the reason the
+# create step is idempotent rather than create-or-die.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Verify the version and publish the release
+    runs-on: ubuntu-latest
+    # Ten minutes for a job that runs no cargo: every step here is git and `gh`,
+    # so anything still running after ten is hung, not slow.
+    timeout-minutes: 10
+    env:
+      # `gh` inside a `run:` step only finds a token when one is in its
+      # environment. The implicit `GITHUB_TOKEN` the toolkit injects for
+      # `actions/checkout` is a runner-version detail, not a contract — stated
+      # explicitly, same as the desktop's release workflow.
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # `fetch-depth: 0` + `fetch-tags: true`, and they are not decoration: the
+      # ancestry gate below needs the real `origin/main` history, and `gh
+      # release create --verify-tag` needs the tag OBJECT, not just the
+      # commit the tag ref happens to point at. A shallow tag checkout gives
+      # neither, and both gates would degrade into checks that cannot look.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # THE GATE, and it runs before anything is created. A release whose two
+      # manifests disagree is a release announcing a number the tree does not
+      # carry — a path dependency in one workspace resolves by PATH, never by
+      # version, so the disagreement COMPILES and nothing else in the repo
+      # notices. `--tag` folds the tag into the same agreement: two manifests
+      # agreeing on `0.1.0` under a `v0.1.1` tag produces a tag no git
+      # dependency pinned by `tag` + `version` can resolve, which is exactly the
+      # pinning scheme this repo is moving the desktop onto.
+      #
+      # `$GITHUB_REF_NAME` is passed as a quoted argument, never interpolated
+      # into the script text — a tag name is attacker-visible input the moment
+      # someone pushes `v1.0.0; curl evil`.
+      - name: Check the manifests, the lock and the tag agree on one version
+        if: github.event_name == 'push'
+        run: bash scripts/check-versions.sh --tag "$GITHUB_REF_NAME"
+
+      # The gate on a branch has no tag to fold in — `$GITHUB_REF_NAME` there is a
+      # BRANCH name, and feeding it to `--tag` would fail the parse rather than
+      # rehearse anything, so the two forms are separate steps with separate `if:`s.
+      # This is the half that makes the rehearsal real: without it, dispatch mode
+      # would run nothing and look green while doing it — the vacuous green this
+      # repo refuses everywhere else.
+      - name: Check the version fields agree (dispatch rehearsal, no tag)
+        if: github.event_name == 'workflow_dispatch'
+        run: bash scripts/check-versions.sh
+
+      # --- the tag's provenance, before a release object can exist -----------
+      #
+      # TWO gates, both cheap, both about a tag nobody intended to ship.
+      #
+      # (1) ANNOTATED, not lightweight. `git cat-file -t` answers `tag` for an
+      #     annotated tag and `commit` for a lightweight one. The annotated form
+      #     is what carries the release message and the tagger date; a
+      #     lightweight tag is a pointer someone made in a hurry. The skill's
+      #     rule is `git tag -a`, so this asserts the rule instead of trusting it.
+      # (2) ON MAIN. A release should be a commit `main` has already proven —
+      #     `ci.yml` runs the whole bar on `main` and `feature/*` pushes and on
+      #     every PR, so a commit reachable from `main` is a commit that passed
+      #     it. A tag pushed on an unmerged branch would publish a release from a
+      #     tree the merge bar never saw, and nothing in this workflow would
+      #     notice. `--is-ancestor` covers the normal case (the tag IS the tip)
+      #     and a tag on an older merged commit alike.
+      #
+      # WHY NOT "check the CI status of the tagged commit" instead: that gate
+      # reddens forever the day someone adds a workflow that does not run on tag
+      # pushes, and the ancestry check gets the same guarantee from the merge bar
+      # without depending on the workflow list staying still.
+      #
+      # Both refuse loudly: a missing `origin/main` makes `merge-base` exit
+      # non-zero rather than pass, which is the intended shape.
+      - name: Check the tag is annotated
+        if: github.event_name == 'push'
+        run: |
+          kind="$(git cat-file -t "$GITHUB_REF_NAME")"
+          if [ "$kind" != "tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME is a $kind, not an annotated tag — release with \`git tag -a v0.1.0 -m 'Release v0.1.0'\`"
+            exit 1
+          fi
+
+      - name: Check the tagged commit is on main
+        if: github.event_name == 'push'
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_REF_NAME^{commit}" FETCH_HEAD; then
+            echo "::error::$GITHUB_REF_NAME does not point at a commit reachable from origin/main — release a commit that passed the merge bar, not one from an unmerged branch"
+            exit 1
+          fi
+
+      # `||` instead of view-then-create, so a re-run on the same tag (a retried
+      # failed job, or the re-tag flow) finds the existing release and keeps going
+      # instead of dying on "release already exists".
+      #
+      # `--generate-notes` runs GitHub's own generator for THIS tag, at the moment
+      # the release for that tag is created — which is why the trap the desktop's
+      # notes script exists to prevent does not reach here: that script exists
+      # because `POST /releases/generate-notes` does not validate `tag_name`, so a
+      # LATER call with a typo'd tag answers 200 with confident, correctly
+      # formatted notes about the PREVIOUS release. Creating with the tag we are
+      # creating, guarded by `--verify-tag`, cannot describe a different release.
+      #
+      # ⚠ What those generated notes are: squash-merged PR subjects with `by
+      # @user` suffixes. Accurate, and not something to ship as the release text.
+      # AGENTS.md's Releasing section is the human rewrite that follows this
+      # workflow — do not read this step as the end of the notes story.
+      #
+      # `--draft` first so the page is never public carrying machine-generated
+      # text this workflow then edits; the flip is the LAST step below.
+      - name: Create the draft release
+        id: create
+        if: github.event_name == 'push'
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --draft --verify-tag --generate-notes \
+                 --title "Fulcrum $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # The last step, and the moment the release becomes visible. Nothing after
+      # it, so there is no window where a published release is half-written.
+      #
+      # Guarded by the create step's outcome, not by `always()`: on
+      # `workflow_dispatch` the create step is SKIPPED, and there is nothing to
+      # publish — a dispatch run that flipped a draft would be rehearsing by
+      # shipping.
+      - name: Publish the release
+        if: steps.create.outcome == 'success'
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+      # Rehearsal mode says what it did not do, so a green dispatch run is never
+      # mistaken for a published release.
+      - name: Report the rehearsal
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "workflow_dispatch is a gate rehearsal: no tag, no release object, nothing published."

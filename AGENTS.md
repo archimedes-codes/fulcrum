@@ -40,17 +40,22 @@ cargo check --target x86_64-pc-windows-gnu --all-targets   # the only local Wind
 bash scripts/check-rquickjs-allocator.sh                   # + --self-test to prove it has teeth
 bash scripts/check-schema-drift.sh                         # + --self-test: neither repo's tests can see the other's DDL
 bash scripts/check-no-stray-processes.sh                   # + --self-test: leak guards ask per-pid, never whole-table
+bash scripts/check-versions.sh                             # + --self-test: the version lives in two members and nothing ties them
 ```
 
-Both new guards run in CI, and neither is a full-strength gate yet, so do not read the
+All three guards run in CI, and none is a full-strength gate yet, so do not read the
 bar as one: `check-schema-drift.sh` runs in `.github/workflows/schema-drift.yml`, where
 the **cross-repo half is not yet wired** — the desktop has no comparator step, so only
 the fulcrum-side leg runs, and the desktop leg REFUSES with a named reason (exit 2)
 rather than passing on an empty comparison. `check-no-stray-processes.sh` runs in
 `ci.yml` after `cargo test` and is **enforced on unix only; the Windows leg is
 advisory** — it reports every live match and kills nothing, because no bash-accessible
-mechanism there reads another process's environment to attribute it to this run. In both
-workflows the `--self-test` step runs BEFORE the live check, so a guard that has lost the
+mechanism there reads another process's environment to attribute it to this run.
+`check-versions.sh` runs in `ci.yml`'s `scripts` job (one OS, no cargo — it is pure text
+tooling, the shape `schema-drift.yml` reasons for) and without `--tag`; the tag half of
+its agreement is enforced by `release.yml`, the only place a tag exists. See
+*Releasing* for what that guard is for. In every
+workflow the `--self-test` step runs BEFORE the live check, so a guard that has lost the
 ability to fail reddens the run instead of printing a green nobody earned.
 
 No `cargo build --all-targets` line, and that is not an oversight: `--all-targets` on the clippy and Windows checks
@@ -225,3 +230,86 @@ panic stays in the Worker — and must never become `abort`. It is also load-bea
 cannot set its own profile: cargo reads profiles from the workspace root only, so the daemon inherits `unwind` and a
 supervisor survives a worker panic. A `panic = "abort"` daemon would take the whole supervisor down with the first
 worker that panicked.
+
+## Releasing
+
+**The version lives in TWO manifests plus the lock file, and nothing in the build ties them
+together.** `Cargo.toml` (the root, which is the `fulcrum-core` package) and
+`fulcrum/Cargo.toml` each declare a `version`, and `Cargo.lock` mirrors both. A path
+dependency inside one workspace resolves by PATH and never by version, so two members that
+disagree still compile, still pass every test, and still ship — the drift is invisible until
+something reads one of the two numbers out loud. Three things do read one: the daemon's
+`hello` answer carries `serverVersion` from `env!("CARGO_PKG_VERSION")`
+(`fulcrum/src/serve.rs:2309`), the engine sends the same macro as its `User-Agent`
+(`src/harness/provider/transport.rs:19`) and as MCP `clientInfo.version`
+(`src/mcp/http.rs:125`). So a bump is not cosmetic: it changes bytes on the wire. No test
+asserts the literal value — every read goes through the macro — which is what makes a bump
+test-safe; a future test that hardcodes `0.1.0` would be the first thing to break on the
+next bump, and that is the wrong shape of pin.
+
+`bash scripts/check-versions.sh` is the tie. It enumerates the members from the root
+manifest rather than naming the two known paths — a check that hardcodes them reads two
+versions and passes green over a third member nobody added, the vacuous-pass class this repo
+records at `check-rquickjs-allocator.sh`'s `-p` form and `childproc.rs`'s blind-census
+witnesses — and fewer than two version-bearing members is a refusal (exit 2), not a pass.
+Both readers are `[package]`-section-aware, because `[workspace.dependencies.<name>]` puts a
+line-start `version` in the same file and a naive first-match grep can report a dependency's
+version as the crate's own; `--self-test` plants that decoy so the regression is caught
+rather than tolerated. It also checks the lock, whose drift cargo self-heals on the next
+build but which would fail a `--locked` build on the release commit itself.
+
+**`v0.1.0` is the first release of this repo, and the numbering restarts from the desktop's.**
+The manifests carried `0.11.0` because that was the desktop's version at extraction, and one
+annotated tag `v0.11.0` was pushed at `e44f382` as a pre-T9 bisect boundary. Both are
+superseded: the desktop app is at `0.11.x` and this engine is not, and continuing to inherit
+the desktop's number would make the two repos' `0.11.0` mean different trees. `v0.11.0` is
+deleted from the remote so there is one version line, not two that sort in the wrong order.
+The tag message's own words already said it was "a legibility marker, not a semver contract",
+so nothing pinned by it breaks: the desktop's `src-tauri/Cargo.toml` pins by `rev`, and a rev
+pin is unaffected by a tag being deleted or renumbered.
+
+**The version is now load-bearing in a way it was not, and that is the point.** The plan is to
+move the desktop from `rev = "40-hex-chars"` to `tag` + `version`, which cargo honours only
+when the tagged manifest carries that version. That makes the tag and the manifests one
+contract, which is why `check-versions.sh --tag vX.Y.Z` is the first step of
+`release.yml` and not a nicety: a tag outrunning the files produces a pin nothing can install.
+
+**What `release.yml` publishes: a GitHub release and its notes, and nothing else.** There is
+no build stage and no artifact upload, deliberately — no consumer installs a binary today (the
+desktop compiles the engine from source as a git dependency), and an unsigned tarball that
+looks like a supported install channel is worse than none. No `cargo publish` either: neither
+`fulcrum-core` nor `fulcrum` is on crates.io, and a name squat there is not recoverable by
+renumbering. The workflow's two jobs are to refuse a version the tree does not carry, and to
+create the release. Its `workflow_dispatch` mode rehearses the gate on a branch and creates
+nothing — and it prints that it created nothing, so a green rehearsal is never mistaken for a
+shipped release.
+
+Two provenance gates run before a release object can exist, both cheap and both about a tag
+nobody intended to ship: the tag must be **annotated** (`git cat-file -t` answers `tag`, not
+`commit` — this asserts the skill's `git tag -a` rule instead of trusting it), and the tagged
+commit must be **reachable from `origin/main`**, so a release is a commit the merge bar already
+proved. Not "check the tagged commit's CI status": that gate reddens forever the day someone
+adds a workflow that does not run on tag pushes, where the ancestry check gets the same
+guarantee without depending on the workflow list staying still.
+
+**Skill-executable step** (the `release` skill reads this file at Step 1 and applies release
+instructions at Step 5, so this is written to be executed, not just read): after the skill's
+automated bump, run `bash scripts/check-versions.sh` from the repo root and require it to
+print `versions match: X.Y.Z` before tagging. The bump commit covers **both manifests and
+`Cargo.lock`** — `cargo check` refreshes the lock, and committing it in the same commit is
+what the guard then proves. The values stay bare `X.Y.Z`, no `v` prefix (the tag carries the
+`v`; the check rejects a `v`-prefixed manifest version because the two are not
+interchangeable).
+
+**Skill-executable final step — write the release notes.** `release.yml` puts GitHub's
+*generated* notes on the release (`--generate-notes`, at creation, for the tag being created),
+so what remains — and what no workflow can do — is notes a person would read. The generated
+list is squash-merged PR subjects with `by @user` suffixes: accurate, and not the release text.
+Group by what a consumer would notice (New / Fixed / Changed), drop internal-only entries
+(`docs`, `chore`, CI, test-only), keep the PR links for what stays, and open with the one
+change worth upgrading for. `gh release edit vX.Y.Z --notes-file /tmp/notes.md`.
+
+The desktop's copy of this ceremony ends with an updater manifest (`latest.json`) and a
+signature-completeness gate. **Neither exists here and no step for them should be copied
+over**: there is no Tauri bundle, no `.sig`, and no `tauri-plugin-updater` client reading a
+manifest. `release.yml`'s last step flips the draft and nothing follows it.

@@ -162,3 +162,33 @@ jobs:
 
       - name: Check the rquickjs build graph
         run: bash scripts/check-rquickjs-allocator.sh
+
+  # The shell guards that need neither cargo nor a matrix, on one OS — the shape
+  # `schema-drift.yml` reasons for: this check is text-only (awk + grep), and its
+  # portability is proven by its own `--self-test`, not by three copies of the same
+  # file read on three platforms. Kept OUT of the `lint-test` matrix so a matrix leg
+  # stays about the `cfg(unix)`/`cfg(windows)` process hygiene it exists for.
+  scripts:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    # Ten minutes for a job that runs no cargo and spawns no process: anything
+    # still going after that is hung, not slow.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ORDER IS LOAD-BEARING, the pairing every guard step in this repo uses: the
+      # self-test runs BEFORE the live check, so a guard that has lost the ability
+      # to fail reddens the run instead of printing a green nobody earned. A
+      # live-only run cannot demonstrate the failure at all — both manifests and
+      # the lock agree today, so the real check has nothing to complain about.
+      - name: Prove the version guard can fail
+        run: bash scripts/check-versions.sh --self-test
+
+      # No `--tag` here: a PR or a branch push has no tag to fold in. The tag half
+      # of the agreement is enforced by `release.yml`, which is the only place a tag
+      # exists; this step catches the drift the day it is introduced, so a bump that
+      # missed a member reddens its own PR rather than the release.
+      - name: Check the workspace members agree on one version
+        run: bash scripts/check-versions.sh
