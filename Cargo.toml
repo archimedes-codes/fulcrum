@@ -75,6 +75,18 @@ name = "fulcrum-harness"
 version = "0.1.0"
 edition = "2021"
 description = "The Fulcrum agent harness — the tool loop, provider clients, tools, sandbox and MCP client; extracted from archimedes"
+# `license` is not decoration: crates.io shows it and `cargo publish` warns without
+# it, and it cannot be amended on a published version — only superseded by a new
+# one. The value must agree with the LICENSE file at the root (MIT, (c) 2026 Daniel
+# Cherubini); LICENSE is auto-included in the package, so the two ship together.
+license = "MIT"
+repository = "https://github.com/archimedes-codes/fulcrum"
+# Both lists are capped at 5 by crates.io, and category entries are validated
+# server-side against the taxonomy — a slug that is not in
+# `https://crates.io/api/v1/categories` fails the upload, and `--dry-run` never
+# reaches that check. These five slugs were checked against that endpoint.
+keywords = ["ai", "agent", "harness", "llm", "mcp"]
+categories = ["artificial-intelligence", "asynchronous", "network-programming", "api-bindings"]
 
 # S8b.1 — the crate's OWN fixture binaries, so `cargo test` inside this package
 # (including a copy of it standing alone, which is the T8b condition) builds the

@@ -2,6 +2,24 @@
 name = "fulcrum-harness-daemon"
 version = "0.1.0"
 edition = "2021"
+# Deliberately NOT published. This is a long-lived supervisor binary that no
+# consumer installs from a registry, and its engine dependency is
+# `fulcrum-harness = { path = ".." }` with no `version` — which is the point: a
+# path dependency inside one workspace cannot be built in two versions at once,
+# and that is the guarantee the daemon needs from the engine. Adding
+# `version = "0.1.0"` to satisfy a publish would trade that for a second
+# independent version line, so the field stays absent and the package stays
+# private.
+#
+# The reason this line is here at all is that `default-members` lists BOTH
+# packages, so a bare `cargo publish` at this root verifies the daemon too and
+# used to fail with the misleading "all dependencies must have a version
+# requirement specified when publishing / dependency `fulcrum-harness` does not
+# specify a version". With `publish = false` the same command now names the real
+# cause instead. Publish the engine explicitly: `cargo publish -p fulcrum-harness`.
+# Never "fix" a bare-publish failure by editing `default-members` — that line is
+# what makes the bare gates (test, clippy, the allocator guard) reach this member.
+publish = false
 
 # The `fulcrum serve` daemon (T9) — the long-lived worker supervisor that lives
 # as a SECOND PACKAGE in this repo so it can link the engine by `path = ".."`

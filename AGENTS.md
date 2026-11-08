@@ -342,10 +342,36 @@ looks like a supported install channel is worse than none. No `cargo publish` ei
 `fulcrum-harness` nor `fulcrum-harness-daemon` is on crates.io, and a name squat there is not recoverable by
 renumbering. Note the bare forms are NOT free — `fulcrum` is a profiler crate and `fulcrum-core` is a
 seven-crate "Fulcrum AI agent framework" family — which is what the two renames moved off; see *The name*
-in the README. A bare `cargo publish` at this root also fails by construction, because `default-members`
-lists both packages and the daemon's engine dep is a `path` dependency: cargo strips `path` when publishing
-and demands a `version` requirement. Publish with `-p`, never bare, and never by editing
-`default-members` — that line is what makes the bare gates reach the daemon. The workflow's two jobs are to refuse a version the tree does not carry, and to
+in the README. Nothing is published today, and `default-members` lists both packages, so a bare
+`cargo publish` at this root verifies the daemon too; the daemon now declares `publish = false`,
+which makes that command say *"`fulcrum-harness-daemon` cannot be published"* instead of the
+misleading "all dependencies must have a version requirement … `fulcrum-harness` does not specify a
+version" that it used to print. Do not resolve that by adding `version = "0.1.0"` to the daemon's
+`fulcrum-harness = { path = ".." }` just to silence it: that field is absent on purpose, because a
+path dep inside one workspace cannot be built in two versions at once, and pinning a version gives
+the daemon a second version line to keep in step. Publish the engine explicitly with
+`cargo publish -p fulcrum-harness`, never bare, and never by editing `default-members` — that line is
+what makes the bare gates reach the daemon.
+
+**Verifying a publish: extract the `.crate` OUTSIDE any repo, or you get a false failure.** The five
+census tests named in *The census* above are layout-aware, and `cargo publish --dry-run` only
+*compiles* the package — it never runs its tests. Extracting `target/package/fulcrum-harness-*.crate`
+into `target/package/` and running `cargo test` there gives **1410 passed / 5 failed**, all five
+`childproc::tests::production_*` / `the_two_layout_witnesses_agree`, panicking that the manifest graph
+says "workspace MEMBER" while `…/src-tauri/src` is not a directory — because the packaged copy sits
+*under the real repo*, so `declaring_workspace_root`'s ancestor walk finds this repo's own
+`[workspace]` manifest. The identical tree extracted to a path with no ancestor workspace gives
+**1415 passed / 0 failed**. The artifact was never broken; the test location was. A pin that fails on
+a fine thing teaches the same lesson as one that passes on a broken thing: measure the consumer's
+condition, not the nearest convenient directory.
+
+Two other publish facts worth not rediscovering: `--dry-run` never reaches crates.io's **server-side**
+checks, so an invalid `categories` slug uploads-fails while the dry-run is clean (check slugs against
+`https://crates.io/api/v1/categories` — `development-tools::testing` and `web-programming::http-clients`
+do NOT exist; the engine's four were checked), and cargo **strips `[workspace]` and prunes the lock**
+when packaging, so the shipped manifest has no `members = ["fulcrum"]` and its 283-package lock holds
+no entry for the never-published daemon. A consumer therefore cannot resolve a package that will never
+exist on the registry. The workflow's two jobs are to refuse a version the tree does not carry, and to
 create the release. Its `workflow_dispatch` mode rehearses the gate on a branch and creates
 nothing — and it prints that it created nothing, so a green rehearsal is never mistaken for a
 shipped release.
