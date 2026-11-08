@@ -273,9 +273,11 @@ are the measurements behind making it:
   namespaces** (`fulcrum::harness`). Accepted in 2022, still unimplemented as of the
   2026 project goals ("needs contributor"), and it needs the root name — which is taken.
 
-`fulcrum-harness` and the `fulcrum-harness-*` family were all still free at the time of
-writing. Nothing is published, so a future rename is still cheap; it stops being cheap
-the moment `cargo publish` runs.
+`fulcrum-harness` and the `fulcrum-harness-*` family were all free when this was first
+written. **`fulcrum-harness` 0.1.0 is now published on crates.io, so that name is
+burned permanently** — crates.io has no rename and no delete, which is the very
+property that made `fulcrum-core` unusable. The rest of the `fulcrum-harness-*` family
+is still unclaimed, and the daemon is deliberately NOT published (`publish = false`).
 
 ### The daemon member's name: one package, four surviving `fulcrum`s
 
@@ -332,12 +334,51 @@ refuses fewer than two version-bearing members.
 
 ## Consuming it
 
+Two channels exist now, and they are not interchangeable:
+
 ```toml
-[dependencies]
+# crates.io — the published release
+fulcrum-harness = "0.1.0"
+
+# or git, pinned to a commit
 fulcrum-harness = { git = "https://github.com/archimedes-codes/fulcrum", rev = "<pinned-rev>" }
 ```
 
-The engine is pre-1.0 and moves with its consumer; pin a `rev`, not a branch.
+The registry route is verified end to end, not assumed: a scratch crate depending on
+`fulcrum-harness = "0.1.0"` resolved from the sparse index, compiled, and ran
+(`SessionId::mint()`), and docs.rs renders the rustdoc.
+
+**A pre-rename git pin keeps working only if you leave the dep line alone.** Measured
+against two scratch consumers at `rev = "ae1fe97"`, which predates PR #17:
+
+| Dep line | Result |
+| --- | --- |
+| `fulcrum-core = { git = "…", rev = "ae1fe97" }` | **Works** — `Checking fulcrum-core v0.1.0 (…?rev=ae1fe97#ae1fe970)` |
+| `fulcrum-harness = { git = "…", rev = "ae1fe97" }` | **Fails** — `error: no matching package named \`fulcrum-harness\` found` |
+
+A rev freezes the manifest at that commit, so the *name in your dep line* has to match
+the name that commit declares. Renaming the dep line and keeping an old rev is the
+combination that breaks.
+
+**Do not use `tag = "v0.1.0"` with a `version` field.** The plan to move the desktop
+from `rev` to `tag` + `version` runs into the rename: `v0.1.0` points at `ae1fe97`, an
+**ancestor** of PR #17, whose manifest still declares `name = "fulcrum-core"`. Measured
+against a scratch consumer:
+
+```
+fulcrum-harness = { git = "…", tag = "v0.1.0", version = "0.1.0" }
+error: no matching package named `fulcrum-harness` found
+```
+
+Loud, not silent — but it will bite the first person who tries the intended pin form.
+The fix is a **new tag on a post-rename commit**, not a repoint of `v0.1.0`; moving a
+released tag is exactly what the ancestry gate in `release.yml` exists to prevent.
+
+`scripts/check-versions.sh --tag v0.1.0` does **not** catch this. It compares the tag's
+*name* against the agreed manifest version and never reads the tagged commit's
+manifest, so it printed `versions match: 0.1.0` (exit 0) over a tag whose tree names a
+different crate. Same vacuous-pass family as `-p`'s subtree form and a blind census
+root: the guard proves the thing it can see, which here is a string in a ref name.
 
 For working on the engine and its consumer at the same time, put a `[patch]` in the
 **consumer's** `.cargo/config.toml` (not here — a patch on the dependency's own side

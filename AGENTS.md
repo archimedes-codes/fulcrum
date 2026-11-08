@@ -335,14 +335,30 @@ when the tagged manifest carries that version. That makes the tag and the manife
 contract, which is why `check-versions.sh --tag vX.Y.Z` is the first step of
 `release.yml` and not a nicety: a tag outrunning the files produces a pin nothing can install.
 
+**`--tag` is weaker than that sentence implies, and `v0.1.0` proves it.** The flag parses the
+version out of the tag's *name* and compares it to the agreed manifest version; it never reads
+the tagged commit's manifest. So it cannot see a tag whose tree declares a **different package
+name**. Measured today: `bash scripts/check-versions.sh --tag v0.1.0` prints
+`versions match: 0.1.0` and exits **0**, while `v0.1.0` points at `ae1fe97` — an ancestor of
+PR #17, whose `Cargo.toml` still says `name = "fulcrum-core"`. A consumer using the intended
+pin form fails at resolution instead: `fulcrum-harness = { git = "…", tag = "v0.1.0",
+version = "0.1.0" }` gives `error: no matching package named \`fulcrum-harness\` found`.
+Loud, and correct to be loud, but the guard that claims to prevent it passes. Do not treat a
+green `--tag` as proof that a tag is installable; it proves a version *number* agrees. The fix
+for a pre-rename tag is a **new tag on a post-rename commit**, never a repoint of a released
+one — repointing is exactly what the ancestry gate exists to forbid.
+
 **What `release.yml` publishes: a GitHub release and its notes, and nothing else.** There is
 no build stage and no artifact upload, deliberately — no consumer installs a binary today (the
 desktop compiles the engine from source as a git dependency), and an unsigned tarball that
-looks like a supported install channel is worse than none. No `cargo publish` either: neither
-`fulcrum-harness` nor `fulcrum-harness-daemon` is on crates.io, and a name squat there is not recoverable by
-renumbering. Note the bare forms are NOT free — `fulcrum` is a profiler crate and `fulcrum-core` is a
-seven-crate "Fulcrum AI agent framework" family — which is what the two renames moved off; see *The name*
-in the README. Nothing is published today, and `default-members` lists both packages, so a bare
+looks like a supported install channel is worse than none. `cargo publish` is also not part of
+the workflow, but the engine **is** on crates.io now: `fulcrum-harness` 0.1.0 was published by
+hand from `b52ce68`, and that name is burned permanently — crates.io supports neither rename nor
+delete, the same property that made `fulcrum-core` unusable. `fulcrum-harness-daemon` is NOT
+published and declares `publish = false`. Note the bare forms are NOT free — `fulcrum` is a
+profiler crate and `fulcrum-core` is a seven-crate "Fulcrum AI agent framework" family — which
+is what the two renames moved off; see *The name*
+in the README. Because `default-members` lists both packages, a bare
 `cargo publish` at this root verifies the daemon too; the daemon now declares `publish = false`,
 which makes that command say *"`fulcrum-harness-daemon` cannot be published"* instead of the
 misleading "all dependencies must have a version requirement … `fulcrum-harness` does not specify a
