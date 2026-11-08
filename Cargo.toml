@@ -88,6 +88,23 @@ repository = "https://github.com/archimedes-codes/fulcrum"
 keywords = ["ai", "agent", "harness", "llm", "mcp"]
 categories = ["artificial-intelligence", "asynchronous", "network-programming", "api-bindings"]
 
+# What the published .crate does NOT carry. Each entry is inert to the shipped
+# crate, and each was checked rather than assumed:
+#   scripts/    the repo's own guards. Nothing in `src/` or `tests/` reads them at
+#               runtime (the only `scripts/` hits in engine source are string
+#               literals inside permission-rule tests), and the `childproc` census
+#               walks `src/` only, so excluding them cannot blind a guard.
+#   .github/    CI workflows; meaningless outside this repo.
+#   docs/roadmap/ planning documents that describe this repo's task history.
+#   AGENTS.md   contributor instructions.
+# `tests/` is DELIBERATELY STILL SHIPPED. `tests/fixture_bins.rs` is the build
+# contract: cargo only writes a package's binaries to the top of `target/debug/`
+# when it builds an integration-test target, and lib unit tests spawn the fixture
+# bins by path. Measured by deleting `tests/` from the extracted .crate: 8 lib
+# tests fail (`mcp::manager::tests::*`, `mcp::stdio::tests::*`,
+# `turn_lifecycle::*`). `docs/features/` stays too — README links into it.
+exclude = ["/scripts", "/.github", "/docs/roadmap", "/AGENTS.md"]
+
 # S8b.1 — the crate's OWN fixture binaries, so `cargo test` inside this package
 # (including a copy of it standing alone, which is the T8b condition) builds the
 # two process fixtures it spawns instead of reaching for bins owned by the
