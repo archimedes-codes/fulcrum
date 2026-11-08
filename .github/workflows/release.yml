@@ -90,11 +90,27 @@ jobs:
       #
       # TWO gates, both cheap, both about a tag nobody intended to ship.
       #
-      # (1) ANNOTATED, not lightweight. `git cat-file -t` answers `tag` for an
-      #     annotated tag and `commit` for a lightweight one. The annotated form
-      #     is what carries the release message and the tagger date; a
-      #     lightweight tag is a pointer someone made in a hurry. The skill's
-      #     rule is `git tag -a`, so this asserts the rule instead of trusting it.
+      # (1) ANNOTATED, not lightweight. The annotated form is what carries the
+      #     release message and the tagger date; a lightweight tag is a pointer
+      #     someone made in a hurry. The skill's rule is `git tag -a`, so this
+      #     asserts the rule instead of trusting it.
+      #
+      # ⚠ THIS ASKS THE SERVER, AND IT HAS TO. The first run of this workflow died
+      #     on its own annotated tag, because the obvious `git cat-file -t` reads
+      #     the RUNNER's ref, and `actions/checkout` has already destroyed it: on a
+      #     tag trigger it resolves the tag (`git rev-parse refs/tags/v0.1.0`), then
+      #     fetches with `--no-tags` using the peeled commit on a refspec that
+      #     OVERWRITES the tag ref — `+<sha>:refs/tags/v0.1.0` — so the annotated
+      #     tag object is replaced by a lightweight one pointing at the same
+      #     commit. Verified in the failed run's log, and the server still answers
+      #     `type: tag` for the very same tag the runner called a commit. A local
+      #     `git cat-file -t v0.1.0` cannot reproduce it: locally the ref is the
+      #     real object, which is exactly why this bug could only be found by
+      #     running the workflow once.
+      #
+      # `gh api …/git/ref/tags/$TAG` reads the git server, which is the thing under
+      # test. Measured against both forms: `tag` for an annotated tag, `commit` for
+      # a lightweight one (a probe tag pushed and deleted to prove it).
       # (2) ON MAIN. A release should be a commit `main` has already proven —
       #     `ci.yml` runs the whole bar on `main` and `feature/*` pushes and on
       #     every PR, so a commit reachable from `main` is a commit that passed
@@ -113,20 +129,28 @@ jobs:
       - name: Check the tag is annotated
         if: github.event_name == 'push'
         run: |
-          kind="$(git cat-file -t "$GITHUB_REF_NAME")"
+          kind="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.type)"
           if [ "$kind" != "tag" ]; then
-            echo "::error::tag $GITHUB_REF_NAME is a $kind, not an annotated tag — release with \`git tag -a v0.1.0 -m 'Release v0.1.0'\`"
+            echo "::error::tag $GITHUB_REF_NAME is a $kind on the server, not an annotated tag — release with \`git tag -a v0.1.0 -m 'Fulcrum v0.1.0'\`"
             exit 1
           fi
+          echo "tag $GITHUB_REF_NAME is annotated (git object type: tag)"
 
       - name: Check the tagged commit is on main
         if: github.event_name == 'push'
         run: |
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$GITHUB_REF_NAME^{commit}" FETCH_HEAD; then
-            echo "::error::$GITHUB_REF_NAME does not point at a commit reachable from origin/main — release a commit that passed the merge bar, not one from an unmerged branch"
+          # `${{ github.sha }}` and not `$GITHUB_REF_NAME^{commit}`: for a tag push
+          # github.sha IS the peeled commit, so this depends on no local ref at all.
+          # The step above just learned the hard way that `actions/checkout` rewrites
+          # the tag ref in the runner's clone; a ref-free form cannot be bitten the
+          # same way. Both were measured against the flattened ref and both pass —
+          # this one simply has one fewer thing that can be lied to it.
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not reachable from origin/main — release a commit that passed the merge bar, not one from an unmerged branch"
             exit 1
           fi
+          echo "$GITHUB_REF_NAME is reachable from origin/main"
 
       # `||` instead of view-then-create, so a re-run on the same tag (a retried
       # failed job, or the re-tag flow) finds the existing release and keeps going
