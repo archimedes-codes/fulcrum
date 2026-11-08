@@ -962,6 +962,19 @@ fn a_discard_line_is_not_captured_as_child_output() {
 /// SAME entry production inserts in `dispatch_subagent`; the
 /// `handle` is `None` because these tests never talk to a Worker
 /// process, they hand the pump's feed the frames).
+///
+/// INERT ON THE TEARDOWN PATHS, and that is worth stating because callers
+/// pass a DIFFERENT parent id to `finish_subagent`: `finish_subagent`
+/// resolves the sink and the outcome delivery from its OWN
+/// `parent_session_id` PARAMETER, so this field never decides where a
+/// teardown close lands. It is NOT globally dead — the pump's
+/// `delivery_id` lookup reads it, and
+/// `lagged_frames_log_continue_and_preserve_partial_salvage` depends on
+/// exactly that — so the mismatch with the teardown's argument is inert,
+/// not a second source of truth. Left as a constant rather than a
+/// parameter because the tests that DO exercise the teardown's parent
+/// routing pass their own parent to `finish_subagent` anyway, and the
+/// ones that exercise the pump want THIS id.
 fn seed_drive(manager: &WorkerManager, child_id: &str) {
     manager
         .state
@@ -1001,7 +1014,7 @@ fn liveness_view(manager: &WorkerManager, child_id: &str) -> (u64, Vec<String>) 
         .unwrap_or_else(|p| p.into_inner());
     let drive = drives.get(child_id).expect("the drive is seeded");
     let liveness = drive.liveness_tx.borrow();
-    let mut ids: Vec<String> = liveness.in_flight.iter().cloned().collect();
+    let mut ids: Vec<String> = liveness.in_flight.keys().cloned().collect();
     ids.sort();
     (liveness.seq, ids)
 }
@@ -2045,6 +2058,792 @@ async fn an_answered_gates_card_is_not_closed_again_at_teardown() {
              card the user already answered"
     );
     manager.detach("g2");
+}
+
+// ── issue #12: teardown closes the child's OPEN tool rows ────────────────────
+
+/// The `session-update` frames the PARENT's sink received (the live half of a
+/// teardown close — the same channel the Worker's own `EmitPipeline::run`
+/// emits on, and the only one the Client's `session-update` listener reads).
+fn session_updates(sink_events: &SinkEvents) -> Vec<Value> {
+    emitted(sink_events, "session-update")
+        .into_iter()
+        .map(|payload| payload["update"].clone())
+        .collect()
+}
+
+/// The tool-call closes among them, keyed by `toolCallId` (one entry per
+/// emitted close, so a duplicate shows up as a second element).
+fn closed_tool_rows(sink_events: &SinkEvents) -> Vec<Value> {
+    session_updates(sink_events)
+        .into_iter()
+        .filter(|u| u["sessionUpdate"] == "tool_call_update")
+        .collect()
+}
+
+/// The CHILD-keyed display rows the teardown handed the persister through
+/// `hooks.on_event` — the DURABLE half (the live `session-update` above dies
+/// with the socket). `(the on_event envelope's id, is_subagent, the frame's
+/// own session_id, the rows)`.
+fn persisted_display_frames(events: &EventLog) -> Vec<(String, bool, String, Vec<Value>)> {
+    let mut out = Vec::new();
+    for (id, is_sub, evt) in events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        if let WorkerInboundEvent::Store(crate::worker_types::StoreFrame::Display {
+            session_id,
+            rows,
+        }) = evt
+        {
+            out.push((
+                id,
+                is_sub,
+                session_id,
+                rows.iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "kind": r.kind,
+                            "messageKey": r.message_key,
+                            "payload": r.payload_json,
+                        })
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    out
+}
+
+/// The drive's CURRENT in-flight tool-call ids (sorted) — the set
+/// `finish_subagent` drains at teardown, read through the pump's own `watch`.
+fn in_flight_view(manager: &WorkerManager, child_id: &str) -> Vec<String> {
+    let drives = manager
+        .state
+        .drives
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut ids: Vec<String> = drives
+        .get(child_id)
+        .expect("the drive is in flight")
+        .liveness_tx
+        .borrow()
+        .in_flight
+        .keys()
+        .cloned()
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The retained VALUE beside one in-flight id (`(tool_name, args)`) — what the
+/// announce carried and what the teardown close re-emits. `None` when the id is
+/// not open. The read the id-only view cannot make, and the only way to see
+/// whether a re-announce replaced the pair or left the first one in place.
+fn open_tool_call_view(
+    manager: &WorkerManager,
+    child_id: &str,
+    tool_call_id: &str,
+) -> Option<(String, Value)> {
+    let drives = manager
+        .state
+        .drives
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // The `watch::Ref` temporary must NOT outlive the `drives` guard (E0597) —
+    // bind the projection so the borrow dies inside the statement.
+    let view = drives
+        .get(child_id)
+        .expect("the drive is in flight")
+        .liveness_tx
+        .borrow()
+        .in_flight
+        .get(tool_call_id)
+        .map(|open| (open.tool_name.clone(), open.args.clone()));
+    view
+}
+
+/// A canned `tool_execution_start` carrying an EXPLICIT name + args (the
+/// `tool_start` helper hardcodes both, which is right for the boundary tests
+/// and wrong for the ones that must tell two announces apart).
+fn tool_start_with(tool_call_id: &str, tool_name: &str, args: Value) -> crate::events::RpcEvent {
+    crate::events::RpcEvent::tool_execution_start {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        args,
+    }
+}
+
+/// Bounded-wait until the pump has RECORDED `tool_call_id` as an outstanding
+/// tool call (the same race `wait_for_open_gate` closes for a gate: without
+/// this, the teardown can win the race against the recording and the test
+/// becomes flaky rather than false).
+async fn wait_for_in_flight(manager: &WorkerManager, child_id: &str, tool_call_id: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if in_flight_view(manager, child_id)
+            .iter()
+            .any(|id| id == tool_call_id)
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the pump never recorded `{tool_call_id}` as an open tool call");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The teardown of a drive seeded directly (no Worker process — `handle` is
+/// `None`, so `finish_subagent` skips the reap and there is nothing to leak).
+async fn tear_down_seeded_drive(manager: &WorkerManager, child_id: &str, parent_id: &str) {
+    finish_subagent(
+        &manager.state,
+        child_id,
+        parent_id,
+        &SubagentDispatchWire {
+            id: "live-dispatch".to_string(),
+            parent_session_id: parent_id.to_string(),
+            parent_cwd: "/tmp/space".to_string(),
+            parent_enabled_tools: vec!["bash".to_string()],
+            agent_name: "tester".to_string(),
+            name_resolution: AgentNameResolution::Matched,
+            launch: crate::subagent::LaunchConfig::default(),
+            task: "the wedged task".to_string(),
+            model_key: "fake/m1".to_string(),
+        },
+        SubagentOutcome::Failed {
+            reason: SubagentFailureReason::Cancelled,
+            error: "cancelled".to_string(),
+            output: String::new(),
+            metrics: Default::default(),
+        },
+        &SubagentOutcomeSink::Requester,
+    )
+    .await;
+}
+
+/// (issue #12) A child torn down with an OPEN tool row gets that row closed,
+/// keyed to the CHILD, with a payload that still carries the tool NAME and
+/// ARGS.
+///
+/// The mirror of `a_torn_down_child_closes_its_own_outstanding_gates`, for the
+/// set that file never read: `finish_subagent` drained `open_gates` and
+/// ignored `in_flight`, so a row the child never closed — a Worker that died
+/// mid-tool, a `Lagged` drop of the `tool_execution_end` off the 256-slot
+/// broadcast, a child the reaper caught inside a tool — stayed
+/// `in_progress` forever, in the live UI and in the persisted display table.
+///
+/// The anti-erase assertion is the point of this test, not an incidental one:
+/// `Store::persist_display` is a WHOLESALE overwrite
+/// (`ON CONFLICT … DO UPDATE SET payload_json = excluded.payload_json`), so a
+/// close carrying only `{toolCallId, status}` does not leave the row spinning,
+/// it REPLACES the row and deletes its `title` and `rawInput` — the card would
+/// render as an id with no name and no arguments. That is why `in_flight`
+/// retains the `tool_name` / `args` the announce carried rather than just the
+/// id, and why the row is built through `compute_display_rows`.
+///
+/// The teardown here is the CANCEL of a child parked inside a tool (the
+/// `__in_tool__` fixture holds its announce open for 3 s, so the ADR 0055
+/// silence clock is DISARMED and only the cancel can end the drive) — the
+/// frames arrive over the REAL IPC wire, so the retained name + args are the
+/// ones the child actually sent.
+#[tokio::test]
+async fn a_torn_down_child_closes_its_own_open_tool_rows() {
+    let (manager, _crashes, events, sinks) = make_manager(Some(Duration::from_secs(30)));
+    let sink_events = register_sink(&sinks, "t1-parent");
+    manager
+        .attach("t1-parent", &test_env("t1-parent", None))
+        .await
+        .expect("the parent attach completes");
+    dispatch_child_task_with_id(&manager, "t1-parent", "__in_tool__", "sub1");
+    let child_id = wait_for_child_id(&sink_events).await;
+    // The announce reached the pump and the id is OUTSTANDING (the vacuity
+    // witness: without it this test would assert on a child that never opened
+    // a row and prove nothing).
+    wait_for_in_flight(&manager, &child_id, "t1").await;
+    assert_eq!(
+        in_flight_view(&manager, &child_id),
+        vec!["t1".to_string()],
+        "the child is inside an UNCLOSED tool call at teardown time"
+    );
+
+    // The parent aborts the turn → the child is cancelled and torn down.
+    manager
+        .handle_for("t1-parent")
+        .expect("the parent handle is reachable")
+        .send_prompt("__cancel__", &[])
+        .expect("the cancel prompt encodes");
+    let closed = wait_for_closed(&sink_events).await;
+    assert_eq!(closed["status"], "failed");
+    assert_eq!(
+        closed["reason"], "cancelled",
+        "the machine-readable why rides the close payload (the card's \
+             short line reads it, never `error`) — the same assertion the gate \
+             precedent `a_torn_down_child_closes_its_own_outstanding_gates` \
+             makes: {closed}"
+    );
+
+    // (1) The LIVE close — an open card must stop spinning without a reload.
+    let rows = closed_tool_rows(&sink_events);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the child's one open tool row is closed exactly once: {:?}",
+        session_updates(&sink_events)
+    );
+    assert_eq!(rows[0]["toolCallId"], "t1");
+    assert_eq!(
+        rows[0]["status"], "failed",
+        "a row that never completed settles FAILED — `mapStatus` in \
+             `lib/transcript/reducer.ts` has exactly one terminal non-success \
+             spelling, and `finalizeSessionMessages` uses it for the same case"
+    );
+    // THE ANTI-ERASE ASSERTION: the title and the args SURVIVE the close.
+    assert_eq!(
+        rows[0]["title"], "bash",
+        "the close carries the tool NAME the announce carried (the store \
+             overwrites the whole payload, so a close without a title erases it)"
+    );
+    assert_eq!(
+        rows[0]["rawInput"],
+        serde_json::json!({ "command": "sleep 3" }),
+        "and the ARGS the announce carried, for the same reason: {rows:?}"
+    );
+    // The honest terminal output: the tool did not fail, the child was torn
+    // down, and the row says so where the failure tooltip reads.
+    assert_eq!(
+        rows[0]["rawOutput"]["isError"], true,
+        "a row closed by teardown is an error row, not a success: {rows:?}"
+    );
+    let output_text = rows[0]["rawOutput"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        output_text.contains("torn down"),
+        "the row says what actually happened (the child was torn down), not \
+             that the tool failed: {output_text:?}"
+    );
+
+    // (2) The DURABLE close — the live frame dies with the socket; the row
+    // only survives a reload if it reaches the display table.
+    let persisted = persisted_display_frames(&events);
+    assert_eq!(
+        persisted.len(),
+        1,
+        "the close is routed to the persister exactly once: {persisted:?}"
+    );
+    let (envelope_id, is_sub, frame_sid, frame_rows) = &persisted[0];
+    assert_eq!(
+        frame_sid, &child_id,
+        "the `StoreFrame::Display` carries the CHILD's own id — that is the id \
+             `TranscriptPersister::apply` re-derives from INSIDE the frame and \
+             therefore the id the display row is written under"
+    );
+    assert_eq!(
+        envelope_id, &child_id,
+        "and it is delivered under the CHILD id too — which decides only which \
+             sockets see it (the relay filter reads the envelope), not where the \
+             row lands; see `finish_subagent`'s durable-half comment"
+    );
+    assert!(
+        *is_sub,
+        "with the subagent flag, so the persister ensures the CHILD's ephemeral row"
+    );
+    assert_eq!(
+        frame_rows[0]["kind"], "tool-call",
+        "the row is the tool-call kind the row already had (a different kind \
+             is a DIFFERENT upsert key and would leave the spinning row in place)"
+    );
+    assert_eq!(frame_rows[0]["messageKey"], "t1");
+    let payload = &frame_rows[0]["payload"];
+    assert_eq!(
+        payload["title"], "bash",
+        "the PERSISTED payload carries the title — this is the payload the \
+             wholesale overwrite writes, so this is where erasure happens or \
+             does not happen: {payload}"
+    );
+    assert_eq!(
+        payload["rawInput"],
+        serde_json::json!({ "command": "sleep 3" }),
+        "and the args: {payload}"
+    );
+    assert_eq!(payload["status"], "failed");
+
+    // The closes precede `subagent-closed` (the teardown drains BEFORE the
+    // lifecycle frame, exactly as the gate path does).
+    let all = sink_events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let idx = |name: &str| {
+        all.iter()
+            .position(|(e, _)| e == name)
+            .unwrap_or_else(|| panic!("no `{name}` event: {all:?}"))
+    };
+    assert!(
+        idx("session-update") < idx("subagent-closed"),
+        "the row closes precede the close frame: {all:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while manager.test_drive_count() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(manager.test_drive_count(), 0, "torn down");
+    manager.detach("t1-parent");
+}
+
+/// (issue #12 — the idempotency half) A row the child closed itself is NOT
+/// closed again at teardown. The pump removes the id on `tool_execution_end`,
+/// so teardown drains only what is STILL open; a teardown that closed every id
+/// it had ever seen would rewrite completed rows with a "torn down" output and
+/// destroy the tool's real result (the same wholesale overwrite, now eating
+/// successes).
+#[tokio::test]
+async fn a_tool_row_the_child_closed_itself_is_not_closed_again_at_teardown() {
+    let (manager, _crashes, events, sinks) = make_manager(Some(Duration::from_secs(30)));
+    let sink_events = register_sink(&sinks, "row-parent");
+    seed_drive(&manager, "row-child");
+    // The teardown removes the `drives` entry, so a post-teardown read of the
+    // liveness value needs its OWN handle on the channel — the same
+    // `SubagentLiveness` the drive's dead-bound guard reads, not a copy.
+    let liveness_tx = {
+        let drives = manager
+            .state
+            .drives
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        drives
+            .get("row-child")
+            .expect("the drive is seeded")
+            .liveness_tx
+            .clone()
+    };
+
+    // TWO announces (the batch announces every call before running any).
+    for id in ["t-open", "t-closed"] {
+        let start = tool_start(id);
+        feed_capture(&manager.state, "row-child", |capture, liveness| {
+            note_liveness_event(liveness, &start);
+            capture.observe_event(&start);
+            false
+        });
+    }
+    // The vacuity witness: BOTH ids really are outstanding.
+    assert_eq!(
+        in_flight_view(&manager, "row-child"),
+        vec!["t-closed".to_string(), "t-open".to_string()],
+        "the setup put BOTH rows in `in_flight` — without this the absence \
+             below would prove nothing"
+    );
+
+    // The child closes ONE of its rows properly (its real result arrives).
+    let end = tool_end("t-closed");
+    feed_capture(&manager.state, "row-child", |capture, liveness| {
+        note_liveness_event(liveness, &end);
+        capture.observe_event(&end);
+        false
+    });
+    assert_eq!(
+        in_flight_view(&manager, "row-child"),
+        vec!["t-open".to_string()],
+        "a `tool_execution_end` retires its own row (the removal is \
+             idempotent by design, ADR 0048)"
+    );
+
+    tear_down_seeded_drive(&manager, "row-child", "row-parent").await;
+
+    let rows = closed_tool_rows(&sink_events);
+    assert_eq!(
+        rows.len(),
+        1,
+        "ONLY the still-open row is closed — the one the child closed itself \
+             already carries its real `rawOutput` and must not be overwritten: {rows:?}"
+    );
+    assert_eq!(rows[0]["toolCallId"], "t-open");
+
+    // THE DURABLE HALF (the brief's Finding 7): the live half above proves the
+    // card stops spinning; this proves the PERSISTED row of the child-closed
+    // call is not rewritten. One frame, and it carries ONLY the still-open row
+    // — a second row here would be a wholesale overwrite eating the real
+    // `rawOutput` the child already wrote.
+    let persisted = persisted_display_frames(&events);
+    assert_eq!(
+        persisted.len(),
+        1,
+        "the close is handed to the persister exactly once: {persisted:?}"
+    );
+    let (envelope_id, is_sub, frame_sid, frame_rows) = &persisted[0];
+    assert_eq!(
+        (envelope_id.as_str(), frame_sid.as_str(), *is_sub),
+        ("row-child", "row-child", true),
+        "child-keyed, with the subagent flag: {persisted:?}"
+    );
+    let keys: Vec<&str> = frame_rows
+        .iter()
+        .map(|r| r["messageKey"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["t-open"],
+        "the DURABLE frame carries ONLY the still-open row — `t-closed` already \
+             owns a real result and the upsert overwrites whole payloads, so a \
+             second row here would destroy it: {frame_rows:?}"
+    );
+    assert_eq!(
+        frame_rows[0]["payload"]["toolCallId"], "t-open",
+        "and it is the right row: {frame_rows:?}"
+    );
+
+    assert!(
+        liveness_tx.borrow().in_flight.is_empty(),
+        "`finish_subagent` DRAINS `in_flight`, it does not merely read it. \
+             Nothing in THIS build reads the value after this point — the only \
+             reader it has ever had is this drive's own dead-bound guard \
+             (`if !in_flight`), and that race loop has already broken before the \
+             teardown runs — so the clear is for SELF-CONSISTENCY (a set whose \
+             contents claim work is outstanding when none is), not because a \
+             guard depends on it: {:?}",
+        liveness_tx.borrow().in_flight.keys().collect::<Vec<_>>()
+    );
+}
+
+/// (issue #12 — the keying half) Every frame a teardown close emits names the
+/// CHILD, never the parent. Which id matters differs per half, and the two are
+/// not the same claim: for the LIVE frame it is the PAYLOAD's `sessionId` the
+/// Client dispatches on, so a parent-keyed payload edits nothing on the child's
+/// slice and the card spins forever; for the DURABLE frame it is the frame's
+/// OWN internal `session_id`, which is what the persister writes the row under.
+/// The envelope id of the durable frame is a third thing again (it decides only
+/// which sockets see it) and is asserted child-keyed here as well.
+#[tokio::test]
+async fn an_open_tool_row_close_is_keyed_to_the_child_and_never_the_parent() {
+    let parent = "key-parent";
+    let child = "key-child";
+    let (manager, _crashes, events, sinks) = make_manager(Some(Duration::from_secs(30)));
+    let sink_events = register_sink(&sinks, parent);
+    seed_drive(&manager, child);
+    let start = tool_start("t9");
+    feed_capture(&manager.state, child, |capture, liveness| {
+        note_liveness_event(liveness, &start);
+        capture.observe_event(&start);
+        false
+    });
+    // The vacuity witness.
+    assert_eq!(
+        in_flight_view(&manager, child),
+        vec!["t9".to_string()],
+        "the child has an open row before the teardown"
+    );
+
+    tear_down_seeded_drive(&manager, child, parent).await;
+
+    // The live frame: emitted on the PARENT's sink (that is the sink a client
+    // is watching) but carrying the CHILD's `sessionId` in its payload — which
+    // is the field the Client's `session-update` listener dispatches on.
+    let live = closed_tool_rows(&sink_events);
+    assert_eq!(live.len(), 1, "the open row is closed: {live:?}");
+    let live_payloads = emitted(&sink_events, "session-update");
+    assert_eq!(
+        live_payloads[0]["sessionId"], child,
+        "the LIVE frame names the child (the Client keys the card list by the \
+             payload's `sessionId`, so a parent-keyed update edits nothing): {live_payloads:?}"
+    );
+
+    // The durable frame: the child's id in BOTH places a consumer can read.
+    let persisted = persisted_display_frames(&events);
+    assert_eq!(persisted.len(), 1, "one display frame: {persisted:?}");
+    for (envelope_id, _, frame_sid, _) in &persisted {
+        assert_eq!(
+            (envelope_id.as_str(), frame_sid.as_str()),
+            (child, child),
+            "the frame's OWN session id is what `TranscriptPersister::apply` \
+             writes, so it must be the child's (the envelope id only decides \
+             which sockets see the frame — see `finish_subagent`'s durable-half \
+             comment for the split)"
+        );
+        assert_ne!(frame_sid, parent, "and specifically not the parent's id");
+    }
+}
+
+/// (issue #12 — the MULTI-ROW half, Finding 3) Three behaviours of the teardown
+/// close are invisible to every other test here, because each of them has at
+/// most ONE open row at teardown (`a_tool_row_the_child_closed_itself_…` seeds
+/// two ids but CLOSES one itself, so the close it observes is a one-row close):
+///
+/// * the `sort_by` on the snapshot, which is what makes the emission order
+///   deterministic — a `HashMap` iterates in unstable order, and the wire order
+///   is observable (this is the same reason the gate path sorts);
+/// * the live-emission loop firing ONCE PER open row rather than once in total;
+/// * ONE `StoreFrame::Display` carrying N rows, built by running EACH update
+///   through `compute_display_rows` against the SAME `tool_call_state`
+///   accumulator.
+///
+/// What the per-row title/args assertion DOES catch, measured: an id paired with
+/// the WRONG retained pair (rotate `open_rows` so each id takes its neighbour's
+/// name + args — the real cross-talk shape, and it reddens here). What it does
+/// NOT catch, and the review brief expected it to: giving each update its OWN
+/// fresh `tool_call_state` instead of one shared map. That mutation is
+/// BEHAVIOURALLY INERT for distinct ids and this test passes over it, because
+/// every id is new to the map either way, so `is_new` is `true` and the entry
+/// merged into is EMPTY — exactly the fresh-state consequence
+/// `torn_down_tool_rows`'s own doc names. The sharing only matters if two
+/// updates ever share an id, which this batch never produces.
+///
+/// FIVE ids, inserted in REVERSE sorted order, not two. The review brief asked
+/// for two, and two cannot do the job the brief asks of it: with two keys, a
+/// `HashMap`'s random per-process hasher lands on sorted order about HALF the
+/// time (measured on this branch — dropping the `sort_by` reddened this test in
+/// 3 of 6 runs), so an unsorted implementation would pass the test as often as
+/// it failed it. Five keys put the accidental-pass rate at 1/5! ≈ 0.8%, and
+/// reverse insertion order still makes an insertion-ordered implementation fail
+/// EVERY time (sorted order is then the exact reverse of what it emits).
+#[tokio::test]
+async fn several_open_rows_at_teardown_close_in_sorted_order_with_their_own_payloads() {
+    let parent = "many-parent";
+    let child = "many-child";
+    let (manager, _crashes, events, sinks) = make_manager(Some(Duration::from_secs(30)));
+    let sink_events = register_sink(&sinks, parent);
+    seed_drive(&manager, child);
+
+    // FIVE announces, INSERTED in reverse sorted order, each with a DISTINCT
+    // name and DISTINCT args — so a payload that migrates between rows is
+    // visible rather than merely possible.
+    let batch: [(&str, &str, Value); 5] = [
+        (
+            "echo-call",
+            "grep",
+            serde_json::json!({ "pattern": "five", "path": "/tmp/e" }),
+        ),
+        (
+            "delta-call",
+            "edit",
+            serde_json::json!({ "path": "/tmp/d", "old_text": "x" }),
+        ),
+        (
+            "charlie-call",
+            "ls",
+            serde_json::json!({ "path": "/tmp/c" }),
+        ),
+        (
+            "bravo-call",
+            "read",
+            serde_json::json!({ "path": "/tmp/b", "limit": 7 }),
+        ),
+        (
+            "alpha-call",
+            "write",
+            serde_json::json!({ "path": "/tmp/a", "content": "z" }),
+        ),
+    ];
+    let sorted: Vec<&str> = {
+        let mut v: Vec<&str> = batch.iter().map(|(id, _, _)| *id).collect();
+        v.sort();
+        v
+    };
+    for (id, name, args) in batch {
+        let start = tool_start_with(id, name, args);
+        feed_capture(&manager.state, child, |capture, liveness| {
+            note_liveness_event(liveness, &start);
+            capture.observe_event(&start);
+            false
+        });
+    }
+    // The vacuity witness (the house pattern): ALL FIVE ids really are open
+    // before the teardown, so the counts asserted below cannot come from a
+    // setup that never opened them.
+    assert_eq!(
+        in_flight_view(&manager, child),
+        sorted
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>(),
+        "the setup left ALL FIVE rows open at teardown time — without this the \
+             counts below prove nothing"
+    );
+    // The insertion order really is the reverse of the sorted order (the
+    // witness that makes the order assertion below non-vacuous).
+    assert_eq!(
+        sorted.first().copied().unwrap_or_default(),
+        "alpha-call",
+        "the setup's LAST announce sorts FIRST — if this ever stops being true \
+             the order assertion below proves nothing: {sorted:?}"
+    );
+
+    tear_down_seeded_drive(&manager, child, parent).await;
+
+    // (1) The LIVE half: FIVE frames, one per open row, IN SORTED ID ORDER.
+    let rows = closed_tool_rows(&sink_events);
+    assert_eq!(
+        rows.len(),
+        5,
+        "the live loop fires ONCE PER open row (fewer frames here means the \
+             loop emits once and four cards spin forever): {rows:?}"
+    );
+    let live_ids: Vec<&str> = rows
+        .iter()
+        .map(|r| r["toolCallId"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        live_ids, sorted,
+        "emission order is SORTED, not insertion order (`echo-call` was \
+             announced FIRST and sorts LAST) and not `HashMap` order — without \
+             the `sort_by` on the snapshot this is whatever the per-process \
+             hasher decided: {live_ids:?}"
+    );
+
+    // (2) Each row keeps ITS OWN title and args, checked for EVERY row rather
+    //     than by sampling. This is the accumulator-cross-talk witness: the
+    //     durable rows are built by feeding all five updates through
+    //     `compute_display_rows` with ONE shared `tool_call_state`, so a merge
+    //     keyed on the wrong id lands here as one row wearing another's title.
+    let want_title = |id: &str| -> &'static str {
+        match id {
+            "echo-call" => "grep",
+            "delta-call" => "edit",
+            "charlie-call" => "ls",
+            "bravo-call" => "read",
+            _ => "write",
+        }
+    };
+    let want_args = |id: &str| -> Value {
+        match id {
+            "echo-call" => serde_json::json!({ "pattern": "five", "path": "/tmp/e" }),
+            "delta-call" => serde_json::json!({ "path": "/tmp/d", "old_text": "x" }),
+            "charlie-call" => serde_json::json!({ "path": "/tmp/c" }),
+            "bravo-call" => serde_json::json!({ "path": "/tmp/b", "limit": 7 }),
+            _ => serde_json::json!({ "path": "/tmp/a", "content": "z" }),
+        }
+    };
+    for row in &rows {
+        let id = row["toolCallId"].as_str().unwrap_or_default();
+        assert_eq!(
+            row["title"],
+            want_title(id),
+            "`{id}` carries the NAME its own announce carried, not a sibling's \
+             (shared-accumulator cross-talk): {row}"
+        );
+        assert_eq!(
+            row["rawInput"],
+            want_args(id),
+            "`{id}` carries ITS OWN args: {row}"
+        );
+        assert_eq!(row["status"], "failed", "`{id}` settles terminal: {row}");
+    }
+
+    // (3) The DURABLE half: ONE frame, FIVE rows, five distinct keys,
+    //     child-keyed.
+    let persisted = persisted_display_frames(&events);
+    assert_eq!(
+        persisted.len(),
+        1,
+        "ALL FIVE rows ride a SINGLE `StoreFrame::Display` (N frames would mean \
+             the batch is emitted per row, which the pump's own upsert shape \
+             does not do): {persisted:?}"
+    );
+    let (envelope_id, is_sub, frame_sid, frame_rows) = &persisted[0];
+    assert_eq!(
+        (envelope_id.as_str(), frame_sid.as_str(), *is_sub),
+        (child, child, true),
+        "child-keyed on both ids and carrying the subagent flag: {persisted:?}"
+    );
+    assert_eq!(
+        frame_rows.len(),
+        5,
+        "the single frame carries ALL FIVE rows: {frame_rows:?}"
+    );
+    let keys: Vec<&str> = frame_rows
+        .iter()
+        .map(|r| r["messageKey"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        keys, sorted,
+        "five DISTINCT `message_key`s in the same sorted order (a repeated key \
+             would collapse two rows into one on the upsert and leave a card \
+             spinning): {frame_rows:?}"
+    );
+    for row in frame_rows {
+        let id = row["messageKey"].as_str().unwrap_or_default();
+        assert_eq!(
+            row["kind"], "tool-call",
+            "the kind the row already had — a different kind is a different \
+                 upsert key: {row}"
+        );
+        assert_eq!(
+            row["payload"]["toolCallId"], id,
+            "the PERSISTED payload names the row it is keyed under (a payload \
+                 that migrated between rows fails here): {row}"
+        );
+        assert_eq!(
+            row["payload"]["title"],
+            want_title(id),
+            "and the PERSISTED payload carries the right title: {row}"
+        );
+        assert_eq!(
+            row["payload"]["rawInput"],
+            want_args(id),
+            "and the right args: {row}"
+        );
+        assert_eq!(row["payload"]["status"], "failed", "{row}");
+    }
+}
+
+/// (issue #12 — the retained-value half, Finding 7) `note_liveness_event`
+/// documents that on a RE-ANNOUNCE of an id already open the LATEST name+args
+/// pair wins (`normalize` treats a `tool_execution_start` for an announced id as
+/// an UPDATE, and `merge_json` applies the same rule to the row). Until now
+/// nothing pinned it, and the claim is load-bearing for the teardown close: the
+/// row it writes re-emits the RETAINED pair, so a first-one-wins `entry` API
+/// here would silently persist the STALE name and args.
+#[test]
+fn a_re_announced_tool_call_keeps_the_latest_name_and_args() {
+    let (manager, _crashes, _events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    seed_drive(&manager, "re-child");
+
+    let first = tool_start_with("t-re", "bash", serde_json::json!({ "command": "ls" }));
+    feed_capture(&manager.state, "re-child", |capture, liveness| {
+        note_liveness_event(liveness, &first);
+        capture.observe_event(&first);
+        false
+    });
+    assert_eq!(
+        open_tool_call_view(&manager, "re-child", "t-re"),
+        Some(("bash".to_string(), serde_json::json!({ "command": "ls" }))),
+        "the first announce's pair is retained"
+    );
+
+    // The re-announce: a DIFFERENT name AND different args for the SAME id.
+    let second = tool_start_with(
+        "t-re",
+        "write",
+        serde_json::json!({ "path": "/tmp/second" }),
+    );
+    feed_capture(&manager.state, "re-child", |capture, liveness| {
+        note_liveness_event(liveness, &second);
+        capture.observe_event(&second);
+        false
+    });
+    assert_eq!(
+        open_tool_call_view(&manager, "re-child", "t-re"),
+        Some((
+            "write".to_string(),
+            serde_json::json!({ "path": "/tmp/second" })
+        )),
+        "the LATEST pair wins on a re-announce (a first-one-wins insert would \
+             leave `bash` here, and the teardown would then persist a row whose \
+             title and input describe a call that no longer exists)"
+    );
+    // Still ONE open row — the re-announce updates, it does not double-count.
+    assert_eq!(
+        in_flight_view(&manager, "re-child"),
+        vec!["t-re".to_string()],
+        "one id, one entry (the set stays keyed, so a re-announce cannot \
+             inflate what the dead-bound guard reads)"
+    );
 }
 
 /// The `subagent-session-started` + `subagent-closed` UI lifecycle

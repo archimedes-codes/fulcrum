@@ -13,9 +13,11 @@ use crate::harness::r#loop::tool_specs;
 use crate::harness::{ModelKey, ModelRef};
 use crate::normalize::is_bookkeeping_message_id;
 use crate::subagent::{SubagentFailureReason, SubagentMetrics, SubagentOutcome};
+use crate::tools::ToolResult;
 use crate::types::mint_session_id;
-use crate::worker::client::WorkerHandle;
+use crate::worker::client::{WorkerHandle, WorkerInboundEvent};
 use crate::worker::protocol::{DesktopConfig, Inbound, StartEnv, StartMode, SubagentDispatchWire};
+use crate::worker_types::StoreFrame;
 
 use super::pump::start_pump;
 use super::registry::{reap_worker, ManagerState};
@@ -343,6 +345,26 @@ impl SubagentCapture {
     }
 }
 
+/// One tool call the child ANNOUNCED and has not closed (issue #12).
+///
+/// `in_flight` used to be a `HashSet<String>` and it carried the whole truth
+/// the drive needed ("is anything outstanding?") while carrying nothing the
+/// teardown needed. `finish_subagent` now closes those rows, and a close is a
+/// display-row UPSERT, which `Store::persist_display` writes as a WHOLESALE
+/// overwrite (`ON CONFLICT … DO UPDATE SET payload_json =
+/// excluded.payload_json`, `fulcrum/src/db/mod.rs`) — so an id alone would
+/// overwrite the row with `toolCallId` + `status` and DELETE its `title` and
+/// `rawInput`. The announce (`tool_execution_start`) carries exactly those two
+/// fields, and the pump used to discard them; they are retained here so the
+/// Supervisor can write a COMPLETE row rather than an erasing one.
+#[derive(Debug, Clone)]
+pub struct OpenToolCall {
+    /// The tool name the announce carried (the row's `title`).
+    pub tool_name: String,
+    /// The arguments the announce carried (the row's `rawInput`).
+    pub args: Value,
+}
+
 /// The subagent's liveness signal (ADR 0055): `seq` bumps on EVERY frame the
 /// pump sees for this child, and `in_flight` holds the `tool_call_id`s that
 /// have been ANNOUNCED (`tool_execution_start`) and not yet closed
@@ -351,11 +373,13 @@ impl SubagentCapture {
 /// The skew is one-directional: it can only keep a child alive longer, never
 /// cut it sooner.
 ///
-/// A `HashSet` and NOT a counter, deliberately: ADR 0048 has the cancel and
+/// A `HashMap` and NOT a counter, deliberately: ADR 0048 has the cancel and
 /// turn-abandoned paths emit `tool_execution_end` for calls that were announced
 /// but never dispatched, so an `end` without a `start` is LEGAL. A counter would
-/// go negative and un-block a child that is still working; a set's removal is
-/// idempotent.
+/// go negative and un-block a child that is still working; a keyed set's
+/// removal is idempotent. (Issue #12 changed the container from `HashSet` to
+/// `HashMap<String, OpenToolCall>` — the idempotency is the map's, unchanged;
+/// what the VALUE is for is [`OpenToolCall`]'s doc.)
 ///
 /// TWO mechanisms produce that `end`, and the second is why the removal must be
 /// idempotent rather than merely tolerant:
@@ -375,7 +399,7 @@ impl SubagentCapture {
 #[derive(Debug, Default)]
 pub struct SubagentLiveness {
     pub seq: u64,
-    pub in_flight: std::collections::HashSet<String>,
+    pub in_flight: HashMap<String, OpenToolCall>,
     /// The **gates** this child opened that the user has not answered
     /// (`PermissionRequest` / `InteractiveRequest` seen, answer not yet relayed).
     /// Drained at teardown to close the child's own cards (ADR 0055) — on
@@ -412,8 +436,24 @@ pub(crate) fn note_liveness_frame(liveness: &mut SubagentLiveness) {
 pub(crate) fn note_liveness_event(liveness: &mut SubagentLiveness, event: &RpcEvent) {
     liveness.seq += 1;
     match event {
-        RpcEvent::tool_execution_start { tool_call_id, .. } => {
-            liveness.in_flight.insert(tool_call_id.clone());
+        RpcEvent::tool_execution_start {
+            tool_call_id,
+            tool_name,
+            args,
+        } => {
+            // The announce's name + args are RETAINED, not discarded (issue
+            // #12) — the teardown needs them to write a complete row. On a
+            // re-announce of an id already open (`normalize` documents that
+            // `tool_execution_start` for an announced id is an UPDATE, so the
+            // name/args can arrive twice) the LATEST pair wins, which is the
+            // same rule `normalize`'s `merge_json` applies to the row.
+            liveness.in_flight.insert(
+                tool_call_id.clone(),
+                OpenToolCall {
+                    tool_name: tool_name.clone(),
+                    args: args.clone(),
+                },
+            );
         }
         RpcEvent::tool_execution_end { tool_call_id, .. } => {
             liveness.in_flight.remove(tool_call_id);
@@ -1064,6 +1104,33 @@ async fn drive_subagent(
             // outstanding — a child inside a tool, parked on a gate, or
             // awaiting its own nested Subagent is Active and has NO timeout.
             // In that state the bound is not "longer"; it does not run.
+            //
+            // (issue #12, the recorded residual.) That makes `in_flight` the
+            // one thing standing between a wedged child and a reaper, so a
+            // STALE id — announced, never closed, and the child never settles —
+            // leaves this drive with NO timeout at all, endable only on settle,
+            // process exit or cancel. Teardown (`finish_subagent`) now closes
+            // those rows and drains the set, but teardown is exactly what an
+            // unending drive never reaches, so this fix cannot repair the
+            // unreapable case in isolation. Do NOT close it here with an
+            // age-based staleness heuristic: a child parked on a nested
+            // delegation is legitimately silent longer than any constant worth
+            // naming, and ADR 0055 exists precisely to stop reaping live work.
+            // The honest shape of the fix is a bound on the THING BEING WAITED
+            // ON (the nested dispatch, the tool's own execution), not a bound
+            // on the silence that follows it.
+            //
+            // The same residual is now WIDER in one more dimension (issue #12
+            // review): `in_flight` used to hold ids and now retains each call's
+            // full `args` `Value`, so a stale entry pins its announce's bytes
+            // for the life of the drive — and nothing caps them on the args side
+            // (`write`'s `content` param is unbounded and `fs_backend` writes it
+            // whole; `MAX_OUTPUT_BYTES` = 100 KiB caps tool RESULTS only), while
+            // a `Lagged` drop of the `tool_execution_end` off the frame ring is
+            // exactly what makes an entry permanent. That documents a WIDENED
+            // constant, not a new leak: the old `HashSet` was already unbounded
+            // in COUNT, and the same stale id suppresses the only reaper either
+            // way. No cap and no eviction policy is added here for that reason.
             _ = &mut sleep, if !in_flight => break Race::Dead,
         };
     };
@@ -1240,6 +1307,67 @@ fn preflight_failed(error: String) -> SubagentOutcome {
     }
 }
 
+/// (issue #12) The `session-update` that closes ONE of a torn-down child's
+/// still-open tool rows.
+///
+/// The payload is deliberately a COMPLETE `tool_call_update` and not the
+/// `{toolCallId, status}` pair a close "only" needs, because of how it is
+/// stored: `Store::persist_display` is a WHOLESALE overwrite —
+/// `ON CONFLICT … DO UPDATE SET payload_json = excluded.payload_json` — and the
+/// merge that would have preserved `title` / `rawInput` lives in
+/// `normalize::compute_display_rows`' `tool_call_state`, which is per-Worker
+/// state the Supervisor does not hold. A partial payload therefore does not
+/// leave the row spinning, it REPLACES the row and deletes the tool's name and
+/// arguments — the card comes back after a reload as an unlabelled id with no
+/// input, which is a worse failure than the spinner it replaced. So the two
+/// fields the announce carried and the pump used to discard are re-emitted
+/// here, exactly as `normalize`'s `tool_execution_start` arm emits them.
+///
+/// `status` is `"failed"` for the same reason the desktop's own
+/// `finalizeSessionMessages` marks a closed session's still-pending rows
+/// `failed`: `mapStatus` has exactly one terminal non-success spelling, and a
+/// row that never produced a result is not a completed one. `rawOutput` says
+/// what actually happened — the child was torn down, the tool may or may not
+/// have run — rather than inventing a tool error.
+fn torn_down_tool_update(tool_call_id: &str, open: &OpenToolCall) -> Value {
+    let raw_output = serde_json::to_value(ToolResult::torn_down()).unwrap_or(Value::Null);
+    json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "title": open.tool_name,
+        "rawInput": open.args,
+        "status": "failed",
+        "rawOutput": raw_output,
+    })
+}
+
+/// The display rows for the closes above, built through `compute_display_rows`
+/// rather than hand-rolled JSON.
+///
+/// That function is the SAME code the Worker runs before it persists a tool
+/// frame, so the row's shape is a fact about the crate and not about this file
+/// staying in sync. One consequence must be understood before changing anything
+/// here: it is called with a FRESH `tool_call_state` map — the Supervisor has no
+/// view of the child's — so `is_new` is `true` and the entry it merges into is
+/// EMPTY. The row's payload is therefore EXACTLY the fields the update carries
+/// and nothing more, which is precisely why [`torn_down_tool_update`] supplies
+/// the retained `title` / `rawInput`. Trim the update to `{toolCallId, status}`
+/// and this function hands back a row that erases the tool, because the merge
+/// that would have saved it has nothing to merge into.
+fn torn_down_tool_rows(updates: &[Value]) -> Vec<crate::store_rows::DisplayRow> {
+    // The three accumulators `compute_display_rows` needs, all EMPTY: this is
+    // the fresh-state consequence the doc above names.
+    let text_acc: StdMutex<HashMap<String, String>> = StdMutex::new(HashMap::new());
+    let tool_state: StdMutex<HashMap<String, Value>> = StdMutex::new(HashMap::new());
+    let thought_state = StdMutex::new(crate::normalize::ThoughtState::default());
+    updates
+        .iter()
+        .flat_map(|u| {
+            crate::normalize::compute_display_rows(u, &text_acc, &tool_state, &thought_state)
+        })
+        .collect()
+}
+
 /// The UNCONDITIONAL teardown (settle / Dead / cancel / crash): the
 /// `subagent-closed` UI lifecycle event (EVERY exit path — the
 /// `subagent.rs:721/743` payload shapes: `status` / `reason` / `error` /
@@ -1255,21 +1383,31 @@ pub(crate) async fn finish_subagent(
     outcome: SubagentOutcome,
     sink: &SubagentOutcomeSink,
 ) {
-    // The child's own UNANSWERED gates (ADR 0055): drained BEFORE the
-    // `subagent-closed` emission, from the `drives` entry — which is still
-    // valid here, because the removal below happens AFTER the emissions. A gate
-    // the user ANSWERED is already gone (`WorkerManager::note_gate_answered`
-    // cleared it at the relay), so only parked gates are closed — and a gate the
-    // user never answered is closed HERE even though its tool call came to a
-    // close (a cancelled gate fabricates one).
+    // The child's own UNANSWERED gates (ADR 0055) and its own STILL-OPEN tool
+    // rows (issue #12): both drained BEFORE the `subagent-closed` emission, from
+    // the `drives` entry — which is still valid here, because the removal below
+    // happens AFTER the emissions. A gate the user ANSWERED is already gone
+    // (`WorkerManager::note_gate_answered` cleared it at the relay), so only
+    // parked gates are closed — and a gate the user never answered is closed
+    // HERE even though its tool call came to a close (a cancelled gate
+    // fabricates one). Symmetrically, a tool row the child CLOSED itself is
+    // already out of `in_flight`, so only rows that never got their
+    // `tool_execution_end` are rewritten here.
     //
     // Read here and NOT snapshotted in `drive_subagent`: a gate can open
     // between that snapshot and this teardown, and this is the path that must
     // be exact.
-    let open_gates: Vec<String> = {
+    let (open_gates, open_rows): (Vec<String>, Vec<(String, OpenToolCall)>) = {
         let drives = state.drives.lock().unwrap_or_else(|p| p.into_inner());
         match drives.get(child_id) {
             Some(drive) => {
+                // HAZARD, currently benign: every `liveness_tx.borrow()` below
+                // and the `send_modify` after them take the SAME `watch` value
+                // lock. They are safe ONLY because each `borrow()` is a
+                // statement-scoped temporary whose guard dies with the statement.
+                // DO NOT BIND THESE BORROWS — hoisting one into a `let` that
+                // outlives the `send_modify` self-deadlocks the drive task on a
+                // `std` `RwLock`.
                 let mut ids: Vec<String> = drive
                     .liveness_tx
                     .borrow()
@@ -1277,15 +1415,82 @@ pub(crate) async fn finish_subagent(
                     .iter()
                     .cloned()
                     .collect();
-                // Sorted for a deterministic emission order (a `HashSet`'s
+                // Sorted for a deterministic emission order (a `HashMap`'s
                 // iteration order is unstable, and the emission order is
                 // observable on the wire).
                 ids.sort();
-                ids
+                let mut rows: Vec<(String, OpenToolCall)> = drive
+                    .liveness_tx
+                    .borrow()
+                    .in_flight
+                    .iter()
+                    .map(|(id, open)| (id.clone(), open.clone()))
+                    .collect();
+                rows.sort_by(|a, b| a.0.cmp(&b.0));
+                // DRAIN `in_flight` (issue #12).
+                //
+                // ONE CLAIM ABOUT THE CLEAR, stated once because the two
+                // passages this block used to carry contradicted each other.
+                // The clear is done for SELF-CONSISTENCY, not because a guard
+                // depends on it. The only reader `in_flight` has ever had is
+                // this drive's OWN dead-bound guard (`if !in_flight`, in
+                // `drive_subagent`'s race loop), and `finish_subagent` runs only
+                // AFTER that loop has broken — every `Race` arm `break`s before
+                // the teardown is reached — so by the time this line runs there
+                // is NO LIVE READER LEFT TO DISARM. The earlier claim that a
+                // stale id here "re-arms issue #12's second defect" was wrong
+                // for exactly that reason: the defect it named needs a reader,
+                // and the reader is gone. Leaving a drained id would leave a set
+                // whose contents are a lie about what is outstanding, which is a
+                // maintenance hazard, not a live bug.
+                //
+                // The snapshot and this clear share the ONE `drives` guard above
+                // (and `feed_capture` takes that same lock), so the two are
+                // ATOMIC against the pump: no id can slip in between the ids
+                // this teardown took responsibility for closing and the removal
+                // of exactly those ids.
+                //
+                // RESIDUAL — the window AFTER this block, and it is WIDE, not
+                // narrow. Between this clear and the `drives.remove` at the end
+                // of `finish_subagent` sits `reap_worker`, which awaits the
+                // child's exit with a grace of up to TWO SECONDS
+                // (`registry.rs`: `send_close` → `timeout(2s, exited)` → `kill`).
+                // The pump is live for all of that — it stops only when the
+                // process dies — so a `tool_execution_start` landing in those
+                // ~2 s inserts an id into the set this teardown just drained.
+                // That row is deliberately NOT closed (this snapshot is already
+                // taken), and once `drives.remove` lands NOTHING can ever repair
+                // it: `feed_capture` becomes a permanent no-op for this child,
+                // so the row stays `in_progress` in the live UI and in the
+                // display table for good. Say plainly: an announce that lands in
+                // the reap grace is left open and unrecoverable.
+                //
+                // This race is NOT introduced here, and a reader must not
+                // attribute it to this change — the pre-existing gate path has
+                // the identical hole (a gate opened during the same window is
+                // equally unsnapshotted, so its card is never closed), and both
+                // share the one cause: the snapshot and the entry removal are
+                // not one atomic step, and the reap await sits between them.
+                //
+                // `send_modify` reports MODIFIED unconditionally, so this clear
+                // fires a `liveness_rx.changed()` that carries no real news.
+                // Harmless ONLY because of the ordering above: the receiver is
+                // OWNED by `drive_subagent`, which RETURNS before this function
+                // is called from the drive task, so it is dropped and there is
+                // nothing left to notify. Reorder the teardown so a live
+                // receiver exists at this point and this becomes a spurious
+                // re-arm of the silence clock.
+                //
+                // `open_gates` is deliberately NOT cleared: nothing READS it to
+                // decide anything (its only other writer is the answer relay),
+                // so the self-consistency argument above does not even reach it
+                // — no reader ever claimed a gate set was a live fact.
+                drive.liveness_tx.send_modify(|l| l.in_flight.clear());
+                (ids, rows)
             }
             // The drive is already gone (an early-failure teardown) → nothing
             // was ever recorded.
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         }
     };
     // The guards are DROPPED before the emissions (a sink emission must never
@@ -1301,6 +1506,82 @@ pub(crate) async fn finish_subagent(
                 json!({ "sessionId": child_id, "requestId": request_id }),
             );
         }
+    }
+    // (issue #12) The child's tool rows it never closed, closed the same way —
+    // the LIVE frame first (an open card stops spinning without a reload), then
+    // the DURABLE frame (the live one dies with the socket; the row only
+    // survives one if it reaches the display table). Same snapshot, same
+    // drop-the-lock, same child keying as the gate loop above.
+    //
+    // The live frame goes on the PARENT's sink because that is the sink a client
+    // is watching (`watched` filters on the envelope's `sessionId`, and only
+    // parents are ever `start`ed) while the payload names the CHILD, which is
+    // the field the `session-update` listener dispatches on — the identical
+    // split the Worker's own `EmitPipeline::run` produces for a child's frames.
+    if !open_rows.is_empty() {
+        let updates: Vec<Value> = open_rows
+            .iter()
+            .map(|(id, open)| torn_down_tool_update(id, open))
+            .collect();
+        if let Some(sink) = state.hooks.sink_for(parent_session_id) {
+            for update in &updates {
+                sink.emit(
+                    "session-update",
+                    json!({ "sessionId": child_id, "update": update }),
+                );
+            }
+        }
+        // The durable half: routed through `hooks.on_event` so the router's
+        // persister applies it, exactly the path `decode_outbound` uses for the
+        // Worker's own `DisplayUpsert` (`client.rs` maps it to this same
+        // `StoreFrame::Display`). Delivered with `is_subagent: true`, which is
+        // what makes the persister ensure the CHILD's ephemeral `sessions` row
+        // before the upsert (the `native_messages` FK).
+        //
+        // TWO IDS, TWO JOBS — and only one of them decides the row. The frame's
+        // INTERNAL `session_id` is what `TranscriptPersister::apply` writes
+        // (`persist.rs`: every `StoreFrame` arm re-derives `sid` from the frame
+        // itself, and the daemon's `persist_frame` forwards only `is_subagent` +
+        // the frame), so THIS id — the child's — is what lands the row on the
+        // child's display table. The ENVELOPE id (`on_event`'s first argument)
+        // decides only WHICH SOCKETS SEE THE FRAME: the daemon publishes
+        // `event_frame(envelope_id, …)` and `serve.rs`'s `watched` relay filter
+        // matches that top-level `sessionId` against the ids a client `start`ed
+        // — always parents. It has no say in WHERE the row goes, so the claim
+        // this comment used to carry (that a parent-keyed envelope "writes the
+        // child's row onto the PARENT's display table") is simply false: a
+        // parent-keyed envelope would persist this row identically.
+        //
+        // WHY THE ENVELOPE IS STILL THE CHILD'S, then. Child-keying makes
+        // `watched` drop this frame for EVERY client, and that is the wanted
+        // outcome: the live half of this exact close went out a few statements
+        // above on the PARENT's sink, so the durable half has nothing to tell a
+        // socket it has not already been told, and putting it on the socket too
+        // would publish the same row twice. The envelope is also the honest one
+        // — this is a frame ABOUT the child.
+        //
+        // The honest limit of that reasoning, so nobody over-reads it as a
+        // keying RULE: the pump's own child `DisplayUpsert` frames are
+        // PARENT-keyed on the envelope (`pump.rs`'s `delivery_id`) and so pass
+        // the same filter, reaching clients ALONGSIDE the child's live
+        // `session-update` frames (which the parent's sink publishes through the
+        // daemon's `FanOutSink`, also parent-keyed). The daemon relays store
+        // frames to sockets rather than only persisting them — that is pinned by
+        // `fulcrum/tests/serve.rs`, which waits for a `transcript-insert` on the
+        // socket as well as on disk. So suppressing this frame's socket half is
+        // tidier, not load-bearing: the duplication it avoids is duplication
+        // this daemon already ships. What IS load-bearing is the frame's internal
+        // id, and the payload's `sessionId` on the live half (the field the
+        // Client dispatches on).
+        let rows = torn_down_tool_rows(&updates);
+        state.hooks.on_event(
+            child_id,
+            true,
+            WorkerInboundEvent::Store(StoreFrame::Display {
+                session_id: child_id.to_string(),
+                rows,
+            }),
+        );
     }
     // The `subagent-closed` UI lifecycle event (the PARENT session's
     // sink — the `subagent.rs:721/743` payload shapes).

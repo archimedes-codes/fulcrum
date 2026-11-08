@@ -66,6 +66,52 @@ impl ToolResult {
             is_error: true,
         }
     }
+
+    /// The result a Supervisor writes for a tool call whose Worker was torn
+    /// down before it could report (issue #12 — the Supervisor's teardown
+    /// closes a child's still-open display row, and the row needs an honest
+    /// `rawOutput`).
+    ///
+    /// A sibling of the harness's `cancelled_tool_result` /
+    /// `abandoned_tool_result` / `sudo_cancelled_result` (in
+    /// `harness::r#loop::tools`), and it lives HERE rather than beside them for
+    /// one mechanical reason: that module is a private `mod tools;` inside
+    /// `harness::r#loop`, so nothing outside it can name those three — and the
+    /// alternative (widening the declaration) edits `harness/loop.rs`, which is
+    /// off-limits while issue #11 is in flight. What matters is that there is
+    /// ONE constructor per sentence and the sentence is not re-typed at the
+    /// call site.
+    ///
+    /// NOT `abandoned_tool_result`'s sentence, because that one asserts a
+    /// different fact: ADR 0048's abandoned attempt never RAN. A child killed
+    /// mid-tool may have run the whole command and died before it could report
+    /// it, and "we do not know" is the only honest statement at the moment the
+    /// row is written.
+    ///
+    /// Do NOT read this as a durable guarantee though: the text is persisted,
+    /// but it is not the LAST word. A late real `tool_execution_end` can still
+    /// arrive off the frame ring after the teardown, and the `DisplayUpsert`
+    /// frame that the child's own emit pipeline derives from it hits the same
+    /// wholesale overwrite (`fulcrum/src/db/mod.rs`'s
+    /// `ON CONFLICT … DO UPDATE SET payload_json = excluded.payload_json`), so
+    /// that row REPLACES this claim with the tool's actual result. (It is the
+    /// upsert that writes, not the raw `RpcEvent` — a bare event reaches the
+    /// persister's socket half only, never the display table.) That makes the
+    /// wording MORE honest rather than less: the row says "unknown" for as long
+    /// as nothing better is known, and the only thing that displaces it is real
+    /// evidence of what happened.
+    pub fn torn_down() -> Self {
+        Self {
+            content: vec![ContentBlock::Text {
+                text: "no result — the Subagent running this tool was torn down \
+                       before it could report one, so whether the tool ran is \
+                       unknown"
+                    .to_string(),
+            }],
+            details: None,
+            is_error: true,
+        }
+    }
 }
 
 /// The stream a tool call reports ITS partial progress to (the bridge's
