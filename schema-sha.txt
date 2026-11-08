@@ -9,7 +9,8 @@
 # is not drift (lines are trimmed, blanks dropped); a renamed/retyped/reordered/
 # added/removed column or a lost index IS. Keep this file's diff reviewable next to
 # the DDL diff: change it in the same PR that changes both repos' DDL in lockstep,
-# then re-run `bash scripts/check-schema-drift.sh --self-test` and `cargo test -p fulcrum`.
+# then re-run `bash scripts/check-schema-drift.sh --self-test` and
+# `cargo test -p fulcrum-harness-daemon`.
 sessions
 id:TEXT
 cwd:TEXT

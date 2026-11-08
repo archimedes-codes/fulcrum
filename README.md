@@ -293,11 +293,22 @@ deliberate — `fulcrum/Cargo.toml` spells out `[lib] name = "fulcrum"` and
 | `[lib] name`, so `use fulcrum::…` | `fulcrum` | 45 lib tests and every `fulcrum::` path in the member |
 | `[workspace] members = ["fulcrum"]` | `fulcrum` | a **directory** path, not a package name |
 
-What *did* change is every `-p fulcrum`, because `-p` matches **package** names: seven
-references, one of them inside a live `panic!` message (`fulcrum/tests/transport.rs:1976`,
-the root-only test's "run it via …" hint). Measured: `cargo test -p fulcrum` now dies with
-`package ID specification \`fulcrum\` did not match any packages`, and **nothing in CI runs
-those strings** — they are doc comments and one message — so no gate catches a missed one.
+What *did* change is every `-p fulcrum`, because `-p` matches **package** names: **eight**
+references on `main`, one of them inside a live `panic!` message
+(`fulcrum/tests/transport.rs:1976`, the root-only test's "run it via …" hint). Measured:
+`cargo test -p fulcrum` now dies with `package ID specification \`fulcrum\` did not match
+any packages`, and **nothing in CI runs those strings** — they are doc comments, one
+message and one pin-file header — so no gate catches a missed one.
+
+Seven sit in the daemon member's own files. The eighth is `schema-sha.txt:12`, and it is
+worth naming because the sweep that found the other seven missed it: that sweep filtered
+`--include='*.rs' --include='*.toml' --include='*.sh' --include='*.md' --include='*.yml'`,
+and `.txt` is not in the list. **A name sweep with an extension allowlist is only as wide
+as the allowlist** — the same vacuous-pass shape this repo records for `-p`'s subtree form
+and a blind census root. `schema-sha.txt` is a comment line and all four readers strip
+`#` lines (`fulcrum/tests/db.rs` filters `starts_with('#')`; the guard's own self-test
+asserts "pin comments carry no comparison weight"), so it carried zero functional weight
+even when it was wrong — which is exactly why nothing caught it.
 `env!("CARGO_BIN_EXE_fulcrum")` is unaffected: it resolves by **bin** name.
 
 `CONTEXT.md` defines **Agent harness** as the model loop + tool registry + persistence +
