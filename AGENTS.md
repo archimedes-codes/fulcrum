@@ -4,12 +4,13 @@ This repo is a two-member Cargo workspace. `fulcrum-core` — the agent engine e
 [`archimedes-codes/archimedes`](https://github.com/archimedes-codes/archimedes), the
 desktop app (renamed from `archimedes-codes/desktop` after the extraction): the tool loop, provider clients, tools
 and sandbox, the MCP client, and the out-of-process worker. A library. It knows nothing about windows, trays, or
-the UI that renders it. Beside it sits `fulcrum`, the `fulcrum serve` daemon — **currently a stub**: its modules are
-declared and compile (`db/`, `transport/`, `serve`, `worker_factory`) and `fn main` is empty, so there is no
-listener, no database and no supervisor loop to run yet. The daemon exists to be the long-lived process supervisor
-that owns the SQLite file and multiplexes clients onto supervised worker processes
-(`docs/roadmap/fulcrum-daemon.md`, ADR 0091); it is a member rather than a rev-pinned consumer so it links the
-engine by `path = ".."` and cannot drift from it.
+the UI that renders it. Beside it sits `fulcrum`, the `fulcrum serve` daemon — **it runs**: one binary with two modes
+(`fulcrum serve` is the supervisor, `fulcrum --worker` the child it spawns, a self-exec of the same executable), a
+listener on a unix socket or a Windows named pipe, the SQLite file, and the accept loop that multiplexes clients onto
+supervised worker processes (ADR 0091). What it does *not* do yet is listed in
+`fulcrum/src/serve.rs:89-95` — no `attach`/replay (T10), no graceful shutdown frame so `run` never returns and
+`WorkerManager::reap_all` is unwired, and no authentication (T13). It is a member rather than a rev-pinned consumer so
+it links the engine by `path = ".."` and cannot drift from it.
 
 Everything below is about `fulcrum-core` unless it says otherwise — and that qualification matters, because the
 guards that police it (`boundary_pins`, the manifest pin) stop at its own directory. See
@@ -145,11 +146,12 @@ change either half of that pairing, re-run the guard and check it still sees the
 **`boundary_pins` does not see the sibling member.** `crate_code()` walks `{CARGO_MANIFEST_DIR}/src`
 (`src/boundary_pins.rs:166-209`) and the manifest pin reads only `{CARGO_MANIFEST_DIR}/Cargo.toml` (`:302-328`), so
 `fulcrum/src/` is outside the walk and `fulcrum/Cargo.toml` is never opened. The daemon may import `rusqlite` —
-intended, it owns the disk and ADR 0091 keeps the disk out of the engine — **and also `tauri`**, which is not
-intended, and nothing in this repo notices. That is a known gap, not a bug to close here: do not widen `boundary_pins`
-to walk the sibling, because it would then fail on the daemon's legitimate `rusqlite` and the fix for that would be an
-allowlist that weakens the engine's pin. T9 Task 6 adds the daemon's own pins over its own tree. Until then, a daemon
-that reaches for a desktop module is caught by review and nothing else.
+intended, it owns the disk and ADR 0091 keeps the disk out of the engine — and a `tauri` import there would be invisible
+to *these* pins. That is the shape, not an open hole: **the daemon carries its own pins over its own tree**, in
+`fulcrum/tests/boundary.rs` (10 tests), which forbid the UI framework, its `_plugin` crates, the desktop package and
+`crate::config::`/`crate::storage::` paths inside `fulcrum/src/`, while naming the SQLite driver as legal here. So do
+not widen `boundary_pins` to walk the sibling: it would fail on the daemon's legitimate `rusqlite`, and the fix for that
+would be an allowlist that weakens the engine's pin. Two pin sets, two trees, neither reading the other.
 
 **The schema-shape pin is the fulcrum↔desktop contract — `schema-sha.txt` is an artifact, not a build output.** The
 daemon's four tables are a transcription of the desktop's and the daemon opens a different file, so a DDL change on
@@ -160,9 +162,31 @@ SAME commit as a lockstep DDL change so the two diffs are reviewed together, and
 or a local experiment — both the guard and the tests refuse a comparison that cannot name all five keys, so a
 hand-tuned pin reddens the contract rather than blessing the fork. Note what it deliberately does not pin (flags,
 the `UNIQUE` keys, the cascades, the SELECT-list subsets — the desktop's `SPACE_COLUMNS` is 4 of `spaces`' 5 columns,
-and comparing subsets false-positives on `spaces.sort_order`) and that the cross-repo leg is **red by design** today: the desktop pins fulcrum at `78e59543`, a
-rev with no schema to fingerprint, so the comparator exits 2 with a named reason instead of passing vacuously. None of
-this widens `boundary_pins` — the daemon's `rusqlite` is legal and the engine's pin stays exactly where it is.
+and comparing subsets false-positives on `spaces.sort_order`).
+
+**The cross-repo leg is not running, and the reason it is not running changed under the docs.** Two states, and the
+paragraph that used to describe them was true of a pin the desktop no longer holds:
+
+- **Still true:** the desktop has no comparator step. `ls` its `.github/workflows/` — `ci.yml` and `release.yml`,
+  neither naming `check-schema-drift` — so only the fulcrum-side leg runs, and `schema-drift.yml`'s green is legitimately
+  green for the one comparison it actually makes. "A change to the desktop's DDL makes some check fail" is still not met.
+- **Obsolete as of this commit:** the stated *reason*. It explained the absence by naming the desktop's pin —
+  `78e59543`, a rev that publishes no `fulcrum` member and no schema, so the desktop leg genuinely had to refuse. That
+  was true when written and it is the reason the guard's refusal path exists. It is no longer the reason the leg does
+  not run.
+
+State the durable fact, not the desktop's current pin — that sentence has gone stale twice by naming it. The boundary
+lives in *our* history, which does not move: the `fulcrum/` member first appears at `38a9986` (PR #2) and
+`schema-sha.txt` first appears at `26d7648` (PR #10), so **any fulcrum ref at or after `26d7648` — `v0.1.0` included —
+publishes a fingerprint worth comparing.** Only pre-T9 revs like `78e59543` carry no schema at all. That is why
+the old refusal reason was not merely stale but already obsolete at the rev the desktop pinned before the tag
+(`2ed5f5a6` contains `26d7648`, verified with `merge-base --is-ancestor`): the leg is **absent, not refusing**, the
+weaker state and the more actionable one. Verify with `ls <desktop>/.github/workflows/` — the only question that
+matters, and the one that can change.
+
+Say "the desktop has no comparator step", not "it refuses". The `--self-test` still runs first in `schema-drift.yml`,
+so a guard that has lost the ability to fail reddens the run. None of this widens `boundary_pins` — the daemon's
+`rusqlite` is legal and the engine's pin stays exactly where it is.
 
 ## The census (`childproc`)
 

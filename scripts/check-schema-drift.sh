@@ -36,11 +36,10 @@
 # "no drift found" here is guarded by a check that there WAS something to compare:
 # a missing or unreadable pin, a pin that does not name all five keys exactly once,
 # a DDL whose extraction named no table at all, and a missing other side all exit 2
-# with a NAMED reason instead of passing. That is not hypothetical: the desktop
-# pins fulcrum at `78e595436ac5612d8ef87f692bee61f48f6e58e7`, and that rev publishes
-# NO schema at all (verified: `git ls-tree` on it shows no `fulcrum` member and no
-# `db/schema.rs`), so the desktop half of this comparison CANNOT pass today and must
-# not pretend to. A check that finds nothing to compare is a lie, and it is refused.
+# with a NAMED reason instead of passing. That is not hypothetical: the desktop has no
+# comparator step at all, so its half of this comparison never runs and the only leg
+# that does is this repo's. A check that finds nothing to compare is a lie, and it is
+# refused.
 #
 # The fulcrum side never fetches the desktop's DDL at a guessed rev — comparing a
 # pair that no build ships together judges nothing. Each repo hands this comparator
@@ -483,10 +482,10 @@ run_self_test() {
   expect_exit "a fingerprint pinning a sixth header is REFUSED" 2 \
     bash "$script" --input "$clean" --schema "$sixth_pin"
 
-  # The MISSING OTHER SIDE — today's real cross-repo state, not a hypothesis. The
-  # desktop pins fulcrum at 78e59543, a rev that publishes no schema-sha.txt at all,
-  # so its half of this comparison lands here. A guard that exited 0 on "I found no
-  # pin to violate" would be the most dangerous version of itself.
+  # The MISSING OTHER SIDE — today's real cross-repo state, not a hypothesis: the
+  # desktop has no comparator step, so a run that lands here has no pin to read. A
+  # guard that exited 0 on "I found no pin to violate" would be the most dangerous
+  # version of itself.
   expect_exit_naming "a missing pin file is REFUSED with a named reason" 2 "no schema-shape pin" \
     bash "$script" --input "$clean" --schema "$self_test_root/does-not-exist.txt"
 
@@ -634,17 +633,20 @@ fi
 pin_file="${schema_file:-$repo_root/schema-sha.txt}"
 
 # --- THE VACUITY FLOOR ON THE PIN ITSELF ---------------------------------------
-# Missing/unreadable is exit 2 with the reason spelled out, and the reason is the
-# CURRENT state of the cross-repo contract rather than a generic "file not found":
-# the desktop pins fulcrum at 78e595436ac5612d8ef87f692bee61f48f6e58e7, a rev whose
-# tree carries no `fulcrum` member and therefore no fingerprint. Whoever runs this
-# on the desktop side must be told the check refused, not that it passed.
+# Missing/unreadable is exit 2 with the reason spelled out. The reason deliberately
+# does NOT name a fulcrum rev any more. It used to cite
+# `78e595436ac5612d8ef87f692bee61f48f6e58e7` as "the rev the desktop pins, which
+# ships no schema-sha.txt" — true of that rev, and the reason the desktop leg had to
+# refuse when this was written. The desktop's pin has since moved to a rev that DOES
+# publish `schema-sha.txt`, so naming a rev here would make this message a claim about
+# another repo's manifest: stale the moment it re-pins, and wrong in the common case.
+# The condition being reported is about THIS file, so that is what it reports.
 if [[ ! -f "$pin_file" || ! -r "$pin_file" ]]; then
   {
     echo "error: no schema-shape pin at $pin_file — nothing to compare, and a comparison that"
-    echo "  finds nothing is a lie; the pinned rev of fulcrum publishes no fingerprint (rev"
-    echo "  78e595436ac5612d8ef87f692bee61f48f6e58e7 ships no schema-sha.txt), so this check"
-    echo "  refuses loudly until the desktop half lands"
+    echo "  finds nothing is a lie. Run this from a tree that carries schema-sha.txt (the"
+    echo "  fulcrum repo does; a checkout of an older fulcrum rev may not), or pass --schema."
+    echo "  Refusing rather than reporting a shape it could not read."
   } >&2
   exit 2
 fi

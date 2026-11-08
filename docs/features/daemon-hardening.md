@@ -23,13 +23,18 @@ The cross-repo drift check splits in two, and only one half runs.
   deliberately never fetches the desktop's DDL at a guessed rev: comparing a pin against a rev no build ships
   together is worse than refusing.
 
-So "a change to the desktop's DDL makes some check fail" is met by a mechanism whose other half does not exist.
-Verified with `git ls-tree 78e5954` — the rev the desktop pins has no `fulcrum` member at all.
+So "a change to the desktop's DDL makes some check fail" is met by a mechanism whose other half does not exist. The
+half is **absent, not refusing** — an earlier version of this bullet explained the absence by naming the desktop's pin
+(`git ls-tree 78e5954` shows no `fulcrum` member, so there was nothing to fingerprint and the desktop leg had to exit
+2). That was true of that rev. The boundary is ours, not the desktop's: the `fulcrum/` member appears at `38a9986` and
+`schema-sha.txt` at `26d7648`, so any ref at or after `26d7648` publishes a fingerprint, and for those the only thing
+missing is the step. Re-measure before repeating this bullet: `ls <desktop>/.github/workflows/`.
 
-Needed, both in `archimedes-codes/desktop`: the desktop emits a fingerprint over its `sessions` / `native_messages`
-DDL in the same canonical form (per-table column **name + type + order**, plus index lines — its `SPACE_COLUMNS`
-is a 4-name name-only subset, so a naive name comparison would false-positive), and it re-pins fulcrum to a rev
-that contains the daemon and wires the comparator step.
+Needed, in `archimedes-codes/archimedes` (renamed from `archimedes-codes/desktop`; the old name still redirects, so a
+stale reference there resolves and reads as current): the desktop emits a fingerprint over its `sessions` /
+`native_messages` DDL in the same canonical form (per-table column **name + type + order**, plus index lines — its
+`SPACE_COLUMNS` is a 4-name name-only subset, so a naive name comparison would false-positive), and it wires the
+comparator step into its own CI, fed its live DDL via `--input`.
 
 **Do not "fix" the guard to pass.** A comparison that succeeds because the other side said nothing is the failure
 class this repo refuses elsewhere. `README.md`'s `## Schema-shape contract with the desktop` section states the

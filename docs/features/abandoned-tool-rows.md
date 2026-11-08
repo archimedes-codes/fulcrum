@@ -207,12 +207,18 @@ followed only by open rows is byte-identical to a legitimate mid-batch transcrip
 not separate them because a batch's announces share a stamp. The engine-side cure removes the ambiguity at its source
 for the two producers it owns; it does not make the reader's discriminator unnecessary.
 
-And the cure does not reach a user yet. `archimedes/src-tauri/Cargo.toml:47` pins `fulcrum-core` at
-`78e595436ac5612d8ef87f692bee61f48f6e58e7` (line 47 in the working tree AND on `origin/main`). That rev predates the
-fix — `git show 78e59543:src/harness/loop/turn.rs` has no `close_announced_tool_calls` — and, consistent with §1 of
-`daemon-hardening.md`, it carries no `fulcrum` member at all, verified the same way `git ls-tree` verified it there.
-**Open work:** the desktop re-pins. Until it does, the engine-side cure is dead code as far as any user is concerned
-and `744aac23`'s reader is the only thing standing between this bug and them.
+And the cure does not reach a user yet — **but not for the reason this paragraph used to give.** It cited the desktop's
+pin (`archimedes/src-tauri/Cargo.toml`, then `78e595436…`, a rev whose `turn.rs` has no `close_announced_tool_calls`).
+That evidence is stale: the desktop's `origin/main` now pins a rev that DOES contain this fix (`2ed5f5a6`, verified with
+`merge-base --is-ancestor 33e3ea7 2ed5f5a6`), and since fulcrum's `v0.1.0` the pin is `tag = "v0.1.0", version = "0.1.0"`
+on a branch of that repo. So the cure is compiled into the desktop's `main` today.
+
+What still keeps it from a user is the **release**, not the pin: the newest desktop tag is `v0.11.0` (2026-11-02), which
+predates this fix (2026-11-08) and predates the extraction — its engine was in-tree at
+`src-tauri/src/agent/harness/loop/turn.rs`, and `git show v0.11.0:…/turn.rs` has no `close_announced_tool_calls`. No
+desktop tag contains the cure, so no installed build runs it. **Open work:** the next desktop release. Until that
+ships, `744aac23`'s reader is the only thing standing between this bug and a user — which is the conclusion this bullet
+has always drawn, now resting on the release boundary rather than on a pin that has since moved.
 
 ## 7. Rows orphaned before the fix stay orphaned — **recorded**
 

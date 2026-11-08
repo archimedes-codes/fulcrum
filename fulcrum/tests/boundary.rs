@@ -3,8 +3,8 @@
 //! ## Why this file exists at all
 //!
 //! The engine's own pins (`src/boundary_pins.rs`) walk `{CARGO_MANIFEST_DIR}/src`
-//! (`crate_code`, `:166-225` there) and read only `{CARGO_MANIFEST_DIR}/Cargo.toml`
-//! (`the_manifest_declares_no_forbidden_dependency`, `:371-399`). `CARGO_MANIFEST_DIR`
+//! (`crate_code`, `:166-209` there) and read only `{CARGO_MANIFEST_DIR}/Cargo.toml`
+//! (`the_manifest_declares_no_forbidden_dependency`, `:302-328`). `CARGO_MANIFEST_DIR`
 //! for that file is the REPO ROOT, so this member's `src/` is outside its walk and
 //! `fulcrum/Cargo.toml` is never opened. Measured at HEAD before this file existed:
 //! the daemon could name the desktop UI framework or import the desktop package and
