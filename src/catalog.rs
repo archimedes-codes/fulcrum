@@ -93,6 +93,25 @@ impl Model {
     pub fn supports_thinking_level(&self, level: &str) -> bool {
         self.thinking_levels.is_empty() || self.thinking_levels.iter().any(|l| l == level)
     }
+
+    /// The ONE selectability predicate (ADR 0024 + 0026): tool support AND a wire
+    /// the harness speaks (`"openai-completions"` / `"anthropic-messages"` /
+    /// `"openai-responses"`) PLUS the `litellm` discovery mode (ADR 0026 — a
+    /// discovery mode, not a fourth wire: its wire is `openai-completions`). A
+    /// `None` / unknown `api` stays unselectable: an unknown API is not one of the
+    /// three wires the harness speaks nor the `litellm` discovery mode.
+    ///
+    /// `ModelCatalog::selectable()` filters on this, and the desktop's
+    /// `list_models` DTO projects it onto the picker — one authority, so a picker
+    /// row can never claim a state the catalog disagrees with.
+    pub fn is_selectable(&self) -> bool {
+        self.supports_tools
+            && self
+                .api
+                .as_deref()
+                .and_then(WireApi::parse)
+                .is_some_and(WireApi::is_supported)
+    }
 }
 
 /// The composed key of a catalog model (its `provider` / `id` halves).
@@ -150,24 +169,11 @@ impl ModelCatalog {
         &self.models
     }
 
-    /// The selectable set (ADR 0024): the tool-supporting models on a wire
-    /// the harness speaks (`"openai-completions"` / `"anthropic-messages"`
-    /// / `"openai-responses"`) PLUS the `litellm` discovery mode (ADR 0026
-    /// — a discovery mode, not a fourth wire: its wire is
-    /// `openai-completions`). A `None` / unknown `api` stays
-    /// unselectable: an unknown API is not one of the three wires the
-    /// harness speaks nor the `litellm` discovery mode.
+    /// The selectable set (ADR 0024): every model [`Model::is_selectable`] accepts
+    /// — the predicate lives there, so the picker's DTO and this filter can never
+    /// disagree about what "selectable" means.
     pub fn selectable(&self) -> Vec<&Model> {
-        self.models
-            .iter()
-            .filter(|m| {
-                m.supports_tools
-                    && m.api
-                        .as_deref()
-                        .and_then(WireApi::parse)
-                        .is_some_and(WireApi::is_supported)
-            })
-            .collect()
+        self.models.iter().filter(|m| m.is_selectable()).collect()
     }
 }
 
@@ -241,7 +247,11 @@ pub struct ProviderDiscovery {
 /// `None` (byte-identical callers), and `DiscoveredMeta` is never serialized to
 /// disk (only the in-memory [`ProviderDiscovery`] cache holds it), so the widening
 /// is schema-invisible. `None` on `supports_tools` preserves today's hardcoded
-/// `true`, `None` on the costs today's `0.0` (interface §10 R5). The terminal
+/// `true`, `None` on the costs today's `0.0` (interface §10 R5). Since issue #9
+/// that `None`-means-status-quo promise is honored for REDUCED LiteLLM routes
+/// too, not only for the OpenAI/Anthropic shapes and the all-bare route: a route
+/// whose deployments never advertised `supports_function_calling` reduces to
+/// `None` instead of a fabricated `Some(false)`. The terminal
 /// consumer that fans them onto `Model` is T3b's `EffectiveCatalog::resolve`
 /// write — this task carries the values, it does NOT apply them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

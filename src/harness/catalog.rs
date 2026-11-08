@@ -767,8 +767,10 @@ pub(crate) struct Aart {
     pub(crate) supports_thinking: bool,
     /// The INTERSECTION over the deployments that advertise levels.
     pub(crate) thinking_levels: Vec<String>,
-    /// ALL deployments advertise `supports_function_calling: true` (absent → `false`).
-    pub(crate) supports_tools: bool,
+    /// `Some(true)` when EVERY deployment advertises `supports_function_calling: true`;
+    /// `Some(false)` when ANY advertises `false` (or advertises `true` while a sibling
+    /// stays silent); `None` when NO deployment advertises the key at all.
+    pub(crate) supports_tools: Option<bool>,
     /// The derived wire (the pure computation; consumed by T3b).
     pub(crate) derived_wire: WireApi,
     /// The un-flattened deployment set (grouping survives the reduction).
@@ -819,8 +821,12 @@ pub(crate) fn derive_wire_for_route(deployments: &[LiteLLMDeployment]) -> WireAp
 /// The conservative reduction of one route's deployment set. Direction differs
 /// per field ON PURPOSE: the windows are `min` (a multi-deployment route must
 /// never overestimate what it accepts), the costs are `max` (the most this route
-/// could cost), and the two capability gates are ALL-deployments (a route whose
-/// peers disagree shows no thinking controls and is not tool-selectable).
+/// could cost), and the two capability gates are ALL-deployments — peers
+/// DISAGREEING still gates (a route whose peers disagree shows no thinking
+/// controls and is not tool-selectable), while peers being SILENT no longer
+/// gates TOOLS (`None`, not `false`: the proxy never said no — issue #9).
+/// The gates stay asymmetric because the downstream fallbacks are opposite
+/// (`unwrap_or(false)` for thinking vs `unwrap_or(true)` for tools).
 pub(crate) fn reduce_litellm_route(name: &str, deployments: &[LiteLLMDeployment]) -> Aart {
     let min_of = |pick: fn(&LiteLLMDeployment) -> Option<u32>| {
         deployments
@@ -871,10 +877,23 @@ pub(crate) fn reduce_litellm_route(name: &str, deployments: &[LiteLLMDeployment]
                 .iter()
                 .all(|d| d.supports_reasoning == Some(true)),
         thinking_levels,
-        supports_tools: !deployments.is_empty()
-            && deployments
-                .iter()
-                .all(|d| d.supports_function_calling == Some(true)),
+        // The two sibling gates DIFFER ON PURPOSE: downstream fallbacks are opposite —
+        // thinking resolves `unwrap_or(false)`, tools `unwrap_or(true)`.
+        //
+        // `None` (NOT `false`) when no deployment advertised the key: the reduction must not
+        // fabricate a claim the proxy never made, and the downstream fallback is `true`
+        // (`EffectiveCatalog::resolve`'s `unwrap_or(true)`), so a fabricated `false` here is what
+        // made an unadvertised LiteLLM route unselectable (issue #9). The vacuous-ALL trap is now
+        // structurally impossible: an empty set advertises nothing, so it yields `None` rather
+        // than cargo-culting "all agree" into `true`.
+        supports_tools: deployments
+            .iter()
+            .any(|d| d.supports_function_calling.is_some())
+            .then(|| {
+                deployments
+                    .iter()
+                    .all(|d| d.supports_function_calling == Some(true))
+            }),
         derived_wire: derive_wire_for_route(deployments),
         deployments: deployments.to_vec(),
     }
@@ -915,7 +934,7 @@ fn aart_to_meta(route: &Aart) -> DiscoveredMeta {
         thinking_levels: (!route.thinking_levels.is_empty()).then(|| route.thinking_levels.clone()),
         supports_thinking: advertised.then_some(route.supports_thinking),
         api: Some(route.derived_wire),
-        supports_tools: Some(route.supports_tools),
+        supports_tools: route.supports_tools,
         cost_per_mtok_in: Some(route.cost_per_mtok_in),
         cost_per_mtok_out: Some(route.cost_per_mtok_out),
     }
@@ -1543,18 +1562,48 @@ mod tests {
     }
 
     #[test]
-    fn reduce_litellm_route_gates_tools_on_all_deployments() {
-        // A route ANY deployment lacks `supports_function_calling` on exposes
-        // `supports_tools == false` (ALL-deployments gate; `None` → `false`).
+    fn reduce_litellm_route_tools_are_three_valued_and_never_fabricate_false() {
+        // Issue #9: the tool gate is THREE-VALUED. Peers DISAGREEING still gates
+        // (`Some(false)`); peers being SILENT does not (`None` — the proxy never
+        // made a claim, so the reduction must not fabricate one, and the
+        // downstream `unwrap_or(true)` fallback is what makes `None` selectable).
         let mut a = deployment("dep-a");
         a.supports_function_calling = Some(true);
         let mut b = deployment("dep-b");
         b.supports_function_calling = Some(false);
-        assert!(!reduce_litellm_route("r", &[a.clone(), b]).supports_tools);
-        assert!(!reduce_litellm_route("r", &[a.clone(), deployment("dep-c")]).supports_tools);
         let mut c = deployment("dep-c");
         c.supports_function_calling = Some(true);
-        assert!(reduce_litellm_route("r", &[a, c]).supports_tools);
+
+        // Row 1: EVERY deployment advertises `true` → `Some(true)`.
+        assert_eq!(
+            reduce_litellm_route("r", &[a.clone(), c.clone()]).supports_tools,
+            Some(true)
+        );
+        // Row 2: ANY deployment advertises `false` → `Some(false)` (the proxy
+        // said no, so the answer is no).
+        assert_eq!(
+            reduce_litellm_route("r", &[a.clone(), b]).supports_tools,
+            Some(false)
+        );
+        // Row 3: some advertise `true`, a SIBLING stays silent → `Some(false)`.
+        // Deliberately NOT relaxed: a proxy that spoke about some deployments and
+        // stayed silent about a sibling is still peers DISAGREEING. This asserts
+        // `Some(false)` ONLY because `a` advertises `true` — without an advertiser
+        // in the set the same shape is row 4 (`None`), not this.
+        assert_eq!(
+            reduce_litellm_route("r", &[a.clone(), deployment("dep-c")]).supports_tools,
+            Some(false)
+        );
+        // Row 4 — THE FIX: NO deployment advertises the key → `None`, NOT a
+        // fabricated `false` (an unadvertised LiteLLM route is not a route that
+        // said no; this was the pin that made such a route unselectable).
+        assert_eq!(
+            reduce_litellm_route("r", &[deployment("dep-a"), deployment("dep-b")]).supports_tools,
+            None
+        );
+        // Row 5: the empty set advertises nothing → the SAME `None` (the
+        // vacuous-ALL trap is structurally gone: no advertiser, no claim).
+        assert_eq!(reduce_litellm_route("r", &[]).supports_tools, None);
     }
 
     #[test]
@@ -1647,7 +1696,9 @@ mod tests {
         // The vacuous-ALL trap: an empty set must NOT read as "all agree".
         let route = reduce_litellm_route("r", &[]);
         assert!(!route.supports_thinking);
-        assert!(!route.supports_tools);
+        // Nothing advertised the key, so the reduction claims nothing (`None`,
+        // not a fabricated `false`) — see the three-valued tool gate.
+        assert_eq!(route.supports_tools, None);
         assert_eq!(route.context_window, None);
         assert_eq!(route.derived_wire, WireApi::OpenAiCompletions);
     }
@@ -2001,6 +2052,31 @@ mod tests {
         // `max` over the deployments (0.000006 × 1e6), NOT the last entry's 1.0.
         assert_eq!(meta.cost_per_mtok_out, Some(6.0));
         assert_eq!(meta.context_window, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn litellm_unadvertised_tools_land_on_none_not_false() {
+        // Issue #9 end-to-end on the REAL rung-1 path: a route whose proxy says
+        // NOTHING about tool calling must land on the META as `None`, not a
+        // fabricated `Some(false)` — the fabricated `false` is what the desktop's
+        // `EffectiveCatalog::resolve` (`unwrap_or(true)`) turned into an
+        // unselectable `Model`. `context_window` is set, so the entry is NOT
+        // `is_bare()` and the route really does reach the reduction (the
+        // all-bare short-circuit is not what produces the `None` here).
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/model/info",
+            200,
+            r#"{"data":[{"model_name":"lit/quiet","model_info":{"max_input_tokens":8000}}]}"#,
+        )
+        .await;
+        let models = discover_models(&server.uri(), "k", "litellm", None)
+            .await
+            .unwrap();
+        let meta = &models["lit/quiet"];
+        assert_eq!(meta.supports_tools, None);
+        assert_eq!(meta.context_window, Some(8000));
     }
 
     #[tokio::test]
