@@ -356,6 +356,22 @@ impl SubagentCapture {
 /// but never dispatched, so an `end` without a `start` is LEGAL. A counter would
 /// go negative and un-block a child that is still working; a set's removal is
 /// idempotent.
+///
+/// TWO mechanisms produce that `end`, and the second is why the removal must be
+/// idempotent rather than merely tolerant:
+///   - the close of an announced-but-never-dispatched call. Since issue #11
+///     those closes come from ONE helper (`close_announced_tool_calls`, in
+///     `harness/loop/turn.rs`), and it is reached from BOTH settle functions as
+///     well as the retry and mid-stream-overflow abandon paths — so a SETTLE
+///     emits them too, where pre-fix a settled attempt emitted nothing at all
+///     and left the id outstanding for the life of the child;
+///   - a `start` THIS pump never saw. The pump's `Lagged` arm log-and-`continue`s
+///     over frames the broadcast ring overwrote, so an `end` can arrive for an
+///     id whose `start` was dropped. Recorded as a residual in
+///     `docs/features/abandoned-tool-rows.md`, and the sharper of the two
+///     reasons: a counter would be decremented for a frame the pump LOST, which
+///     un-blocks a child that is still working — the exact failure the set
+///     exists to make impossible.
 #[derive(Debug, Default)]
 pub struct SubagentLiveness {
     pub seq: u64,

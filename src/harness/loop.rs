@@ -1238,7 +1238,20 @@ impl AgentLoop {
 
         loop {
             if turn.is_cancelled() {
-                self.settle_cancelled(std::mem::take(&mut state.turn_tool_results));
+                // Site 5 of the eight (`loop.rs`, top-of-loop cancel): VACUOUS,
+                // and the emptiness is derived, not assumed. No `TurnAccumulator`
+                // exists yet at this point in the iteration — `acc` is declared
+                // below, after the model call. And a PREVIOUS iteration cannot
+                // have left a row open: the only paths into a later iteration are
+                // a completed batch (which closes every call it processed in
+                // `run_tool_batch`, including on cancel — a cancelled turn still
+                // gets `cancelled_tool_result()` per call) or a
+                // `TurnFlow::Continue` from an abandon path (which closes via
+                // `close_announced_tool_calls` before it continues). Plus
+                // `acc.tool_calls` is emptied by `std::mem::take` before the batch
+                // runs, so a settle reached after the batch sees an empty
+                // accumulator by construction.
+                self.settle_cancelled(std::mem::take(&mut state.turn_tool_results), &[]);
                 return;
             }
 
@@ -1265,7 +1278,19 @@ impl AgentLoop {
                     &mut emit,
                 ) => s,
                 _ = turn.cancelled() => {
-                    self.settle_cancelled(std::mem::take(&mut state.turn_tool_results));
+                    // Site 6 of the eight (the model call races the cancel):
+                    // VACUOUS. The stream has not been opened, let alone
+                    // consumed — `acc` is declared below this `select!` — so no
+                    // `ProviderEvent::ToolCall` can have reached
+                    // `consume_stream`, which is the ONLY place a `tool_call`
+                    // row is opened (`toolcall_end` / `tool_execution_start`).
+                    // A previous iteration cannot have left a row open either:
+                    // the only paths into a later iteration are a completed
+                    // batch (which closes every call it processed, including on
+                    // cancel) or a `TurnFlow::Continue` from an abandon path
+                    // (which closes first), and `acc.tool_calls` is emptied by
+                    // `std::mem::take` before the batch runs.
+                    self.settle_cancelled(std::mem::take(&mut state.turn_tool_results), &[]);
                     return;
                 }
             };
@@ -1280,7 +1305,13 @@ impl AgentLoop {
                 }
                 Err(e) => {
                     eprintln!("harness: model call failed: {e}");
-                    self.settle_error(std::mem::take(&mut state.turn_tool_results));
+                    // Site 7 of the eight (the model call returned `Err`):
+                    // VACUOUS for the same reason as site 6 — `complete` failed,
+                    // so there is no stream to consume and `acc` (declared below)
+                    // does not exist; `consume_stream`'s `ToolCall` arm never ran,
+                    // so no `tool_call` row was opened. The previous-iteration
+                    // argument is the same one recorded at site 5.
+                    self.settle_error(std::mem::take(&mut state.turn_tool_results), &[]);
                     return;
                 }
             };
@@ -1296,7 +1327,17 @@ impl AgentLoop {
 
             let mid_stream_error = self.consume_stream(&mut stream, turn, &mut acc).await;
             if turn.is_cancelled() {
-                self.settle_cancelled(std::mem::take(&mut state.turn_tool_results));
+                // Site 8 of the eight (Stop pressed while the model streams tool
+                // calls): NOT vacuous — this is the exit the field report is
+                // about, and it was missing from the issue's list of four.
+                // `consume_stream` has just run, so `acc.tool_calls` holds every
+                // row this attempt opened at `in_progress` and will never
+                // dispatch; a Stop mid-stream is exactly the shape that orphans
+                // them. Pass the real calls.
+                self.settle_cancelled(
+                    std::mem::take(&mut state.turn_tool_results),
+                    &acc.tool_calls,
+                );
                 return;
             }
             if let Some(err) = mid_stream_error {

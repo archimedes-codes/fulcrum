@@ -7,5 +7,6 @@ mod policy_gate;
 mod provider_switch;
 mod subagents;
 pub(super) mod support;
+mod tool_row_settle;
 mod tools_enabled;
 mod turn_lifecycle;

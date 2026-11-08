@@ -513,6 +513,45 @@ pub(super) fn event_kinds(rx: &mut mpsc::UnboundedReceiver<RpcEvent>) -> Vec<Str
     kinds
 }
 
+/// Collect EVERY event until `pred` matches (bounded — a missing event is a
+/// test failure, not a hang). Unlike [`wait_for_event`] this KEEPS what it
+/// passes over, which is the whole point: the caller asserts on the order of
+/// the sequence and on what did NOT arrive (`event_kinds` throws the events
+/// away and `wait_for_event` discards the ones before its predicate).
+pub(super) async fn collect_events_until(
+    rx: &mut mpsc::UnboundedReceiver<RpcEvent>,
+    pred: impl Fn(&RpcEvent) -> bool,
+) -> Vec<RpcEvent> {
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    let mut events = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ev)) => {
+                let hit = pred(&ev);
+                events.push(ev);
+                if hit {
+                    return events;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    events
+}
+
+/// Drain every event the (already-awaited, so finished) turn emitted.
+pub(super) fn drain_events(rx: &mut mpsc::UnboundedReceiver<RpcEvent>) -> Vec<RpcEvent> {
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    events
+}
+
 /// A sink that interleaves the `RpcEvent` stream with the `session-update`
 /// frames it receives: on every emission it first drains the event channel
 /// into the same log, so the log is the turn's TRUE emission order across

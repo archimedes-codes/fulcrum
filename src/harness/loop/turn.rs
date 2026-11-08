@@ -123,7 +123,23 @@ impl AgentLoop {
             // the indicator clear and typing "continue", the symptom ADR 0045
             // exists to end.
             if t.reason == CompactionReason::Overflow && ran == CompactionRan::Skipped {
-                self.settle_error(std::mem::take(turn_tool_results));
+                // Site 1 of the eight in
+                // `docs/roadmap/settle-announced-tool-rows.md`: there is NO
+                // `TurnAccumulator` in this function's scope — the compaction
+                // check runs at the TOP of the turn loop, before the model call
+                // that produces one — so nothing has announced a row yet.
+                // Derivation for the claim: the only paths into a later loop
+                // iteration are a completed batch (which closes every call it
+                // processed, `run_tool_batch`, including on cancel) or a
+                // `TurnFlow::Continue` from an abandon path (which closes via
+                // `close_announced_tool_calls` before it continues), and
+                // `acc.tool_calls` is emptied by `std::mem::take` before the
+                // batch runs — so a settle reached after the batch sees an empty
+                // accumulator by construction. Hence `&[]` is VACUOUS here, not
+                // merely convenient: if a call site ever appears that can reach
+                // this line with announced calls open, this argument is false
+                // and this literal is what must change.
+                self.settle_error(std::mem::take(turn_tool_results), &[]);
                 return TurnFlow::Return;
             }
         }
@@ -308,16 +324,7 @@ impl AgentLoop {
         if let ProviderError::ContextOverflow(_) = &err {
             if !state.overflow_recovered {
                 state.overflow_recovered = true;
-                for tc in &acc.tool_calls {
-                    let result = Self::abandoned_tool_result();
-                    let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                    self.emit(RpcEvent::tool_execution_end {
-                        tool_call_id: tc.id.clone(),
-                        tool_name: tc.name.clone(),
-                        result: result_value,
-                        is_error: true,
-                    });
-                }
+                self.close_announced_tool_calls(&acc.tool_calls);
                 if !acc.text.is_empty() || !acc.thinking.is_empty() || !acc.tool_calls.is_empty() {
                     self.emit(RpcEvent::message_retracted);
                 }
@@ -328,7 +335,13 @@ impl AgentLoop {
         }
 
         eprintln!("harness: mid-stream model error: {err}");
-        self.settle_error(std::mem::take(&mut state.turn_tool_results));
+        // Site 2 of the eight: `acc` IS in scope — this attempt announced rows
+        // and is about to be abandoned without dispatching them, so its calls
+        // close before the settle.
+        self.settle_error(
+            std::mem::take(&mut state.turn_tool_results),
+            &acc.tool_calls,
+        );
         TurnFlow::Return
     }
 
@@ -408,21 +421,22 @@ impl AgentLoop {
             // the delay, up to 8 s).
             tokio::select! {
                 _ = turn.cancelled() => {
-                    self.settle_cancelled(std::mem::take(&mut state.turn_tool_results));
+                    // Site 3 of the eight — the asymmetry issue #11 is about.
+                    // This arm used to settle and RETURN, skipping the close
+                    // loop a few statements below: the path where the backoff
+                    // COMPLETED closed this same attempt's announced rows and
+                    // the path where it was CANCELLED did not. Same function,
+                    // same abandoned attempt, same `acc`. `acc` is in scope
+                    // here, so the calls are passed for real.
+                    self.settle_cancelled(
+                        std::mem::take(&mut state.turn_tool_results),
+                        &acc.tool_calls,
+                    );
                     return TurnFlow::Return;
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
-            for tc in &acc.tool_calls {
-                let result = Self::abandoned_tool_result();
-                let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
-                self.emit(RpcEvent::tool_execution_end {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    result: result_value,
-                    is_error: true,
-                });
-            }
+            self.close_announced_tool_calls(&acc.tool_calls);
             if !acc.text.is_empty() || !acc.thinking.is_empty() || !acc.tool_calls.is_empty() {
                 self.emit(RpcEvent::message_retracted);
             }
@@ -434,7 +448,13 @@ impl AgentLoop {
             attempt: self.retry.attempt(),
             final_error: Some(error_message.to_string()),
         });
-        self.settle_error(std::mem::take(&mut state.turn_tool_results));
+        // Site 4 of the eight: the budget is spent and this attempt is
+        // abandoned for good — `acc` is in scope and its announced rows are
+        // never dispatched, so they close before the settle.
+        self.settle_error(
+            std::mem::take(&mut state.turn_tool_results),
+            &acc.tool_calls,
+        );
         TurnFlow::Return
     }
 
@@ -611,8 +631,73 @@ impl AgentLoop {
         turn_tool_results
     }
 
-    /// Settle a CANCELLED turn: `turn_end` followed by `agent_settled`.
-    pub(super) fn settle_cancelled(&mut self, tool_results: Vec<Value>) {
+    /// Close every tool row an ABANDONED attempt announced — the ONE close
+    /// implementation behind issue #11.
+    ///
+    /// A `tool_call` row is opened when the model finishes NAMING a call
+    /// (`consume_stream`'s `ProviderEvent::ToolCall` arm emits `toolcall_end` +
+    /// `tool_execution_start`, and `normalize` renders either as a `tool_call`
+    /// frame at `status: "in_progress"`). It leaves `in_progress` ONLY on a
+    /// `tool_call_update` carrying `completed`/`failed`, which `normalize`
+    /// derives from `tool_execution_end` ALONE (`normalize.rs:413-423`) — it has
+    /// no arm for `turn_end` / `agent_settled`. So an attempt that announced
+    /// calls and then died without dispatching them leaves those rows spinning
+    /// forever: the desktop reads a Subagent frozen on a stale tool name with a
+    /// climbing duration while its tool count and cost keep rising.
+    ///
+    /// Three constraints are load-bearing here, each because of what breaks if
+    /// this is "tidied":
+    ///
+    /// - **The caller passes the ordered `Vec<ToolCall>`, never
+    ///   `TurnState::announced_tool_calls`.** That `HashSet` (`normalize.rs:72`)
+    ///   is insert-only (no removal anywhere in the file) and it ALSO holds
+    ///   compaction card ids (`compact:N`, `normalize.rs:456`) which are closed
+    ///   by `compaction_end`, not by `tool_execution_end` — closing from the set
+    ///   would emit a bogus failed tool close for every compaction card the
+    ///   session ever opened. The `Vec` is transcript order, which is what the
+    ///   desktop reads these frames as.
+    /// - **Frames only, never transcript rows.** No `ChatMessage { role: Tool }`
+    ///   is pushed and nothing is appended to `turn_tool_results`: an abandoned
+    ///   attempt persists NO assistant row, because the abandon path reaches
+    ///   none of the three `persist_transcript_message()` call sites — the user
+    ///   prompt (`begin_turn`), the dispatched tool result (`run_tool_batch`)
+    ///   and the accepted assistant message (`handle_turn` over in `loop.rs`)
+    ///   — and neither `compactor.turn_abandoned` (watermark arithmetic) nor
+    ///   `message_retracted` (an outbound frame to the Client) writes the
+    ///   transcript. So a tool-result message here would dangle with no
+    ///   preceding assistant `tool_calls` for the provider to pair against —
+    ///   the orphan the provider 400s on.
+    /// - **The result text is `abandoned_tool_result()`, unchanged.** Several
+    ///   tests pin it byte-for-byte; it is honest about the reason — the tool did
+    ///   not FAIL, it was discarded.
+    ///
+    /// This stays a private `fn`, not `pub(super)`, and that visibility is part
+    /// of the invariant: the parent module reaches a close only through the two
+    /// `pub(super)` settle functions, so it cannot open a close without settling.
+    fn close_announced_tool_calls(&self, tool_calls: &[ToolCall]) {
+        for tc in tool_calls {
+            let result = Self::abandoned_tool_result();
+            let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
+            self.emit(RpcEvent::tool_execution_end {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                result: result_value,
+                is_error: true,
+            });
+        }
+    }
+
+    /// Settle a CANCELLED turn: close what the abandoned attempt announced,
+    /// then `turn_end` followed by `agent_settled`.
+    ///
+    /// `announced` is the abandoned attempt's `acc.tool_calls` — the calls it
+    /// opened rows for and will never dispatch. It is `&[]` wherever no attempt
+    /// is in scope (see the eight-site table in
+    /// `docs/roadmap/settle-announced-tool-rows.md`); the close MUST precede
+    /// `turn_end`, because `normalize` closes a row on `tool_execution_end` and
+    /// on nothing that follows it.
+    pub(super) fn settle_cancelled(&mut self, tool_results: Vec<Value>, announced: &[ToolCall]) {
+        self.close_announced_tool_calls(announced);
         self.compactor.turn_abandoned(&self.messages);
         self.emit(RpcEvent::turn_end {
             message: Value::Null,
@@ -621,8 +706,11 @@ impl AgentLoop {
         self.emit(RpcEvent::agent_settled);
     }
 
-    /// Settle a FAILED turn: `turn_end` followed by `agent_settled`.
-    pub(super) fn settle_error(&mut self, tool_results: Vec<Value>) {
+    /// Settle a FAILED turn: close what the abandoned attempt announced, then
+    /// `turn_end` followed by `agent_settled`. See [`Self::settle_cancelled`]
+    /// for what `announced` is and why the close comes first.
+    pub(super) fn settle_error(&mut self, tool_results: Vec<Value>, announced: &[ToolCall]) {
+        self.close_announced_tool_calls(announced);
         self.compactor.turn_abandoned(&self.messages);
         self.emit(RpcEvent::turn_end {
             message: Value::Null,

@@ -154,9 +154,10 @@ impl McpManager {
     /// Inject the "open this URL in the OS" seam (T5/S3, edge E6).
     ///
     /// The builder shape is the house rule for a desktop dependency the crate
-    /// must not name (the `with_auth_file` precedent two lines above): the
-    /// constructor signature stays frozen — fixtures outside the move set call
-    /// `McpManager::new` positionally — and the seam arrives as a second step.
+    /// must not name (the `with_auth_file` precedent further down this impl):
+    /// the constructor signature stays frozen — fixtures outside the move set
+    /// call `McpManager::new` positionally — and the seam arrives as a second
+    /// step.
     ///
     /// Production wires this at every construction site that can reach the
     /// `auth` action: `AgentLoop::new` and `AgentLoop::set_desktop_config` (the

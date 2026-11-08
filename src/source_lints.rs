@@ -584,7 +584,7 @@ fn the_crate_threads_the_opener_into_its_production_loop() {
     );
     // The seam is still a SEAM, and this reads `default_build_loop`'S OWN
     // signature — NOT the whole file. `WorkerCore::new` carries an
-    // identically-typed parameter two hundred lines below, so a file-wide
+    // identically-typed parameter further down the same file, so a file-wide
     // `contains` was MEASURED VACUOUS on the desktop side: deleting
     // `default_build_loop`'s parameter and hard-coding a no-op at the
     // `AgentLoop::new(` site left that scan green. Hence the scoped region.

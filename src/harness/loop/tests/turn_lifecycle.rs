@@ -981,15 +981,6 @@ async fn an_empty_text_tool_calls_turn_is_not_treated_as_empty() {
     );
 }
 
-/// Drain every event the (already-awaited, so finished) turn emitted.
-fn drain_events(rx: &mut mpsc::UnboundedReceiver<RpcEvent>) -> Vec<RpcEvent> {
-    let mut events = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        events.push(ev);
-    }
-    events
-}
-
 /// The empty turn spends the SAME budget the retry ladder owns — there is no
 /// second counter, so a turn never makes more than `max_attempts` model calls
 /// however many distinct conditions fire inside it. Here a mid-stream

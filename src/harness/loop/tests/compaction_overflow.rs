@@ -140,34 +140,6 @@ async fn a_skipped_compaction_reports_no_shrink() {
     assert_eq!(loop_.messages.len(), len_before, "the transcript is intact");
 }
 
-/// Collect events until `pred` matches (bounded — a missing event is a
-/// test failure, not a hang). Unlike `event_kinds` this keeps EVERY event
-/// it saw, so the caller can also assert what did NOT arrive.
-async fn collect_events_until(
-    rx: &mut mpsc::UnboundedReceiver<RpcEvent>,
-    pred: impl Fn(&RpcEvent) -> bool,
-) -> Vec<RpcEvent> {
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    let mut events = Vec::new();
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(ev)) => {
-                let hit = pred(&ev);
-                events.push(ev);
-                if hit {
-                    return events;
-                }
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    events
-}
-
 /// A transcript large enough that `older` is non-empty (three ~20 000
 /// token messages — over the default `keep_recent_tokens` budget), so a
 /// compaction actually attempts the summary call.
