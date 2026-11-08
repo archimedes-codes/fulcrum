@@ -2080,6 +2080,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn litellm_disagreement_lands_on_some_false_at_the_meta_seam() {
+        // The `Some(false)` leg of the tri-state, pinned at the META seam (the
+        // rung-1 path that writes `DiscoveredMeta`), not merely at the `Aart`
+        // level. This is the leg that must stay DISTINGUISHABLE from `None` all
+        // the way to the meta, because the desktop's `EffectiveCatalog::resolve`
+        // fallback is `unwrap_or(true)`: `None` becomes selectable, `Some(false)`
+        // becomes UNSELECTABLE — opposite outcomes from one field. A
+        // reintroduced `advertised.then_some(...)` gate or a
+        // `.unwrap_or(false)` at the seam would silently collapse the two, and no
+        // other fulcrum test would notice (the sibling repo's suite is not ours to
+        // depend on).
+        //
+        // TWO routes on the ONE `/model/info` mock (grouping is by `model_name`):
+        // `lit/clash` — peers DISAGREEING (`true` vs an advertised `false`) →
+        // `Some(false)`; `lit/half_silent` — one advertiser plus a SILENT sibling
+        // → `Some(false)` too (row 3 of the gate, deliberately NOT relaxed: the
+        // proxy spoke about a sibling, so it is not the silent route of
+        // `litellm_unadvertised_tools_land_on_none_not_false`). Both carry a
+        // `max_input_tokens` so neither route is `is_bare()` and both really
+        // reach the reduction.
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/model/info",
+            200,
+            r#"{"data":[
+                {"model_name":"lit/clash","model_info":{
+                    "id":"d-yes","max_input_tokens":4000,"supports_function_calling":true}},
+                {"model_name":"lit/clash","model_info":{
+                    "id":"d-no","max_input_tokens":4000,"supports_function_calling":false}},
+                {"model_name":"lit/half_silent","model_info":{
+                    "id":"d-loud","max_input_tokens":4000,"supports_function_calling":true}},
+                {"model_name":"lit/half_silent","model_info":{"max_input_tokens":4000}}
+            ]}"#,
+        )
+        .await;
+        let models = discover_models(&server.uri(), "k", "litellm", None)
+            .await
+            .unwrap();
+        // Advertised disagreement → `Some(false)`, NOT `None`.
+        assert_eq!(models["lit/clash"].supports_tools, Some(false));
+        // The not-relaxed row 3 → also `Some(false)`.
+        assert_eq!(models["lit/half_silent"].supports_tools, Some(false));
+        // Both routes reached the reduction (a bare short-circuit would leave the
+        // window `None`, and the seam would have been untested).
+        assert_eq!(models["lit/clash"].context_window, Some(4000));
+        assert_eq!(models["lit/half_silent"].context_window, Some(4000));
+    }
+
+    #[tokio::test]
     async fn litellm_non_claude_proxy_never_probes_messages() {
         // The `/v1/messages` latch costs ONE request per root per process and
         // only for a payload that names a Claude-family adapter — an all-OpenAI
