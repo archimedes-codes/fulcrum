@@ -47,14 +47,14 @@ fn main() {
         // The Worker mode: hand the process to the engine. This call does not
         // return — `run_worker` builds its own multi-thread runtime and
         // `block_on`s the stdio loop until `close` / stdin EOF / a panic.
-        serve::Command::Worker => fulcrum_core::worker::run_worker(
+        serve::Command::Worker => fulcrum_harness::worker::run_worker(
             // The browser opener. `NoOpenRequester` is the engine's PRODUCTION,
             // ungated no-op impl, and it is the honest answer for this host: a
             // headless supervisor has no browser to open, and an MCP OAuth error
             // still carries its URL for the user to visit by hand. The desktop
             // injects its Tauri opener instead — that is what this parameter
             // exists for.
-            std::sync::Arc::new(fulcrum_core::mcp::NoOpenRequester),
+            std::sync::Arc::new(fulcrum_harness::mcp::NoOpenRequester),
             // No crash-logging panic hook. `run_worker_inner`'s own doc names
             // this argument's `None` as "the shape a non-desktop host (the
             // daemon, T9) passes": the hook writes into the desktop's data dir,

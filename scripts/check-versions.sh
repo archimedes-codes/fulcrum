@@ -3,7 +3,7 @@
 # Fail if this workspace's packages do not agree on one version, or if a release
 # tag does not match that version.
 #
-# WHY THIS EXISTS. This repo is TWO packages in one workspace — `fulcrum-core` at
+# WHY THIS EXISTS. This repo is TWO packages in one workspace — `fulcrum-harness` at
 # the root and the `fulcrum` daemon member — and nothing in the build ties their
 # `version` fields together. Two manifests that disagree still COMPILE (a path
 # dependency inside one workspace resolves by path, never by version, so the
@@ -232,7 +232,7 @@ run_check() {
   # reading one version means the enumeration stopped working, and a green from here
   # certifies nothing. Refused, not passed.
   if (( ${#manifests[@]} < 2 )); then
-    die "found ${#manifests[@]} version-bearing member(s) under $repo_root, expected at least 2 — this workspace is \`fulcrum-core\` plus the \`fulcrum\` member by design, so a check that read one version would be checking nothing" 2
+    die "found ${#manifests[@]} version-bearing member(s) under $repo_root, expected at least 2 — this workspace is \`fulcrum-harness\` plus the \`fulcrum\` member by design, so a check that read one version would be checking nothing" 2
   fi
 
   # Read every member's version, and its package name (the name is what keys the

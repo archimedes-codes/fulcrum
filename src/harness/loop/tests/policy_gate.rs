@@ -72,7 +72,7 @@ fn allow_rule(path: &str) -> String {
 /// [`AgentLoop::set_desktop_config`]. It used to be written to
 /// `config_dir/settings.json` and read back by the loop on every turn — and
 /// the loop cannot read it any more, because the Worker process no longer
-/// opens desktop config (the prerequisite for the `fulcrum-core` crate split).
+/// opens desktop config (the prerequisite for the `fulcrum-harness` crate split).
 ///
 /// Parsing rather than hand-building the `FilePolicy` keeps the fixture's
 /// vocabulary the REAL WIRE DOCUMENT (the same `filePolicy` block the Settings

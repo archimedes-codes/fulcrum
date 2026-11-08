@@ -40,7 +40,7 @@
 //!
 //! Two things here are deliberately load-bearing and must not be "simplified":
 //!
-//! - **The `UNIQUE` constraints.** `fulcrum_core::persist::TranscriptPersister`
+//! - **The `UNIQUE` constraints.** `fulcrum_harness::persist::TranscriptPersister`
 //!   is idempotent because `INSERT … ON CONFLICT` has something to conflict
 //!   with. `UNIQUE(session_id, kind, message_key)` is the display upsert key and
 //!   `UNIQUE(session_id, seq)` is the transcript upsert key. Drop either and a

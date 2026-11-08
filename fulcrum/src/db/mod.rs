@@ -11,9 +11,9 @@
 //!
 //! `rusqlite::Connection` is `!Sync`, so it cannot be shared across tasks as-is.
 //! The desktop solved this the same way (`storage/db.rs:305-311`) and for the
-//! same reason: the calls that reach the store — `fulcrum_core::persist`'s
+//! same reason: the calls that reach the store — `fulcrum_harness::persist`'s
 //! `apply` / `apply_interactive_event`, and every method on
-//! [`fulcrum_core::FulcrumPersistence`] — are SYNCHRONOUS. Wrapping the pool in
+//! [`fulcrum_harness::FulcrumPersistence`] — are SYNCHRONOUS. Wrapping the pool in
 //! `tokio-rusqlite` would buy a `.await` on every one of them and force the
 //! persister's callers to be async for no behaviour change, so this holds the
 //! connection in a plain mutex and blocks, exactly as the desktop does.
@@ -699,7 +699,7 @@ impl Db {
     /// resumed (ADR 0075).
     pub fn record_session(
         &self,
-        info: &fulcrum_core::store_rows::SessionInfo,
+        info: &fulcrum_harness::store_rows::SessionInfo,
     ) -> Result<(), DbError> {
         let capabilities = serde_json::to_string(&info.capabilities)?;
         self.conn().execute(
@@ -712,7 +712,7 @@ impl Db {
             params![
                 info.session_id,
                 info.cwd.display().to_string(),
-                fulcrum_core::clock::now_ms(),
+                fulcrum_harness::clock::now_ms(),
                 Option::<String>::None,
                 capabilities,
                 info.is_subagent,
@@ -804,7 +804,7 @@ impl Db {
     pub fn session(
         &self,
         id: &str,
-    ) -> Result<Option<fulcrum_core::store_rows::SessionRow>, DbError> {
+    ) -> Result<Option<fulcrum_harness::store_rows::SessionRow>, DbError> {
         let guard = self.conn();
         let mut stmt = guard.prepare(&format!(
             "SELECT {} FROM sessions WHERE id = ?1",
@@ -826,7 +826,7 @@ impl Db {
     pub fn list_sessions(
         &self,
         include_archived: bool,
-    ) -> Result<Vec<fulcrum_core::store_rows::SessionRow>, DbError> {
+    ) -> Result<Vec<fulcrum_harness::store_rows::SessionRow>, DbError> {
         let guard = self.conn();
         let sql = if include_archived {
             format!(
@@ -870,7 +870,7 @@ impl Db {
                 kind,
                 message_key,
                 payload_json,
-                fulcrum_core::clock::now_ms()
+                fulcrum_harness::clock::now_ms()
             ],
         )?;
         Ok(())
@@ -880,7 +880,7 @@ impl Db {
     pub fn messages_for(
         &self,
         session_id: &str,
-    ) -> Result<Vec<fulcrum_core::store_rows::MessageRow>, DbError> {
+    ) -> Result<Vec<fulcrum_harness::store_rows::MessageRow>, DbError> {
         let guard = self.conn();
         let mut stmt = guard.prepare(&format!(
             "SELECT {} FROM messages
@@ -915,7 +915,7 @@ impl Db {
                 seq,
                 role,
                 content_json,
-                fulcrum_core::clock::now_ms()
+                fulcrum_harness::clock::now_ms()
             ],
         )?;
         Ok(())
@@ -960,7 +960,7 @@ impl Db {
                     *seq,
                     *role,
                     *content_json,
-                    fulcrum_core::clock::now_ms()
+                    fulcrum_harness::clock::now_ms()
                 ],
             )?;
         }
@@ -1000,7 +1000,7 @@ impl Db {
     /// that test exists to catch.
     pub fn upsert_space(&self, path: &str, default_trusted: bool) -> Result<(), DbError> {
         let key = space_key(path).unwrap_or_else(|| path.to_string());
-        let now = fulcrum_core::clock::now_ms();
+        let now = fulcrum_harness::clock::now_ms();
         self.conn().execute(
             "INSERT INTO spaces (path, created_at, last_opened_at, trusted, sort_order) \
              VALUES (?1, ?2, ?2, ?3, COALESCE((SELECT MAX(sort_order) FROM spaces), -1) + 1)
@@ -1037,8 +1037,8 @@ fn space_key(path: impl AsRef<std::path::Path>) -> Option<String> {
 /// `InvalidColumnType` instead of silently mis-mapping.
 fn session_row_from(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<fulcrum_core::store_rows::SessionRow> {
-    Ok(fulcrum_core::store_rows::SessionRow {
+) -> rusqlite::Result<fulcrum_harness::store_rows::SessionRow> {
+    Ok(fulcrum_harness::store_rows::SessionRow {
         id: row.get(0)?,
         cwd: row.get(1)?,
         created_at: row.get(2)?,
@@ -1055,8 +1055,8 @@ fn session_row_from(
 /// Map one row of [`Db::MESSAGE_COLUMNS`] onto a `MessageRow`, index for index.
 fn message_row_from(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<fulcrum_core::store_rows::MessageRow> {
-    Ok(fulcrum_core::store_rows::MessageRow {
+) -> rusqlite::Result<fulcrum_harness::store_rows::MessageRow> {
+    Ok(fulcrum_harness::store_rows::MessageRow {
         id: row.get(0)?,
         session_id: row.get(1)?,
         kind: row.get(2)?,

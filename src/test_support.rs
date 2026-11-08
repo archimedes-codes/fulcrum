@@ -1,4 +1,4 @@
-//! Crate-scoped test helpers for `fulcrum-core` (T5 plan, "Create files":
+//! Crate-scoped test helpers for `fulcrum-harness` (T5 plan, "Create files":
 //! `lib.rs` — "module tree + re-export block + crate-scoped test helpers").
 //!
 //! WHY THIS EXISTS: the S1/S2 modules moved WITH their `#[cfg(test)]` blocks
@@ -25,9 +25,9 @@
 //! one and the desktop's. That is safe, and the reason is load-bearing enough to
 //! pin here rather than leave to luck:
 //!
-//!   * This module is `#[cfg(test)]`, so it is compiled into `fulcrum-core`'s own
+//!   * This module is `#[cfg(test)]`, so it is compiled into `fulcrum-harness`'s own
 //!     unit-test binary and is NOT in the rlib. A desktop test therefore CANNOT
-//!     reach it (measured: zero `fulcrum_core::test_support` references under
+//!     reach it (measured: zero `fulcrum_harness::test_support` references under
 //!     `src-tauri/tests/`), so the two locks can never both be held in one
 //!     process — which is what an `ENV_LOCK` self-deadlock would require.
 //!   * `cargo test` runs each test BINARY to completion before starting the next

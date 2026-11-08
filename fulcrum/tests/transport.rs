@@ -15,7 +15,7 @@
 //!
 //! NOT covered here, deliberately: replay, `attach`, `afterSeq`, a session
 //! registry. Those are T10, and the protocol's `frameSeq`
-//! (`fulcrum_core::worker::protocol::stamp_outbound`) stays unconsumed until
+//! (`fulcrum_harness::worker::protocol::stamp_outbound`) stays unconsumed until
 //! then — see the module docs on `transport`.
 
 use fulcrum::transport::{

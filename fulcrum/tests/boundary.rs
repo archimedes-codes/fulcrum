@@ -111,10 +111,10 @@
 
 use std::path::{Path, PathBuf};
 
-// ── the machinery (this member cannot reach fulcrum-core's) ──────────────────
+// ── the machinery (this member cannot reach fulcrum-harness's) ──────────────────
 //
 // `needle`, `crate_code` and `strip_string_literals` are all `pub(crate)` inside
-// `fulcrum-core`, hence invisible to this crate; making them `pub` would mean editing
+// `fulcrum-harness`, hence invisible to this crate; making them `pub` would mean editing
 // the engine, which this task is frozen out of. So: a local copy of the shape.
 
 /// Remove `//`, `///`, `//!` line comments and `/* */` block comments, leaving
@@ -1091,11 +1091,11 @@ fn the_engine_tree_still_carries_no_sqlite_driver() {
     assert!(
         hits.is_empty(),
         "`{forbidden}` appears in the ENGINE's code at {hits:?} — the daemon's \
-         persistence code has migrated into `fulcrum-core`, which puts the disk back \
+         persistence code has migrated into `fulcrum-harness`, which puts the disk back \
          under the engine and breaks ADR 0091: the engine is not a host and holds no \
          connection. The driver is legal in the DAEMON (`fulcrum/src/db` is its home \
          and `fulcrum/Cargo.toml` declares it); move this code back behind \
-         `fulcrum_core::FulcrumPersistence` instead of moving the driver forward. \
+         `fulcrum_harness::FulcrumPersistence` instead of moving the driver forward. \
          The engine's own pin \
          (`no_code_names_the_sqlite_driver_or_the_desktop_package`) reddens too — \
          fix it in the same commit, never by relaxing either pin."

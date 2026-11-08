@@ -24,7 +24,7 @@
 //! child's frames to whichever socket asked for that session. There is **no**
 //! "attach to session X on worker Y" frame in the worker protocol
 //! (`Inbound::Start` is per-process), so the client↔daemon surface below is the
-//! daemon's OWN new surface. Nothing in `fulcrum_core::worker::protocol` changed
+//! daemon's OWN new surface. Nothing in `fulcrum_harness::worker::protocol` changed
 //! to build it, and the worker protocol stays byte-compatible.
 //!
 //! The fan-out is ONE `tokio` broadcast of already-encoded client frames, with
@@ -177,14 +177,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use fulcrum_core::events::EventSink;
-use fulcrum_core::persist::TranscriptPersister;
-use fulcrum_core::seams::FulcrumPersistence;
-use fulcrum_core::store_rows::SessionInfo;
-use fulcrum_core::worker::client::{WorkerHandle, WorkerInboundEvent};
-use fulcrum_core::worker::manager::{OnCrash, SinkLookup};
-use fulcrum_core::worker::protocol::{StartEnv, PROTOCOL_VERSION};
-use fulcrum_core::worker::{WorkerFactory, WorkerManager};
+use fulcrum_harness::events::EventSink;
+use fulcrum_harness::persist::TranscriptPersister;
+use fulcrum_harness::seams::FulcrumPersistence;
+use fulcrum_harness::store_rows::SessionInfo;
+use fulcrum_harness::worker::client::{WorkerHandle, WorkerInboundEvent};
+use fulcrum_harness::worker::manager::{OnCrash, SinkLookup};
+use fulcrum_harness::worker::protocol::{StartEnv, PROTOCOL_VERSION};
+use fulcrum_harness::worker::{WorkerFactory, WorkerManager};
 
 use crate::db::Db;
 use crate::transport::{Connection, ConnectionWriter, Endpoint, Listener, TransportError};
@@ -1332,8 +1332,8 @@ fn worker_frame(evt: &WorkerInboundEvent) -> serde_json::Value {
 /// `Outbound` frames collapsed into one vocabulary for the persister), so this
 /// re-derives the worker-protocol shape the client already recognises from
 /// `Outbound`'s names — the same names, the same field names, no new dialect.
-fn store_frame(frame: &fulcrum_core::worker_types::StoreFrame) -> serde_json::Value {
-    use fulcrum_core::worker_types::StoreFrame;
+fn store_frame(frame: &fulcrum_harness::worker_types::StoreFrame) -> serde_json::Value {
+    use fulcrum_harness::worker_types::StoreFrame;
     match frame {
         StoreFrame::Insert {
             session_id,
@@ -2327,7 +2327,7 @@ async fn handle_frame(
 /// daemon owns: the `cwd` registration the persister needs, the eager `sessions`
 /// row, the subscription, and the reply. A `start-result` that took ~5 s to say
 /// `ok: false` is that bound expiring, which is why the number is named in
-/// `fulcrum_core::worker::manager::WorkerManager::attach` rather than duplicated.
+/// `fulcrum_harness::worker::manager::WorkerManager::attach` rather than duplicated.
 async fn start(
     daemon: &Arc<Daemon>,
     watching: &mut HashSet<String>,
@@ -2480,7 +2480,7 @@ fn prompt(daemon: &Arc<Daemon>, frame: &serde_json::Value) -> serde_json::Value 
     let images = match frame.get("images") {
         None | Some(serde_json::Value::Null) => Vec::new(),
         Some(value) => {
-            match serde_json::from_value::<Vec<fulcrum_core::tools::ImageRef>>(value.clone()) {
+            match serde_json::from_value::<Vec<fulcrum_harness::tools::ImageRef>>(value.clone()) {
                 Ok(images) => images,
                 Err(e) => {
                     return serde_json::json!({
@@ -2571,7 +2571,7 @@ fn close(
 /// thing to act on (start it, or stop talking to it).
 fn relay(
     handle: Option<WorkerHandle>,
-    f: impl FnOnce(&WorkerHandle) -> Result<(), fulcrum_core::worker::WorkerError>,
+    f: impl FnOnce(&WorkerHandle) -> Result<(), fulcrum_harness::worker::WorkerError>,
 ) -> Result<(), String> {
     let handle = handle.ok_or_else(|| "no session is running under that id".to_string())?;
     f(&handle).map_err(|e| e.to_string())
@@ -2813,7 +2813,7 @@ mod tests {
         let frame = event_frame(
             "s7",
             false,
-            &WorkerInboundEvent::Event(fulcrum_core::events::RpcEvent::turn_start),
+            &WorkerInboundEvent::Event(fulcrum_harness::events::RpcEvent::turn_start),
         );
         assert_eq!(frame["sessionId"], "s7");
         assert_eq!(frame["type"], "event");
@@ -2831,7 +2831,7 @@ mod tests {
         let store = event_frame(
             "parent",
             true,
-            &WorkerInboundEvent::Store(fulcrum_core::worker_types::StoreFrame::Insert {
+            &WorkerInboundEvent::Store(fulcrum_harness::worker_types::StoreFrame::Insert {
                 session_id: "child".to_string(),
                 seq: 1,
                 role: "user".to_string(),
@@ -3370,8 +3370,8 @@ mod tests {
     /// provider that needs no network, because the daemon must be testable
     /// without an LLM).
     fn test_env(session_id: &str) -> StartEnv {
-        use fulcrum_core::harness::catalog::{Model, ModelCatalog};
-        use fulcrum_core::worker::protocol::StartMode;
+        use fulcrum_harness::harness::catalog::{Model, ModelCatalog};
+        use fulcrum_harness::worker::protocol::StartMode;
 
         fn model(id: &str) -> Model {
             Model {

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repo is a two-member Cargo workspace. `fulcrum-core` — the agent engine extracted from
+This repo is a two-member Cargo workspace. `fulcrum-harness` — the agent engine extracted from
 [`archimedes-codes/archimedes`](https://github.com/archimedes-codes/archimedes), the
 desktop app (renamed from `archimedes-codes/desktop` after the extraction): the tool loop, provider clients, tools
 and sandbox, the MCP client, and the out-of-process worker. A library. It knows nothing about windows, trays, or
@@ -12,7 +12,7 @@ supervised worker processes (ADR 0091). What it does *not* do yet is listed in
 `WorkerManager::reap_all` is unwired, and no authentication (T13). It is a member rather than a rev-pinned consumer so
 it links the engine by `path = ".."` and cannot drift from it.
 
-Everything below is about `fulcrum-core` unless it says otherwise — and that qualification matters, because the
+Everything below is about `fulcrum-harness` unless it says otherwise — and that qualification matters, because the
 guards that police it (`boundary_pins`, the manifest pin) stop at its own directory. See
 *`boundary_pins` does not see the sibling member*.
 
@@ -81,7 +81,7 @@ this branch by deleting the file and running cold**. That is the trap's only wit
 green after the file was gone — re-arming the exact thing the file exists to prevent. `ci.yml` says the same thing at
 line 60 and forbids the step. Nothing here argues for cold-target fragility: measured on this branch, a `target/` that
 had never existed and no build step at all gives **1406 passed / 0 failed / 1 ignored** — the same total from
-`cargo test -p fulcrum-core` (1401 lib + the 5 in `fixture_bins.rs`) and from bare `cargo test`, which additionally
+`cargo test -p fulcrum-harness` (1401 lib + the 5 in `fixture_bins.rs`) and from bare `cargo test`, which additionally
 builds and runs the `fulcrum` member's targets — its totals are whatever the `test result:`
 lines of that run print, and this file does not copy them.
 
@@ -114,9 +114,30 @@ helper moved into a non-`tests/` module. `boundary_pins` obfuscates its own need
 `harness/loop.rs` carries a `#[cfg(test)]` on a `use` at line 54, so its production region is 53 lines and contains
 neither `McpManager::new` site. Picking the wrong one silently changes what is policed.
 
+**The daemon's scanner is a third behaviour, and it is deliberately weaker on string literals.**
+`fulcrum/tests/boundary.rs::scan` runs `strip_string_literals(strip_comments(…))`; the engine's `crate_code` strips
+comments only. Measured with the same planted file in the engine's tree (`pub const LEAK: &str = "rusqlite::Connection";`):
+the engine's `no_code_names_the_sqlite_driver_or_the_desktop_package` **reddens** on it and the daemon's
+`the_engine_tree_still_carries_no_sqlite_driver` — which scans the same directory for the same needle — **passes**. That
+is not a hole in the invariant (the engine's pin holds it) but it is a real difference in what each guard reports, and it
+means the daemon's reverse pin cannot be the sole witness for anything whose only occurrence is inside a string. The
+stripping is justified in that file's own comment: `db/schema.rs` cites the desktop's source path in docs, and a name
+inside a literal cannot become a dependency. Do not "unify" the two scanners to make the daemon's fire — that would put
+`schema.rs`'s prose citations into the daemon's crosshairs.
+
+**A renamed package does not move the census's root label — and if you move only half of it, the census fails loudly.**
+`source_roots()` labels the engine's tree with the constant `"fulcrum-harness/"` (was `"fulcrum-core/"`), and
+`assert_root_floors` pairs a tally with its floor **by that label**, so a half-moved label is caught, not tolerated.
+Measured both ways: reverting only `crate_floor()`'s label fails two tests with `the census tallied
+\`fulcrum-harness/\` against \`fulcrum-core/\`'s floor`; renaming both labels but leaving the per-file path constants
+(`SELF`, `SUDO_EXEC`, …) on the old root fails four, because `production_region` panics on a path that names no file.
+The census's claim that a stale prefix is RED rather than "0 sites, all clear" survived the rename unchanged. The label
+is a label, not a derived path — `CARGO_PKG_NAME` feeds only `member_entry_names_us`, which matches `members` entries,
+and those are directory paths, so the rename could not have quietly re-pointed a walk root.
+
 **`default-members = [".", "fulcrum"]` in the root `Cargo.toml` is what makes the bare gates reach the daemon, and
 deleting it fails nothing.** Because the workspace root is *also* a package, cargo resolves `workspace_default_members`
-to `fulcrum-core` **alone** — `cargo metadata` reports exactly one default member without that line — so every command
+to `fulcrum-harness` **alone** — `cargo metadata` reports exactly one default member without that line — so every command
 that does not name a package is package-scoped to the engine and compiles the daemon not at all. Measured on this
 branch with a planted `E0308` type error in `fulcrum/src/transport/frame.rs`, a module `main.rs` never references:
 
@@ -200,32 +221,32 @@ every desktop-conditional floor **vanishes rather than fails** when the discrimi
 A pin that passes on the broken thing is worse than no pin. When you change one, prove it with a mutation that still
 compiles — hoist a value into a local, don't delete it — and report if you cannot.
 
-### The layout is forced: do not move `src/` and `tests/` into a `fulcrum-core/` directory
+### The layout is forced: do not move `src/` and `tests/` into a `fulcrum-harness/` directory
 
 The cargo-idiomatic shape for this repo is a pure `[workspace]` manifest at the root with the engine in a
-`fulcrum-core/` subdirectory. **It is the shape the grounding report recommended and it panics the census.** The two
+`fulcrum-harness/` subdirectory. **It is the shape the grounding report recommended and it panics the census.** The two
 shapes:
 
-- **Layout A (this repo):** `fulcrum-core`'s `[package]` stays at the root, `src/` and `tests/` beside it, plus the
+- **Layout A (this repo):** `fulcrum-harness`'s `[package]` stays at the root, `src/` and `tests/` beside it, plus the
   `fulcrum` member. Census passes.
-- **Layout B:** move `src/` and `tests/` into `fulcrum-core/`, put a pure `[workspace]` at the root. Census panics.
+- **Layout B:** move `src/` and `tests/` into `fulcrum-harness/`, put a pure `[workspace]` at the root. Census panics.
 
-Reproduced on this branch in a scratch tree (`fulcrum-core/` moved down one level, root manifest reduced to
-`[workspace] resolver = "2"` + `members = ["fulcrum-core", "fulcrum"]` + the `[profile.release]` block, the member's
-path dep repointed to `../fulcrum-core`), running `cargo test -p fulcrum-core --lib -- childproc::tests`:
+Reproduced on this branch in a scratch tree (`fulcrum-harness/` moved down one level, root manifest reduced to
+`[workspace] resolver = "2"` + `members = ["fulcrum-harness", "fulcrum"]` + the `[profile.release]` block, the member's
+path dep repointed to `../fulcrum-harness`), running `cargo test -p fulcrum-harness --lib -- childproc::tests`:
 
 ```
 test result: FAILED. 5 passed; 5 failed; 1 ignored; 1392 filtered out
 
 the census resolved the wrong root: <root>/src-tauri/src is not a directory
-  (layout WorkspaceMember { workspace_root: "<root>" }, CARGO_MANIFEST_DIR=<root>/fulcrum-core)
+  (layout WorkspaceMember { workspace_root: "<root>" }, CARGO_MANIFEST_DIR=<root>/fulcrum-harness)
 ```
 
 **Why.** `declaring_workspace_root` (`src/childproc.rs:712-714`) walks **ancestors only**, starting at
 `manifest_dir().parent()`. A `[workspace]` sitting **at** the manifest dir is therefore never examined, so Layout A
 resolves `Layout::SinglePackage` — the correct answer here, since this checkout has no desktop tree to police. Move the
 package down one level and the workspace lands on the ancestor path, `member_entry_names_us` matches
-`"fulcrum-core"`, the layout becomes `WorkspaceMember`, and `source_roots()` (`:985-988`) then hardcodes
+`"fulcrum-harness"`, the layout becomes `WorkspaceMember`, and `source_roots()` (`:985-988`) then hardcodes
 `workspace_root.join("src-tauri").join("src")` — which does not exist in this repo. The census panics loudly instead of
 policing nothing, which is why the trap is discoverable at all.
 
@@ -258,7 +279,7 @@ worker that panicked.
 ## Releasing
 
 **The version lives in TWO manifests plus the lock file, and nothing in the build ties them
-together.** `Cargo.toml` (the root, which is the `fulcrum-core` package) and
+together.** `Cargo.toml` (the root, which is the `fulcrum-harness` package) and
 `fulcrum/Cargo.toml` each declare a `version`, and `Cargo.lock` mirrors both. A path
 dependency inside one workspace resolves by PATH and never by version, so two members that
 disagree still compile, still pass every test, and still ship — the drift is invisible until
@@ -302,7 +323,7 @@ contract, which is why `check-versions.sh --tag vX.Y.Z` is the first step of
 no build stage and no artifact upload, deliberately — no consumer installs a binary today (the
 desktop compiles the engine from source as a git dependency), and an unsigned tarball that
 looks like a supported install channel is worse than none. No `cargo publish` either: neither
-`fulcrum-core` nor `fulcrum` is on crates.io, and a name squat there is not recoverable by
+`fulcrum-harness` nor `fulcrum` is on crates.io, and a name squat there is not recoverable by
 renumbering. The workflow's two jobs are to refuse a version the tree does not carry, and to
 create the release. Its `workflow_dispatch` mode rehearses the gate on a branch and creates
 nothing — and it prints that it created nothing, so a green rehearsal is never mistaken for a

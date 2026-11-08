@@ -22,7 +22,7 @@ use crate::worker::protocol::Outbound;
 // (T5/S5b + T8/S8.1) The `Store` trait moved to this crate with its error type
 // re-typed to the crate's `StoreError`, so this impl follows it — and now the
 // FILE has moved too, so the error is named crate-internally rather than through
-// the package path: `use fulcrum_core::StoreError` from inside `fulcrum-core` is
+// the package path: `use fulcrum_harness::StoreError` from inside `fulcrum-harness` is
 // a cycle (a crate cannot import itself by name), which is exactly what the
 // compiler reported at the RED step. `crate::seams::StoreError` is the same type.
 // The mapping is free HERE and worth stating: `IpcStore` never touches SQLite —

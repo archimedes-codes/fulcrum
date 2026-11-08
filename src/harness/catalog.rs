@@ -1,5 +1,5 @@
 //! The model catalog's LIVE DISCOVERY half (T5/S4: the DATA types moved to
-//! `fulcrum_core::catalog`, this file keeps the network).
+//! `fulcrum_harness::catalog`, this file keeps the network).
 //!
 //! The split and its reason live in `crates/fulcrum-core/src/catalog.rs`; in one
 //! line — `resolve_composed_model` moved to the crate for edge E4 and its
@@ -945,7 +945,7 @@ mod tests {
     use super::*;
     // (T5/S4) Moved here from the file head with the split: `ModelKey` is now ONLY
     // used by these tests (the pure `From<&Model>` impl that used it lives in
-    // `fulcrum_core::catalog`), so the production build no longer imports it.
+    // `fulcrum_harness::catalog`), so the production build no longer imports it.
     use crate::harness::model_key::ModelKey;
 
     // ── `Model` ───────────────────────────────────────────────────────

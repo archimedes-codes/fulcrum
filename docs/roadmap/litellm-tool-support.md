@@ -10,7 +10,7 @@ issue: https://github.com/archimedes-codes/fulcrum/issues/9
 absent `supports_function_calling`, and give the session model picker the two facts it
 needs to show an unselectable model instead of offering it silently.
 
-**Architecture:** Two repos, one rule, strictly ordered. `fulcrum-core`'s `reduce_litellm_route`
+**Architecture:** Two repos, one rule, strictly ordered. `fulcrum-harness`'s `reduce_litellm_route`
 carries the tool-support gate as `Option<bool>` so an unadvertised marker reaches the desktop as
 `None` and `unwrap_or(true)` applies — the shape `supports_thinking` already has. The desktop then
 bumps its rev pin, projects selectability onto the `list_models` DTO from ONE authority
@@ -26,7 +26,7 @@ desktop), React + TypeScript + vitest (desktop frontend), ADR 0026 as the decisi
 
 ### The ordering constraint that shapes the whole plan
 
-The desktop consumes `fulcrum-core` as a **rev-pinned git dependency**
+The desktop consumes `fulcrum-harness` as a **rev-pinned git dependency**
 (`archimedes/src-tauri/Cargo.toml:47`, `rev = "78e595436ac5612d8ef87f692bee61f48f6e58e7"`,
 verified to already contain `reduce_litellm_route`). So:
 
@@ -161,7 +161,7 @@ just a serial task.
 
 ---
 
-### Task 1: `fulcrum-core` — tool support becomes three-valued in the LiteLLM reduction
+### Task 1: `fulcrum-harness` — tool support becomes three-valued in the LiteLLM reduction
 
 **Parallel:** none — the only code task in this repo's branch, and the gate on every other task.
 
@@ -409,7 +409,7 @@ creates no file.)
 
 ---
 
-### Task 3: desktop — bump the `fulcrum-core` rev and flip the coupling witness
+### Task 3: desktop — bump the `fulcrum-harness` rev and flip the coupling witness
 
 **Parallel:** wave 1 — disjoint from Task 2. `Cargo.lock` is this task's alone (Task 2 touches no
 lockfile).
@@ -436,7 +436,7 @@ other `litellm_*` resolve fixtures assert only `api`, `resolve_non_litellm_provi
 amendment does not touch.
 
 **Files:**
-- Modify: `src-tauri/Cargo.toml` (`:47`), `Cargo.lock` (the `fulcrum-core` source line, rewritten
+- Modify: `src-tauri/Cargo.toml` (`:47`), `Cargo.lock` (the `fulcrum-harness` source line, rewritten
   by cargo — this is the task's only lockfile touch)
 - Modify: `src-tauri/src/agent/session/tests/mod.rs:3025-3050` — the assertion, its message, and
   its doc comment
@@ -450,8 +450,8 @@ amendment does not touch.
 - [ ] Record the merged FULL 40-char SHA (`gh api repos/archimedes-codes/fulcrum/commits/main
       --jq .sha`, or `git -C ../fulcrum rev-parse origin/main` after a fetch). It MUST be full in
       the manifest (`src-tauri/Cargo.toml:34-39` explains why).
-- [ ] Edit `src-tauri/Cargo.toml:47`; run `cargo update -p fulcrum-core`; confirm
-      `cargo tree -i fulcrum-core` prints the new `?rev=` source (and NOT a local path — a stale
+- [ ] Edit `src-tauri/Cargo.toml:47`; run `cargo update -p fulcrum-harness`; confirm
+      `cargo tree -i fulcrum-harness` prints the new `?rev=` source (and NOT a local path — a stale
       `.cargo/config.toml` would make this proof meaningless; delete it first if you used one).
 - [ ] Run `cargo test resolve_propagates_reduced_supports_tools_and_costs_for_litellm`
   - It must now FAIL with `left: true, right: false`. **That failure IS the proof the bump
@@ -471,7 +471,7 @@ amendment does not touch.
       `/v1/models` shape → `None`) must still pass.
 - [ ] `cargo clippy --all-targets` (0 warnings), `cargo fmt --all -- --check`, `pnpm test`,
       `pnpm build`.
-- [ ] Commit: `chore(deps): bump fulcrum-core for the three-valued LiteLLM tool gate (#9)`
+- [ ] Commit: `chore(deps): bump fulcrum-harness for the three-valued LiteLLM tool gate (#9)`
 
 **Acceptance criteria:**
 - [ ] `src-tauri/Cargo.toml` names a full 40-char rev that is an ancestor of `fulcrum` `main`.
@@ -479,14 +479,14 @@ amendment does not touch.
       unadvertised route, with the ADR clause cited in its message.
 - [ ] `reduction_lands_costs_and_tools_truth_on_discovered_meta` still asserts `Some(false)` for a
       route with an explicit `false` — the non-relaxed row.
-- [ ] `cargo tree -i fulcrum-core` shows the git rev, not a local path.
+- [ ] `cargo tree -i fulcrum-harness` shows the git rev, not a local path.
 - [ ] Both repos' full bars green on the integrated desktop tree.
 
 **Local cross-repo development (only if you must draft before the merge):**
 `cp .cargo/config.toml.example .cargo/config.toml` (the `[patch]` form — `[paths]` cannot override
 a git source and silently does nothing). The live file is gitignored **precisely so it can never be
 committed**: committing it breaks every other machine and defeats the rev pin. Prove it is working
-with `cargo tree -i fulcrum-core`, which must print a PATH, not `git+…?rev=`; cargo's
+with `cargo tree -i fulcrum-harness`, which must print a PATH, not `git+…?rev=`; cargo's
 `Patch … was not used in the crate graph` means the table name does not match the dependency URL
 character-for-character. **Delete the file before committing anything, and never treat a
 patch-built green run as CI-proof** — CI compiles the pinned rev.
@@ -575,7 +575,7 @@ Task 1 nothing on the loop side reads that field, so widening its gate would add
 writes to buy nothing (finding #3, and the residual recorded at the foot of this plan).
 
 **Steps:**
-- [ ] Confirm Task 3's bump is in this branch: `cargo tree -i fulcrum-core` prints the NEW rev. If
+- [ ] Confirm Task 3's bump is in this branch: `cargo tree -i fulcrum-harness` prints the NEW rev. If
       not, STOP — `m.is_selectable()` does not exist on the pinned rev and the build will die with
       `no method named 'is_selectable'`.
 - [ ] Edit the Rust DTO + `From` impl, then run `cargo test list_models_dto_mapping`

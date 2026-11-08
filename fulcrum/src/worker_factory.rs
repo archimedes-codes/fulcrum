@@ -28,13 +28,13 @@
 
 use std::path::PathBuf;
 
-use fulcrum_core::worker::client::{WorkerError, WorkerHandle};
-use fulcrum_core::worker::WorkerFactory;
+use fulcrum_harness::worker::client::{WorkerError, WorkerHandle};
+use fulcrum_harness::worker::WorkerFactory;
 
 /// The daemon's factory: `spawn` is `WorkerHandle::spawn(&self.exe)`, nothing else.
 ///
 /// One instance per daemon, shared as `Arc<dyn WorkerFactory>` into
-/// [`WorkerManager::new`](fulcrum_core::worker::WorkerManager::new). It is
+/// [`WorkerManager::new`](fulcrum_harness::worker::WorkerManager::new). It is
 /// `Send + Sync` by construction (`PathBuf`), and it holds no state — the
 /// registry of live Workers is `WorkerManager`'s, and there is deliberately no
 /// second one here.

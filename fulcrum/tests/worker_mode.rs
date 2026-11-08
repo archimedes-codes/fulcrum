@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use fulcrum_core::worker::protocol::PROTOCOL_VERSION;
+use fulcrum_harness::worker::protocol::PROTOCOL_VERSION;
 
 /// The shared process-table probe. One copy, included by both files that ask the
 /// question (`worker_mode.rs`'s `pid_is_reaped` and `serve.rs`'s `pid_is_alive`),

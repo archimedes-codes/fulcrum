@@ -115,7 +115,7 @@ The `gap` frames and their numbers are unaffected — only the log line.
 ## 8. `cargo doc` warns and is not in the validation bar — **recorded; NOT a failure**
 
 `cargo doc --no-deps --workspace` exits **0** with `private_intra_doc_links` warnings (3 in `fulcrum`, 39 in
-`fulcrum-core`). Warn-by-default lint, no errors, nothing in the validation bar runs `cargo doc`.
+`fulcrum-harness`). Warn-by-default lint, no errors, nothing in the validation bar runs `cargo doc`.
 
 Attribution, measured against the pre-PR commit rather than guessed: pre-PR `main` had **4** in `fulcrum`
 (`db/mod.rs:281`, `serve.rs:112`, `transport/frame.rs:116`, `transport/unix.rs:83`). The branch fixed

@@ -369,13 +369,13 @@ mod tests {
     fn production_process_group_kill_lives_only_in_childproc() {
         // T5/S2 repointed every path here at its OWN package, and T5/S3 had to
         // do it again: `interactive/` moved into the crate with S3, so both
-        // `interactive` paths below carry the `fulcrum-core/` label now. A stale
+        // `interactive` paths below carry the `fulcrum-harness/` label now. A stale
         // prefix is not a wrong-file bug but a MISSING file — `production_region`
         // panics on an unreadable path, so it fails loudly rather than reading as
         // "0 sites, all clear". That is the property that makes this census the
         // instructive contrast to the `fake_mcp_stdio` spawners (the status file's
         // finding 3): a wrong root here is RED, not silently green.
-        const SUDO_EXEC: &str = "fulcrum-core/interactive/sudo_exec.rs";
+        const SUDO_EXEC: &str = "fulcrum-harness/interactive/sudo_exec.rs";
         // The needle is the negative-pid SIGKILL itself — the syscall shape,
         // not a name that a wrapper could rename.
         const NEEDLE: &str = "libc::kill(-(pid as i32)";
@@ -385,14 +385,14 @@ mod tests {
         let files = [
             SELF,
             SUDO_EXEC,
-            "fulcrum-core/tools/exec/bash.rs",
+            "fulcrum-harness/tools/exec/bash.rs",
             // T8/S8.3: `worker/client.rs` moved into this crate, so its census
-            // label changed root (`archimedes/` → `fulcrum-core/`). A stale
+            // label changed root (`archimedes/` → `fulcrum-harness/`). A stale
             // prefix here is a RED, not a skip — `region_of_labeled` panics when
             // a labelled path names no file.
-            "fulcrum-core/worker/client.rs",
+            "fulcrum-harness/worker/client.rs",
             // T5/S3: moved with `interactive`.
-            "fulcrum-core/interactive/mod.rs",
+            "fulcrum-harness/interactive/mod.rs",
         ];
 
         let roots = source_roots();
@@ -979,7 +979,7 @@ mod tests {
             // The crate's own tree. The label is a CONSTANT, not a derived path,
             // so it survives the layout change: `SELF` and every labelled entry
             // below resolve against this root in BOTH layouts.
-            label: "fulcrum-core/",
+            label: "fulcrum-harness/",
             path: manifest_dir().join("src"),
         }];
         if let Layout::WorkspaceMember { workspace_root } = &layout {
@@ -1162,7 +1162,7 @@ mod tests {
     /// desktop root's floor is where `command_std` is watched.
     fn crate_floor() -> RootFloor {
         RootFloor {
-            label: "fulcrum-core/",
+            label: "fulcrum-harness/",
             files_scanned: 40,
             calls: 8,
             call_files: 4,
@@ -1202,9 +1202,9 @@ mod tests {
     /// yields `\`.
     ///
     /// T5/S2 moved this file out of `src-tauri/src/agent/` into the crate, so the
-    /// label changed from `agent/childproc.rs` to `fulcrum-core/childproc.rs`:
+    /// label changed from `agent/childproc.rs` to `fulcrum-harness/childproc.rs`:
     /// the label IS the root's identity, so a moved file's label moves with it.
-    const SELF: &str = "fulcrum-core/childproc.rs";
+    const SELF: &str = "fulcrum-harness/childproc.rs";
 
     /// Resolve one labelled path (`"<label><rest>"`, as the `files` lists below
     /// spell them) to an absolute path, WITHOUT reading it. Panics if the label
@@ -1235,7 +1235,7 @@ mod tests {
     /// Every `*.rs` under BOTH packages' `src/`, as `(labelled path, production
     /// region)` pairs sorted by path so a violation report is reproducible.
     ///
-    /// The label is prefixed BEFORE sorting so `fulcrum-core/…` and `archimedes/…`
+    /// The label is prefixed BEFORE sorting so `fulcrum-harness/…` and `archimedes/…`
     /// form two contiguous blocks and a file that exists in both packages (both
     /// have a `web/config.rs` story to tell, and `types.rs` exists on both sides)
     /// can never be conflated in a report.
@@ -1335,7 +1335,7 @@ mod tests {
         // non-empty). Deliberately NOT a bare "files scanned >= N" — the walk
         // visits 100+ files whether or not the CALLS are visible — so each root
         // is floored on the calls it must see as well as on how far it descended.
-        assert_root_floors(&RootTally::of("fulcrum-core/", &regions), &crate_floor());
+        assert_root_floors(&RootTally::of("fulcrum-harness/", &regions), &crate_floor());
         if layout.polices_the_desktop() {
             assert_root_floors(&RootTally::of("archimedes/", &regions), &desktop_floor());
         }
@@ -1401,7 +1401,7 @@ mod tests {
             // prefix would match nothing and `total_tool_ctors` would be 0 — the
             // `== 4` below catches that, but only because the count is asserted;
             // the prefix is repointed so the invariant reads the real files.
-            if !rel.starts_with("fulcrum-core/tools/exec") {
+            if !rel.starts_with("fulcrum-harness/tools/exec") {
                 continue;
             }
             if rel.contains("/tests/") || rel.ends_with("/tests.rs") || rel.ends_with("tests.rs") {
@@ -1446,10 +1446,10 @@ mod tests {
         // cosmetic — `region_of` PANICS when a labelled path names no file, so a
         // stale entry is a red test rather than a file the census skipped.
         let mut runtime_children = vec![
-            "fulcrum-core/mcp/stdio.rs",
+            "fulcrum-harness/mcp/stdio.rs",
             // T8/S8.3: moved into this crate — the label follows the file.
-            "fulcrum-core/worker/client.rs",
-            "fulcrum-core/interactive/sudo_exec.rs",
+            "fulcrum-harness/worker/client.rs",
+            "fulcrum-harness/interactive/sudo_exec.rs",
         ];
         // `commands/update.rs` is the DESKTOP's relaunch path, so it is in scope
         // only while the desktop tree is (see `source_roots`). Listing it
@@ -1478,7 +1478,7 @@ mod tests {
     /// The CRATE-side half of the same invariant: the seam that installs the
     /// hook. `run_worker_inner` resolves the base dir at INSTALL time and hands
     /// it to the injected closure; the crate itself must never own the hook slot.
-    const CRASH_HOOK: &str = "fulcrum-core/worker/mod.rs";
+    const CRASH_HOOK: &str = "fulcrum-harness/worker/mod.rs";
 
     /// Invariant D — `agent/crashlog.rs` may not resolve a data dir.
     ///
@@ -1681,7 +1681,7 @@ mod tests {
 
         // ── Vacuity guard FIRST, PER ROOT (see `assert_root_floors`), then the
         // aggregate that pins this invariant's own API.
-        assert_root_floors(&RootTally::of("fulcrum-core/", &regions), &crate_floor());
+        assert_root_floors(&RootTally::of("fulcrum-harness/", &regions), &crate_floor());
         if layout.polices_the_desktop() {
             assert_root_floors(&RootTally::of("archimedes/", &regions), &desktop_floor());
         }

@@ -81,7 +81,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fulcrum::transport::{connect, Connection, ConnectionWriter, Endpoint};
-use fulcrum_core::worker::protocol::{StartEnv, StartMode, PROTOCOL_VERSION};
+use fulcrum_harness::worker::protocol::{StartEnv, StartMode, PROTOCOL_VERSION};
 
 /// The shared process-table probe, whose own header explains why it is one module
 /// included by two test binaries rather than a helper in each (they had already
@@ -144,7 +144,7 @@ const ATTACH_READY_CEILING: Duration = Duration::from_secs(5);
 /// `src/fixtures/worker.rs`).
 ///
 /// A mirror and not an import: the fixture's constants are private to
-/// `fulcrum-core`'s fixture module, which a `tests/` crate of the OTHER package
+/// `fulcrum-harness`'s fixture module, which a `tests/` crate of the OTHER package
 /// cannot name. If the fixture's cadence ever changes, this number and
 /// [`CHUNK_SILENCE`] have to be re-derived from it — the slow-start test would fail
 /// LOUDLY (its silence detector would fire while the stream is still flowing), not
@@ -314,7 +314,7 @@ const _: () = assert!(
 ///
 /// # Why the fallback builds into an ISOLATED `--target-dir`
 ///
-/// The obvious fallback — `cargo build -p fulcrum-core --bin fake_worker_core`,
+/// The obvious fallback — `cargo build -p fulcrum-harness --bin fake_worker_core`,
 /// which drops the binary in `target/debug/` — is WRONG here, and subtly so.
 /// `ci.yml` forbids a `cargo build --all-targets` step because it would keep the
 /// suite green after someone deleted `tests/fixture_bins.rs`, the target whose
@@ -322,7 +322,7 @@ const _: () = assert!(
 /// `target/debug/` is that same step wearing a test's clothes. Measured, with
 /// `tests/fixture_bins.rs` removed and both fixture bins deleted:
 ///
-/// * `cargo test -p fulcrum-core --lib` alone → **66 failed** (loud, as designed)
+/// * `cargo test -p fulcrum-harness --lib` alone → **66 failed** (loud, as designed)
 /// * the same workspace `cargo test` WITH this file's shared-target fallback →
 ///   **32 failed** — this file rebuilt `target/debug/fake_worker_core` at test
 ///   time and silently rescued 34 of the engine's own tests.
@@ -372,7 +372,7 @@ fn worker_fixture() -> PathBuf {
         .args([
             "build",
             "-p",
-            "fulcrum-core",
+            "fulcrum-harness",
             "--bin",
             WORKER_FIXTURE,
             "--target-dir",
@@ -1059,7 +1059,7 @@ impl Client {
 ///
 /// The path is four keys deep and each level is called `type`, which is how this
 /// file got it wrong once: `frame["frame"]["event"]` is the SERIALIZED
-/// [`fulcrum_core::events::RpcEvent`], and that enum is internally tagged
+/// [`fulcrum_harness::events::RpcEvent`], and that enum is internally tagged
 /// (`#[serde(tag = "type")]`), so it is an OBJECT `{"type": "agent_settled"}` —
 /// not the string a first reading suggests. It is a string only on the OTHER
 /// event-bearing variant, `SinkFrame`, whose `event` is a bare name like
@@ -1100,8 +1100,8 @@ fn agent_message_chunk_for(session: &str) -> impl Fn(&serde_json::Value) -> bool
 /// `StartEnv` requires a `Model`, so the envelope has to carry one. This is the
 /// same shape `client.rs`'s own `test_env` builds.
 fn start_env(session_id: &str, cwd: &str) -> StartEnv {
-    fn model(id: &str) -> fulcrum_core::harness::catalog::Model {
-        fulcrum_core::harness::catalog::Model {
+    fn model(id: &str) -> fulcrum_harness::harness::catalog::Model {
+        fulcrum_harness::harness::catalog::Model {
             id: id.to_string(),
             provider: "fake".to_string(),
             base_url: "http://127.0.0.1:1/v1".to_string(),
@@ -1122,7 +1122,7 @@ fn start_env(session_id: &str, cwd: &str) -> StartEnv {
         StartMode::Fresh,
         None,
         m.clone(),
-        fulcrum_core::harness::catalog::ModelCatalog {
+        fulcrum_harness::harness::catalog::ModelCatalog {
             models: vec![m],
             ..Default::default()
         },

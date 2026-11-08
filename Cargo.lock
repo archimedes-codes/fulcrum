@@ -631,7 +631,7 @@ name = "fulcrum"
 version = "0.1.0"
 dependencies = [
  "dirs",
- "fulcrum-core",
+ "fulcrum-harness",
  "libc",
  "rusqlite",
  "serde",
@@ -642,7 +642,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fulcrum-core"
+name = "fulcrum-harness"
 version = "0.1.0"
 dependencies = [
  "async-trait",

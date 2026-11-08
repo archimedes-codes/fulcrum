@@ -27,7 +27,7 @@ use crate::seams::Dispatcher;
 use crate::types::mint_session_id;
 use crate::worker_types::SubagentDispatchWire;
 
-// T5/S3: `LaunchConfig` moved to `fulcrum_core::launch_config` — it is pure
+// T5/S3: `LaunchConfig` moved to `fulcrum_harness::launch_config` — it is pure
 // data (six `Option` fields, its only non-`std` reference is
 // `definition_permission::PermissionBlock`, which moved in S2) while THIS file
 // could not move until S5b because of the `WorkerManager` edge below it.
@@ -42,7 +42,7 @@ use crate::worker_types::SubagentDispatchWire;
 pub use crate::launch_config::LaunchConfig;
 
 // T5/S4 (plan Step E.2/E.3): the subagent dispatch VOCABULARY moved to
-// `fulcrum_core::subagent_types` with `LaunchConfig`'s siblings. The reason is the
+// `fulcrum_harness::subagent_types` with `LaunchConfig`'s siblings. The reason is the
 // same ordering constraint S3 hit and for the same remedy — `SubagentDispatchWire`
 // (E3) names `AgentNameResolution` in a field, and the crate's `Dispatcher` trait
 // (E2) takes a `oneshot::Sender<SubagentOutcome>`, so neither the wire type nor the

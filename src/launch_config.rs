@@ -55,7 +55,7 @@ pub struct LaunchConfig {
     /// Resolved model (`"provider/id"` or `"provider/id:<thinking>"`); `None` =
     /// pi default. (The quotes are rustdoc, not prose: bare `<thinking>` in a doc
     /// comment is parsed as an unclosed HTML tag — the same text was silent in
-    /// `subagent.rs` only because that file is not a `cargo doc -p fulcrum-core`
+    /// `subagent.rs` only because that file is not a `cargo doc -p fulcrum-harness`
     /// target. T5/S3 A.6.)
     pub model: Option<String>,
     /// The thinking level from the OVERRIDE layer or the explicit tool-call
