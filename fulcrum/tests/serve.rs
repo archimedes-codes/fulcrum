@@ -21,9 +21,9 @@
 //! emits canned store frames with no network.
 //!
 //! It is a bin of the OTHER package, so `env!("CARGO_BIN_EXE_…")` cannot name it
-//! and cargo need not build it for `cargo test -p fulcrum --test serve`. Measured
+//! and cargo need not build it for `cargo test -p fulcrum-harness-daemon --test serve`. Measured
 //! both ways: a workspace-wide `cargo test` does materialise it (both default
-//! members, all targets), and `cargo test -p fulcrum --test serve` on a target
+//! members, all targets), and `cargo test -p fulcrum-harness-daemon --test serve` on a target
 //! dir that has never seen it does not. So [`worker_fixture`] resolves it, and
 //! only builds it when it is genuinely absent.
 //!

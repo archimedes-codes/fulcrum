@@ -1909,7 +1909,7 @@ mod unix_specific {
     /// runners are all unprivileged, so on every automated run this is SKIPPED and
     /// the automated proof of the reject path is the unit test of the comparison in
     /// `unix.rs`. An operator who wants the end-to-end half runs
-    /// `sudo cargo test -p fulcrum --test transport -- --ignored`.
+    /// `sudo cargo test -p fulcrum-harness-daemon --test transport -- --ignored`.
     ///
     /// # Why the socket's mode is WIDENED first, and why that is not cheating
     ///
@@ -1973,7 +1973,7 @@ mod unix_specific {
         if unsafe { libc::geteuid() } != 0 {
             panic!(
                 "this test is `#[ignore]`d precisely because it needs root, and it is \
-                 running as uid {} — run it via `sudo cargo test -p fulcrum --test \
+                 running as uid {} — run it via `sudo cargo test -p fulcrum-harness-daemon --test \
                  transport -- --ignored`, or do not select it at all",
                 unsafe { libc::geteuid() }
             );
