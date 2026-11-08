@@ -4,7 +4,8 @@ This repo is a two-member Cargo workspace. `fulcrum-harness` — the agent engin
 [`archimedes-codes/archimedes`](https://github.com/archimedes-codes/archimedes), the
 desktop app (renamed from `archimedes-codes/desktop` after the extraction): the tool loop, provider clients, tools
 and sandbox, the MCP client, and the out-of-process worker. A library. It knows nothing about windows, trays, or
-the UI that renders it. Beside it sits `fulcrum`, the `fulcrum serve` daemon — **it runs**: one binary with two modes
+the UI that renders it. Beside it sits `fulcrum-harness-daemon` (package name; its bin,
+lib and directory are all still `fulcrum`), the `fulcrum serve` daemon — **it runs**: one binary with two modes
 (`fulcrum serve` is the supervisor, `fulcrum --worker` the child it spawns, a self-exec of the same executable), a
 listener on a unix socket or a Windows named pipe, the SQLite file, and the accept loop that multiplexes clients onto
 supervised worker processes (ADR 0091). What it does *not* do yet is listed in
@@ -96,6 +97,21 @@ desktop now consumes this crate as a git dependency, and **a dependency's bins a
 collision cannot happen from the desktop's checkout anymore. **The suffix is still load-bearing, because re-adding this
 package to the desktop's `members` — a normal move for local engine work — re-arms the collision silently.** Renaming
 these bins to drop the suffix is the way to reintroduce a bug that produced wrong test results with a green suite.
+
+**Renaming the daemon's PACKAGE must not rename its BIN.** `scripts/check-no-stray-processes.sh`
+watches `MATCH_IMAGES=(fulcrum fake_worker_core fake_mcp_stdio_core)` by matching the **full basename of
+the first `args=` element** (`is_watched_image`, an exact match — never a prefix). A daemon image renamed
+to the package name fails that match, and then fails the only other branch that reaches a verdict,
+`image_truncation_collision`, because `fulcrum-harness-daemon`[:15] is `fulcrum-harness`, not `fulcrum`.
+Control then falls to a bare `continue`: the process is skipped **with no accounting at all** — not a
+candidate, not `COLLISION_COUNT`, not a `left-alone:` line — so the census prints `clean: the process
+table was read; 0 candidate(s)` over a leaked daemon and the summary gives no hint it happened. Verified
+by sourcing both predicates and calling them, and by reading the dispatch in `enumerate_unix`
+(`if … elif … else continue`), not by reasoning about the arithmetic. That is the vacuous-green class this
+file refuses elsewhere (`-p`'s subtree form, a blind census root). The package rename is therefore
+confined to `[package] name`; `[[bin]] name`, `[lib] name`, the on-disk `target/debug/fulcrum`, the
+self-exec and the member path `members = ["fulcrum"]` all stay, and the daemon spawns *itself* via
+`current_exe()` (`fulcrum/src/worker_factory.rs`), so the image name is also the worker's identity.
 
 **`Path::is_file()` does not append `EXE_SUFFIX`; `CreateProcessW` does.** A fixture path built without the suffix
 spawns fine and fails an existence check. `test_support::fixture_bin()` owns the suffix; `target_debug_dir()` names a
@@ -323,8 +339,13 @@ contract, which is why `check-versions.sh --tag vX.Y.Z` is the first step of
 no build stage and no artifact upload, deliberately — no consumer installs a binary today (the
 desktop compiles the engine from source as a git dependency), and an unsigned tarball that
 looks like a supported install channel is worse than none. No `cargo publish` either: neither
-`fulcrum-harness` nor `fulcrum` is on crates.io, and a name squat there is not recoverable by
-renumbering. The workflow's two jobs are to refuse a version the tree does not carry, and to
+`fulcrum-harness` nor `fulcrum-harness-daemon` is on crates.io, and a name squat there is not recoverable by
+renumbering. Note the bare forms are NOT free — `fulcrum` is a profiler crate and `fulcrum-core` is a
+seven-crate "Fulcrum AI agent framework" family — which is what the two renames moved off; see *The name*
+in the README. A bare `cargo publish` at this root also fails by construction, because `default-members`
+lists both packages and the daemon's engine dep is a `path` dependency: cargo strips `path` when publishing
+and demands a `version` requirement. Publish with `-p`, never bare, and never by editing
+`default-members` — that line is what makes the bare gates reach the daemon. The workflow's two jobs are to refuse a version the tree does not carry, and to
 create the release. Its `workflow_dispatch` mode rehearses the gate on a branch and creates
 nothing — and it prints that it created nothing, so a green rehearsal is never mistaken for a
 shipped release.

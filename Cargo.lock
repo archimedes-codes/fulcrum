@@ -627,21 +627,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fulcrum"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "fulcrum-harness",
- "libc",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "fulcrum-harness"
 version = "0.1.0"
 dependencies = [
@@ -669,6 +654,21 @@ dependencies = [
  "uuid",
  "walkdir",
  "wiremock",
+]
+
+[[package]]
+name = "fulcrum-harness-daemon"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "fulcrum-harness",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

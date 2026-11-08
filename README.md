@@ -23,8 +23,12 @@ This repo is a Cargo workspace with two members:
   with `src/` and `tests/` beside it. That is not laziness; the shape is forced by
   the `childproc` census and moving it is fatal. `AGENTS.md` carries the finding and
   the reproduction.
-- **`fulcrum`** — the `fulcrum serve` daemon (ADR 0091): a long-lived supervisor that
-  owns the SQLite file and multiplexes clients onto supervised worker processes. It
+- **`fulcrum-harness-daemon`** — the `fulcrum serve` daemon (ADR 0091): a long-lived
+  supervisor that owns the SQLite file and multiplexes clients onto supervised worker
+  processes. The package is `fulcrum-harness-daemon`; the **bin, the `[lib]` name and the
+  directory are all still `fulcrum`** (see *The daemon member's name* below), so the member
+  entry is `fulcrum`, `use fulcrum::…` still works, and `ps` still says `fulcrum`.
+  It
   runs. One binary, two modes — `fulcrum serve` is the supervisor, `fulcrum --worker`
   is the child it spawns, which is a self-exec of the same executable (that is what
   makes the daemon's default `--worker-exe` correct without guessing a path):
@@ -227,9 +231,8 @@ SAME commit, so the pin diff and the DDL diff are reviewed together.
 ## The name (and why it changed)
 
 This package was `fulcrum-core` through T5–T9 and is `fulcrum-harness` from the
-rename onward. The daemon sibling follows in its own change as `fulcrum-harness-daemon`
-(its package is still `fulcrum` here), so the family prefix is `fulcrum-harness-` and
-the suffix after it names the thing.
+rename onward. Its daemon sibling is `fulcrum-harness-daemon`, so the family prefix is
+`fulcrum-harness-` and the suffix after it names the thing.
 
 **Why the old name had to go — this half is measured.** `fulcrum-core` is taken on
 crates.io, and not by a squatted empty crate: `fulcrum-core`, `fulcrum-assets`,
@@ -274,10 +277,32 @@ are the measurements behind making it:
 writing. Nothing is published, so a future rename is still cheap; it stops being cheap
 the moment `cargo publish` runs.
 
-The daemon member is untouched by this change — its package is still `fulcrum` here, as
-are its bin, lib and directory. `CONTEXT.md` defines **Agent harness** as the model loop
-+ tool registry + persistence + provider integration, and lists **Agent** under *Avoid*
-for it — "a harness *runs* the agent; it is not the agent".
+### The daemon member's name: one package, four surviving `fulcrum`s
+
+Its package is `fulcrum-harness-daemon` (`fulcrum` is taken on crates.io too, by an
+unrelated profiler crate). Everything else kept the old name, and the split is
+deliberate — `fulcrum/Cargo.toml` spells out `[lib] name = "fulcrum"` and
+`[[bin]] name = "fulcrum"`, so neither follows the package name:
+
+| Surface | Name | Why it must not change |
+| --- | --- | --- |
+| `[package] name` | `fulcrum-harness-daemon` | the registry name — the only one that was taken |
+| `[[bin]] name`, `target/debug/fulcrum` | `fulcrum` | the CLI users type (`fulcrum serve`) |
+| process image watched by `scripts/check-no-stray-processes.sh` | `fulcrum` | renaming it would make the daemon invisible to the census, which would print "clean" over a leaked process — see AGENTS.md |
+| the daemon→worker self-exec (`current_exe()` + `--worker`) | `fulcrum` | the daemon spawns *itself*; see `fulcrum/src/worker_factory.rs` |
+| `[lib] name`, so `use fulcrum::…` | `fulcrum` | 45 lib tests and every `fulcrum::` path in the member |
+| `[workspace] members = ["fulcrum"]` | `fulcrum` | a **directory** path, not a package name |
+
+What *did* change is every `-p fulcrum`, because `-p` matches **package** names: seven
+references, one of them inside a live `panic!` message (`fulcrum/tests/transport.rs:1976`,
+the root-only test's "run it via …" hint). Measured: `cargo test -p fulcrum` now dies with
+`package ID specification \`fulcrum\` did not match any packages`, and **nothing in CI runs
+those strings** — they are doc comments and one message — so no gate catches a missed one.
+`env!("CARGO_BIN_EXE_fulcrum")` is unaffected: it resolves by **bin** name.
+
+`CONTEXT.md` defines **Agent harness** as the model loop + tool registry + persistence +
+provider integration, and lists **Agent** under *Avoid* for it — "a harness *runs* the
+agent; it is not the agent".
 
 **The name is on the wire, so this was not a cosmetic change.** `env!("CARGO_PKG_NAME")`
 is not read anywhere in the tree, but `env!("CARGO_PKG_VERSION")` — which the rename

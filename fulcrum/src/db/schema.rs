@@ -25,7 +25,7 @@
 //!   reporting two digests that differ.
 //! - `the_pinned_schema_fingerprint_matches_the_shipped_file` in
 //!   `fulcrum/tests/db.rs` diffs that file against the shapes this build pins, so a
-//!   DDL change HERE reddens `cargo test -p fulcrum` in the same commit that made it.
+//!   DDL change HERE reddens `cargo test -p fulcrum-harness-daemon` in the same commit that made it.
 //! - `scripts/check-schema-drift.sh` is the reusable comparator, run on every
 //!   `main`/`feature/*` push and every PR by
 //!   `.github/workflows/schema-drift.yml`, preceded by its own `--self-test` so a
@@ -101,7 +101,7 @@
 //!   migration history, and the SELECT-list subsets — `Db::SESSION_COLUMNS` is 10 of
 //!   `sessions`' 12 columns and the desktop's `SPACE_COLUMNS` is 4 of `spaces`' 5, so
 //!   comparing those would FALSE-POSITIVE on `spaces.sort_order`.
-//! - Where the daemon side is enforced: `cargo test -p fulcrum` (the pin-vs-shapes
+//! - Where the daemon side is enforced: `cargo test -p fulcrum-harness-daemon` (the pin-vs-shapes
 //!   test) and `.github/workflows/schema-drift.yml` on every push and PR.
 //! - Where the desktop side is enforced: the same `scripts/check-schema-drift.sh`
 //!   comparator in the desktop's own CI, against the fingerprint of the fulcrum rev

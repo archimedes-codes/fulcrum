@@ -916,7 +916,7 @@ fn help_prints_the_usage_and_exits_zero() {
 /// (`~/.local/share/fulcrum/`). This file shipped without `--db` and so opened,
 /// created and migrated a database in the developer's home directory on every
 /// run: measured as `fulcrum.db` + `-wal` + `-shm` in `~/.local/share/`, created
-/// fresh by a single `cargo test -p fulcrum --test worker_mode`. Compounding it,
+/// fresh by a single `cargo test -p fulcrum-harness-daemon --test worker_mode`. Compounding it,
 /// the daemon's store holds full conversation transcripts, and until the mode
 /// fix it was created 0644 — world-readable. A test must not write to a real
 /// user path regardless of the mode bits.
