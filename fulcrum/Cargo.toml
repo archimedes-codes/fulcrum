@@ -1,6 +1,6 @@
 [package]
 name = "fulcrum"
-version = "0.11.0"
+version = "0.1.0"
 edition = "2021"
 
 # The `fulcrum serve` daemon (T9) — the long-lived worker supervisor that lives
