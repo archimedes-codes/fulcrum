@@ -124,7 +124,7 @@ impl AgentLoop {
             // exists to end.
             if t.reason == CompactionReason::Overflow && ran == CompactionRan::Skipped {
                 // Site 1 of the eight in
-                // `docs/roadmap/settle-announced-tool-rows.md`: there is NO
+                // `docs/features/abandoned-tool-rows.md` §2: there is NO
                 // `TurnAccumulator` in this function's scope — the compaction
                 // check runs at the TOP of the turn loop, before the model call
                 // that produces one — so nothing has announced a row yet.
@@ -693,7 +693,7 @@ impl AgentLoop {
     /// `announced` is the abandoned attempt's `acc.tool_calls` — the calls it
     /// opened rows for and will never dispatch. It is `&[]` wherever no attempt
     /// is in scope (see the eight-site table in
-    /// `docs/roadmap/settle-announced-tool-rows.md`); the close MUST precede
+    /// `docs/features/abandoned-tool-rows.md` §2); the close MUST precede
     /// `turn_end`, because `normalize` closes a row on `tool_execution_end` and
     /// on nothing that follows it.
     pub(super) fn settle_cancelled(&mut self, tool_results: Vec<Value>, announced: &[ToolCall]) {

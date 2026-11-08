@@ -5,8 +5,9 @@ Landed on `feature/11-settle-announced-tool-calls` against
 (`close_announced_tool_calls`, `src/harness/loop/turn.rs`, reached from both settle functions) and the module that pins
 each exit (`src/harness/loop/tests/tool_row_settle.rs`, 7 tests). This file is the permanent residue — the invariant,
 the derivation behind the exits that close nothing, the three constraints that break if the helper is tidied, and the
-residual this crate cannot reach. The plan that drove it (`docs/roadmap/settle-announced-tool-rows.md`) goes at ship
-like every plan in this family; `git log` has it.
+residual this crate cannot reach. The plan that drove it (`docs/roadmap/settle-announced-tool-rows.md`) went at ship
+like every plan in this family; `git log` has it. §2 below is that plan's eight-site table, which is why three code
+comments cite this file and not the plan.
 
 Every line number below was read in the tree this note lands in, with the fix already committed (`a245180`, tests in
 `2334d83`). The plan's references were written against `45e576d` — the commit it verified its problem statement against —
@@ -100,10 +101,10 @@ should not have to re-derive which are which. `loop.rs:1419` is the accepted cle
 arm, and `loop.rs:1209` settles the prompt `handle_prompt` skipped on an already-cancelled token — in both, no turn body
 ran, so nothing was announced.
 
-**One pointer to retarget at ship — open work, one line.** `settle_cancelled`'s own doc comment sends a reader to the
-eight-site table "in `docs/roadmap/settle-announced-tool-rows.md`" (`turn.rs:695-696`), and that file is deleted on
-ship, as every plan in this repo family is. This file is its successor; the comment should name it instead. Not fixed
-here because Task 3 owns two files and `turn.rs` is not one of them.
+**The pointer this note flagged for retargeting has been retargeted.** `settle_cancelled`'s doc comment used to send a
+reader to the eight-site table "in `docs/roadmap/settle-announced-tool-rows.md`" (`turn.rs:695-696`), and that plan
+file is deleted on ship, as every plan in this repo family is. This file is its successor, so all three code comments
+that cited the plan (`turn.rs` twice, `tool_row_settle.rs` once) now cite §2 here instead.
 
 ## 3. Three constraints on the helper that are load-bearing — **recorded**
 

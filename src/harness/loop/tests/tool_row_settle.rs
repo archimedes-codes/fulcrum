@@ -14,7 +14,7 @@
 //!
 //! Task 1 shipped the fix (`close_announced_tool_calls`, reached from both
 //! settle functions; the eight-site table and its vacuity derivations live in
-//! `docs/roadmap/settle-announced-tool-rows.md`). This module pins the exits
+//! `docs/features/abandoned-tool-rows.md` §2). This module pins the exits
 //! Task 1 did not itself test: site 2 (mid-stream `Fatal`), site 3 asserted as
 //! the PAIR its asymmetry was the bug, site 4 (budget exhausted), site 8 (Stop
 //! pressed mid-stream — the exit the field report is about), the emission
