@@ -226,6 +226,19 @@ pub struct ToolCtx {
     /// derived `Clone` SHARES the sink: the codemode bridge clones the ctx it
     /// was given and the clone must keep streaming.
     pub event_sink: Option<std::sync::Arc<dyn ToolEventSink>>,
+    /// (issue #180 F1) The task-board seam handle: `None` in every direct fixture
+    /// is a silent "no task store" (the seven task arms answer
+    /// [`ToolResult::fail`], never a panic); the production loop sets it via
+    /// [`AgentLoop::set_task_store`](crate::harness::r#loop::AgentLoop).
+    ///
+    /// `Arc` so the derived `Clone` SHARES the caller — the codemode bridge clones
+    /// the ctx and the clone must reach the same seam (the same reason
+    /// `event_sink` above is an `Arc`).
+    ///
+    /// The type is the crate-internal async [`TaskCaller`](crate::seams::TaskCaller),
+    /// NOT the sync [`TaskStore`](crate::seams::TaskStore): an arm has to park on the
+    /// answer and race the turn token, which only a future can do.
+    pub task_store: Option<std::sync::Arc<dyn crate::seams::TaskCaller>>,
 }
 
 impl ToolCtx {

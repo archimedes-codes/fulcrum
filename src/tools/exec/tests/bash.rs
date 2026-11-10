@@ -370,6 +370,8 @@ async fn bash_cancel_kills_child() {
         render_requester: None,
         // (B1) No event sink: emitting is a silent no-op here.
         event_sink: None,
+        // (issue #180 F1) No task store: a task tool answers "no task store", here.
+        task_store: None,
     };
     let handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -535,6 +537,8 @@ async fn bash_cancel_kills_a_child_that_closed_its_pipes() {
         render_requester: None,
         // (B1) No event sink: emitting is a silent no-op here.
         event_sink: None,
+        // (issue #180 F1) No task store: a task tool answers "no task store", here.
+        task_store: None,
     };
     let handle = tokio::spawn(async move {
         execute_tool(

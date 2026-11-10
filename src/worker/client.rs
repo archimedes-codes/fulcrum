@@ -118,6 +118,24 @@ pub enum WorkerInboundEvent {
     /// A Worker-side error (e.g. the loop task panicked — the crash
     /// log is already written; the process exits right after).
     WorkerError { code: String, message: String },
+    /// A task-board call from the Worker's `IpcTaskStore` (issue #180 F1).
+    ///
+    /// The Supervisor-side consumer must ANSWER it — the Worker parked a oneshot
+    /// before emitting the frame and is waiting on it, racing the turn token. In
+    /// the desktop that is D2's `route_event` branch (answering with
+    /// `Inbound::TaskResponse` through the handle's inbound writer); the daemon
+    /// carries a loud refusal instead (see `fulcrum/src/serve.rs::worker_frame`),
+    /// because it has no `TaskStore` to answer from yet.
+    ///
+    /// THIS VARIANT IS THE CRATE-SIDE FREIGHT of F1 and it is a breaking change
+    /// for SOURCE, not for the wire: every exhaustive `match` over this enum must
+    /// gain an arm, and there are exactly two — the daemon's `worker_frame` (in
+    /// this repo, landed here) and the desktop's `route_event` (D2, which must
+    /// therefore land its arm in the SAME commit that bumps the crate pin).
+    TaskRequest {
+        request_id: String,
+        call: crate::seams::TaskCall,
+    },
     /// The process exited (crash detection — the read loop ended on
     /// the stdout EOF; the code is the `child.wait()` result).
     Exited(Option<i32>),
@@ -1010,6 +1028,24 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
             message,
             backtrace: _,
         } => WorkerInboundEvent::WorkerError { code, message },
+        // (issue #180 F1) The task-board call. Routing it DESKTOP-side is D2's
+        // half (a branch in `agent/session/router.rs::route_event` that answers
+        // with `Inbound::TaskResponse`); the crate's job here is only to carry the
+        // variant across the boundary, because `WorkerInboundEvent` is what the
+        // desktop's pump consumes.
+        //
+        // NOTE the deliberate asymmetry with `Outbound::TranscriptInsert`: the
+        // store frames land on `WorkerInboundEvent::Store` because the Supervisor
+        // ANSWERS them by writing SQLite. This one has no crate-side answer — the
+        // crate holds no `TaskStore` (the Supervisor's `Db` is the only impl) — so
+        // it is relayed as its own event and the consumer decides. `IpcStore`'s
+        // write-only sibling behaviour is NOT mirrored: an older Supervisor never
+        // sees this event at all, because its decoder routes `task-request` to
+        // `Outbound::Unknown` above and returns `None` (the F1→D2 window, and the
+        // reason the Worker's park must race the turn token).
+        Outbound::TaskRequest { request_id, call } => {
+            WorkerInboundEvent::TaskRequest { request_id, call }
+        }
         // A newer Worker's frame this build predates — ignored, never an
         // error (the permissive-decoder contract; the overall surface is
         // negotiated on the `hello` frame, handled above).

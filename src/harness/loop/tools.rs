@@ -94,7 +94,17 @@ impl AgentLoop {
         }
         match tc.name.as_str() {
             "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
-            | "read_skill" | "web_search" | "fetch_content" | "get_search_content" => {
+            | "read_skill" | "web_search" | "fetch_content" | "get_search_content"
+            // (issue #180 F1) The seven board / artifact verbs. They join the
+            // BUILT-IN list — not the loop-internal arms below — because their
+            // executors are `execute_tool` arms, and every one of them races the
+            // turn token INSIDE the arm (`task_tools::parked`), so this dispatch
+            // needs no `select!` for these names. Forgetting a name here does not
+            // fail to compile: `dispatch_tool` falls through to `unknown tool`, so
+            // the tool is advertised and dead. That is what
+            // `every_advertised_tool_reaches_an_executor` is for.
+            | "list_board" | "get_task" | "create_task" | "edit_task" | "move_task"
+            | "get_artifact" | "write_artifact" => {
                 // The ONE `ToolCtx` construction is `PermissionContext::to_tool_ctx`
                 // (finding 6): the frozen boundary + guard list, the per-turn
                 // rule list + policy, the web config and the render requester

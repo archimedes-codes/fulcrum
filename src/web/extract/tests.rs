@@ -30,6 +30,8 @@ fn test_ctx() -> ToolCtx {
         render_requester: None,
         // (B1) No event sink: emitting is a silent no-op here.
         event_sink: None,
+        // (issue #180 F1) No task store: a task tool answers "no task store", here.
+        task_store: None,
     }
 }
 

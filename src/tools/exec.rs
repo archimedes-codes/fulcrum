@@ -10,6 +10,7 @@ pub mod bash;
 pub mod fs_tools;
 pub mod search;
 pub mod skills;
+pub mod task_tools;
 
 #[cfg(test)]
 mod tests;
@@ -54,6 +55,19 @@ pub async fn execute_tool(ctx: &ToolCtx, tool: &str, params: &Value) -> ToolResu
         "web_search" => crate::web::tools::exec_web_search(ctx, params).await,
         "fetch_content" => crate::web::tools::exec_fetch_content(ctx, params).await,
         "get_search_content" => crate::web::tools::exec_get_search_content(ctx, params).await,
+        // (issue #180 F1) The seven board / artifact verbs. Arms of `execute_tool`
+        // and NOT loop-internal, so codemode reaches them on a cloned `ToolCtx`
+        // (ADR 0092) — and they are absent from `EXCLUDED_FROM_SCRIPT` for the same
+        // reason: none of them is interactive or recursive. Each arm races the turn
+        // token internally (`task_tools::parked`), which is why `dispatch_tool`
+        // needs no `select!` for these names.
+        "list_board" => task_tools::exec_list_board(ctx, params).await,
+        "get_task" => task_tools::exec_get_task(ctx, params).await,
+        "create_task" => task_tools::exec_create_task(ctx, params).await,
+        "edit_task" => task_tools::exec_edit_task(ctx, params).await,
+        "move_task" => task_tools::exec_move_task(ctx, params).await,
+        "get_artifact" => task_tools::exec_get_artifact(ctx, params).await,
+        "write_artifact" => task_tools::exec_write_artifact(ctx, params).await,
         other => ToolResult::fail(format!("unknown tool: {other}"), None),
     }
 }

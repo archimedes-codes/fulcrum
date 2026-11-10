@@ -529,3 +529,117 @@ async fn list_agents_tool_flattens_block_scalar_descriptions() {
         "one line per agent (a leaked block-scalar newline would add lines): {text:?}"
     );
 }
+
+/// (issue #180 F1) EVERY advertised tool reaches an executor through
+/// `dispatch_tool` — the census the two `tool_specs.rs` param censuses cannot be.
+///
+/// Those two compare `tool_specs()` against `exec_param_keys()`, both of which are
+/// tables a half-registered tool can join perfectly while `dispatch_tool`'s built-in
+/// OR-list still omits its name. That omission is NOT a compile error: the match falls
+/// through to the `unknown tool:` arm, so the model is told the tool exists, calls it,
+/// and gets "unknown tool" for the whole session. A silent gap of exactly the kind the
+/// spec's four-mandatory-registration-sites rule exists to prevent.
+///
+/// So: for every name `tool_specs()` advertises that is NOT loop-internal, dispatch a
+/// call and assert the result is not the `unknown tool` sentence. No task store is
+/// attached (these fixtures build a loop with no Supervisor), which is the point — a
+/// routed task arm answers "no task store", an UNROUTED one answers "unknown tool", and
+/// the two sentences are what this test tells apart.
+#[tokio::test]
+async fn every_advertised_tool_reaches_an_executor() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    // The loop-internal names are excluded for the reason their own census gives:
+    // their arms are not `execute_tool`, and several would BLOCK on a prompt or
+    // dispatch a child rather than answer. `codemode` is excluded because its arm
+    // needs a live engine and is covered by `codemode_dispatch_runs_a_script_through_agent_loop`.
+    const LOOP_INTERNAL: &[&str] = &[
+        "ask",
+        "sudo_exec",
+        "manage_todo_list",
+        "subagent",
+        "dispatch_subagent",
+        "list_agents",
+        "mcp",
+        "codemode",
+    ];
+    let mut checked = 0usize;
+    for spec in crate::harness::tool_specs::tool_specs() {
+        if LOOP_INTERNAL.contains(&spec.name.as_str()) {
+            continue;
+        }
+        let r = loop_
+            .dispatch_tool(
+                &ToolCall {
+                    id: "t1".to_string(),
+                    name: spec.name.clone(),
+                    // `{}` fails every arm's own param validation — which is fine.
+                    // An unreachable name produces `unknown tool` instead, and THAT
+                    // is the string under test.
+                    arguments: json!({}),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        let text = result_text(&r);
+        assert!(
+            !text.contains("unknown tool"),
+            "`{}` is ADVERTISED by `tool_specs()` but `dispatch_tool` routes it to \
+             `unknown tool` ({text:?}) — add it to the built-in OR-list (or to the \
+             loop-internal arms) in `loop/tools.rs`",
+            spec.name
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 19,
+        "the census must actually walk the advertised set, counted {checked}"
+    );
+}
+
+/// The seven task verbs specifically are reachable AND answer the seam sentence (the
+/// loop's `ToolCtx` carries no task store, so "no task store" is the correct, routed
+/// answer — proof the name reached `execute_tool` and its arm).
+#[tokio::test]
+async fn the_seven_task_tools_are_dispatchable() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    for name in [
+        "list_board",
+        "get_task",
+        "create_task",
+        "edit_task",
+        "move_task",
+        "get_artifact",
+        "write_artifact",
+    ] {
+        let r = loop_
+            .dispatch_tool(
+                &ToolCall {
+                    id: "t1".to_string(),
+                    name: name.to_string(),
+                    arguments: json!({}),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        let text = result_text(&r);
+        assert!(
+            text.contains("no task store"),
+            "`{name}` answered {text:?} — it must reach its arm and report the \
+             missing seam, not `unknown tool`"
+        );
+    }
+}

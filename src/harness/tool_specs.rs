@@ -443,6 +443,116 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["response_id"]
             }),
         },
+        // ── (issue #180 F1) the seven board / artifact verbs ───────────────
+        //
+        // HARD CONSTRAINT on every string below (description AND parameter
+        // descriptions — both render into the prompt's `<tools>` section): no
+        // substring `read`, no substring `subagent`, not even inside a word.
+        // `src-tauri/tests/worker_e2e.rs` asserts
+        // `!tools_section.contains("read") && !tools_section.contains("subagent")`
+        // as a SUBSTRING test over the WHOLE rendered section, so a description
+        // carrying either word makes that assertion PASS WHILE PROVING NOTHING —
+        // a silent CI weakening, not a failure, and it only shows on the Windows
+        // leg. Hence "fetch" / "load" / "show" instead of "read", and no
+        // `thread` / `already` / `spread` / `reads` either (all contain `read`).
+        // `no_task_tool_description_names_read_or_subagent` keeps the ban visible
+        // from Linux, over the WHOLE spec, not just the description.
+        ToolSpec {
+            name: "list_board".into(),
+            description: "List the task board for a space — one row per card (titles, \
+                          stage slugs, artifact key names only; never content)."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "space_path": { "type": "string", "description": "The space whose board to list" }
+                },
+                "required": ["space_path"]
+            }),
+        },
+        ToolSpec {
+            name: "get_task".into(),
+            description: "Fetch one task's full row by id.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "The task id" }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolSpec {
+            name: "create_task".into(),
+            description: "Create a task on a space's board (a space starts on its first \
+                          stage)."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "space_path": { "type": "string", "description": "The space to create the task in" },
+                    "title": { "type": "string", "description": "The task title" },
+                    "body": { "type": "string", "description": "Optional task body (prose)" },
+                    "stage_slug": { "type": "string", "description": "Optional starting stage (defaults to the space's first stage)" }
+                },
+                "required": ["space_path", "title"]
+            }),
+        },
+        ToolSpec {
+            name: "edit_task".into(),
+            description: "Edit a task's title, body or spec path by id.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "The task id" },
+                    "title": { "type": "string", "description": "Optional new title" },
+                    "body": { "type": "string", "description": "Optional new body (prose)" },
+                    "spec_path": { "type": "string", "description": "Optional new spec path" }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolSpec {
+            name: "move_task".into(),
+            description: "Move a task to another stage.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "space_path": { "type": "string", "description": "The space the task lives in" },
+                    "task_id": { "type": "string", "description": "The task id" },
+                    "to_stage": { "type": "string", "description": "The destination stage slug" }
+                },
+                "required": ["space_path", "task_id", "to_stage"]
+            }),
+        },
+        ToolSpec {
+            name: "get_artifact".into(),
+            description: "Fetch a task's named artifact as full markdown (the board row \
+                          lists key names only)."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "The task id" },
+                    "key": { "type": "string", "description": "The artifact key" }
+                },
+                "required": ["task_id", "key"]
+            }),
+        },
+        ToolSpec {
+            name: "write_artifact".into(),
+            description: "Write a named markdown artifact for a task (upserts; refused \
+                          over 256 KiB)."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "The task id" },
+                    "key": { "type": "string", "description": "The artifact key" },
+                    "markdown": { "type": "string", "description": "The full markdown to store" }
+                },
+                "required": ["task_id", "key", "markdown"]
+            }),
+        },
     ]
 }
 
@@ -552,7 +662,7 @@ mod tests {
         }
     }
 
-    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 13] {
+    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 20] {
         [
             ("bash", &["command", "timeout_ms"]),
             ("codemode", &["code"]),
@@ -591,6 +701,22 @@ mod tests {
                     "findText",
                 ],
             ),
+            // (issue #180 F1) The seven board / artifact verbs. Each row is EXACTLY
+            // the key set its `tool_specs()` block advertises and exactly the keys
+            // its arm reads — the exact-equality census below is what makes those
+            // three agree, so adding a fourth place for a key to disagree is not
+            // possible. snake_case, like every other tool's params (the camelCase
+            // rule is the WORKER PROTOCOL's, not the tool-argument vocabulary's).
+            ("list_board", &["space_path"]),
+            ("get_task", &["task_id"]),
+            (
+                "create_task",
+                &["space_path", "title", "body", "stage_slug"],
+            ),
+            ("edit_task", &["task_id", "title", "body", "spec_path"]),
+            ("move_task", &["space_path", "task_id", "to_stage"]),
+            ("get_artifact", &["task_id", "key"]),
+            ("write_artifact", &["task_id", "key", "markdown"]),
         ]
     }
 
@@ -608,6 +734,109 @@ mod tests {
         "list_agents",
         "mcp",
     ];
+
+    /// (issue #180 F1) No Task tool spec renders the substring `read` or
+    /// `subagent` anywhere a model can see it.
+    ///
+    /// Why this is worth a separate pin from the two above it: the failure is not
+    /// a red test, it is a GREEN ONE THAT STOPS PROVING ANYTHING.
+    /// `worker_e2e.rs`'s `full_turn_real_worker_canned_provider` asserts the
+    /// rendered section omits both words to prove `enabled_tools` filtering works;
+    /// a task description carrying `read` makes that assertion pass while proving
+    /// nothing — a silently weakened CI check, on the Windows leg only. So the ban
+    /// covers words that CONTAIN the substring too (`thread`, `already`, `spread`,
+    /// `reads`), which is why these descriptions say "fetch" and "list".
+    ///
+    /// The scope is the RENDERER'S OWN SHAPE: `prompt.rs` emits one
+    /// `- {name}: {description}` line per spec, so a NAME is in scope exactly as a
+    /// description is — checking only descriptions would miss a tool named, say,
+    /// `spread_notes`. (The seven names here are clean; the pre-existing
+    /// `read` / `read_skill` specs are legitimately in the full section, which is why
+    /// the desktop's e2e renders that assertion with ONLY `bash` enabled. So this pin
+    /// checks the seven names SEPARATELY from their descriptions — folding names and
+    /// descriptions into one string would trip on `read_skill` and teach nothing.)
+    /// The parameter descriptions ride along as a belt: they are part of the
+    /// `tools[]` API payload even where this particular renderer drops them.
+    #[test]
+    fn no_task_tool_description_names_read_or_subagent() {
+        const TASK_TOOLS: &[&str] = &[
+            "list_board",
+            "get_task",
+            "create_task",
+            "edit_task",
+            "move_task",
+            "get_artifact",
+            "write_artifact",
+        ];
+        let specs = tool_specs();
+        for name in TASK_TOOLS {
+            let spec = specs
+                .iter()
+                .find(|s| s.name == *name)
+                .unwrap_or_else(|| panic!("`{name}` must be advertised by `tool_specs()`"));
+            // The NAME half of the rendered line, checked separately (see the doc:
+            // folding every advertised name into one string would trip the real
+            // `read` / `read_skill` specs and prove nothing).
+            let rendered_name = format!("- {}", spec.name);
+            // The exact line `prompt.rs` renders into `<tools>` (ADR 0017 renders
+            // the same specs into `tools[]`).
+            let rendered_line = format!("{rendered_name}: {}", spec.description);
+            // The full advertised surface, parameter descriptions included.
+            let rendered = format!(
+                "{rendered_line}{}",
+                serde_json::to_string(&spec.parameters).expect("a spec is serializable")
+            );
+            for banned in ["read", "subagent"] {
+                assert!(
+                    !spec.name.contains(banned),
+                    "`{name}`'s NAME contains `{banned}`, and the name is rendered \
+                     into `<tools>` — that makes `worker_e2e.rs`'s assertion pass \
+                     while proving nothing. got {:?}",
+                    spec.name
+                );
+                assert!(
+                    !spec.description.contains(banned),
+                    "`{name}`'s DESCRIPTION contains `{banned}` — that makes \
+                     `worker_e2e.rs`'s `full_turn_real_worker_canned_provider` \
+                     assertion PASS WHILE PROVING NOTHING (a silent CI weakening on \
+                     the Windows leg, not a failure). Say \"fetch\" / \"load\". \
+                     got {:?}",
+                    spec.description
+                );
+                assert!(
+                    !rendered.contains(banned),
+                    "`{name}`'s full advertised surface (params included) contains \
+                     `{banned}`. got {rendered:?}"
+                );
+            }
+        }
+        // And the ban is not accidentally vacuous: these seven really are advertised.
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|s| TASK_TOOLS.contains(&s.name.as_str()))
+                .count(),
+            7,
+            "all seven task tools are advertised"
+        );
+    }
+
+    /// `tool_specs()` is 26 = the 19 this file shipped before issue #180 + the seven
+    /// task verbs. The count is pinned because the two censuses above are
+    /// SUBSET-shaped (`every spec is in the table` / `every table row has a spec`)
+    /// and both stay green if a spec is DELETED — a deleted spec silently un-advertises
+    /// a tool the desktop's `toolDetailsRegistry` still expects. The `odd` fixture in
+    /// this module's own tests is NOT in `tool_specs()` and must not be counted.
+    #[test]
+    fn tool_specs_advertises_twenty_six_tools() {
+        assert_eq!(
+            tool_specs().len(),
+            26,
+            "19 pre-existing + the 7 task verbs (the `odd` test fixture is not a \
+             production spec — if this count moved by accident, a task tool was \
+             dropped or a fixture leaked into `tool_specs()`)"
+        );
+    }
 
     #[test]
     fn every_tool_spec_is_in_the_param_key_table() {
