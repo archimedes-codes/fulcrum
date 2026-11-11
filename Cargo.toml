@@ -72,7 +72,7 @@ default-members = [".", "fulcrum"]
 
 [package]
 name = "fulcrum-harness"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "The Fulcrum agent harness — the tool loop, provider clients, tools, sandbox and MCP client; extracted from archimedes"
 # `license` is not decoration: crates.io shows it and `cargo publish` warns without
