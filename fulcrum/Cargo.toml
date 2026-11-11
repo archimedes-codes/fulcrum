@@ -1,6 +1,6 @@
 [package]
 name = "fulcrum-harness-daemon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Deliberately NOT published. This is a long-lived supervisor binary that no
 # consumer installs from a registry, and its engine dependency is

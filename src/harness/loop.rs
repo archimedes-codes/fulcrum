@@ -323,6 +323,12 @@ pub(crate) struct PermissionContext {
     /// nested-call rows. `None` until attached (and in every harness-free
     /// fixture, where emitting is a silent no-op).
     pub(super) tool_event_sink: Option<Arc<dyn crate::tools::ToolEventSink>>,
+    /// (issue #180 F1) The task-board seam handle, copied into the ONE `ToolCtx`
+    /// construction like the two handles above it. `None` in every harness-free
+    /// fixture — where a task tool answers `ToolResult::fail` ("no task store")
+    /// rather than panicking — and set in production by `core.rs`'s
+    /// `default_build_loop` through [`AgentLoop::set_task_store`].
+    pub(super) task_store: Option<Arc<dyn crate::seams::TaskCaller>>,
 }
 
 impl PermissionContext {
@@ -372,6 +378,10 @@ impl PermissionContext {
             // (B1) `None` until `AgentLoop::new` attaches the loop's sink
             // (this constructor cannot see the loop's sink/store/events).
             tool_event_sink: None,
+            // (issue #180 F1) `None` until `default_build_loop` calls
+            // `AgentLoop::set_task_store` — the same construction-time `None` as
+            // the two handles above it.
+            task_store: None,
         }
     }
 
@@ -454,6 +464,10 @@ impl PermissionContext {
             // Arc handle is COPIED so every ctx — and every clone of one —
             // streams through the SAME sink.
             event_sink: self.tool_event_sink.clone(),
+            // (issue #180 F1) The task-board handle travels with the cluster, so a
+            // task arm cannot reach a seam its gate never saw (the same one-bundle
+            // rule the two handles above it exist for).
+            task_store: self.task_store.clone(),
         }
     }
 }
@@ -912,6 +926,21 @@ impl AgentLoop {
         requester: Option<Arc<dyn crate::web::RenderRequester>>,
     ) {
         self.permissions.render_requester = requester;
+    }
+
+    /// Attach the task-board seam (issue #180 F1) — the mirror of
+    /// [`Self::set_render_requester`] directly above, for the same reason: the
+    /// handle is built by `worker::core.rs`'s `default_build_loop` AFTER the loop
+    /// exists (it needs the Worker's outbound channel and its pending map), and
+    /// adding a 25th `AgentLoop::new` argument would rewrite every call site in the
+    /// crate for a handle three of them do not have.
+    ///
+    /// `None` is a legitimate value, not a degraded one: it means "this loop has no
+    /// board to talk to", and the seven task arms answer
+    /// [`ToolResult::fail`](crate::tools::ToolResult) with that reason instead of
+    /// panicking or hanging.
+    pub fn set_task_store(&mut self, store: Option<Arc<dyn crate::seams::TaskCaller>>) {
+        self.permissions.task_store = store;
     }
 
     /// Queue a prompt (best-effort — a full / closed queue is dropped).

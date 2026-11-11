@@ -27,6 +27,7 @@ pub mod manager;
 pub mod protocol;
 pub mod sink;
 pub mod store;
+pub mod task_store;
 
 pub use client::{WorkerError, WorkerErrorKind, WorkerHandle, WorkerInboundEvent};
 pub use core::{default_build_loop, LoopControl, LoopHandles, WorkerCore};

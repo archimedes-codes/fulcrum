@@ -282,9 +282,370 @@ pub trait Dispatcher: Send + Sync {
     fn cancel_subagent(&self, child_session_id: &str);
 }
 
+// ── (issue #180 F1) the Task-board seam ──────────────────────────────────────
+//
+// The two halves of one seam, and the split is the crate's existing house shape
+// (`RenderRequester`, `SubagentDispatcher`): a SYNC trait the DESKTOP implements,
+// plus — here, because this module's doc says it holds the traits — the
+// crate-internal ASYNC half the Worker parks on. See
+// [`crate::worker::task_store::IpcTaskStore`] for the requester and
+// [`crate::tools::exec::task_tools`] for the seven arms that call it.
+
+/// The crate-side Task-seam error (issue #180 F1).
+///
+/// Deliberately NOT `StoreError`: that type is `#[from] std::io::Error` /
+/// `#[from] serde_json::Error` and is NOT serializable, while this one has to ride
+/// the wire inside `Inbound::TaskResponse`'s `Result` — the desktop builds it at
+/// the same boundary `From<DbError> for StoreError` occupies (Sqlite → `Io`,
+/// missing row → `NotFound`, grammar or size refusal → `Invalid`). No `rusqlite`
+/// here, exactly the `StoreError` rule that keeps a SQLite driver out of the crate.
+///
+/// `PartialEq` so a test in EITHER repo can compare an answer instead of
+/// string-matching its `Display`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TaskStoreError {
+    /// The store itself failed (the desktop folds every SQLite failure here).
+    Io {
+        /// What failed, in one sentence — it reaches the model as the tool result.
+        message: String,
+    },
+    /// The row the call named does not exist (a missing Task or artifact).
+    NotFound {
+        /// Which id or key was not found.
+        message: String,
+    },
+    /// The call was well-formed JSON and still not admissible (a key outside the
+    /// artifact grammar, a markdown over the command layer's size cap).
+    Invalid {
+        /// Why it was refused.
+        message: String,
+    },
+}
+
+/// One board row — a card, and deliberately **key names only** for its artifacts.
+///
+/// A card payload must NEVER carry markdown: that is the whole point of splitting
+/// `BoardRow` from [`Artifact`]. A board of thirty cards each carrying a spec would
+/// otherwise put the entire corpus in one tool result.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardRow {
+    /// The task id (`tsk_…`).
+    pub id: String,
+    /// The Space the card lives in.
+    pub space_path: String,
+    /// The per-Space card number (what the human sees).
+    pub number: u32,
+    /// The card's title.
+    pub title: String,
+    /// The card's prose (one of the two fields that have always carried it).
+    pub body: Option<String>,
+    /// The spec PATH (a path chip — NOT an artifact, and not rendered as one).
+    pub spec_path: Option<String>,
+    /// The Stage the card currently sits on.
+    pub stage_slug: String,
+    /// The card's position within its column.
+    pub sort_order: i64,
+    /// Creation time, unix millis.
+    pub created_at: i64,
+    /// Last touch, unix millis.
+    pub updated_at: i64,
+    /// The names of the Task's artifacts — REQUIRED, never optional, `[]` when
+    /// nobody has written one. Fetching the content is
+    /// [`TaskStore::get_artifact`]'s job.
+    pub artifact_keys: Vec<String>,
+}
+
+/// [`TaskStore::get_task`]'s row: the desktop's `TaskRow` 1:1, plus the artifact
+/// key names (the detail dialog shows the chips, so the fetch has to answer them).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDetail {
+    /// The task id (`tsk_…`).
+    pub id: String,
+    /// The Space the card lives in.
+    pub space_path: String,
+    /// The per-Space card number.
+    pub number: u32,
+    /// The card's title.
+    pub title: String,
+    /// The card's prose.
+    pub body: Option<String>,
+    /// The spec path.
+    pub spec_path: Option<String>,
+    /// The Stage the card currently sits on.
+    pub stage_slug: String,
+    /// The card's position within its column.
+    pub sort_order: i64,
+    /// Creation time, unix millis.
+    pub created_at: i64,
+    /// Last touch, unix millis.
+    pub updated_at: i64,
+    /// The artifact key names (never the content — see [`BoardRow`]).
+    pub artifact_keys: Vec<String>,
+}
+
+/// The write answer ([`TaskStore::create_task`] / [`TaskStore::edit_task`]): the
+/// plain row, no artifact keys (the write did not touch them, so the answer says
+/// nothing about them).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRow {
+    /// The task id (`tsk_…`).
+    pub id: String,
+    /// The Space the card lives in.
+    pub space_path: String,
+    /// The per-Space card number.
+    pub number: u32,
+    /// The card's title.
+    pub title: String,
+    /// The card's prose.
+    pub body: Option<String>,
+    /// The spec path.
+    pub spec_path: Option<String>,
+    /// The Stage the card sits on after the write.
+    pub stage_slug: String,
+    /// The card's position within its column.
+    pub sort_order: i64,
+    /// Creation time, unix millis.
+    pub created_at: i64,
+    /// Last touch, unix millis.
+    pub updated_at: i64,
+}
+
+/// An artifact's content — the ONLY DTO that carries `markdown`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artifact {
+    /// The Task the artifact belongs to.
+    pub task_id: String,
+    /// The artifact's name (the grammar is the desktop's rule).
+    pub key: String,
+    /// The full markdown, verbatim.
+    pub markdown: String,
+    /// Creation time, unix millis (survives an upsert).
+    pub created_at: i64,
+    /// Last write, unix millis.
+    pub updated_at: i64,
+}
+
+/// The write answer ([`TaskStore::write_artifact`]) — meta ONLY, never the
+/// markdown back: the caller just sent it, so echoing it doubles the frame.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactMeta {
+    /// The key that was written.
+    pub key: String,
+    /// Write time, unix millis.
+    pub updated_at: i64,
+    /// The stored size in bytes (what the command layer capped).
+    pub bytes: usize,
+}
+
+/// The answer to a move.
+///
+/// `on_enter` is **OPAQUE string data**: the crate passes it through and never
+/// interprets it. The boost it names needs the desktop's `SessionManager`, which
+/// storage cannot name, so it stays command-layer — the crate never learns what
+/// compaction is, and this type must not grow a field that says otherwise (pinned
+/// by `move_outcome_stays_free_of_compaction`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveOutcome {
+    /// The Stage the card landed on (the destination the call named, unless the
+    /// desktop's rules redirected it — which is what `note` explains).
+    pub to_stage: String,
+    /// Opaque destination metadata for the CALLER's command layer to act on.
+    pub on_enter: Option<String>,
+    /// A human-readable note about the move, when there is one worth making.
+    pub note: Option<String>,
+}
+
+/// The seven verbs as DATA, so the Worker can frame one over
+/// [`Outbound::TaskRequest`](crate::worker::protocol::Outbound::TaskRequest) and
+/// the Supervisor can decode it into the matching [`TaskStore`] method.
+///
+/// Tagged by `verb` (camelCase), payload keys camelCase. An optional that is `None`
+/// serializes to `null` (serde's own `Option` encoding) and decodes from EITHER
+/// `null` or an absent key (`#[serde(default)]`) — a frame from a peer that omits it
+/// entirely is a peer saying "no value", not a malformed frame.
+///
+/// The `rename_all` appears TWICE on purpose, and the second one is load-bearing:
+/// serde's enum-level `rename_all` renames the VARIANT names (hence `listBoard`,
+/// `getArtifact`) and does NOT reach into a struct variant's fields — measured, not
+/// assumed (an enum-level-only spelling emits `{"verb":"listBoard",
+/// "space_path":…}`, which would silently break the camelCase contract the desktop
+/// decodes against). The per-variant `rename_all` is what makes the PAYLOAD keys
+/// camelCase, and `the_task_store_dtos_serialize_to_the_agreed_camel_case_wire_keys`
+/// is the pin that keeps it there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "verb", rename_all = "camelCase")]
+pub enum TaskCall {
+    /// [`TaskStore::list_board`].
+    #[serde(rename_all = "camelCase")]
+    ListBoard {
+        /// The Space to list.
+        space_path: String,
+    },
+    /// [`TaskStore::get_task`].
+    #[serde(rename_all = "camelCase")]
+    GetTask {
+        /// The task id.
+        task_id: String,
+    },
+    /// [`TaskStore::create_task`].
+    #[serde(rename_all = "camelCase")]
+    CreateTask {
+        /// The Space to create in.
+        space_path: String,
+        /// The card's title.
+        title: String,
+        /// The card's prose, when given.
+        #[serde(default)]
+        body: Option<String>,
+        /// The starting Stage, when given (a Space starts on its first stage).
+        #[serde(default)]
+        stage_slug: Option<String>,
+    },
+    /// [`TaskStore::edit_task`].
+    #[serde(rename_all = "camelCase")]
+    EditTask {
+        /// The task id.
+        task_id: String,
+        /// A new title, when given.
+        #[serde(default)]
+        title: Option<String>,
+        /// A new body, when given.
+        #[serde(default)]
+        body: Option<String>,
+        /// A new spec path, when given.
+        #[serde(default)]
+        spec_path: Option<String>,
+    },
+    /// [`TaskStore::move_task`].
+    #[serde(rename_all = "camelCase")]
+    MoveTask {
+        /// The Space the card lives in.
+        space_path: String,
+        /// The task id.
+        task_id: String,
+        /// The destination stage.
+        to_stage: String,
+    },
+    /// [`TaskStore::get_artifact`].
+    #[serde(rename_all = "camelCase")]
+    GetArtifact {
+        /// The task id.
+        task_id: String,
+        /// The artifact key.
+        key: String,
+    },
+    /// [`TaskStore::write_artifact`].
+    #[serde(rename_all = "camelCase")]
+    WriteArtifact {
+        /// The task id.
+        task_id: String,
+        /// The artifact key.
+        key: String,
+        /// The full markdown to store.
+        markdown: String,
+    },
+}
+
+/// The crate's Task-board seam (ADR 0092, issue #180 F1): every board verb the
+/// model can reach.
+///
+/// SYNC by design — this is the contract the DESKTOP implements
+/// (`impl TaskStore for storage::Db`, Supervisor-side, because the Supervisor is
+/// the sole SQLite writer and the Worker has no `Db`). The Worker's half is the
+/// async [`TaskCaller`], because a sync method receives no turn token and cannot
+/// park on a oneshot: the two rules ADR 0092 mandates for this seam (race the turn
+/// token, clean the pending map on `Drop`) only exist for a future the executor can
+/// drop.
+///
+/// Every method takes borrows and returns an owned answer: the answer crosses a
+/// channel, the arguments do not.
+pub trait TaskStore: Send + Sync {
+    /// The Space's board, one row per card (artifact KEY NAMES only).
+    fn list_board(&self, space_path: &str) -> Result<Vec<BoardRow>, TaskStoreError>;
+
+    /// One task, `None` when the id names nothing (asking for what is not there is
+    /// an answer, not an error).
+    fn get_task(&self, task_id: &str) -> Result<Option<TaskDetail>, TaskStoreError>;
+
+    /// Create a card. `stage_slug` `None` = the Space's first stage.
+    fn create_task(
+        &self,
+        space_path: &str,
+        title: &str,
+        body: Option<&str>,
+        stage_slug: Option<&str>,
+    ) -> Result<TaskRow, TaskStoreError>;
+
+    /// Edit a card's title / body / spec path (`None` = leave that field alone).
+    fn edit_task(
+        &self,
+        task_id: &str,
+        title: Option<&str>,
+        body: Option<&str>,
+        spec_path: Option<&str>,
+    ) -> Result<TaskRow, TaskStoreError>;
+
+    /// Move a card to another stage.
+    fn move_task(
+        &self,
+        space_path: &str,
+        task_id: &str,
+        to_stage: &str,
+    ) -> Result<MoveOutcome, TaskStoreError>;
+
+    /// One artifact's markdown, `None` when the key names nothing.
+    fn get_artifact(&self, task_id: &str, key: &str) -> Result<Option<Artifact>, TaskStoreError>;
+
+    /// Write one artifact (upsert — one row per `(task_id, key)`).
+    fn write_artifact(
+        &self,
+        task_id: &str,
+        key: &str,
+        markdown: &str,
+    ) -> Result<ArtifactMeta, TaskStoreError>;
+}
+
+/// The Worker-side ASYNC half of the Task seam (issue #180 F1): the request-issuer
+/// the executor arms park on.
+///
+/// The same shape as
+/// [`RenderRequester::request_render`](crate::web::RenderRequester::request_render)
+/// — a SYNC method returning a boxed future — and the same reason: the trait object
+/// has to live in an `Arc` the `ToolCtx` can clone, and `async fn` in a trait object
+/// is not object safe. The desktop NEVER implements this; it implements
+/// [`TaskStore`]. The Worker implements it once, as
+/// [`IpcTaskStore`](crate::worker::task_store::IpcTaskStore), which frames the call
+/// over the wire and parks until `Inbound::TaskResponse` answers it.
+///
+/// The `Value` it hands back is the DTO the matching [`TaskStore`] method returns,
+/// serialized — each arm deserializes the shape it expects, so the wire needs no
+/// per-verb result enum.
+pub trait TaskCaller: Send + Sync {
+    /// Issue one call. Resolves with the answer, or fails with the store's error.
+    ///
+    /// The returned future MUST be droppable mid-park: dropping it removes the
+    /// pending-map entry (the `TaskRequestCleanup` guard), which is what keeps a
+    /// Stop from leaking.
+    fn call(
+        &self,
+        call: TaskCall,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, TaskStoreError>> + Send>,
+    >;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::StoreError;
+    use super::*;
+    use serde_json::Value;
+    use std::sync::Arc;
 
     /// The one behaviour the crate itself can observe about its error type: the
     /// two variants carry their source's `Display` verbatim, so a message that
@@ -310,5 +671,503 @@ mod tests {
             Ok(())
         }
         assert!(matches!(reads(), Err(StoreError::Json(_))));
+    }
+
+    // ── (issue #180 F1) the Task seam ────────────────────────────────────
+
+    /// The compile proof for the EXACT sync signature.
+    ///
+    /// The real impl (`impl TaskStore for storage::Db`) lives in the OTHER repo, so
+    /// in-clone the only thing that can pin the seven signatures is an impl HERE.
+    /// This one answers every verb with the same canned failure — its job is
+    /// INSTANTIATION (D2 compiles against these exact parameter orders and
+    /// option-ness, or this type stops satisfying the trait), not behaviour, and
+    /// [`TestTaskStore`] is named by the object-safety pin below so it cannot rot
+    /// into dead code.
+    struct TestTaskStore;
+
+    impl TaskStore for TestTaskStore {
+        fn list_board(&self, _space_path: &str) -> Result<Vec<BoardRow>, TaskStoreError> {
+            Err(TaskStoreError::Io {
+                message: "test store".into(),
+            })
+        }
+        fn get_task(&self, _task_id: &str) -> Result<Option<TaskDetail>, TaskStoreError> {
+            Err(TaskStoreError::Io {
+                message: "test store".into(),
+            })
+        }
+        fn create_task(
+            &self,
+            _space_path: &str,
+            _title: &str,
+            _body: Option<&str>,
+            _stage_slug: Option<&str>,
+        ) -> Result<TaskRow, TaskStoreError> {
+            Err(TaskStoreError::Io {
+                message: "test store".into(),
+            })
+        }
+        fn edit_task(
+            &self,
+            _task_id: &str,
+            _title: Option<&str>,
+            _body: Option<&str>,
+            _spec_path: Option<&str>,
+        ) -> Result<TaskRow, TaskStoreError> {
+            Err(TaskStoreError::Io {
+                message: "test store".into(),
+            })
+        }
+        fn move_task(
+            &self,
+            _space_path: &str,
+            _task_id: &str,
+            _to_stage: &str,
+        ) -> Result<MoveOutcome, TaskStoreError> {
+            Err(TaskStoreError::Io {
+                message: "test store".into(),
+            })
+        }
+        fn get_artifact(
+            &self,
+            _task_id: &str,
+            _key: &str,
+        ) -> Result<Option<Artifact>, TaskStoreError> {
+            Err(TaskStoreError::Io {
+                message: "test store".into(),
+            })
+        }
+        fn write_artifact(
+            &self,
+            _task_id: &str,
+            _key: &str,
+            _markdown: &str,
+        ) -> Result<ArtifactMeta, TaskStoreError> {
+            Err(TaskStoreError::Io {
+                message: "test store".into(),
+            })
+        }
+    }
+
+    /// The seam is usable as a trait object behind the same `Arc` shape every
+    /// other seam in this crate is held by — object safety, and the `Send + Sync`
+    /// bound that lets a `Worker`-thread handle cross an await point.
+    #[test]
+    fn task_store_is_object_safe_and_shareable() {
+        let store: Arc<dyn TaskStore> = Arc::new(TestTaskStore);
+        let err = store
+            .list_board("/some/space")
+            .expect_err("the test store always fails");
+        assert_eq!(
+            err,
+            TaskStoreError::Io {
+                message: "test store".into()
+            },
+            "the canned failure rides back verbatim (`TaskStoreError` is `PartialEq` \
+             so a test in either repo can compare it)"
+        );
+        fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        assert_send_sync(&store);
+    }
+
+    /// A full board row, every field populated (the fixture the wire-key pin
+    /// walks — a field that is missing from the pin's expected key list shows up
+    /// as an EXTRA key here, which is how the pin catches a rename in either
+    /// direction).
+    fn a_board_row() -> BoardRow {
+        BoardRow {
+            id: "tsk_1".into(),
+            space_path: "/space".into(),
+            number: 7,
+            title: "Ship the seam".into(),
+            body: Some("prose".into()),
+            spec_path: Some("docs/x.md".into()),
+            stage_slug: "doing".into(),
+            sort_order: -3,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_500,
+            artifact_keys: vec!["spec".into(), "research".into()],
+        }
+    }
+
+    /// A full task-detail row, every field populated.
+    fn a_task_detail() -> TaskDetail {
+        TaskDetail {
+            id: "tsk_1".into(),
+            space_path: "/space".into(),
+            number: 7,
+            title: "Ship the seam".into(),
+            body: None,
+            spec_path: None,
+            stage_slug: "approved".into(),
+            sort_order: 2,
+            created_at: 1,
+            updated_at: 2,
+            artifact_keys: vec![],
+        }
+    }
+
+    /// A full task row, every field populated.
+    fn a_task_row() -> TaskRow {
+        TaskRow {
+            id: "tsk_1".into(),
+            space_path: "/space".into(),
+            number: 7,
+            title: "Ship the seam".into(),
+            body: Some("prose".into()),
+            spec_path: None,
+            stage_slug: "approved".into(),
+            sort_order: 2,
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    /// The DTO wire keys ARE the cross-repo contract (issue #180 F1's
+    /// `## Provides`): the desktop's `impl TaskStore for Db` and its
+    /// `toolDetailsRegistry` reader keys are written against these spellings, so
+    /// a rename here is a silent contract break in the other repo — the field
+    /// still compiles, the JSON just stops matching. This pins the EXACT key set
+    /// of every DTO and of `TaskCall`'s verb tags, in the camelCase the protocol
+    /// mandates.
+    ///
+    /// Mutation note: rename `BoardRow::sort_order` to `sortOrder` in the struct
+    /// and this test reddens with `sortOrder` in the ACTUAL set (serde would then
+    /// emit `sort_order`, because the attribute only rewrites snake_case inputs) —
+    /// i.e. it fails for the right reason, in both directions.
+    #[test]
+    fn the_task_store_dtos_serialize_to_the_agreed_camel_case_wire_keys() {
+        let keys_of = |v: &Value| -> Vec<String> {
+            v.as_object()
+                .expect("a DTO serializes to a JSON object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            sorted(keys_of(&serde_json::to_value(a_board_row()).unwrap())),
+            sorted(
+                [
+                    "id",
+                    "spacePath",
+                    "number",
+                    "title",
+                    "body",
+                    "specPath",
+                    "stageSlug",
+                    "sortOrder",
+                    "createdAt",
+                    "updatedAt",
+                    "artifactKeys",
+                ]
+                .map(String::from)
+                .to_vec()
+            ),
+            "`BoardRow` wire keys"
+        );
+        assert_eq!(
+            sorted(keys_of(&serde_json::to_value(a_task_detail()).unwrap())),
+            sorted(
+                [
+                    "id",
+                    "spacePath",
+                    "number",
+                    "title",
+                    "body",
+                    "specPath",
+                    "stageSlug",
+                    "sortOrder",
+                    "createdAt",
+                    "updatedAt",
+                    "artifactKeys",
+                ]
+                .map(String::from)
+                .to_vec()
+            ),
+            "`TaskDetail` wire keys"
+        );
+        assert_eq!(
+            sorted(keys_of(&serde_json::to_value(a_task_row()).unwrap())),
+            sorted(
+                [
+                    "id",
+                    "spacePath",
+                    "number",
+                    "title",
+                    "body",
+                    "specPath",
+                    "stageSlug",
+                    "sortOrder",
+                    "createdAt",
+                    "updatedAt",
+                ]
+                .map(String::from)
+                .to_vec()
+            ),
+            "`TaskRow` wire keys (no `artifactKeys`)"
+        );
+        assert_eq!(
+            sorted(keys_of(
+                &serde_json::to_value(Artifact {
+                    task_id: "tsk_1".into(),
+                    key: "spec".into(),
+                    markdown: "# Spec".into(),
+                    created_at: 1,
+                    updated_at: 2,
+                })
+                .unwrap()
+            )),
+            sorted(
+                ["taskId", "key", "markdown", "createdAt", "updatedAt"]
+                    .map(String::from)
+                    .to_vec()
+            ),
+            "`Artifact` wire keys — the ONLY DTO that carries `markdown`"
+        );
+        assert_eq!(
+            sorted(keys_of(
+                &serde_json::to_value(ArtifactMeta {
+                    key: "spec".into(),
+                    updated_at: 2,
+                    bytes: 6,
+                })
+                .unwrap()
+            )),
+            sorted(["key", "updatedAt", "bytes"].map(String::from).to_vec()),
+            "`ArtifactMeta` wire keys (never the markdown back)"
+        );
+        assert_eq!(
+            sorted(keys_of(
+                &serde_json::to_value(MoveOutcome {
+                    to_stage: "done".into(),
+                    on_enter: Some("compact".into()),
+                    note: None,
+                })
+                .unwrap()
+            )),
+            sorted(["toStage", "onEnter", "note"].map(String::from).to_vec()),
+            "`MoveOutcome` wire keys — three and only three (`on_enter` is OPAQUE data)"
+        );
+
+        // `TaskCall`'s verb tags, and the per-verb payload keys.
+        let verb_of = |c: &TaskCall| -> (String, Vec<String>) {
+            let v = serde_json::to_value(c).unwrap();
+            let tag = v
+                .get("verb")
+                .and_then(Value::as_str)
+                .expect("every TaskCall carries a `verb` tag")
+                .to_string();
+            (tag, sorted(keys_of(&v)))
+        };
+        assert_eq!(
+            verb_of(&TaskCall::ListBoard {
+                space_path: "/s".into()
+            }),
+            (
+                "listBoard".into(),
+                sorted(vec!["verb".into(), "spacePath".into()])
+            )
+        );
+        assert_eq!(
+            verb_of(&TaskCall::GetTask {
+                task_id: "tsk_1".into()
+            }),
+            (
+                "getTask".into(),
+                sorted(vec!["verb".into(), "taskId".into()])
+            )
+        );
+        assert_eq!(
+            verb_of(&TaskCall::CreateTask {
+                space_path: "/s".into(),
+                title: "t".into(),
+                body: Some("b".into()),
+                stage_slug: None,
+            }),
+            (
+                "createTask".into(),
+                sorted(vec![
+                    "verb".into(),
+                    "spacePath".into(),
+                    "title".into(),
+                    "body".into(),
+                    "stageSlug".into()
+                ])
+            ),
+            "`createTask` carries all four keys; an absent optional is `null` (serde's \
+             `Option` encoding — the plan's `#[serde(default)]` spelling, which accepts \
+             BOTH `null` and an absent key on the way in)"
+        );
+        assert_eq!(
+            serde_json::to_value(&TaskCall::CreateTask {
+                space_path: "/s".into(),
+                title: "t".into(),
+                body: None,
+                stage_slug: None,
+            })
+            .unwrap()["body"],
+            Value::Null,
+            "the `null` spelling is explicit, so a reader of the contract never has to \
+             guess whether an absent key was ever legal"
+        );
+        assert_eq!(
+            verb_of(&TaskCall::EditTask {
+                task_id: "tsk_1".into(),
+                title: Some("t".into()),
+                body: None,
+                spec_path: Some("p".into()),
+            }),
+            (
+                "editTask".into(),
+                sorted(vec![
+                    "verb".into(),
+                    "taskId".into(),
+                    "title".into(),
+                    "body".into(),
+                    "specPath".into()
+                ])
+            )
+        );
+        assert_eq!(
+            verb_of(&TaskCall::MoveTask {
+                space_path: "/s".into(),
+                task_id: "tsk_1".into(),
+                to_stage: "done".into(),
+            }),
+            (
+                "moveTask".into(),
+                sorted(vec![
+                    "verb".into(),
+                    "spacePath".into(),
+                    "taskId".into(),
+                    "toStage".into()
+                ])
+            )
+        );
+        assert_eq!(
+            verb_of(&TaskCall::GetArtifact {
+                task_id: "tsk_1".into(),
+                key: "spec".into(),
+            }),
+            (
+                "getArtifact".into(),
+                sorted(vec!["verb".into(), "taskId".into(), "key".into()])
+            )
+        );
+        assert_eq!(
+            verb_of(&TaskCall::WriteArtifact {
+                task_id: "tsk_1".into(),
+                key: "spec".into(),
+                markdown: "# Spec".into(),
+            }),
+            (
+                "writeArtifact".into(),
+                sorted(vec![
+                    "verb".into(),
+                    "taskId".into(),
+                    "key".into(),
+                    "markdown".into()
+                ])
+            )
+        );
+    }
+
+    /// `TaskStoreError`'s wire shape (the desktop maps `DbError → TaskStoreError`
+    /// at the same boundary `From<DbError> for StoreError` occupies, and the
+    /// `Inbound::TaskResponse` result rides serde's `Result` encoding, so this
+    /// shape is what the OTHER repo decodes). Tag `kind`, camelCase value:
+    /// `{"kind":"notFound","message":"…"}`.
+    #[test]
+    fn task_store_error_has_the_agreed_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(TaskStoreError::NotFound {
+                message: "no task tsk_9".into()
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "notFound", "message": "no task tsk_9" })
+        );
+        let round: TaskStoreError =
+            serde_json::from_str(r#"{"kind":"invalid","message":"bad key"}"#).unwrap();
+        assert_eq!(
+            round,
+            TaskStoreError::Invalid {
+                message: "bad key".into()
+            }
+        );
+        // serde's `Result` encoding, which is what `TaskResponse.result` carries.
+        let ok: Result<Value, TaskStoreError> = Ok(serde_json::json!({"ok": true}));
+        assert_eq!(
+            serde_json::to_value(&ok).unwrap(),
+            serde_json::json!({ "Ok": { "ok": true } })
+        );
+        let err: Result<Value, TaskStoreError> = Err(TaskStoreError::Io {
+            message: "disk".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            serde_json::json!({ "Err": { "kind": "io", "message": "disk" } })
+        );
+    }
+
+    /// An optional `TaskCall` field that is ABSENT on the wire decodes to `None`
+    /// (a pre-F1 or hand-built frame that omits `body` must not fail to decode —
+    /// the decoder's permissiveness rule, applied to the payload).
+    #[test]
+    fn a_task_call_with_om_optionals_decodes() {
+        let call: TaskCall =
+            serde_json::from_str(r#"{"verb":"createTask","spacePath":"/s","title":"t"}"#).unwrap();
+        assert_eq!(
+            call,
+            TaskCall::CreateTask {
+                space_path: "/s".into(),
+                title: "t".into(),
+                body: None,
+                stage_slug: None,
+            }
+        );
+    }
+
+    /// `MoveOutcome` carries exactly three fields and NOTHING that names
+    /// compaction: the crate never learns what `on_enter` MEANS (the boost stays
+    /// command-layer in the desktop). A field-name census is the only way to pin
+    /// an absence that a future "helpful" widening would introduce.
+    #[test]
+    fn move_outcome_stays_free_of_compaction() {
+        let v = serde_json::to_value(MoveOutcome {
+            to_stage: "done".into(),
+            on_enter: Some("fresh".into()),
+            note: None,
+        })
+        .unwrap();
+        let keys = keys_of_names(&v);
+        assert_eq!(
+            keys,
+            vec![
+                "note".to_string(),
+                "onEnter".to_string(),
+                "toStage".to_string()
+            ],
+            "`MoveOutcome` has exactly its three contract fields"
+        );
+        let text = v.to_string().to_lowercase();
+        for banned in ["compact", "session", "launch", "boost"] {
+            assert!(
+                !text.contains(banned),
+                "`MoveOutcome` must not learn about `{banned}` — the on_enter boost \
+                 is the desktop's command layer"
+            );
+        }
+    }
+
+    fn keys_of_names(v: &Value) -> Vec<String> {
+        let mut ks: Vec<String> = v.as_object().expect("an object").keys().cloned().collect();
+        ks.sort();
+        ks
     }
 }

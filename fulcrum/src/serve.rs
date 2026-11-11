@@ -1323,6 +1323,28 @@ fn worker_frame(evt: &WorkerInboundEvent) -> serde_json::Value {
         WorkerInboundEvent::WorkerError { code, message } => serde_json::json!({
             "type": "worker-error", "code": code, "message": message,
         }),
+        // (issue #180 F1, Decision A — a LOUD refusal, never a silent drop) The
+        // daemon is a pre-D2 supervisor: it holds no `TaskStore`, so it cannot
+        // answer a board call. But it must not swallow the frame either. This
+        // function is PURE — it RETURNS the frame, and the pump's `on_event`
+        // closure already broadcasts whatever comes back — so returning a refusal
+        // here is the whole relay: no fan-out plumbing, no new channel.
+        //
+        // What the refusal does NOT do is answer the Worker. The daemon's `on_event`
+        // carries no inbound writer, so the Worker's oneshot stays unresolved until
+        // the turn token cancels the parked tool and `TaskRequestCleanup` empties the
+        // pending map — the SAME hang-until-turn-cancel the old-desktop window costs.
+        // The difference is what the human sees: a reason on screen instead of a tool
+        // that looks frozen. D2 replaces this with a real answer path; until then the
+        // loud arm stays, because dropping the frame is the one thing that would make
+        // this surface strictly worse than the pre-F1 daemon.
+        WorkerInboundEvent::TaskRequest { request_id, .. } => serde_json::json!({
+            "type": "task-unsupported",
+            "requestId": request_id,
+            "message": "this supervisor (the daemon) predates D2 and has no task store: \
+                        board and artifact tools are served by the desktop session \
+                        (issue #180 F1)",
+        }),
     }
 }
 
@@ -2856,6 +2878,87 @@ mod tests {
             &serde_json::json!({"type": "gap", "skipped": 3}),
             &HashSet::new()
         ));
+    }
+
+    /// (issue #180 F1, Decision A) The daemon refuses a `TaskRequest` LOUDLY.
+    ///
+    /// The daemon is a pre-D2 supervisor: it has no `TaskStore` to answer from, so
+    /// the Worker's oneshot cannot be resolved here. What it must NOT do is drop the
+    /// frame — the pump relays whatever `worker_frame` RETURNS, so returning `null`
+    /// would turn "this supervisor cannot serve the board" into a tool that appears
+    /// frozen until the turn is cancelled, which is the exact failure the rest of F1
+    /// works to make visible. So: an unmistakable frame, carrying the `requestId` it
+    /// refuses, through the existing relay.
+    #[test]
+    fn a_task_request_gets_a_loud_task_unsupported_refusal() {
+        let frame = worker_frame(&WorkerInboundEvent::TaskRequest {
+            request_id: "task-abc".into(),
+            call: fulcrum_harness::seams::TaskCall::ListBoard {
+                space_path: "/some/space".into(),
+            },
+        });
+        assert_eq!(
+            frame["type"], "task-unsupported",
+            "the refusal is its own frame type (a client must not have to guess)"
+        );
+        assert_eq!(
+            frame["requestId"], "task-abc",
+            "the refusal names the call it refuses, so a client can correlate it"
+        );
+        let message = frame["message"]
+            .as_str()
+            .expect("the refusal explains itself");
+        assert!(
+            message.contains("task") && (message.contains("desktop") || message.contains("daemon")),
+            "the message says WHY and WHERE the verb is served, got {message}"
+        );
+        // It is a RELAY, not an answer: no `result` field pretending to be an
+        // `Inbound::TaskResponse`, because the daemon cannot produce one.
+        assert!(
+            frame.get("result").is_none(),
+            "the daemon does not fabricate an answer it did not compute"
+        );
+        // And it reaches a client: `event_frame` is what the pump sends, so the
+        // refusal must survive the envelope the relay filters on.
+        let wrapped = event_frame(
+            "s9",
+            false,
+            &WorkerInboundEvent::TaskRequest {
+                request_id: "task-abc".into(),
+                call: fulcrum_harness::seams::TaskCall::ListBoard {
+                    space_path: "/some/space".into(),
+                },
+            },
+        );
+        assert_eq!(wrapped["sessionId"], "s9", "addressed to the session");
+        assert_eq!(wrapped["frame"]["type"], "task-unsupported");
+        assert!(
+            watched(&wrapped, &HashSet::from(["s9".to_string()])),
+            "a relay watching the session receives the refusal"
+        );
+    }
+
+    /// The refusal must not be the SILENT-DROP shape `null`, and must not be
+    /// confused with the store frames' `_ => {}` catch-all in `persist_frame`
+    /// (which is deliberately untouched: persistence has nothing to persist for a
+    /// task call, and a task frame is not a row).
+    #[test]
+    fn the_task_refusal_is_never_a_silent_drop() {
+        let frame = worker_frame(&WorkerInboundEvent::TaskRequest {
+            request_id: "task-z".into(),
+            call: fulcrum_harness::seams::TaskCall::GetTask {
+                task_id: "tsk_1".into(),
+            },
+        });
+        assert!(
+            !frame.is_null(),
+            "`worker_frame` returning `null` is the silent drop that recreates the \
+             hang with no diagnosis"
+        );
+        assert!(
+            frame.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+            "the frame carries content, got {frame}"
+        );
     }
 
     /// A subagent's `cost_update` is the CHILD's money and must land on the

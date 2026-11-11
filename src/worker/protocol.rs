@@ -32,6 +32,12 @@
 
 use serde_json::Value;
 
+// (issue #180 F1) The task-board frame payloads. These come from `crate::seams`,
+// NOT from anywhere under `worker/`: the DTO/verb types are the DESKTOP-FACING
+// contract (the desktop implements `TaskStore` against them), and the wire merely
+// carries them. Importing them from a sibling worker module would invert that.
+use crate::seams::{TaskCall, TaskStoreError};
+
 // ── T5/S4 + T8/S8.1 — this file and its DATA types are now ONE crate ─────────
 //
 // S4 moved the wire DATA (`StoreFrame`, `SubagentDispatchWire`, `StartEnv`,
@@ -168,6 +174,23 @@ pub enum Inbound {
     },
     #[serde(rename = "fetch-render-response", rename_all = "camelCase")]
     FetchRenderResponse { id: String, value: Value },
+    /// Supervisor → Worker answer to a task-board call (issue #180 F1).
+    ///
+    /// `result` is serde's `Result` encoding — `{"Ok": <value>}` or
+    /// `{"Err": {"kind": "notFound", "message": "…"}}` — so the crate needs no
+    /// per-verb result enum: the tool arm deserializes the DTO its verb returns.
+    ///
+    /// ADDITIVE: an older Worker never sends this and a Worker that predates F1
+    /// never decodes it (its decoder routes the unknown `type` to `Unknown` and
+    /// ignores it, which is the correct answer to a frame it has no caller for).
+    /// A `request_id` with no pending entry is IGNORED by the handler, never an
+    /// error — a late or stale answer to a call whose turn already cancelled is
+    /// ordinary, not a protocol violation.
+    #[serde(rename = "task-response", rename_all = "camelCase")]
+    TaskResponse {
+        request_id: String,
+        result: Result<Value, TaskStoreError>,
+    },
     /// An inbound `type` this version of the Worker doesn't know
     /// (permissive — the raw line is preserved; never an error).
     #[serde(rename = "unknown", rename_all = "camelCase")]
@@ -305,6 +328,17 @@ pub enum Outbound {
         message: String,
         backtrace: Option<String>,
     },
+    /// Worker → Supervisor task-board call (issue #180 F1). ADDITIVE: an older
+    /// Supervisor decodes this into `Outbound::Unknown` and ignores it, so the
+    /// Worker's oneshot stays unresolved until the turn token cancels the parked
+    /// tool — hang-until-turn-cancel, never a leak, because the
+    /// [`TaskRequestCleanup`](crate::worker::task_store::TaskRequestCleanup) guard
+    /// empties the pending map when the future is dropped.
+    ///
+    /// The `call` payload is the verb AS DATA ([`TaskCall`](crate::seams::TaskCall)),
+    /// so one variant covers all seven verbs and a new verb costs no new frame.
+    #[serde(rename = "task-request", rename_all = "camelCase")]
+    TaskRequest { request_id: String, call: TaskCall },
     /// An outbound `type` this version of the Supervisor doesn't know
     /// (permissive — the raw line is preserved; never an error).
     #[serde(rename = "unknown", rename_all = "camelCase")]
@@ -426,7 +460,8 @@ pub fn decode_inbound(line: &str) -> Result<Inbound, ProtoError> {
         | "permission-response"
         | "interactive-response"
         | "subagent-result"
-        | "fetch-render-response" => {
+        | "fetch-render-response"
+        | "task-response" => {
             serde_json::from_value(value).map_err(|e| ProtoError::Json(e.to_string()))
         }
         // Unknown `type` (and the literal `unknown`) — permissive.
@@ -464,7 +499,8 @@ pub fn decode_outbound(line: &str) -> Result<Outbound, ProtoError> {
         | "subagent-cancel"
         | "sink-frame"
         | "fetch-render-request"
-        | "worker-error" => {
+        | "worker-error"
+        | "task-request" => {
             serde_json::from_value(value).map_err(|e| ProtoError::Json(e.to_string()))
         }
         // Unknown `type` (and the literal `unknown`) — permissive.
@@ -1935,6 +1971,297 @@ mod tests {
         assert_ne!(
             a.incarnation, b.incarnation,
             "two `Start`s must not share one stamp"
+        );
+    }
+
+    // ── (issue #180 F1) the task-board frames ─────────────────────────────
+
+    /// Every verb round-trips through the outbound wire, field for field.
+    ///
+    /// This is the frame `IpcTaskStore` emits and a Supervisor decodes, so a verb
+    /// whose payload drifted is a call the desktop answers with the wrong arguments
+    /// — not a decode failure. The assertion is the whole variant, not a
+    /// field-by-field peek, so a renamed field fails loudly.
+    #[test]
+    fn task_request_round_trips_through_the_wire() {
+        let calls = vec![
+            TaskCall::ListBoard {
+                space_path: "/space/a".into(),
+            },
+            TaskCall::GetTask {
+                task_id: "tsk_1".into(),
+            },
+            TaskCall::CreateTask {
+                space_path: "/space/a".into(),
+                title: "Ship it".into(),
+                body: Some("prose".into()),
+                stage_slug: Some("approved".into()),
+            },
+            TaskCall::CreateTask {
+                space_path: "/space/a".into(),
+                title: "Ship it".into(),
+                body: None,
+                stage_slug: None,
+            },
+            TaskCall::EditTask {
+                task_id: "tsk_1".into(),
+                title: Some("Newer".into()),
+                body: None,
+                spec_path: Some("docs/x.md".into()),
+            },
+            TaskCall::MoveTask {
+                space_path: "/space/a".into(),
+                task_id: "tsk_1".into(),
+                to_stage: "doing".into(),
+            },
+            TaskCall::GetArtifact {
+                task_id: "tsk_1".into(),
+                key: "spec".into(),
+            },
+            TaskCall::WriteArtifact {
+                task_id: "tsk_1".into(),
+                key: "spec".into(),
+                markdown: "# Spec\n\n- one\n- two\n".into(),
+            },
+        ];
+        for expected in calls {
+            let frame = Outbound::TaskRequest {
+                request_id: "task-abc".into(),
+                call: expected.clone(),
+            };
+            let line = encode_outbound(&frame);
+            assert!(line.ends_with('\n'), "one JSONL line, newline-terminated");
+            match decode_outbound(&line).expect("a `task-request` line decodes") {
+                Outbound::TaskRequest { request_id, call } => {
+                    assert_eq!(request_id, "task-abc");
+                    assert_eq!(call, expected, "the call rides verbatim");
+                }
+                other => panic!(
+                    "`task-request` must decode to `Outbound::TaskRequest`, got {other:?} \
+                     (the `decode_outbound` type allow-list is missing `task-request` — the \
+                     permissive decoder would silently swallow every task call as `Unknown`)"
+                ),
+            }
+        }
+    }
+
+    /// The `task-request` line routes to the variant rather than to `Unknown`
+    /// (the sibling of `decode_outbound_routes_a_hello_line_to_the_hello_variant`,
+    /// and the reason it exists: the decoder is permissive, so a variant added
+    /// WITHOUT extending the allow-list is silently dropped as `Unknown { raw }` —
+    /// a green suite that never saw a single task call. That specific mistake would
+    /// hang every task tool against a peer that speaks the newer frame).
+    #[test]
+    fn decode_outbound_routes_a_task_request_line_to_its_variant() {
+        let line = r#"{"type":"task-request","requestId":"task-7","call":{"verb":"listBoard","spacePath":"/s"}}"#;
+        match decode_outbound(line).expect("the `task-request` line decodes") {
+            Outbound::TaskRequest { request_id, call } => {
+                assert_eq!(request_id, "task-7");
+                assert_eq!(
+                    call,
+                    TaskCall::ListBoard {
+                        space_path: "/s".into()
+                    }
+                );
+            }
+            other => panic!("expected `TaskRequest`, got {other:?}"),
+        }
+    }
+
+    /// `decode_inbound` routes a `task-response` line to its variant (the same
+    /// allow-list trap on the inbound side).
+    #[test]
+    fn decode_inbound_routes_a_task_response_line_to_its_variant() {
+        let line = r#"{"type":"task-response","requestId":"task-7","result":{"Ok":{"key":"spec","updatedAt":9,"bytes":3}}}"#;
+        match decode_inbound(line).expect("the `task-response` line decodes") {
+            Inbound::TaskResponse { request_id, result } => {
+                assert_eq!(request_id, "task-7");
+                let meta = result.expect("the Ok arm");
+                assert_eq!(meta["key"], "spec");
+                assert_eq!(meta["bytes"], 3);
+            }
+            other => panic!("expected `TaskResponse`, got {other:?}"),
+        }
+    }
+
+    /// Both `Result` arms round-trip: `Ok(<dto value>)` and
+    /// `Err(TaskStoreError)` — the latter in its `{"kind":"notFound",…}` encoding,
+    /// which is what the desktop's `DbError` mapping produces.
+    #[test]
+    fn task_response_round_trips_through_the_wire() {
+        let ok = Inbound::TaskResponse {
+            request_id: "task-1".into(),
+            result: Ok(serde_json::json!([
+                { "id": "tsk_1", "spacePath": "/s", "artifactKeys": ["spec"] }
+            ])),
+        };
+        match decode_inbound(&encode_inbound(&ok)).expect("the Ok arm decodes") {
+            Inbound::TaskResponse { request_id, result } => {
+                assert_eq!(request_id, "task-1");
+                let rows = result.expect("the Ok arm stays Ok");
+                assert_eq!(rows[0]["spacePath"], "/s");
+                assert_eq!(rows[0]["artifactKeys"][0], "spec");
+            }
+            other => panic!("expected `TaskResponse`, got {other:?}"),
+        }
+        let err = Inbound::TaskResponse {
+            request_id: "task-2".into(),
+            result: Err(TaskStoreError::NotFound {
+                message: "no task tsk_9".into(),
+            }),
+        };
+        let line = encode_inbound(&err);
+        assert!(
+            line.contains("\"notFound\""),
+            "the error kind is camelCase on the wire, got {line}"
+        );
+        match decode_inbound(&line).expect("the Err arm decodes") {
+            Inbound::TaskResponse { request_id, result } => {
+                assert_eq!(request_id, "task-2");
+                assert_eq!(
+                    result.expect_err("the Err arm stays Err"),
+                    TaskStoreError::NotFound {
+                        message: "no task tsk_9".into()
+                    },
+                    "the error kind AND message ride verbatim (the model sees this text)"
+                );
+            }
+            other => panic!("expected `TaskResponse`, got {other:?}"),
+        }
+    }
+
+    /// A 256 KiB markdown — the command layer's cap, exercised at the REAL size,
+    /// not a toy (issue #180 Risk 3: a large markdown is a new frame-size profile
+    /// for this wire). Byte-for-byte, both directions.
+    ///
+    /// The stdio readers on both ends are UNBOUNDED `read_line`
+    /// (`worker/mod.rs`, `worker/client.rs`), so this is a codec-and-transport-shape
+    /// proof, not a cap test: F1 deliberately adds NO crate-side cap. The refusal is
+    /// the desktop's command-layer rule (D1/D2).
+    #[test]
+    fn a_256_kib_markdown_request_round_trips_byte_for_byte() {
+        let markdown = "x".repeat(256 * 1024);
+        let frame = Outbound::TaskRequest {
+            request_id: "task-big".into(),
+            call: TaskCall::WriteArtifact {
+                task_id: "tsk_1".into(),
+                key: "spec".into(),
+                markdown: markdown.clone(),
+            },
+        };
+        let line = encode_outbound(&frame);
+        assert!(
+            line.len() > 256 * 1024,
+            "the frame really is over the cap-size, got {} bytes",
+            line.len()
+        );
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "one frame is ONE line — a markdown containing a newline would otherwise \
+             split the frame and the reader would decode a truncated call"
+        );
+        match decode_outbound(&line).expect("a 256 KiB frame decodes") {
+            Outbound::TaskRequest { call, .. } => match call {
+                TaskCall::WriteArtifact { markdown: back, .. } => {
+                    assert_eq!(back.len(), markdown.len(), "byte count");
+                    assert_eq!(back, markdown, "byte-for-byte");
+                }
+                other => panic!("expected `WriteArtifact`, got {other:?}"),
+            },
+            other => panic!("expected `TaskRequest`, got {other:?}"),
+        }
+        // The answer path carries markdown too (`get_artifact`'s `Artifact`), and
+        // that one rides a `Value`, so the same size is proven on the inbound side.
+        let answer = Inbound::TaskResponse {
+            request_id: "task-big".into(),
+            result: Ok(serde_json::json!({
+                "taskId": "tsk_1", "key": "spec", "markdown": markdown,
+                "createdAt": 1, "updatedAt": 2,
+            })),
+        };
+        match decode_inbound(&encode_inbound(&answer)).expect("a 256 KiB answer decodes") {
+            Inbound::TaskResponse { result, .. } => {
+                let back = result
+                    .expect("Ok")
+                    .get("markdown")
+                    .unwrap()
+                    .as_str()
+                    .expect("markdown is a string")
+                    .to_string();
+                assert_eq!(back.len(), 256 * 1024);
+                assert!(back.bytes().all(|b| b == b'x'), "byte-for-byte back");
+            }
+            other => panic!("expected `TaskResponse`, got {other:?}"),
+        }
+    }
+
+    /// A markdown carrying a newline (every real document does) survives the
+    /// line-oriented framing — the JSON encoder escapes it, so the frame stays one
+    /// line. Cheap to pin, and its absence is a frame-splitting bug.
+    #[test]
+    fn a_multiline_markdown_stays_one_frame_line() {
+        let md = "# Title\nline two\n\tindented\n";
+        let line = encode_outbound(&Outbound::TaskRequest {
+            request_id: "task-nl".into(),
+            call: TaskCall::WriteArtifact {
+                task_id: "t".into(),
+                key: "spec".into(),
+                markdown: md.into(),
+            },
+        });
+        assert_eq!(line.lines().count(), 1, "exactly one line");
+        match decode_outbound(&line).expect("decodes") {
+            Outbound::TaskRequest { call, .. } => {
+                let TaskCall::WriteArtifact { markdown, .. } = call else {
+                    panic!("expected WriteArtifact");
+                };
+                assert_eq!(markdown, md, "newlines and the tab ride verbatim");
+            }
+            other => panic!("expected TaskRequest, got {other:?}"),
+        }
+    }
+
+    /// Adding the two types does NOT widen the permissive fallback: a type this
+    /// build still does not know is `Unknown { raw }` on both sides, and the
+    /// literal `unknown` type stays `Unknown` rather than a task frame.
+    #[test]
+    fn the_new_task_types_do_not_widen_the_unknown_fallback() {
+        for line in [
+            r#"{"type":"brand-new-event","foo":1}"#,
+            r#"{"type":"task-requestz","foo":1}"#,
+            r#"{"type":"task-responsz","foo":1}"#,
+            r#"{"type":"unknown","foo":1}"#,
+        ] {
+            assert!(
+                matches!(
+                    decode_outbound(line).expect("permissive"),
+                    Outbound::Unknown { .. }
+                ),
+                "`{line}` must stay `Outbound::Unknown`"
+            );
+            assert!(
+                matches!(
+                    decode_inbound(line).expect("permissive"),
+                    Inbound::Unknown { .. }
+                ),
+                "`{line}` must stay `Inbound::Unknown`"
+            );
+        }
+    }
+
+    /// `PROTOCOL_VERSION` stays **1**: the two task frames are ADDITIVE (a new
+    /// `type` an older peer routes to `Unknown` and ignores), and the module's own
+    /// rule is that only a frame an older peer cannot READ bumps it. Pinning the
+    /// number is the point — a bump here would break every existing peer handshake
+    /// for no reason, and a silent bump is exactly what this test makes expensive.
+    #[test]
+    fn the_task_frames_are_additive_so_the_protocol_version_stays_one() {
+        assert_eq!(
+            PROTOCOL_VERSION, 1,
+            "adding `task-request` / `task-response` is additive — do NOT bump the wire \
+             version (the decoder is permissive by design: an older peer routes the new \
+             type to `Unknown` and ignores it)"
         );
     }
 }
