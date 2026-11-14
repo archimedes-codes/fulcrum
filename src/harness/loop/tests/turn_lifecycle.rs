@@ -8,11 +8,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::*;
 use super::support::*;
-use crate::events::RpcEvent;
+use crate::events::{EventSink, RpcEvent};
+use crate::harness::catalog::Model;
+use crate::harness::dispatch::SubagentDispatcher;
 use crate::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
 };
 use crate::harness::retry::RetryPolicy;
+use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
 use crate::tools::ContentBlock;
 
 /// (finding 3 — ADR 0025's UNBOUNDED `events` channel): a slow /
@@ -1733,5 +1736,518 @@ async fn a_placeholder_stream_is_never_emitted_or_persisted() {
             .count(),
         1,
         "exactly ONE assistant row (the retry's), got {loaded:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (issue #190) The turn the output cap cut off.
+//
+// `FinishReason::Length` was mapped by all three wires and read by nobody in
+// the turn loop: a stream that ended `Done(Length)` fell through the #64 gate
+// (whose first conjunct demanded `Some(Stop)`) and reached the SUCCESS triple —
+// `agent_end` / `turn_end` / `agent_settled` — with the model's half-finished
+// sentence as its reply. The user watched the composer unlock and re-prompted.
+// The three tests below are the three shapes of that turn, and the fourth is
+// the gate the fix generalised.
+// ---------------------------------------------------------------------------
+
+/// `abandoned_tool_result()`'s text (`loop/tools.rs`), pinned byte-for-byte so
+/// a truncated call's card cannot silently reword itself into the misleading
+/// ``missing `path` or `content` parameter`` sentence the bug produced.
+const ABANDONED: &str = "discarded — the model call that asked for this tool was \
+                         abandoned before it ran";
+
+/// The `(id, tool_name, result, is_error)` of every `tool_execution_end`, in
+/// emission order.
+fn closes(events: &[RpcEvent]) -> Vec<(String, String, Value, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            RpcEvent::tool_execution_end {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => Some((
+                tool_call_id.clone(),
+                tool_name.clone(),
+                result.clone(),
+                *is_error,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A `SubagentDispatcher` that COUNTS dispatches and resolves `Completed` with
+/// a value no assertion here accepts — so a loop that DID dispatch the
+/// truncated call fails on the counter AND on the close's text, instead of
+/// hanging on a never-resolving oneshot and reporting a timeout.
+struct CountingDispatcher {
+    dispatches: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SubagentDispatcher for CountingDispatcher {
+    fn dispatch(
+        &self,
+        _parent_session_id: &str,
+        _parent_cwd: &std::path::Path,
+        _parent_model: &Model,
+        _parent_enabled_tools: Vec<String>,
+        _agent_name: String,
+        _name_resolution: AgentNameResolution,
+        _launch: LaunchConfig,
+        _task: String,
+        _sink: &Arc<dyn EventSink>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<SubagentOutcome>,
+        crate::subagent::SubagentCancel,
+    ) {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(SubagentOutcome::Completed {
+            output: "A TRUNCATED CALL WAS DISPATCHED — this must never happen".to_string(),
+            metrics: crate::subagent::SubagentMetrics {
+                output: "A TRUNCATED CALL WAS DISPATCHED — this must never happen".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cost: Some(0.0),
+                duration_ms: 1,
+            },
+        });
+        (rx, crate::subagent::SubagentCancel::none())
+    }
+}
+
+/// (issue #190, Decision 1) A turn the output cap cut off is TERMINAL and
+/// reads as a truncation, never as a success: `turn_truncated` is emitted
+/// BEFORE the settle, `agent_end` (the success event) is never emitted, the
+/// text the model did produce is persisted exactly once, and no retry is
+/// attempted — re-issuing the assistant turn can duplicate a non-idempotent
+/// tool call, which is why the whole family of "retry with a bigger
+/// `max_tokens`" designs was rejected (ADR 0108).
+#[tokio::test]
+async fn a_turn_cut_off_by_the_output_cap_settles_as_truncated_and_persists_its_text() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        // The field report verbatim: a confident half-sentence, then the cap.
+        ProviderEvent::TextDelta("OK, the plans look good — I'm going to write it now".to_string()),
+        ProviderEvent::Done(FinishReason::Length),
+    ])]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("write it")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    // The event is a UNIT variant (Decision 3): it states one fact about the
+    // turn and re-reports nothing from the wire.
+    assert!(
+        events.iter().any(|e| matches!(e, RpcEvent::turn_truncated)),
+        "`turn_truncated` was emitted as a unit variant, got {kinds:?}",
+    );
+
+    // The disposition is announced BEFORE the settle resolves the turn, so a
+    // peer can stash it while `turn_end` is still ahead of it.
+    let truncated_at = kinds
+        .iter()
+        .position(|k| k == "turn_truncated")
+        .unwrap_or_else(|| panic!("the truncation was announced, got {kinds:?}"));
+    let turn_end_at = kinds
+        .iter()
+        .position(|k| k == "turn_end")
+        .expect("the turn settled with turn_end");
+    let settled_at = kinds
+        .iter()
+        .position(|k| k == "agent_settled")
+        .expect("the turn settled with agent_settled");
+    assert!(
+        truncated_at < turn_end_at && truncated_at < settled_at,
+        "`turn_truncated` precedes `turn_end` ({turn_end_at}) and `agent_settled` \
+         ({settled_at}) — an event after the settle is an event no peer is still \
+         listening for, got {kinds:?}",
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "agent_end"),
+        "a truncated turn is NOT a clean stop — `agent_end` is the success event and \
+         this turn never succeeded, got {kinds:?}",
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "auto_retry_start"),
+        "a `Length` stop is terminal, never retried (Decision 1: replaying the \
+         assistant turn can duplicate a non-idempotent tool call), got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly ONE model call — no re-issue, no bigger `max_tokens`"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "message_end").count(),
+        1,
+        "the streamed reply is announced once, got {kinds:?}",
+    );
+
+    // The text IS persisted. It is real content the model produced; showing it
+    // in the display while the transcript lacks it recreates the display /
+    // transcript split the compaction-recovery follow-ups §4 documents.
+    let assistants: Vec<&ChatMessage> = loop_
+        .messages
+        .iter()
+        .filter(|m| matches!(m.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        1,
+        "exactly ONE assistant row in the transcript, got {:?}",
+        loop_.messages
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    let persisted: Vec<&ChatMessage> = loaded
+        .iter()
+        .filter(|m| matches!(m.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(
+        persisted.len(),
+        1,
+        "exactly ONE assistant row in the store a reload reads back, got {loaded:?}",
+    );
+    assert_eq!(
+        persisted[0].content,
+        MessageContent::Text("OK, the plans look good — I'm going to write it now".to_string()),
+        "the persisted row carries the streamed text"
+    );
+    assert!(
+        persisted[0].tool_calls.is_none(),
+        "a truncated turn never carries its tool calls to the provider"
+    );
+}
+
+/// (issue #190, Decision 2) A truncated turn's tool calls are NEVER executed.
+/// Truncated arguments go `parse_arguments` → `{}` → `unknown_param_error`
+/// passes (it checks only EXTRANEOUS keys) → the permission gate returns
+/// `Allow` (there is no `path` to judge) → the executor refuses with
+/// ``write: missing `path` or `content` parameter``. That card is red for the
+/// wrong reason, and 566 of them are measured in this machine's DB. The close
+/// here is `abandoned_tool_result()`'s honest sentence, and the counting
+/// dispatcher proves nothing ran.
+#[tokio::test]
+async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatched() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("writing the file now".to_string()),
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            // The truncated shape: `parse_arguments` hands `{}` for arguments
+            // the cap cut off mid-object, which is exactly what used to reach
+            // the executor and produce the misleading refusal.
+            name: "write".to_string(),
+            arguments: json!({}),
+        }),
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t2".to_string(),
+            // A `subagent` rides along so the no-dispatch claim is OBSERVABLE
+            // rather than inferred: `run_tool_batch` would have spawned it in
+            // the concurrent `join_all` ahead of the sequential loop.
+            name: "subagent".to_string(),
+            arguments: json!({}),
+        }),
+        ProviderEvent::Done(FinishReason::Length),
+    ])]);
+    let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatcher = Arc::new(CountingDispatcher {
+        dispatches: dispatches.clone(),
+    });
+    let (_space, mut loop_) = build_loop_with_dispatcher(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        Arc::new(TestSink {
+            updates: Arc::new(StdMutex::new(Vec::new())),
+        }),
+        Some(dispatcher.clone() as Arc<dyn SubagentDispatcher>),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("write it")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert_eq!(
+        dispatches.load(Ordering::SeqCst),
+        0,
+        "NOT ONE call was dispatched — a truncated `arguments` payload is not a \
+         request the model finished making (Decision 2 / ADR 0108)"
+    );
+
+    // Both announced rows closed, in accumulator order, BEFORE the settle.
+    let closed = closes(&events);
+    assert_eq!(
+        closed.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+        vec!["t1", "t2"],
+        "every announced row is closed exactly once, in `acc.tool_calls` order, \
+         got {kinds:?}",
+    );
+    let turn_end_at = kinds
+        .iter()
+        .position(|k| k == "turn_end")
+        .expect("the turn settled with turn_end");
+    for (idx, k) in kinds.iter().enumerate() {
+        if k == "tool_execution_end" {
+            assert!(
+                idx < turn_end_at,
+                "the close at {idx} must precede `turn_end` ({turn_end_at}) — \
+                 `normalize` closes a row on `tool_execution_end` and on nothing \
+                 after it, got {kinds:?}",
+            );
+        }
+    }
+
+    for (id, _, result, is_error) in &closed {
+        assert!(*is_error, "a truncated call is a failed card, got {id}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            text, ABANDONED,
+            "the close is the honest `abandoned_tool_result()` sentence, not the \
+             executor's misleading refusal, got {id} → {text}"
+        );
+        assert!(
+            !text.contains("missing"),
+            "the card must NOT blame the model for a `path`/`content` parameter \
+             the output cap never let it send, got {id} → {text}"
+        );
+    }
+
+    // And no `tool` transcript row: nothing dispatched, so nothing to answer.
+    assert!(
+        !loop_
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, ChatRole::Tool)),
+        "no `tool` row is pushed for a call that never ran, got {:?}",
+        loop_.messages
+    );
+    let RpcEvent::turn_end { tool_results, .. } = &events[turn_end_at] else {
+        unreachable!("turn_end_at indexes a turn_end");
+    };
+    assert!(
+        tool_results.is_empty(),
+        "the close adds no entry to `turn_end.tool_results`, got {tool_results:?}",
+    );
+}
+
+/// (issue #190) A `Length` stop that streamed NO text persists NOTHING — the
+/// 33-byte `{"role":"assistant","content":"","tool_calls":[]}` row issue #64
+/// exists to prevent is gone on this route too, and the turn still settles
+/// (loudly, as a truncation) rather than hanging.
+#[tokio::test]
+async fn a_truncated_turn_with_no_text_persists_no_assistant_row() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) =
+        ScriptedProvider::new(vec![Some(vec![ProviderEvent::Done(FinishReason::Length)])]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert!(
+        events.iter().any(|e| matches!(e, RpcEvent::turn_truncated)),
+        "an empty truncation is still announced as one, got {kinds:?}",
+    );
+    assert!(
+        kinds.iter().any(|k| k == "turn_end") && kinds.iter().any(|k| k == "agent_settled"),
+        "the truncated turn settles (it is terminal, not stuck), got {kinds:?}",
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "message_end"),
+        "with no text there is no reply to announce, got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no retry — a `Length` stop is terminal"
+    );
+    assert!(
+        !loop_
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, ChatRole::Assistant)),
+        "no assistant row was pushed at all, got {:?}",
+        loop_.messages
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert!(
+        !loaded.iter().any(|m| matches!(m.role, ChatRole::Assistant)),
+        "the 33-byte empty assistant row does not exist on the `Length` route \
+         either, got {loaded:?}",
+    );
+}
+
+/// The generalised #64 gate: with the `Some(Stop)` conjunct gone, the gate is
+/// keyed on \"nothing was produced\", so the provider that CLAIMS tool calls
+/// (`Done(ToolCalls)`) while delivering none is now caught by the same
+/// recovery instead of settling clean on an empty message.
+#[tokio::test]
+async fn a_provider_that_claims_tool_calls_and_dispatches_none_is_retried() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        // `finish_reason: tool_calls` with NO tool call in the stream — the
+        // shape the old `Some(Stop)` conjunct let through, settling as a clean
+        // stop on an empty reply.
+        Some(vec![ProviderEvent::Done(FinishReason::ToolCalls)]),
+        Some(vec![
+            ProviderEvent::TextDelta("here you go".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("do the thing")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    let start = events
+        .iter()
+        .find(|e| matches!(e, RpcEvent::auto_retry_start { .. }))
+        .expect("an attempt that produced nothing is retried whatever it claimed");
+    assert!(
+        matches!(
+            start,
+            RpcEvent::auto_retry_start {
+                attempt: 2,
+                max_attempts: 5,
+                ..
+            }
+        ),
+        "the retry rides the SHARED budget, got {start:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the empty attempt + the retry, got {kinds:?}",
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    let assistants: Vec<&ChatMessage> = loaded
+        .iter()
+        .filter(|m| matches!(m.role, ChatRole::Assistant))
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        1,
+        "the empty attempt persisted NOTHING — only the retry's reply, got {loaded:?}",
+    );
+    assert_eq!(
+        assistants[0].content,
+        MessageContent::Text("here you go".to_string()),
+        "the single persisted assistant row is the retry's"
+    );
+}
+
+/// The same generalised gate with the budget spent: `auto_retry_start` IS
+/// announced (so the catch is the retry path, not the error path) and NO
+/// assistant row is persisted at all — the claimed-`ToolCalls`-with-nothing
+/// attempt leaves no 33-byte row behind it either, and the turn ends as a
+/// VISIBLE failure rather than a silent clean stop.
+#[tokio::test]
+async fn a_claimed_tool_calls_turn_with_a_spent_budget_announces_the_retry_and_persists_nothing() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // ONE script, repeated (out of range repeats the last): every attempt
+    // claims tool calls and delivers none.
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![ProviderEvent::Done(
+        FinishReason::ToolCalls,
+    )])]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        // TWO attempts: the first empty turn spends the budget, so the second
+        // settles as a failure — after ONE announced retry.
+        RetryPolicy::new_with(2, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("do the thing")).await;
+    let events = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RpcEvent::auto_retry_start { .. })),
+        "the retry WAS announced (so this is the generalised gate firing, not a \
+         different exit), got {kinds:?}",
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            RpcEvent::auto_retry_end {
+                success: false,
+                final_error: Some(_),
+                ..
+            }
+        )),
+        "the spent budget fails LOUDLY, got {kinds:?}",
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "agent_end"),
+        "a turn that produced nothing is never a clean stop, got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a turn never makes more than `max_attempts` model calls"
+    );
+    assert!(
+        !loop_
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, ChatRole::Assistant)),
+        "no assistant row in the transcript, got {:?}",
+        loop_.messages
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert!(
+        !loaded.iter().any(|m| matches!(m.role, ChatRole::Assistant)),
+        "and NOTHING persisted to the store a reload reads back, got {loaded:?}",
     );
 }

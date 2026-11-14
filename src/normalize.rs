@@ -74,6 +74,12 @@ pub struct TurnState {
     /// messageId UNIQUE per discard (ADR 0048) — two lines on the shared
     /// `system` key (today `{stamp}:system`) would weld into one bubble.
     pub retract_seq: u64,
+    /// How many truncation notices this session has announced (issue #190).
+    /// Same role as `retract_seq`, same reason: the notice needs a messageId
+    /// UNIQUE per notice, because two lines on the shared `system` key
+    /// (`{stamp}:system`) weld into one bubble — and a truncated turn can
+    /// happen more than once in a session that keeps hitting the cap.
+    pub truncate_seq: u64,
     /// The card id of the compaction currently in flight, set by
     /// `compaction_start` and taken by `compaction_end` (issue #90: a
     /// compaction renders as a `ToolCallCard`, so the settle must land on the
@@ -102,6 +108,25 @@ impl TurnState {
     fn id(&self, suffix: &str) -> String {
         format!("{}:{}", self.incarnation, suffix)
     }
+
+    /// Mint the id of the NEXT truncation notice (issue #190): `{stamp}:truncate:N`.
+    ///
+    /// The mint mirrors the Retraction id (`message_retracted`'s arm) — stamped,
+    /// because a Resume restarts these counters and an unstamped `truncate:0`
+    /// would land on its predecessor's row (ADR 0049; an EMPTY stamp is a test
+    /// artifact, production builds a `TurnState` only through `AgentLoop::new`,
+    /// which requires a stamp) — and unique per notice, because two lines on the
+    /// shared `system` key weld into one bubble (Decision 4).
+    ///
+    /// The counter is read BEFORE it advances, so the FIRST notice of a session
+    /// is `truncate:0`. (The Retraction mint pre-increments and starts at
+    /// `retract:1`; that offset is incidental to it, and the truncation pins
+    /// here assert `truncate:0`, so the order here is the one that must hold.)
+    pub fn truncate_id(&mut self) -> String {
+        let n = self.truncate_seq;
+        self.truncate_seq += 1;
+        self.id(&format!("truncate:{n}"))
+    }
 }
 
 /// A one-line `agent_message_chunk` carrying a UNIQUE messageId — for a line
@@ -118,25 +143,32 @@ fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
 }
 
 /// Is this messageId a harness bookkeeping line rather than model output?
-/// The bookkeeping WORDS are `system` (the shared one-liner key) and `retract`
-/// (a discard line, ADR 0048). The predicate matches either as a `:`-separated
-/// word ANYWHERE in the id — deliberately a word-set, not a position: the id
-/// `normalize` mints today is `{stamp}:system` / `{stamp}:retract:N` (ADR
-/// 0049), and the BARE shape (`system`, `retract:1`) is accepted as well
+/// The bookkeeping WORDS are `system` (the shared one-liner key), `retract`
+/// (a discard line, ADR 0048) and `truncate` (the output-cap notice, issue
+/// #190 — Decision 5). The third is here for the SAME reason as the second:
+/// the Subagent capture hands its text to the PARENT as the tool result, so a
+/// notice the harness wrote about its own turn would otherwise be quoted back
+/// as if the child had said it. The predicate matches any of them as a
+/// `:`-separated word ANYWHERE in the id — deliberately a word-set, not a
+/// position: the id
+/// `normalize` mints today is `{stamp}:system` / `{stamp}:retract:N` /
+/// `{stamp}:truncate:N` (ADR 0049), and the BARE shape (`system`, `retract:1`)
+/// is accepted as well
 /// because that is the id shape WITH NO stamp — the test fixtures that
 /// hand-write these ids, and `TurnState::default()`, whose EMPTY stamp mints
 /// `:system` / `:retract:1` (a "strip a leading 6-hex field, then match" rule
 /// would misclassify those). A stamp is SIX HEX CHARS
-/// (`types::mint_incarnation`), and neither word is spelled from the hex
+/// (`types::mint_incarnation`), and no bookkeeping word is spelled from the hex
 /// alphabet (`system` carries `s`/`y`/`t`/`m`; `retract` is seven chars and
-/// carries `r`/`t`), so a stamp can never EQUAL one. `default` is deliberately NOT here: it is the
+/// carries `r`/`t`; `truncate` is eight and carries `r`/`u`/`n`), so a stamp can
+/// never EQUAL one. `default` is deliberately NOT here: it is the
 /// no-id-open fallback over REAL model text, and the subagent capture must
 /// still hand it to the parent. Anything that must capture ONLY what the model
 /// said — the subagent capture, whose text becomes the PARENT's tool result —
 /// asks this instead of re-deciding the convention.
 pub fn is_bookkeeping_message_id(id: &str) -> bool {
     id.split(':')
-        .any(|field| field == "system" || field == "retract")
+        .any(|field| field == "system" || field == "retract" || field == "truncate")
 }
 
 /// The transcript title of a compaction's card (issue #90 item 2). Not a real
@@ -557,6 +589,18 @@ pub fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
                 ),
             ]
         }
+        // (issue #190, Decision 3) The turn's reply was cut off by the
+        // provider's output cap. The notice is a line of its own on a UNIQUE id,
+        // NOT a `system_chunk`: the shared `{stamp}:system` key APPENDS, so a
+        // truncation that follows the retry one-liner (or another truncation)
+        // welds into one bubble and reads as nonsense (Decision 4). It is
+        // deliberately not a field on `turn_end` either — `turn_end.message` is
+        // `Value::Null` at every settle site and read by nobody, so an untyped
+        // `Value` no consumer reads is invisible in review.
+        RpcEvent::turn_truncated => vec![unique_system_chunk(
+            &st.truncate_id(),
+            "Response was truncated before completion",
+        )],
         RpcEvent::auto_retry_start {
             attempt,
             max_attempts,
@@ -1405,6 +1449,66 @@ mod normalize_tests {
         assert_eq!(frames[0]["messageId"], "t:default");
     }
 
+    /// (issue #190, Decision 3 + Decision 4) A truncated turn says so on the
+    /// transcript, on its OWN messageId. `turn_end` cannot carry the fact (its
+    /// `message` is `Value::Null` at every settle site and read by nobody), and
+    /// the shared `system` key would weld the notice onto whatever one-liner
+    /// preceded it — so the frame is a `unique_system_chunk` on `{stamp}:truncate:N`.
+    #[test]
+    fn a_truncation_emits_one_line_on_its_own_message_id() {
+        // The unit variant must also PARSE off the wire (the enum is
+        // internally tagged by `type`, and the permissive reader routes on that
+        // field — `ev(...)` is the real `serde_json::from_value`, so this is the
+        // decode path an older/newer peer actually travels).
+        let from_wire = ev(json!({ "type": "turn_truncated" }));
+        assert_eq!(from_wire, RpcEvent::turn_truncated);
+        assert_eq!(from_wire.kind(), "turn_truncated");
+        let mut st = TurnState::stamped("t");
+        let frames = normalize(&from_wire, &mut st);
+        assert_eq!(
+            frames,
+            vec![json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Response was truncated before completion" },
+                "messageId": "t:truncate:0",
+            })],
+            "exactly ONE frame, on the first minted id"
+        );
+    }
+
+    /// Two truncations in one session must not weld (Decision 4 — two lines on
+    /// the shared `system` key become one bubble), so the notice's id
+    /// increments per notice.
+    #[test]
+    fn a_second_truncation_gets_its_own_line_id() {
+        let mut st = TurnState::stamped("t");
+        let first = normalize(&RpcEvent::turn_truncated, &mut st);
+        let second = normalize(&RpcEvent::turn_truncated, &mut st);
+        assert_eq!(first[0]["messageId"], "t:truncate:0");
+        assert_eq!(second[0]["messageId"], "t:truncate:1");
+        assert_ne!(
+            first[0]["messageId"], second[0]["messageId"],
+            "two notices on one id weld into one bubble"
+        );
+        assert_eq!(st.truncate_seq, 2, "the counter advanced once per notice");
+    }
+
+    /// The notice is a stamp-namespaced id like every other mint (ADR 0049): a
+    /// resumed Worker's notice must not land on its predecessor's row.
+    #[test]
+    fn two_incarnations_mint_disjoint_truncation_ids() {
+        let mut st_a = TurnState::stamped("aaaaaa");
+        let mut st_b = TurnState::stamped("bbbbbb");
+        let a = normalize(&RpcEvent::turn_truncated, &mut st_a);
+        let b = normalize(&RpcEvent::turn_truncated, &mut st_b);
+        assert_eq!(a[0]["messageId"], "aaaaaa:truncate:0");
+        assert_eq!(b[0]["messageId"], "bbbbbb:truncate:0");
+        assert_ne!(
+            a[0]["messageId"], b[0]["messageId"],
+            "the same counter value in two incarnations must not collide"
+        );
+    }
+
     /// A stamp is a NAMESPACE, not a suffix to sort by: the same counter value
     /// in two incarnations must produce two different ids, or a resumed Worker
     /// is back in its predecessor's rows (ADR 0049 — the Resume restarts the
@@ -1438,13 +1542,20 @@ mod normalize_tests {
         );
     }
 
-    /// The bookkeeping set is `system` and `retract`, in either id shape — and
-    /// `default` is NOT in it: that id carries real model text (a
+    /// The bookkeeping set is `system`, `retract` and `truncate`, in either id
+    /// shape — and `default` is NOT in it: that id carries real model text (a
     /// `message_update` before any assistant `message_start`), and the subagent
     /// capture must still hand it to the parent (ADR 0048's fourth consumer).
     #[test]
     fn the_bookkeeping_predicate_reads_both_id_shapes() {
-        for id in ["system", "retract:1", "a3f9c1:system", "a3f9c1:retract:1"] {
+        for id in [
+            "system",
+            "retract:1",
+            "truncate:0",
+            "a3f9c1:system",
+            "a3f9c1:retract:1",
+            "a3f9c1:truncate:0",
+        ] {
             assert!(is_bookkeeping_message_id(id), "{id} is bookkeeping");
         }
         for id in ["a3f9c1:m1", "a3f9c1:m2#3", "default", "a3f9c1:default"] {
@@ -1453,6 +1564,22 @@ mod normalize_tests {
                 "{id} carries model output, not bookkeeping"
             );
         }
+        // `truncate` (issue #190) joins the set for the same reason `retract`
+        // did: the notice is harness bookkeeping, and a Subagent's
+        // parent-facing captured text must not carry it.
+        assert!(
+            is_bookkeeping_message_id("truncate"),
+            "the bare pre-stamp truncation id is bookkeeping"
+        );
+        assert!(
+            is_bookkeeping_message_id("anything:truncate:3"),
+            "the predicate matches a WORD, not a position"
+        );
+        assert!(
+            is_bookkeeping_message_id(":truncate:0"),
+            "the EMPTY-stamp shape (`TurnState::default()`) is bookkeeping too \
+             — a position-based rule would miss it"
+        );
         // The LOOSENESS is chosen, not accidental: the predicate scans the id's
         // `:`-separated fields for a WORD, it does not decode a POSITION. No
         // reachable id tells the two readings apart (`normalize` is the only
