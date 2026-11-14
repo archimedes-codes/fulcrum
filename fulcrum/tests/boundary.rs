@@ -228,6 +228,76 @@ fn sqlite_driver_name() -> String {
     needle('\u{72}', "usqlite")
 }
 
+// ── the child-process needles ────────────────────────────────────────────────
+//
+// These three are NOT in [`forbidden_names`]: that list is the desktop-leakage
+// boundary (a name whose presence makes this member a second desktop), and a raw
+// constructor is a different invariant with a different owner. They get their own
+// list so each carries its own ruling, and both lists feed the same two
+// fail-open proofs below.
+
+/// The raw child-process constructor — the call form that produces a `Command`
+/// carrying NO `CREATE_NO_WINDOW`. Legal in the engine's `childproc.rs`, which is
+/// the designated owner; illegal here, because the daemon has no child to build.
+///
+/// The trailing `(` is what makes this a call matcher rather than a type matcher:
+/// `fn build() -> tokio::process::Command` is a perfectly legal signature in this
+/// member (it is the return type of the engine's own constructor), while the
+/// constructor call is not. The engine's census invariant A uses the same
+/// call-anchored form.
+fn raw_child_constructor() -> String {
+    needle('\u{43}', "ommand::new(")
+}
+
+/// The creation-flags call. Deliberately matched WITHOUT the leading `.` the
+/// engine's census anchors on, so a UFCS call also fires: `creation_flags`
+/// REPLACES rather than ORs (rust-lang/rust#96794, no getter), so a second caller
+/// anywhere silently un-hides a child, and the UFCS spelling reaches it just as
+/// well. Broader is the safe direction for an ABSENCE check; measured cost today
+/// is zero hits in `fulcrum/src`.
+fn creation_flags_call() -> String {
+    needle('\u{63}', "reation_flags(")
+}
+
+/// The raw command-line append, the sibling of the flag on the SAME
+/// `std::os::windows::process::CommandExt` trait. A daemon site holding a
+/// `Command` from `childproc::command` could otherwise build its own `cmd /c`
+/// tail and skip `append_cmd_c`'s `/d /s /c` form — the bug that produced a
+/// modal dialog on the user's desktop (issue #79), because `Command::arg`
+/// escapes for `CommandLineToArgvW` and `cmd.exe` does not.
+fn raw_arg_call() -> String {
+    needle('\u{72}', "aw_arg(")
+}
+
+/// The three child-process needles, each with the ruling its absence protects.
+fn spawn_needles() -> Vec<(String, &'static str)> {
+    vec![
+        (
+            raw_child_constructor(),
+            "the daemon spawns exactly one child, the Worker, and it does so by \
+             delegating to the engine's `WorkerHandle::spawn`; a raw constructor \
+             here builds a `Command` with no `CREATE_NO_WINDOW` (one console \
+             window per command on Windows) and silently skips the env scrub, the \
+             process-group `pre_exec` and the stderr drain. Route it through \
+             `fulcrum_harness::childproc::command`.",
+        ),
+        (
+            creation_flags_call(),
+            "`creation_flags` REPLACES rather than ORs and has no getter \
+             (rust-lang/rust#96794), so a caller outside the owning constructor \
+             un-hides every other child in this process with nothing observable \
+             at the call site.",
+        ),
+        (
+            raw_arg_call(),
+            "`raw_arg` sits on the same `CommandExt` trait as the creation flags \
+             and is how a hand-built `cmd /c` tail is smuggled past \
+             `childproc::append_cmd_c`, whose `/d /s /c` form is the fix for a \
+             modal error dialog on the user's desktop (issue #79).",
+        ),
+    ]
+}
+
 /// The word `crate`, assembled. This is the scanner, and exempting the scanner
 /// would be the loophole the engine's module docs refuse to take — but note this
 /// word alone is NOT one of the scanned needles (the scan looks for the two-segment
@@ -767,6 +837,68 @@ fn the_needles_are_the_identifiers_they_stand_for() {
         assembled, expected,
         "an assembled needle is not the real identifier — the scan is matching nothing"
     );
+
+    // The child-process needles, same proof: assembled spelling equals the
+    // identifier rebuilt from raw characters, and the scan FIRES on planted code.
+    // These are the ones whose failure would be invisible — an absent match string
+    // on an ABSENCE pin is indistinguishable from a clean daemon, and this pin's
+    // whole job is to be the only witness over `fulcrum/src`.
+    let ctor: String = [
+        'C', 'o', 'm', 'm', 'a', 'n', 'd', ':', ':', 'n', 'e', 'w', '(',
+    ]
+    .iter()
+    .collect();
+    let flags: String = [
+        'c', 'r', 'e', 'a', 't', 'i', 'o', 'n', '_', 'f', 'l', 'a', 'g', 's', '(',
+    ]
+    .iter()
+    .collect();
+    let raw: String = ['r', 'a', 'w', '_', 'a', 'r', 'g', '('].iter().collect();
+    let expected_spawn = [ctor.clone(), flags.clone(), raw.clone()];
+    let assembled_spawn: Vec<String> = spawn_needles().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(
+        assembled_spawn, expected_spawn,
+        "a child-process needle is not the real call form — that pin would pass any tree"
+    );
+    // Each fires in the spelling a real violation takes, and each reports exactly
+    // one site.
+    for (needle, planted) in expected_spawn.iter().zip([
+        format!("fn go() {{ let _c = std::process::{ctor}\"rg\"); }}"),
+        format!("fn hide(c: &mut std::process::Command) {{ c.{flags}0x0800_0000); }}"),
+        format!("fn tail(c: &mut std::process::Command) {{ c.{raw}\"/c dir\"); }}"),
+    ]) {
+        let sample = vec![(PathBuf::from("planted.rs"), planted.clone())];
+        assert_eq!(
+            offenders(&sample, needle).len(),
+            1,
+            "the child-process scan did not fire on planted code: {planted}"
+        );
+    }
+    // And the call-anchored constructor needle does NOT fire on a legal signature
+    // that merely names the type — the distinction the trailing `(` buys, and the
+    // one a later "simplification" into `Command::new` would lose.
+    let legal_signature = vec![(
+        PathBuf::from("clean.rs"),
+        "fn build() -> tokio::process::Command { unimplemented!() }".to_string(),
+    )];
+    assert!(
+        offenders(&legal_signature, &ctor).is_empty(),
+        "the constructor needle reports a function that only names the type as a \
+         return value — it must anchor on the CALL form, or it fires on the engine's \
+         own constructor signature and gets silenced: {legal_signature:?}"
+    );
+    // The UFCS spelling fires too, which is why the flag needle drops the leading
+    // `.` the engine's census anchors on.
+    let ufcs = vec![(
+        PathBuf::from("planted.rs"),
+        format!("fn f(c: &mut std::process::Command) {{ std::os::windows::process::CommandExt::{flags}c, 1); }}"),
+    )];
+    assert_eq!(
+        offenders(&ufcs, &flags).len(),
+        1,
+        "the flag needle misses the UFCS call form, so a second owner compiles \
+         silently and un-hides every child"
+    );
     assert_eq!(
         sqlite_driver_name(),
         driver,
@@ -920,6 +1052,32 @@ fn prose_is_stripped_but_code_is_not() {
         );
     }
 
+    // The child-process needles get the same proof, and here it is not
+    // belt-and-braces: `fulcrum/src/worker_factory.rs` names the raw constructor
+    // form in a doc comment TODAY, so that pin's green depends on comment
+    // stripping working for THESE needles specifically. If the stripper ever stops
+    // eating them, the pin fires on a comment and gets deleted as a false alarm;
+    // if it over-eats, the pin goes blind. Both halves are asserted.
+    let mut spawn_sample = String::new();
+    for (i, (name, _)) in spawn_needles().into_iter().enumerate() {
+        spawn_sample.push_str(&format!("//! Prose about {name} must vanish ({i}).\n"));
+        spawn_sample.push_str(&format!("pub fn h{i}() {{ let _x = {name}\"p\"); }}\n"));
+    }
+    let spawn_stripped = strip_comments(&spawn_sample);
+    for (name, _) in spawn_needles() {
+        assert!(
+            !spawn_stripped.contains(&format!("Prose about {name}")),
+            "a doc comment naming `{name}` survived stripping — the pin would fire \
+             on prose and be silenced as a false alarm: {spawn_stripped}"
+        );
+        assert!(
+            spawn_stripped.contains(&format!("let _x = {name}")),
+            "the comment-stripper swallowed `{name}` out of a real statement — the \
+             child-process pin would then pass over a daemon that builds its own \
+             `Command`. Stripped:\n{spawn_stripped}"
+        );
+    }
+
     // The literal-stripper: it must blank a desktop DIRECTORY literal without blanking
     // an adjacent real path segment, or the UI-framework pin is blind.
     let dir = format!("src-{}", names[0]);
@@ -988,6 +1146,7 @@ fn the_scanner_source_contains_no_needle() {
         .map(|(name, _)| name)
         .collect();
     names.push(sqlite_driver_name());
+    names.extend(spawn_needles().into_iter().map(|(name, _)| name));
     for name in names {
         assert!(
             !text.contains(&name),
@@ -1147,5 +1306,80 @@ fn the_daemon_manifest_allows_the_driver_and_forbids_the_desktop() {
         "the ENGINE's manifest declares the SQLite driver ({offender:?}) — the engine \
          holds no disk, and `StoreError` exists precisely so `DbError` did not have to \
          move (Step B-bis)",
+    );
+}
+
+// ── the child-process pin ────────────────────────────────────────────────────
+
+/// The daemon builds no `Command` of its own — every child goes through the
+/// engine's constructor.
+///
+/// ## Why this pin exists when the engine already has a census
+///
+/// The engine's census (`src/childproc.rs`, invariants A and B) is the thing that
+/// keeps `childproc::command` the only constructor, and
+/// `fulcrum/src/worker_factory.rs` used to name that census as the reason a
+/// daemon-side raw constructor would be caught. That claim was false, and the
+/// reason is structural: `source_roots` walks this crate's
+/// `src/` and — only in the workspace-member layout — the desktop's own source
+/// tree. This member is a SIBLING directory of the engine, never a
+/// subdirectory of either, so no layout of that walk opens `fulcrum/src`. Measured
+/// by planting a raw constructor in `fulcrum/src/serve.rs` and running the census:
+/// every invariant stayed green.
+///
+/// So the daemon's share of the invariant gets its own witness, here, where the
+/// tree is actually in scope. This is the same two-pin-sets-two-trees shape
+/// `boundary_pins` already documents for the leakage boundary, and for the same
+/// reason the sets are not merged: the daemon legitimately names the SQLite driver
+/// and the engine may not, so one shared walk needs an allowlist that weakens the
+/// engine's pin.
+///
+/// ## Why the daemon needs no policy of its own
+///
+/// It has exactly one child — the Worker — and `DaemonWorkerFactory::spawn`
+/// delegates to `WorkerHandle::spawn`, which is built by the engine's constructor.
+/// The correct rule for this member is therefore not "apply the flags correctly"
+/// but "do not build one at all", which is also the only rule that cannot drift
+/// from the engine's flag values.
+#[test]
+fn the_daemon_builds_no_child_outside_the_engine_constructor() {
+    let daemon = scan(&daemon_src_root(), DAEMON_FILE_FLOOR);
+    for (needle, why) in spawn_needles() {
+        let hits = offenders(&daemon, &needle);
+        assert!(
+            hits.is_empty(),
+            "the daemon builds a child process outside the engine's constructor: \
+             `{needle}` appears in {} — {why}\nOffending sites:\n{}",
+            hits.iter()
+                .map(|(p, _)| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            hits.iter()
+                .map(|(p, l)| format!("  {}: {}", p.display(), l))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+}
+
+/// The daemon's one legitimate child is the Worker, and it reaches it by
+/// delegation — the positive half, so the pin above cannot be satisfied by a
+/// member that simply lost the ability to spawn anything.
+///
+/// Without this, `the_daemon_builds_no_child_outside_the_engine_constructor`
+/// degrades into a green that is indistinguishable from "the daemon no longer
+/// spawns its Worker", which is a feature deletion masquerading as a cleanup.
+#[test]
+fn the_daemon_still_spawns_its_worker_by_delegation() {
+    let daemon = scan(&daemon_src_root(), DAEMON_FILE_FLOOR);
+    let spawner = daemon
+        .iter()
+        .find(|(p, _)| p.ends_with("worker_factory.rs"))
+        .expect("the daemon walk must read worker_factory.rs");
+    assert!(
+        spawner.1.contains("WorkerHandle::spawn"),
+        "`worker_factory.rs` no longer delegates to `WorkerHandle::spawn` — either \
+         the daemon's only child has lost its spawner, or it has grown its own \
+         `Command`, which the pin above exists to refuse",
     );
 }
