@@ -257,17 +257,18 @@
 #                    says why the gap is tolerated. See the skip section below for why
 #                    this is a flag and never an env var.
 #
-# THE SELF-TEST SKIPS, AND WHAT A SKIP COSTS. Four cases plant real processes and so
+# THE SELF-TEST SKIPS, AND WHAT A SKIP COSTS. Five cases plant real processes and so
 # need real tooling: I (ps -eo, a copyable sleep, setsid), M (the same, plus python3),
-# L (a renamable bash), R (L's plant, plus /proc). Where a dependency is missing the
-# case records itself in the skip ledger and says so on STDERR; it does NOT fail (a
-# missing tool is not a census defect) and it does NOT pass (an unproven case is not a
-# behaved one). Under CI=true a skip is exit 1 — on a runner an unproven case is
+# L (a renamable bash), R (L's plant, plus /proc), U (ps -eo and a copyable sleep —
+# plain background jobs, NO setsid, so it runs where I cannot). Where a dependency is
+# missing the case records itself in the skip ledger and says so on STDERR; it does NOT
+# fail (a missing tool is not a census defect) and it does NOT pass (an unproven case is
+# not a behaved one). Under CI=true a skip is exit 1 — on a runner an unproven case is
 # indistinguishable from a deleted one. Off CI it stays a loud note. The summary line
 # `skip summary: N case(s) …` prints EVERY run, including N=0, so "which cases did not
 # run" is answerable from any log. Cases are gated INDIVIDUALLY: macOS has no setsid,
-# so I and M skip there while L and R still run, and a blanket guard would have thrown
-# away the lineage coverage that macOS genuinely can provide.
+# so I and M skip there while L, R and U still run, and a blanket guard would have
+# thrown away the lineage coverage that macOS genuinely can provide.
 #
 # WHY `--allow-skips` EXISTS, AND WHY IT IS A FLAG. `setsid` is absent BY PLATFORM
 # DESIGN on macOS and on Git-for-Windows bash (measured on real runners: macOS has
@@ -1546,8 +1547,101 @@ plant_was_alive() {
   return 1
 }
 
+# find_planted <path> <argv-1> — the pid of a LIVE process whose argv is EXACTLY
+# `<path> <argv-1>`, printed; nothing and exit 1 if the table never showed one.
+#
+# This exists because `"$!"` is not the plant. Case I used to record `$!` from a
+# backgrounded `setsid "$live/fake_worker_core" 300` and then grade the census
+# against THAT pid. `setsid` forks when it is already a process-group leader — which
+# is exactly what a backgrounded job of a script shell is — so the pid the shell
+# reports is `setsid`'s own, and it exits the moment it has forked the real plant,
+# which lives on under a different pid. The case then reported "the planted process
+# was never OBSERVED alive" for a plant that was sitting in the table the whole time
+# under a pid nobody was looking at. Measured on the ubuntu runner across two runs of
+# ONE commit (7f21099): run 43638510359 saw NEITHER plant and both recorded pids were
+# dead within the poll window; run 43639574382 saw the recorded pid alive for ~50 ms
+# and gone before the census ran, so the census reported `clean: … 0 candidate(s)`
+# and the case STILL printed "the planted process was alive, and is gone after the
+# census" — a green assertion about a kill that never happened, which is the exact
+# vacuity `plant_was_alive` was written to make impossible.
+#
+# Case M has never had this bug, on the same runner, because it does not trust `$!`:
+# it scans `ps` for the plant's own path. The technique that works and the technique
+# that fails were both in this file; Case I is now on the side that works.
+#
+# WHY THE SCAN KEYS ON argv AND NOT ON A MARKER ARGUMENT: the plant is a COPY OF
+# `sleep`, so the only arguments it can be given are intervals — `sleep 300
+# selftest-xyz` is an invalid interval, sleep exits, and the plant is gone again
+# (which is the very bug this rewrite is fixing). So the two plants Case I needs are
+# told apart by their INTERVAL (`300` for this run's, `301` for the other run's), a
+# legal argv element for sleep and visible in `args=`. The image name itself is NOT
+# available as a discriminator: `fake_worker_core` is one of MATCH_IMAGES and is
+# matched on the exact basename of the first argv element, so renaming the plant would
+# make it invisible to the census and the case vacuous.
+#
+# Polls for the same reason plant_was_alive does: fork+exec races this shell.
+#
+# NO SEPARATE CAPABILITY PROBE IS NEEDED for its `ps -eo pid=,args=` spelling, and that
+# is an argument rather than an oversight: `pid=` and `args=` are two of the five columns
+# unix_enumeration_works already proves answer on this machine, so cap_ps==1 means every
+# keyword find_planted asks for has been measured here. A probe for a proven subset would
+# only add a second place to be wrong about the same `ps`.
+find_planted() {
+  local base="$1" arg="$2" attempt=0 hit=""
+  [[ -n "$base" && -n "$arg" ]] || return 1
+  while ((attempt < 30)); do
+    hit="$(ps -eo pid=,args= 2>/dev/null \
+      | awk -v b="$base" -v a="$arg" '$2 == b && $3 == a { print $1; exit }')"
+    if [[ -n "$hit" ]]; then
+      printf '%s' "$hit"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+# describe_plant_table <path> — on a FAIL, print what the process table actually
+# held for this self-test's plant path, plus the `setsid` this runner really has.
+# A plant that cannot be found is a claim about the table, and a claim about a table
+# nobody printed is not debuggable: the two runs of 7f21099 disagreed about whether
+# the plant existed AT ALL, and the FAIL line alone could not say which of them saw a
+# real absence and which saw a lookup that was aimed at the wrong pid. Only ever
+# called from a failure branch, so the green path stays quiet.
+describe_plant_table() {
+  local base="$1" setsid_path="" setsid_version=""
+  printf '       the table, for %s:\n' "$base"
+  # The needle goes through the ENVIRONMENT and not through awk's -v: awk's own argv
+  # carries `-v b=<path>`, so a -v form would report the scan itself as a row of the
+  # table it is describing — a diagnostic that invents the process it was asked about.
+  # The assignment is on AWK, not on `ps`: an env prefix binds to the command it
+  # precedes, and on the pipeline HEAD it would set nothing the matcher can see,
+  # leaving an EMPTY needle that matches every row on the box (measured — that is
+  # exactly what the first draft of this printed). Only pid/ppid/stat/args, the columns
+  # this file has MEASURED on every runner; a column BSD ps rejects would make the
+  # whole `ps` fail and this would report "nothing was in the table" about a table it
+  # never read.
+  local rows=""
+  rows="$(ps -eo pid=,ppid=,stat=,args= 2>/dev/null \
+    | PLANT_NEEDLE="$base" awk '
+      ENVIRON["PLANT_NEEDLE"] != "" && index($0, ENVIRON["PLANT_NEEDLE"]) { print "         " $0 }
+    ' || true)"
+  if [[ -n "$rows" ]]; then
+    printf '%s\n' "$rows"
+  else
+    printf '       (NOTHING in the table at that path — the plant is not there)\n'
+  fi
+  setsid_path="$(command -v setsid 2>/dev/null || true)"
+  if [[ -n "$setsid_path" ]]; then
+    setsid_version="$("$setsid_path" --version 2>/dev/null | head -1)"
+  fi
+  printf '       setsid: %s%s\n' "${setsid_path:-<absent — setsid cannot be the plant here>}" \
+    "${setsid_version:+ — $setsid_version}"
+}
+
 # unix_enumeration_works — does the exact `ps` spelling enumerate_unix uses actually
-# answer HERE? This is a CAPABILITY probe, not an opinion about the platform: the
+# answer HERE? This is a CAPABILITY PROBE, not an opinion about the platform: the
 # live-census cases (I, L, R, M) are all unix-shaped, and on Git-Bash/MSYS the cygwin
 # `ps` exists but `ps -eo …` EXITS 1, so `command -v ps` alone would let every one of
 # them run against an empty table and grade a look that was never taken.
@@ -1563,12 +1657,86 @@ unix_enumeration_works() {
 # with, which is exactly the misattribution this branch just fixed for the message.
 # So probe it with a throwaway marker (nothing in the table can carry it, so the
 # answer is 0 or 2 and never 1) and skip rather than fail when the census cannot look.
+#
+# It RUNS THE CENSUS MORE THAN ONCE, and that is not hedging — it is the difference
+# between grading the census and grading a race. On a CI runner the table this probe
+# reads also holds the `cargo test` that finished seconds earlier, and that suite
+# spawns `target/debug/fake_worker_core` BY PATH. One of those, exiting inside the
+# census's own list-then-read window, makes the census refuse with gone-before-read —
+# which is the RIGHT answer for the guard, and a wrong reason to conclude "this
+# platform cannot read provenance". Measured on macos-latest, two runs of one commit:
+# 43638510359 refused here and Case H2 went red; 43639574382 refused and the probe
+# answered "cannot answer", so I, L, R and M were SKIPPED — the same foreign transient
+# candidate flipping between a false FAIL and a silent UNPROVEN. A bounded retry rides
+# through the race; a census that refuses on EVERY attempt is still refused, and the
+# refusal is what gets reported.
 live_census_can_answer() {
   local probe_marker="selftest-capability-$$-$RANDOM"
-  local rc=0
-  env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-    FULCRUM_CI_RUN_MARKER="$probe_marker" bash "$script" >/dev/null 2>&1 || rc=$?
-  ((rc == 0))
+  local attempt=1 rc=0 out
+  while ((attempt <= LIVE_CENSUS_ATTEMPTS)); do
+    rc=0
+    out="$(env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+      FULCRUM_CI_RUN_MARKER="$probe_marker" bash "$script" 2>&1)" || rc=$?
+    if ((rc == 0)); then
+      return 0
+    fi
+    if ! census_refusal_is_a_foreign_transient "$out"; then
+      # A refusal this harness cannot blame on somebody else's vanishing process — a
+      # blocked env read, an unreadable candidate, a ps that will not answer. That is
+      # the real answer and the retry must not bury it.
+      return 1
+    fi
+    printf 'NOTE live-census probe: attempt %s/%s refused because a candidate this self-test\n' "$attempt" "$LIVE_CENSUS_ATTEMPTS" >&2
+    printf '     does not own vanished mid-read (%s) — retrying\n' "$(first_declined_pid "$out")" >&2
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  return 1
+}
+
+# How many times a live census whose ONLY complaint is somebody else's vanishing
+# candidate is re-run before the harness accepts the refusal as the platform's answer.
+# Three, with half a second between: the race is a millisecond window, so a real
+# block reproduces on every attempt and a race does not.
+LIVE_CENSUS_ATTEMPTS=3
+
+# census_refusal_is_a_foreign_transient <census output> — 0 only when the census
+# refused AND every candidate it could not resolve is named by pid AND none of those
+# pids is a process this self-test planted. The harness owns its plants and nothing
+# else in the table, so "I could not read pid X" is somebody else's business only when
+# X is not ours; the same sentence about a pid we planted is a finding about THIS
+# census and stays a failure. A refusal that names no candidate at all (the macOS
+# control probe, a ps that failed) is NOT forgiven by this predicate — nothing about it
+# is attributable to a race.
+census_refusal_is_a_foreign_transient() {
+  local out="$1" pid seen=0 owned=" "
+  case "$out" in
+    *"gone-before-read: "* | *"unreadable: "*) : ;;
+    *) return 1 ;;
+  esac
+  # `${arr[@]+"${arr[@]}"}` and not `${arr[*]}`: this file runs under `set -u` on macOS's
+  # bash 3.2, where an empty array is UNBOUND and the plain form dies. The idiom is the
+  # one self_test_cleanup already uses for the same array.
+  local owned_pid
+  for owned_pid in ${self_test_planted[@]+"${self_test_planted[@]}"}; do
+    owned="$owned$owned_pid "
+  done
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    seen=1
+    case "$owned" in
+      *" $pid "*) return 1 ;;
+    esac
+  done < <(printf '%s\n' "$out" \
+    | sed -n 's/^\(gone-before-read\|unreadable\): \([0-9][0-9]*\) .*/\2/p')
+  ((seen == 1)) || return 1
+  return 0
+}
+
+# first_declined_pid <census output> — the first candidate pid the census could not
+# resolve, for the retry note. Purely cosmetic; empty if the refusal names none.
+first_declined_pid() {
+  printf '%s\n' "$1" | sed -n 's/^\(gone-before-read\|unreadable\): \([0-9][0-9]*\) .*/\2/p' | head -1
 }
 
 self_test_cleanup() {
@@ -1594,6 +1762,15 @@ expect_exit() {
   # read in the then-branch is 0, which would report a working guard as broken.
   local got=0 output
   output="$("$@" 2>&1)" || got=$?
+  report_exit "$what" "$want" "$got" "$output"
+}
+
+# report_exit <what> <want> <got> <output> — the ONE reporter for exit-code claims.
+# It exists so expect_live_census can retry a census without growing a second copy of
+# this pass/fail wording: a verdict printed by a paraphrase proves nothing about the
+# path that actually runs.
+report_exit() {
+  local what="$1" want="$2" got="$3" output="$4"
   if [[ "$got" == "$want" ]]; then
     printf 'ok   %s (exit %s)\n' "$what" "$got"
     LAST_OUTPUT="$output"
@@ -1607,6 +1784,75 @@ expect_exit() {
 }
 
 LAST_OUTPUT=""
+
+# run_live_census <marker> [mode] — the LIVE census, spelled ONCE, with the bounded
+# retry a case that does not own the whole process table needs.
+#
+# WHAT IS NEVER TOUCHED: no seam variable survives, not even CENSUS_PLATFORM (the live
+# path derives it from `uname` and REFUSES it from the environment — see
+# refuse_self_test_only_env_seams). The marker is the only thing a live run is allowed
+# to be told. `mode` exists for exactly one caller, Case H2, which is testing that
+# `CENSUS_MODE=live` — the HONEST spelling of the mode, not a seam — is accepted; every
+# other case runs with it unset, which is what the CI step does.
+#
+# THE RETRY, and its deliberately microscopic scope: it fires only when the census
+# refused (exit 2) AND named every candidate it could not resolve AND none of those pids
+# is one this self-test planted. That is the shape a FOREIGN process takes when it dies
+# inside the census's own list-then-read window, and on a CI runner that window is
+# shared with a `cargo test` that finished seconds earlier and spawns
+# `target/debug/fake_worker_core` BY PATH. The census is RIGHT to refuse over it ("I
+# could not tell" is not "nothing leaked") — but a case must not grade its own claim on
+# a table it does not own, and the measured fact is that this commit's self-test flips
+# on exactly that: run 43638510359's macOS leg went red at H2 over `gone-before-read:
+# 8329 fake_worker_core`, and run 43639574382, same SHA minutes later, never hit it.
+#
+# WHY IT COSTS NO TEETH. A refusal this may ride through can only name pids the harness
+# does NOT own; every pid Case I planted is in `self_test_planted`, so a census that
+# cannot read one of OUR plants is never retried — it fails, loudly. A census that
+# reports clean when it must report a leak (exit 1 ≠ 2) is never retried either. The
+# teeth stay where the CI step puts them: in Case I, graded against pids it observed.
+#
+# Sets LAST_CENSUS_OUT / LAST_CENSUS_RC (globals, because a retrying capture cannot
+# return a status and a body from one command substitution — and a caller that read the
+# body through `$(…)` would lose the status, which is the bug class expect_exit exists
+# to avoid).
+capture_live_census() {
+  local marker="$1" mode="${2-}"
+  local attempt=1 got=0 output=""
+  LAST_CENSUS_OUT=""
+  LAST_CENSUS_RC=0
+  while :; do
+    got=0
+    if [[ -n "$mode" ]]; then
+      output="$(env -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+        CENSUS_MODE="$mode" FULCRUM_CI_RUN_MARKER="$marker" bash "$script" 2>&1)" || got=$?
+    else
+      output="$(env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+        FULCRUM_CI_RUN_MARKER="$marker" bash "$script" 2>&1)" || got=$?
+    fi
+    if ((got != 2)) || ((attempt >= LIVE_CENSUS_ATTEMPTS)) \
+        || ! census_refusal_is_a_foreign_transient "$output"; then
+      break
+    fi
+    printf 'NOTE the live census refused on attempt %s/%s over pid %s — a candidate this\n' \
+      "$attempt" "$LIVE_CENSUS_ATTEMPTS" "$(first_declined_pid "$output")" >&2
+    printf '     self-test does not own vanished mid-read. The census is right to refuse;\n' >&2
+    printf '     the claim being graded is not about it, so the census is re-run.\n' >&2
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  LAST_CENSUS_OUT="$output"
+  LAST_CENSUS_RC="$got"
+}
+LAST_CENSUS_OUT=""
+LAST_CENSUS_RC=0
+
+# expect_live_census <what> <want-exit> <marker> [mode] — expect_exit over capture_live_census.
+expect_live_census() {
+  local what="$1" want="$2"
+  capture_live_census "$3" "${4-}"
+  report_exit "$what" "$want" "$LAST_CENSUS_RC" "$LAST_CENSUS_OUT"
+}
 
 # Assert the previous expect_exit case also SAID the thing it must say — an exit
 # code alone cannot tell "refused because unreadable" from "refused for another
@@ -1869,7 +2115,16 @@ run_self_test() {
   # always (CENSUS_MODE must not appear in the refusal's offender list, and no
   # fabricated clean), and the outcome half only where a census can actually reach one.
   local h2_live_out h2_live_rc=0
-  h2_live_out="$(env CENSUS_MODE=live bash "$script" 2>&1)" || h2_live_rc=$?
+  # The marker is this run's OWN (the harness exported it at the top of run_self_test).
+  # It used to be `live_census_can_answer`'s throwaway probe marker, and that is what
+  # turned a foreign process's exit into a false FAIL here: a throwaway marker means
+  # NOTHING in the table is attributable to this census, so the census is guaranteed to
+  # classify every candidate it meets — including a `cargo test` worker that dies
+  # inside its list-then-read window — and to refuse over it. With the run's real marker
+  # the census is answering its actual production question instead of an artificial one.
+  capture_live_census "$marker" live
+  h2_live_out="$LAST_CENSUS_OUT"
+  h2_live_rc="$LAST_CENSUS_RC"
   LAST_OUTPUT="$h2_live_out"
   # Match the seam-refusal's own signature, not the bare variable name: an unrelated
   # message that merely mentions CENSUS_MODE must not fail this.
@@ -1887,12 +2142,31 @@ run_self_test() {
   # (CENSUS_MODE=fixture and friends), which the loop above pins one variable at a
   # time; conflating the two would mean this case could only pass by refusing to run a
   # census it is asking for by name.
+  #
+  # THE OUTCOME HALF ASKS A QUESTION THIS CASE CAN ANSWER. It used to demand exit 0 —
+  # "the census certifies this machine clean" — which is not H2's claim (H2 is about
+  # seams) AND is not this case's property to own: the table belongs to the runner, and
+  # on a CI runner it holds the `cargo test` that just ran, whose fixture workers this
+  # census is expressly designed to catch. Measured, one commit, two macOS legs:
+  # 43638510359 refused over `gone-before-read: 8329 fake_worker_core` and H2 went red
+  # for a process it had nothing to do with; 43639574382 exited 0. So the assertion is
+  # now the one that is actually invariant: the live path must reach a VERDICT — 0
+  # clean, or 1 naming leaks — and must never be unable to look. Exit 2 stays red here,
+  # because "could not classify" is exactly what this guard refuses to paper over.
   if ((cap_enumerable == 1)); then
-    if [[ "$h2_live_rc" == 0 ]]; then
-      printf 'ok   H2 CENSUS_MODE=live reaches a real verdict on a platform that can read the table (exit 0)\n'
+    if [[ "$h2_live_rc" == 0 || "$h2_live_rc" == 1 ]]; then
+      printf 'ok   H2 CENSUS_MODE=live reaches a real verdict on a platform that can read the table (exit %s)\n' "$h2_live_rc"
+      if [[ "$h2_live_rc" == 1 ]]; then
+        # Loud, not hidden: a red census here is a real leak in the runner's table and
+        # H2 must not be the place that gets to swallow that. The run still goes red —
+        # from the census step, which is the step that owns the question.
+        printf 'NOTE H2 the live census reported LEAKS (exit 1) — H2 is satisfied (it reached a\n' >&2
+        printf '     verdict), the stray-process step is the one that must go red over these.\n' >&2
+      fi
     else
-      printf 'FAIL H2 CENSUS_MODE=live should have completed here, got exit %s\n' "$h2_live_rc"
+      printf 'FAIL H2 CENSUS_MODE=live could not reach a verdict here, got exit %s\n' "$h2_live_rc"
       printf '       output: %s\n' "$(printf '%s' "$h2_live_out" | tr '\n' '|')"
+      describe_plant_table "$live/fake_worker_core"
       self_test_failures=$((self_test_failures + 1))
     fi
   else
@@ -1986,20 +2260,52 @@ run_self_test() {
   # that would double-count the same gap as a census defect.
   if ((cap_ps == 1)) && ((cap_plant == 1)) && ((cap_setsid == 1)) && ((cap_live_env == 1)); then
     local live_marker="selftest-live-$$-$RANDOM"
+    # The two plants are told apart by their INTERVAL — `300` for this run's, `301`
+    # for the decoy's — and that choice is forced, not stylistic:
+    #   * the image name is NOT available as a discriminator. `fake_worker_core` is one
+    #     of MATCH_IMAGES and the census matches the exact basename of the FIRST argv
+    #     element, so a plant renamed to make it findable is a plant the census cannot
+    #     see, and the case would grade a look that was never taken;
+    #   * a marker ARGUMENT is not available either. The plant is a copy of `sleep`, so
+    #     `sleep 300 selftest-xyz` is an invalid interval — sleep exits, and the case is
+    #     back to asserting about a process that never existed, which is the bug this
+    #     block is fixing.
+    # An interval is legal argv for sleep and is visible in `ps`'s untruncated `args=`,
+    # which is the same column the census itself classifies on. Paths are unique per
+    # self-test root, so the pair (path, interval) names exactly one process on the box.
+    local plant_arg_own=300 plant_arg_other=301
+
     # setsid + full stdio redirection: the planted process must not hold the
     # self-test's output pipe, and must not die with the census's process group.
-    ( CENSUS_LIVE_MARKER="$live_marker" FULCRUM_CI_RUN_MARKER="$live_marker" \
-        setsid "$live/fake_worker_core" 300 </dev/null >/dev/null 2>&1 &
-      printf '%s' "$!" >"$live/planted.pid" )
-    local planted=""
-    [[ -r "$live/planted.pid" ]] && planted="$(cat "$live/planted.pid")"
-    [[ -n "$planted" ]] && self_test_planted+=("$planted")
+    #
+    # NO `$!` ANYWHERE BELOW THIS LINE. `setsid` forks when it is already a
+    # process-group leader — which a backgrounded job of a script shell is — so the pid
+    # the shell reports is setsid's own, and it dies the instant it has forked the real
+    # plant, which lives on under a pid nobody recorded. This commit's own ubuntu logs
+    # show both shapes of that, on the same SHA: 43638510359 never saw either plant
+    # ("never OBSERVED alive", pids 5792 / 6024 both long dead), and 43639574382 caught
+    # the recorded pid alive for one poll and then lost it, so the census printed
+    # `clean: … 0 candidate(s)` about a plant that was in the table under another pid,
+    # and the case STILL reported "the planted process was alive, and is gone after the
+    # census" — a GREEN for a kill that never happened. Case M has always been immune on
+    # the same runner because it scans `ps` for the plant's own path instead of trusting
+    # `$!`; Case I now does the same thing (see find_planted).
+    ( FULCRUM_CI_RUN_MARKER="$live_marker" \
+        setsid "$live/fake_worker_core" "$plant_arg_own" </dev/null >/dev/null 2>&1 & )
 
-    # PRECONDITION, OBSERVED: the plant is in the table before any assertion about it.
-    # Everything below is gated on this, so a plant that never started can only be a
-    # FAILURE of this line — never a green "it was killed" three lines later.
+    # PRECONDITION, OBSERVED: the plant is in the table before any assertion about it,
+    # and the pid that goes into every assertion below came OUT of the table. A plant
+    # that never started can only ever be a FAILURE of this line — never a green "it was
+    # killed" three lines later.
+    local planted=""
+    if planted="$(find_planted "$live/fake_worker_core" "$plant_arg_own")"; then
+      self_test_planted+=("$planted")
+    else
+      planted=""
+    fi
     if ! plant_was_alive "$planted"; then
-      printf 'FAIL I  the planted process was never OBSERVED alive (pid %s) — nothing below this line can be graded\n' "${planted:-<no pid>}"
+      printf 'FAIL I  the planted process was never OBSERVED alive (pid %s) — nothing below this line can be graded\n' "${planted:-<no pid found at $live/fake_worker_core $plant_arg_own>}"
+      describe_plant_table "$live/fake_worker_core"
       self_test_failures=$((self_test_failures + 1))
     else
       printf 'ok   I  the planted process %s was OBSERVED alive before any verdict about it\n' "$planted"
@@ -2015,38 +2321,42 @@ run_self_test() {
       else
         printf 'FAIL I  the enumerated stream does not contain the planted pid %s\n' "$planted"
         printf '       enumerated: %s\n' "$(tr '\n' '|' <"$enum_out" 2>/dev/null || echo '<missing>')"
+        describe_plant_table "$live/fake_worker_core"
         self_test_failures=$((self_test_failures + 1))
       fi
 
-      # NOTE: these three invoke the LIVE census, so they must set NO seam variable —
-      # not even CENSUS_PLATFORM, which the live path now derives from `uname` alone
-      # (see refuse_self_test_only_env_seams). The marker is the only thing a live run
-      # is allowed to be told.
-      expect_exit "I  the LIVE census reports the planted process as a leak" 1 \
-        env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-        FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
+      # NOTE: these three run the LIVE census through capture_live_census, so they set
+      # NO seam variable — not even CENSUS_PLATFORM, which the live path now derives
+      # from `uname` alone (see refuse_self_test_only_env_seams). The marker is the only
+      # thing a live run is allowed to be told.
+      expect_live_census "I  the LIVE census reports the planted process as a leak" 1 "$live_marker"
       expect_output_has "I  the live leak line names the pid and the image" "leak: $planted fake_worker_core"
 
       # Reachable ONLY from the observed-alive branch above, which is what makes the
       # negative `ps -p` below evidence of a KILL rather than evidence of a typo.
       if ps -p "$planted" >/dev/null 2>&1; then
         printf 'FAIL I  the census did not kill the planted process (pid %s is still alive)\n' "$planted"
+        describe_plant_table "$live/fake_worker_core"
         self_test_failures=$((self_test_failures + 1))
       else
         printf 'ok   I  the planted process %s was alive, and is gone after the census\n' "$planted"
       fi
     fi
 
-    # And the discriminator, live: a DIFFERENT run's marker must not be touched.
-    ( FULCRUM_CI_RUN_MARKER="some-other-run-$$" setsid "$live/fake_worker_core" 300 </dev/null >/dev/null 2>&1 &
-      printf '%s' "$!" >"$live/other.pid" )
+    # And the discriminator, live: a DIFFERENT run's marker must not be touched. Same
+    # locate-by-ps rule (interval 301, see plant_arg_other above) — for exactly the same
+    # reason, and this one had no green to lose: it just printed "the discriminator is
+    # UNPROVEN" on a runner where the decoy was sitting in the table the whole time.
+    ( FULCRUM_CI_RUN_MARKER="some-other-run-$$" \
+        setsid "$live/fake_worker_core" "$plant_arg_other" </dev/null >/dev/null 2>&1 & )
     local other=""
-    [[ -r "$live/other.pid" ]] && other="$(cat "$live/other.pid")"
-    [[ -n "$other" ]] && self_test_planted+=("$other")
+    if other="$(find_planted "$live/fake_worker_core" "$plant_arg_other")"; then
+      self_test_planted+=("$other")
+    else
+      other=""
+    fi
     if plant_was_alive "$other"; then
-      expect_exit "I  a live process with ANOTHER run's marker is left alone" 0 \
-        env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-        FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
+      expect_live_census "I  a live process with ANOTHER run's marker is left alone" 0 "$live_marker"
       if ps -p "$other" >/dev/null 2>&1; then
         printf 'ok   I  the other-run process %s is still alive (untouched)\n' "$other"
         kill -KILL "$other" 2>/dev/null || true
@@ -2054,20 +2364,136 @@ run_self_test() {
         self_test_planted=("${self_test_planted[@]/$other/}")
       else
         printf "FAIL I  the census killed a process that was NOT this run's (pid %s)\n" "$other"
+        describe_plant_table "$live/fake_worker_core"
         self_test_planted=("${self_test_planted[@]/$other/}")
         self_test_failures=$((self_test_failures + 1))
       fi
     else
-      printf 'FAIL I  the OTHER-run plant was never observed alive (pid %s) — the discriminator is UNPROVEN\n' "${other:-<no pid>}"
+      printf 'FAIL I  the OTHER-run plant was never observed alive (pid %s) — the discriminator is UNPROVEN\n' "${other:-<no pid found at $live/fake_worker_core $plant_arg_other>}"
+      describe_plant_table "$live/fake_worker_core"
       self_test_failures=$((self_test_failures + 1))
     fi
 
     # The census must also survive being run from a checkout whose directory is
     # named `fulcrum` (this repo's own CI): the census skips its own lineage.
-    expect_exit "I  a clean live census passes and proves it read the table" 0 \
-      env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-      FULCRUM_CI_RUN_MARKER="selftest-clean-$$-$RANDOM" bash "$script"
+    expect_live_census "I  a clean live census passes and proves it read the table" 0 "selftest-clean-$$-$RANDOM"
     expect_output_has "I  the clean census reports the candidate count it looked at" "the process table was read"
+  fi
+
+  # ---- Case U: the plant is LOCATED, and only what the harness owns is forgiven --
+  # Two rules this branch introduced and this case owns, both of which run on EVERY
+  # leg — including the macOS and Windows legs where Case I is skipped, because a rule
+  # that is only exercised where the case it serves runs cannot catch a regression on
+  # the leg that loses the case. Neither needs `setsid`: these plants are ordinary
+  # background jobs, which is the same trick Case L already uses for its parent.
+  #
+  # 1. `find_planted` locates a real process by (its own path, its argv interval) and
+  #    tells TWO plants of the SAME image path apart. That discriminator is what lets
+  #    Case I still assert "kill ours, leave theirs" without renaming the image — and
+  #    renaming it is the trap: `fake_worker_core` is matched on the exact basename of
+  #    the first argv element, so a renamed plant is invisible to the census and Case I
+  #    becomes vacuous. A pin on this rule is therefore a pin on Case I's teeth, not on
+  #    a helper.
+  # 2. The live-census retry forgives a refusal ONLY when the census named the pid it
+  #    could not read AND that pid is not one the harness planted. If that predicate
+  #    were loosened to "any refusal", the retry would ride through the census's own
+  #    failure to read OUR plant — which is the exact vacuous green this whole file
+  #    exists to refuse.
+  if ((cap_ps == 1)) && ((cap_plant == 1)); then
+    local u_a="" u_b=""
+    # NO run marker on these two: they are props for a locating rule, not leaks, and a
+    # marker-bearing plant left alive would make the LATER live censuses (Case L's,
+    # Case M's) red for a reason that has nothing to do with them. They are killed at
+    # the end of this case regardless; the missing marker is the belt to that braces.
+    ( env -u "$MARKER_NAME" "$live/fake_worker_core" 302 </dev/null >/dev/null 2>&1 & )
+    ( env -u "$MARKER_NAME" "$live/fake_worker_core" 303 </dev/null >/dev/null 2>&1 & )
+    if u_a="$(find_planted "$live/fake_worker_core" 302)"; then
+      self_test_planted+=("$u_a")
+    else
+      u_a=""
+    fi
+    if u_b="$(find_planted "$live/fake_worker_core" 303)"; then
+      self_test_planted+=("$u_b")
+    else
+      u_b=""
+    fi
+
+    if plant_was_alive "$u_a" && plant_was_alive "$u_b"; then
+      printf 'ok   U  find_planted located BOTH plants by path+interval (pids %s and %s)\n' "$u_a" "$u_b"
+      if [[ "$u_a" != "$u_b" ]]; then
+        printf 'ok   U  the two plants of the SAME image path got DISTINCT pids (the discriminator works)\n'
+      else
+        printf 'FAIL U  both intervals resolved to pid %s — the discriminator is NOT separating them\n' "$u_a"
+        describe_plant_table "$live/fake_worker_core"
+        self_test_failures=$((self_test_failures + 1))
+      fi
+      # A claim about a table must be graded against the table, so the negative half is
+      # asserted too: an interval nobody planted must resolve to NOTHING. A locator that
+      # returned "the first fake_worker_core it saw" whenever its key missed would pass
+      # the two assertions above and then hand Case I a pid belonging to the OTHER plant
+      # — grading the census's kill against the wrong process.
+      if find_planted "$live/fake_worker_core" 399; then
+        printf 'FAIL U  find_planted invented a pid for an interval nobody planted (got %s)\n' "$u_a"
+        describe_plant_table "$live/fake_worker_core"
+        self_test_failures=$((self_test_failures + 1))
+      else
+        printf 'ok   U  an interval nobody planted resolves to NOTHING (no pid is invented)\n'
+      fi
+    else
+      # Every dependency was present and the plant still produced nothing: that IS a
+      # finding about this machine's `ps`, and it stays a failure — same rule Case M
+      # holds.
+      printf 'FAIL U  could not locate the two plants (sleep present, ps answers, plain background jobs)\n'
+      describe_plant_table "$live/fake_worker_core"
+      self_test_failures=$((self_test_failures + 1))
+    fi
+
+    # Both props die here. Leaving one alive past this point would put a watched image
+    # in the table for every later live census to reason about.
+    local u_pid
+    for u_pid in "$u_a" "$u_b"; do
+      [[ -n "$u_pid" ]] || continue
+      kill -KILL "$u_pid" 2>/dev/null || true
+      wait "$u_pid" 2>/dev/null || true
+      self_test_planted=("${self_test_planted[@]/$u_pid/}")
+    done
+
+    # 2. THE WIRING PINS. Behaviourally forcing "the census could not read OUR plant"
+    # needs a plant that dies inside the census's own read window, which is a race and
+    # not a test — so this half is pinned the way Case O pins its own wiring.
+    #
+    # EVERY NEEDLE IS ASSEMBLED AT RUNTIME. expect_file_has greps THIS FILE, so a needle
+    # written literally appears in the file as this assertion's own argument — and the pin
+    # matches itself, staying green after the branch it guards is deleted. Case O's
+    # `note M sk""ipped` trick is the house answer; concatenation, not a literal.
+    local u_dollar='$'
+    local u_needle_owned="for owned_pid in ${u_dollar}{self_test_planted[@]+\"${u_dollar}{self_test_planted[@]}\"}"
+    local u_needle_retry='if ((got !='
+    u_needle_retry="${u_needle_retry} 2)) ||"
+    local u_needle_own='planted="$(find_planted "$live/fake_worker_core" "$plant_a'
+    u_needle_own="${u_needle_own}rg_own\")\""
+    local u_needle_other='other="$(find_planted "$live/fake_worker_core" "$plant_a'
+    u_needle_other="${u_needle_other}rg_other\")\""
+    # Assembled at runtime for the opposite reason: written literally it would appear in
+    # this file as the assertion's own argument and expect_file_lacks would then ALWAYS
+    # fail. This is the exact statement the old Case I used to record a plant from `$!`.
+    local old_pidfile_shape='printf '"'"'%s'"'"' "$!"'
+
+    expect_file_has "U  the retry asks which pids the harness planted (our own plant is never forgiven)" \
+      "$script" "$u_needle_owned"
+    expect_file_has "U  only a REFUSAL (exit 2) is ever retried — a wrong verdict fails immediately" \
+      "$script" "$u_needle_retry"
+    expect_file_lacks "U  no case records a plant from \$! again (setsid sits in between)" \
+      "$script" "$old_pidfile_shape"
+    expect_file_has "U  Case I locates its own plant through the table, not through the shell" \
+      "$script" "$u_needle_own"
+    expect_file_has "U  Case I locates the DECOY the same way (the discriminator is graded on a real pid)" \
+      "$script" "$u_needle_other"
+  else
+    local u_missing=""
+    ((cap_ps == 0)) && u_missing="ps -eo does not answer here"
+    ((cap_plant == 0)) && u_missing="${u_missing:+$u_missing, }no sleep binary to copy as fake_worker_core"
+    self_test_skip "U" "$u_missing — the plant-locating rule and the retry's ownership rule are UNPROVEN"
   fi
 
   # ---- Case P: gone-before-read is DECLINED, never silently dropped -----------
