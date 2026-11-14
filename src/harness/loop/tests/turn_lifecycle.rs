@@ -13,6 +13,7 @@ use crate::harness::catalog::Model;
 use crate::harness::dispatch::SubagentDispatcher;
 use crate::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
+    Usage,
 };
 use crate::harness::retry::RetryPolicy;
 use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
@@ -2106,6 +2107,296 @@ async fn a_truncated_turn_with_no_text_persists_no_assistant_row() {
         !loaded.iter().any(|m| matches!(m.role, ChatRole::Assistant)),
         "the 33-byte empty assistant row does not exist on the `Length` route \
          either, got {loaded:?}",
+    );
+}
+
+/// A `Model` whose compaction threshold sits at exactly `threshold` tokens:
+/// the `Compactor` is built with the DEFAULT reserve (`16384`) and the config
+/// is fixed at `AgentLoop::new`, so the only knob a test can turn AFTER
+/// construction is the window — `should_compact()` is
+/// `context_tokens > context_window - reserve`, so a threshold of `t` is a
+/// window of `16384 + t`. (The same fixture exists in
+/// `context_usage.rs::model_with_threshold`; that one is private to its
+/// module, so this file carries its own copy rather than widening it.)
+fn model_with_threshold(id: &str, threshold: u32) -> Model {
+    Model {
+        context_window: 16_384 + threshold,
+        ..fake_model(id)
+    }
+}
+
+/// (issue #190, follow-up) A truncation that streamed NOTHING must leave the
+/// compaction watermark honest.
+///
+/// The arithmetic this pins, in `compact.rs`. `record_usage` (`:72`) writes
+/// `usage_watermark = messages.len() + 1` — the `+1` anticipates the reply the
+/// caller is about to append — and `turn_abandoned` (`:104`) early-returns on
+/// `usage_watermark <= messages.len()`, otherwise drops `pending_output` from
+/// the anchor and pulls the watermark back to what the transcript HOLDS. So on
+/// the two halves of the truncation route the SAME call does two different
+/// things, and both matter:
+///
+/// * **text streamed** — `handle_truncated_turn` pushes the reply BEFORE the
+///   settle, so `watermark == len` and the guard fires: a NO-OP, Δ = 0 on every
+///   field. (Asserted below, in
+///   `a_truncation_that_streamed_text_leaves_the_context_count_where_usage_put_it`.)
+/// * **nothing streamed** — nothing is pushed, so `watermark == len + 1 > len`
+///   and the guard does NOT fire: the call ACTS, and acting is correct.
+///
+/// `settle_truncated` left the call out on the theory that it was either harmful
+/// (the text-streamed half) or a no-op (this half). Both halves of that theory
+/// are false, and this is the half that costs real money: without the reconcile
+/// the count keeps the 50 output tokens of a reply that was never persisted and
+/// the watermark keeps an index past the end of the transcript, so the loop
+/// believes in an assistant row that does not exist.
+#[tokio::test]
+async fn a_truncation_that_streamed_nothing_does_not_leave_phantom_output_tokens() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        // The provider charges for a reply the output cap then cut off before
+        // a single character of it reached us: `input + output` = 150, of which
+        // 50 is output that NEVER EXISTED.
+        ProviderEvent::Usage(
+            Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
+            None,
+        ),
+        ProviderEvent::Done(FinishReason::Length),
+    ])]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let kinds: Vec<String> = drain_events(&mut events_rx)
+        .iter()
+        .map(|e| e.kind().to_string())
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "turn_truncated"),
+        "the turn settled as a truncation (this pin is about the counter, not \
+         about the disposition), got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one model call — the truncation is terminal (Decision 1)"
+    );
+
+    // THE watermark claim: the reply `record_usage` assumed was never appended,
+    // so the anchor must have given its output back. 150 - 50 = 100.
+    assert_eq!(
+        loop_.compactor.context_tokens(),
+        100,
+        "a truncation with NO text must retract the phantom reply's output from \
+         the context count: the provider reported `input 100 + output 50`, but the \
+         50 belongs to a reply that was never pushed or persisted, so the honest \
+         count is the 100 the transcript actually holds. Leaving `turn_abandoned` \
+         out of `settle_truncated` leaves 150 here — 50 tokens the model never \
+         generated, and the number the next turn's threshold is compared against.",
+    );
+
+    // And the transcript agrees: nothing was persisted, so nothing may be
+    // counted. `context_tokens` and the row count are the two halves of the
+    // same lie — the count asserts a row the transcript does not have.
+    assert!(
+        !loop_
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, ChatRole::Assistant)),
+        "ZERO assistant rows in the transcript (issue #64's 33-byte row must not \
+         come back on this route) — which is exactly why the count above may not \
+         carry a reply, got {:?}",
+        loop_.messages
+    );
+    let loaded = loop_
+        .store
+        .load_messages("s1")
+        .expect("the native transcript loads");
+    assert!(
+        !loaded.iter().any(|m| matches!(m.role, ChatRole::Assistant)),
+        "and ZERO in the store a reload reads back, got {loaded:?}",
+    );
+}
+
+/// The OTHER half of the same `turn_abandoned` guard, and the fact that made the
+/// omission in `settle_truncated` look safe: when text DID stream, the reply is
+/// pushed before the settle, so `usage_watermark == messages.len()`, the
+/// `watermark <= len` guard fires, and the call is a **no-op on every field**
+/// (Δ = 0). The docblock that justified the omission claimed the call would
+/// "discount a real message and reset the count to the bare anchor" on this
+/// route — that harm is arithmetically unreachable.
+///
+/// Pinned as an invariant rather than as a behaviour, because it is what stops a
+/// later reader from "fixing" the no-text case back the other way: the count is
+/// the provider's own `input + output` here, and it stays that way WITH the
+/// correction — the correction does not touch a reply that is really in the
+/// transcript.
+#[tokio::test]
+async fn a_truncation_that_streamed_text_leaves_the_context_count_where_usage_put_it() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("half a sentence, then the cap".to_string()),
+        ProviderEvent::Usage(
+            Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
+            None,
+        ),
+        ProviderEvent::Done(FinishReason::Length),
+    ])]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    drain_events(&mut events_rx);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "terminal, not retried");
+
+    // The reply IS in the transcript — that is the premise the guard reads.
+    assert_eq!(
+        loop_
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Assistant))
+            .count(),
+        1,
+        "a truncated turn persists its streamed text (Decision 3 / §7), got {:?}",
+        loop_.messages
+    );
+
+    // ...so `turn_abandoned` — which `settle_truncated` now makes — is a no-op:
+    // the count is still the provider's own report, 100 + 50. Δ = 0 against the
+    // same run without the call, which is the whole reason making the two halves
+    // of the settle identical is safe.
+    assert_eq!(
+        loop_.compactor.context_tokens(),
+        150,
+        "with text streamed the reply is real, the watermark guard fires, and the \
+         count stays at the provider's `input + output` = 150 — the correction is a \
+         NO-OP here, not the \"discount a real message and reset to the bare \
+         anchor\" the old docblock claimed, got {}",
+        loop_.compactor.context_tokens(),
+    );
+}
+
+/// Pin B — the pin that would have caught the omission.
+///
+/// A phantom 50 output tokens is not a rounding detail: it is the number the
+/// NEXT turn's `should_compact()` compares against the threshold, and the
+/// inflated watermark swallows that turn's own prompt inside the watermark
+/// window (`refresh` estimates only `messages[watermark..]`, so a watermark at
+/// `len` after the prompt is pushed estimates nothing) — which is how the
+/// inflation self-perpetuates instead of decaying.
+///
+/// The arithmetic, re-derived from the fixtures rather than trusted:
+/// `model_with_threshold(_, 120)` is a window of `16384 + 120` = 16504, and with
+/// the default reserve the threshold is exactly **120**, which sits BETWEEN the
+/// honest 100 and the inflated 150. Turn 1 is the no-text truncation; turn 2 is a
+/// cheap prompt (`"next"` = 4 chars / 4 + 1 = 2 tokens of trailing estimate).
+///
+/// Correct: `refresh` adds the new prompt to the corrected anchor → 102, not
+/// > 120 → no compaction, ONE model call for turn 2, TWO for the session.
+/// Omitting the call: the watermark (`len + 1` = 2) already covers the freshly
+/// pushed prompt, so `refresh` estimates NOTHING and the count stays 150 →
+/// 150 > 120 → a compaction that had nothing real to compact: one
+/// `compaction_start`, a SUMMARY model call the session did not need, the
+/// transcript rewritten, and turn 2's own call on top — 3 calls for the session
+/// instead of 2.
+#[tokio::test]
+async fn a_truncation_that_streamed_nothing_does_not_compact_the_next_turn() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        // Turn 1: charged for a reply that never arrived.
+        Some(vec![
+            ProviderEvent::Usage(
+                Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                },
+                None,
+            ),
+            ProviderEvent::Done(FinishReason::Length),
+        ]),
+        // Turn 2: the cheap follow-up. A provider that is ASKED FOR A SUMMARY
+        // (the spurious compaction's call) gets this same script, so the
+        // compaction runs to completion and rewrites the transcript exactly as
+        // production would — the failure this pin reports is therefore the real
+        // cost, not a stubbed one.
+        Some(vec![
+            ProviderEvent::TextDelta("the follow-up reply".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        // Threshold 120: the honest 100 (plus the next prompt's 2) stays under
+        // it, the inflated 150 crosses it.
+        vec![model_with_threshold("m1", 120)],
+        None,
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let first_turn: Vec<String> = drain_events(&mut events_rx)
+        .iter()
+        .map(|e| e.kind().to_string())
+        .collect();
+    assert!(
+        first_turn.iter().any(|k| k == "turn_truncated"),
+        "turn 1 is the truncation, got {first_turn:?}",
+    );
+    // What the counter is carrying INTO turn 2 is reported by the assertions
+    // below rather than asserted here: this test's evidence is the compaction,
+    // and a precondition assert would replace that evidence with the same
+    // 100-vs-150 number pin A already reports.
+    let after_turn_one = loop_.compactor.context_tokens();
+
+    loop_.handle_prompt(&text_prompt("next")).await;
+    let second_turn: Vec<String> = drain_events(&mut events_rx)
+        .iter()
+        .map(|e| e.kind().to_string())
+        .collect();
+
+    assert!(
+        !second_turn.iter().any(|k| k == "compaction_start"),
+        "turn 2 must NOT compact. Turn 1 left the counter at {after_turn_one} and \
+         turn 2's own prompt adds 2 more; the threshold is 120. A `compaction_start` \
+         here means the threshold was read against the 150 the phantom reply left \
+         behind — a spurious compaction that spends a SUMMARY model call and \
+         rewrites the transcript for context pressure that does not exist, got \
+         {second_turn:?}",
+    );
+    assert!(
+        !second_turn.iter().any(|k| k == "compaction_end"),
+        "and therefore no `compaction_end` either, got {second_turn:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "exactly TWO model calls for the session: the truncated one and turn 2's. \
+         A third is the summary call of the compaction that should never have been \
+         considered — the extra money and the rewritten transcript this pin exists \
+         to prevent.",
+    );
+    assert!(
+        second_turn.iter().any(|k| k == "agent_settled"),
+        "turn 2 settles normally (it is a clean stop), got {second_turn:?}",
     );
 }
 

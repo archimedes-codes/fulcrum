@@ -812,19 +812,55 @@ impl AgentLoop {
     /// [`Self::settle_cancelled`] for what `announced` is and why the close comes
     /// first.
     ///
-    /// This is `settle_error` WITHOUT `compactor.turn_abandoned`, and the
-    /// omission is the whole difference. `turn_abandoned` exists to pull the
-    /// Watermark back on the premise that the reply the last `record_usage`
-    /// assumed was NEVER persisted — and here a reply WAS persisted whenever text
-    /// streamed ([`Self::handle_truncated_turn`]). Calling it on a truncated turn
-    /// would discount a real message and reset the count to the bare anchor, so
-    /// the NEXT turn's context snapshot would understate a transcript that
-    /// genuinely grew — the lag `turn_abandoned` was added to prevent, arriving
-    /// through the opposite door. When nothing streamed the call would be a
-    /// no-op anyway (its `watermark > len` guard), which is exactly why leaving
-    /// it out is safe on both halves of the route.
+    /// **The body is `settle_error`, delegated.** It used to be `settle_error`
+    /// MINUS `compactor.turn_abandoned`, and the docblock justified the omission
+    /// with two claims. Both are false, and the arithmetic that says so is in
+    /// `compact.rs`: `record_usage` (`:72`) writes `usage_watermark =
+    /// messages.len() + 1` — the `+1` anticipates the reply the caller is about
+    /// to append — and `turn_abandoned` (`:104`) early-returns on
+    /// `usage_watermark <= messages.len()`. So the call does different things on
+    /// the two halves of this route, and neither is what the old text claimed:
     ///
-    /// It also NEVER dispatches. A truncated call's `arguments` arrived cut off
+    /// * **text streamed** — [`Self::handle_truncated_turn`] pushes the reply
+    ///   BEFORE settling, so `watermark == len`, the guard fires, and the call is
+    ///   a NO-OP: Δ = 0 on `context_tokens`, `usage_base`, `usage_watermark` and
+    ///   `pending_output`. The harm the old docblock predicted — "discount a real
+    ///   message and reset the count to the bare anchor" — is unreachable. That
+    ///   is what `turn_abandoned`'s own guard exists to prevent, and
+    ///   `compact.rs:83-85` says in terms that the call is "safe to call on
+    ///   EVERY turn exit" precisely BECAUSE it is a no-op when the append
+    ///   happened (`:99-103` is the guard that buys that). This function
+    ///   inverted that.
+    ///   Pinned as the Δ = 0 fact by
+    ///   `a_truncation_that_streamed_text_leaves_the_context_count_where_usage_put_it`.
+    /// * **nothing streamed** — nothing is pushed, so `watermark == len + 1 >
+    ///   len`, the guard does NOT fire, and the call ACTS. This is the half the
+    ///   old text dismissed as "a no-op anyway", and acting on it is the whole
+    ///   point. Leaving the call out left `context_tokens` at **150** instead of
+    ///   **100** for a `Usage { input: 100, output: 50 }` + `Done(Length)` with no
+    ///   text — 50 output tokens for a reply that was never persisted, with **0**
+    ///   assistant rows in the transcript and the watermark still pointing at
+    ///   index 1. The next turn then reads the threshold against that number: at
+    ///   a window whose threshold sits between 100 and 150 it emitted **1
+    ///   `compaction_start` and 3 model calls instead of 0 and 2** — a spurious
+    ///   compaction, an extra summary call, the transcript rewritten. And the
+    ///   inflation is self-perpetuating, because the watermark window swallows
+    ///   that next prompt too (`refresh` estimates only `messages[watermark..]`).
+    ///   Pinned by
+    ///   `a_truncation_that_streamed_nothing_does_not_leave_phantom_output_tokens`
+    ///   (the counter) and
+    ///   `a_truncation_that_streamed_nothing_does_not_compact_the_next_turn`
+    ///   (the spurious compaction — the pin that would have caught this).
+    ///
+    /// The wrapper therefore stays for its NAME and its docs, not for its body:
+    /// the nine-site settle table in `docs/features/abandoned-tool-rows.md` §2
+    /// names `settle_truncated` at site 9, and the `announced`-column discipline
+    /// there depends on that name existing to carry a derivation. Two divergent
+    /// copies of the same settle is what this function was, and the divergence
+    /// was the bug.
+    ///
+    /// What does NOT change is the other half of this function's reason to exist.
+    /// It NEVER dispatches. A truncated call's `arguments` arrived cut off
     /// mid-object, so `parse_arguments` hands back `{}`, `unknown_param_error`
     /// passes (it checks only EXTRANEOUS keys), the permission gate has no
     /// `path` to judge and returns `Allow`, and the executor then refuses with
@@ -841,11 +877,10 @@ impl AgentLoop {
     /// [`Self::close_announced_tool_calls`] already gives each call its own
     /// precise error either way. Decision 2 / ADR 0108.
     pub(super) fn settle_truncated(&mut self, tool_results: Vec<Value>, announced: &[ToolCall]) {
-        self.close_announced_tool_calls(announced);
-        self.emit(RpcEvent::turn_end {
-            message: Value::Null,
-            tool_results,
-        });
-        self.emit(RpcEvent::agent_settled);
+        // Identical to an errored exit — INCLUDING the `turn_abandoned` this used
+        // to skip. See the docblock: skipping it was measured to inflate the
+        // count by the phantom reply's output and to buy a spurious compaction on
+        // the NEXT turn.
+        self.settle_error(tool_results, announced);
     }
 }
