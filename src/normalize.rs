@@ -129,6 +129,21 @@ impl TurnState {
     }
 }
 
+/// The machine-readable disposition the truncation notice frame carries
+/// (issue #190, durability follow-up).
+///
+/// The value is the `gen_ai.response.finish_reasons` (OpenTelemetry GenAI)
+/// spelling — `"length"` — NOT a serialization of `provider_types::FinishReason`:
+/// that enum is `#[serde(rename_all = "snake_case")]` with 4 variants, so
+/// `to_value(FinishReason::ToolCalls)` yields `tool_calls`, not the OTel
+/// `tool_call`, and only `Length` exists on this path anyway. Hence a NAMED
+/// CONSTANT rather than a call into the enum.
+///
+/// This frame is emitted ONLY from the `FinishReason::Length` path, so the
+/// value is a fact about the emitter, not a lookup. A second emitter (another
+/// disposition) must introduce its OWN value rather than reuse this constant.
+const TRUNCATION_DISPOSITION: &str = "length";
+
 /// A one-line `agent_message_chunk` carrying a UNIQUE messageId — for a line
 /// that must survive being adjacent to another line. `system_chunk`'s shared
 /// key (the stamped `system` key, `{stamp}:system`) APPENDS (that is its
@@ -596,11 +611,16 @@ pub fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
         // welds into one bubble and reads as nonsense (Decision 4). It is
         // deliberately not a field on `turn_end` either — `turn_end.message` is
         // `Value::Null` at every settle site and read by nobody, so an untyped
-        // `Value` no consumer reads is invisible in review.
-        RpcEvent::turn_truncated => vec![unique_system_chunk(
-            &st.truncate_id(),
-            "Response was truncated before completion",
-        )],
+        // `Value` no consumer reads is invisible in review. The frame is built
+        // HERE rather than through `unique_system_chunk` because that helper is
+        // shared with the Retraction line, which must NOT gain the disposition
+        // key (no parameter was added to it).
+        RpcEvent::turn_truncated => vec![json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "Response was truncated before completion" },
+            "messageId": st.truncate_id(),
+            "disposition": TRUNCATION_DISPOSITION,
+        })],
         RpcEvent::auto_retry_start {
             attempt,
             max_attempts,
@@ -742,7 +762,17 @@ pub fn compute_display_rows(
                 .expect("agent-text accumulator poisoned");
             let entry = acc.entry(key.clone()).or_default();
             entry.push_str(text);
-            let payload = json!({ "text": entry });
+            let mut payload = json!({ "text": entry });
+            // (issue #190, durability follow-up) Forward a frame's machine-readable
+            // disposition into the row, so a client can hydrate the disposition from
+            // disk (the desktop's in-memory `stopReasons` map dies on restart).
+            // CONDITIONAL by requirement: every other `agent_message_chunk` payload
+            // must stay byte-identical to before (`{"text":"Hello"}` is pinned as a
+            // byte string by `the_memory_store_is_not_a_noop_store`), so an
+            // unconditional write would redden the existing pins.
+            if let Some(d) = update.get("disposition") {
+                payload["disposition"] = d.clone();
+            }
             vec![DisplayRow {
                 kind: "agent-text".to_string(),
                 message_key: key,
@@ -1453,7 +1483,11 @@ mod normalize_tests {
     /// transcript, on its OWN messageId. `turn_end` cannot carry the fact (its
     /// `message` is `Value::Null` at every settle site and read by nobody), and
     /// the shared `system` key would weld the notice onto whatever one-liner
-    /// preceded it — so the frame is a `unique_system_chunk` on `{stamp}:truncate:N`.
+    /// preceded it — so the frame is a one-line `agent_message_chunk` on
+    /// `{stamp}:truncate:N`, carrying the machine-readable `"disposition":
+    /// "length"` the persistence layer forwards into the row's payload (see
+    /// `a_truncation_row_carries_the_length_disposition`). This is a WHOLE-FRAME
+    /// equality pin: it reddens when the frame's key set changes.
     #[test]
     fn a_truncation_emits_one_line_on_its_own_message_id() {
         // The unit variant must also PARSE off the wire (the enum is
@@ -1471,6 +1505,7 @@ mod normalize_tests {
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "type": "text", "text": "Response was truncated before completion" },
                 "messageId": "t:truncate:0",
+                "disposition": "length",
             })],
             "exactly ONE frame, on the first minted id"
         );
@@ -1786,7 +1821,8 @@ mod normalize_tests {
 mod compute_display_rows_tests {
     use serde_json::json;
 
-    use super::{compute_display_rows, ThoughtState};
+    use super::{compute_display_rows, normalize, ThoughtState, TurnState};
+    use crate::events::RpcEvent;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
@@ -2003,6 +2039,88 @@ mod compute_display_rows_tests {
         assert!(
             rows.is_empty(),
             "a Retraction for an id that streamed nothing writes no row, got {rows:?}"
+        );
+    }
+
+    /// (issue #190, durability follow-up) The truncation notice's row carries a
+    /// MACHINE-READABLE disposition, so a client can hydrate the disposition
+    /// from disk instead of string-matching English prose (the desktop's
+    /// in-memory `stopReasons` map is lost on restart).
+    ///
+    /// Driven through `normalize` — NOT a hand-written update object — because
+    /// the feature is the FRAME→ROW path: `compute_display_rows`'
+    /// `agent_message_chunk` arm reads only `content.text` and `messageId`, so
+    /// any extra key on the frame is silently dropped unless the arm forwards
+    /// it. A test that hand-built the frame would pass with the frame key
+    /// missing AND with the row key missing (the silent-green trap).
+    #[test]
+    fn a_truncation_row_carries_the_length_disposition() {
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
+        let mut st = TurnState::stamped("t");
+
+        let frames = normalize(&RpcEvent::turn_truncated, &mut st);
+        assert_eq!(frames.len(), 1, "one notice frame per truncation");
+        assert_eq!(
+            frames[0]["disposition"],
+            json!("length"),
+            "the FRAME carries the disposition (the row cannot, if it does not)"
+        );
+
+        let rows: Vec<_> = frames
+            .iter()
+            .flat_map(|f| compute_display_rows(f, &text_acc, &tool_state, &thought_state))
+            .collect();
+        assert_eq!(rows.len(), 1, "the notice persists exactly one row");
+        assert_eq!(rows[0].kind, "agent-text");
+        assert!(
+            rows[0].message_key.ends_with("truncate:0"),
+            "the row is the FIRST minted notice id, got {}",
+            rows[0].message_key
+        );
+        assert_eq!(
+            rows[0].payload_json["disposition"],
+            json!("length"),
+            "the ROW payload carries the disposition, got {}",
+            rows[0].payload_json
+        );
+        assert_eq!(
+            rows[0].payload_json,
+            json!({
+                "text": "Response was truncated before completion",
+                "disposition": "length",
+            }),
+            "the payload is EXACTLY the prose plus the key",
+        );
+    }
+
+    /// The key is CONDITIONAL by requirement: a normal model chunk carries no
+    /// disposition, and its payload must stay byte-identical to before (three
+    /// existing tests pin exact payloads, including the byte string
+    /// `{"text":"Hello"}` — `the_memory_store_is_not_a_noop_store`).
+    #[test]
+    fn an_ordinary_chunk_carries_no_disposition_key() {
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
+
+        let rows = compute_display_rows(
+            &json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": { "type": "text", "text": "Hello" } }),
+            &text_acc,
+            &tool_state,
+            &thought_state,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].payload_json.get("disposition").is_none(),
+            "a frame with no disposition writes the payload it wrote before, got {}",
+            rows[0].payload_json
+        );
+        assert_eq!(
+            rows[0].payload_json,
+            json!({ "text": "Hello" }),
+            "the ordinary payload is byte-identical to the pre-feature shape"
         );
     }
 }
