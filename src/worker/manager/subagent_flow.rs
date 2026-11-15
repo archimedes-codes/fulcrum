@@ -145,7 +145,32 @@ pub struct SubagentCapture {
     /// Only a child that produced NEITHER text NOR a tool boundary settled with
     /// nothing at all — and only that is the empty-`Completed` the #122 guard
     /// reclassifies.
+    ///
+    /// THE ONE EXCEPTION IS THE TRUNCATION, and it lives in the flag below: a
+    /// `Length` turn's announce is a call that Decision 2 CLOSES without ever
+    /// dispatching, so on that route an announce is NOT evidence of work. Read
+    /// [`Self::saw_truncation`] alongside this before treating the marker as
+    /// "did real work".
     saw_tool_activity: std::sync::atomic::AtomicBool,
+    /// (issue #190 follow-up, F1) Did the child's turn get CUT OFF by the
+    /// provider's output cap (`RpcEvent::turn_truncated`)?
+    ///
+    /// This flag exists because `saw_tool_activity` stopped implying real work:
+    /// Decision 2 closes a `Length` turn's announced call WITHOUT dispatching it,
+    /// so a truncated child can announce a tool and still produce NOTHING. The
+    /// #122 exemption therefore had to stop reading the announce alone — see the
+    /// `Race::Settled` arm, where a recorded truncation DEFEATS the exemption.
+    ///
+    /// Why a separate flag and not something inferred from `captured_text()`: the
+    /// truncation notice is a bookkeeping line on `{stamp}:truncate:N`, and
+    /// `is_bookkeeping_message_id` answers true for it (Decision 5) precisely
+    /// because a parent must never read the harness's own notice as its child's
+    /// answer. The disposition is thus invisible to the text capture BY DESIGN,
+    /// so it has to be carried beside it. It is also invisible to
+    /// `SubagentLiveness::in_flight`: the close the child emits for the abandoned
+    /// call drains that set, so the liveness half cannot tell a truncated child
+    /// from one whose tool finished.
+    saw_truncation: std::sync::atomic::AtomicBool,
 }
 
 impl Default for SubagentCapture {
@@ -162,6 +187,7 @@ impl SubagentCapture {
             usage: StdMutex::new((0, 0)),
             cost: StdMutex::new(None),
             saw_tool_activity: std::sync::atomic::AtomicBool::new(false),
+            saw_truncation: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -279,6 +305,15 @@ impl SubagentCapture {
             self.saw_tool_activity
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // (issue #190 follow-up, F1) The truncation marker (see
+        // `saw_truncation`). Recorded HERE because `pump.rs` feeds every child
+        // `RpcEvent` through this method, and the child emits `turn_truncated`
+        // BEFORE its settle — so the flag is set while the drive is still
+        // listening, which is the same contract the notice has on the wire.
+        if matches!(event, RpcEvent::turn_truncated) {
+            self.saw_truncation
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let RpcEvent::message_update { usage, .. } = event {
             let input = usage
                 .get("inputTokens")
@@ -329,6 +364,17 @@ impl SubagentCapture {
     /// text nor a tool boundary (the empty-`Completed` this guard reclassifies).
     pub fn saw_tool_activity(&self) -> bool {
         self.saw_tool_activity
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// (issue #190 follow-up, F1) Did the child's turn end in a truncation
+    /// (`RpcEvent::turn_truncated`)? The settle guard reads this to DEFEAT the
+    /// `saw_tool_activity()` exemption: since Decision 2 a `Length` turn's
+    /// announced call is closed and never dispatched, so an announce no longer
+    /// proves the child did work. See the field's doc for why the disposition
+    /// cannot be read out of `captured_text()`.
+    pub fn saw_truncation(&self) -> bool {
+        self.saw_truncation
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1174,7 +1220,47 @@ async fn drive_subagent(
             //
             // Pinned end-to-end through this real settle by
             // `manager::tests::a_silent_child_that_settled_is_not_completed_empty`.
-            if content_is_effectively_empty(&output) && !capture.saw_tool_activity() {
+            //
+            // (issue #190 follow-up, F1) FIRST comes the truncation arm, which
+            // outranks BOTH this guard and the `Completed` fall-through. A child
+            // whose turn the provider's output cap cut off is not a success, with
+            // text or without (Decision 1: terminal), and since Decision 2 its
+            // announced tool call was CLOSED rather than dispatched — so
+            // `saw_tool_activity` no longer distinguishes "did real work and had
+            // nothing to say" (ADR 0055's legitimate `Completed`) from "announced
+            // a call that will never run and produced nothing". Reading the
+            // announce alone made a truncated, text-less child exempt from the #122
+            // guard and hand the parent `Completed { output: "" }` — the exact
+            // empty-`Completed` #122 exists to prevent, on a route this branch
+            // created. Pinned by
+            // `manager::tests::a_truncated_child_that_streamed_nothing_is_not_completed_empty`.
+            if capture.saw_truncation() {
+                // The SALVAGE is the child's own streamed text, when it has any
+                // (the same partial-output hand-off `failed_with_salvage` gives a
+                // dead child); an empty or placeholder-only capture yields `""`,
+                // so the banner never reaches the parent — the #122 discipline,
+                // unchanged in kind.
+                let salvage = if content_is_effectively_empty(&output) {
+                    String::new()
+                } else {
+                    output.clone()
+                };
+                // The metrics ride the `Failed` path UNCHANGED, exactly as the
+                // guard below does: a truncated child spent real tokens and real
+                // money, and its failure is not a reason to report it as free.
+                let mut metrics = metrics;
+                metrics.output = salvage.clone();
+                SubagentOutcome::Failed {
+                    // `Other` for the same reason the #122 guard uses it: the
+                    // child was not reaped, did not crash, and was not cancelled.
+                    reason: SubagentFailureReason::Other,
+                    error: "the subagent's turn was truncated by the provider's \
+                            output cap"
+                        .to_string(),
+                    output: salvage,
+                    metrics,
+                }
+            } else if content_is_effectively_empty(&output) && !capture.saw_tool_activity() {
                 // The metrics ride the `Failed` path UNCHANGED (the child's real
                 // tokens and money are not forfeited by its empty answer); only
                 // the `output` mirror is emptied, so nothing placeholder-shaped

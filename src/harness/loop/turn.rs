@@ -462,12 +462,65 @@ impl AgentLoop {
             });
             self.persist_transcript_message();
         }
+        // (issue #190 follow-up, F3) Retire a retry report this turn left
+        // pending, and CLOSE it honestly. `RetryPolicy::reported` is set only by
+        // `note_success()` and cleared only by `next_retry_delay()`, and this
+        // route returns before `note_success()` is ever reached (deliberately — a
+        // truncated attempt is not a success), so a turn that retried to get here
+        // would leave the report outstanding for the NEXT prompt to call a
+        // success.
+        //
+        // THE SHAPE CHOSEN: one `auto_retry_end { success: false }` whose
+        // `final_error` names the truncation — the same close
+        // `retry_abandoned_attempt`'s budget-EXHAUSTED arm emits (its
+        // `self.emit(RpcEvent::auto_retry_end { success: false, .. })` immediately
+        // before its `settle_error`), for the same reason: a peer that opened a
+        // retry card on the `auto_retry_start` must see it CLOSE, and `normalize`
+        // renders the close as the "Retry failed" line. The alternative — retiring
+        // the flag silently — would leave that card spinning until some later turn
+        // happened to close it, which is the same class of dangling-row bug this
+        // file's tool-row discipline refuses elsewhere.
+        //
+        // Emitted BEFORE the settle for the same ordering reason as
+        // `turn_truncated` above: nothing a peer still needs arrives after
+        // `agent_settled`.
+        if let Some(attempt) = self.retry.retire_pending_report() {
+            self.emit(RpcEvent::auto_retry_end {
+                success: false,
+                attempt,
+                final_error: Some(
+                    "the retried turn was truncated by the provider's output cap \
+                     (finish_reason `length`) — terminal, not retried"
+                        .to_string(),
+                ),
+            });
+        }
         // Site 9 of the nine in `docs/features/abandoned-tool-rows.md` §2:
         // NOT vacuous. `consume_stream` has just run and this route reaches no
         // batch, so `acc.tool_calls` holds every row the cut-off attempt opened
         // at `in_progress` and will never dispatch — Decision 2 forbids the
         // dispatch, so the close is the only thing that can end those rows.
         self.settle_truncated(tool_results, &acc.tool_calls);
+        // (issue #190 follow-up, F2) Re-anchor the context count, in the SAME
+        // position the clean-stop path uses it: AFTER the assistant row is
+        // persisted (`loop.rs:1473`, which follows its own
+        // `push` + `persist_transcript_message`). This route is the fourth site
+        // that persists an assistant row — Decision 3 keeps the streamed text —
+        // and without the refresh the displayed/saved count still described the
+        // transcript as it was BEFORE the reply landed, so the context bar and
+        // the `sessions` row a reload reads both under-reported a real row until
+        // some later turn happened to refresh. It sits after the settle (and so
+        // after `settle_truncated`'s `turn_abandoned`) for the same reason the
+        // clean stop puts it after its own transcript write: the number emitted
+        // must be the one the transcript now actually has — on the no-text half
+        // that is the corrected anchor `turn_abandoned` just produced, and
+        // emitting the pre-correction figure would show the phantom output this
+        // branch's other fix exists to remove.
+        //
+        // `note_context` emits only when the estimate MOVED, so the half where
+        // the provider reported usage and the anchor already covers the reply
+        // emits nothing (the guard in `emit.rs:274`'s doc).
+        self.note_context();
         TurnFlow::Return
     }
 

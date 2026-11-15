@@ -1113,3 +1113,91 @@ async fn a_model_switch_emits_a_context_usage_update_with_the_new_window() {
          already knows is too large, got {kinds:?}"
     );
 }
+
+/// (issue #190 follow-up, F2) A truncated turn that PERSISTED its reply
+/// refreshes the context count, exactly like the clean-stop path does.
+///
+/// `note_context` is the loop's only re-anchor of the displayed/saved count, and
+/// it is called wherever the transcript grows: `begin_turn` (`turn.rs:93`), after
+/// a tool batch (`turn.rs:714`), and on the clean stop AFTER the assistant row is
+/// persisted (`loop.rs:1473`). `handle_truncated_turn` is the FOURTH site that
+/// persists an assistant row (Decision 3 keeps the streamed text) and it returned
+/// without the refresh, so the truncated reply was missing from the count — and
+/// from the `sessions` row the bar reads after a reload — until some later turn
+/// happened to refresh it.
+///
+/// The fixture carries NO `Usage` on purpose: with a usage anchor the provider's
+/// own report already covers the reply (`input + output`), so a missing refresh is
+/// invisible. Anchor 0 makes the local estimate the ONLY measurement, which is
+/// also the usage-less-endpoint case the fallback exists for. So the frame must
+/// state the whole transcript — the prompt AND the persisted half-sentence.
+#[tokio::test]
+async fn a_truncated_turn_that_persisted_text_refreshes_the_context_count() {
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let updates = Arc::new(StdMutex::new(Vec::new()));
+    let sink: Arc<dyn EventSink> = Arc::new(TestSink {
+        updates: updates.clone(),
+    });
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        // 40 chars → 40/4 + 1 = 11 tokens of estimate, then the cap.
+        ProviderEvent::TextDelta("x".repeat(40)),
+        ProviderEvent::Done(FinishReason::Length),
+    ])]);
+    let (_space, mut loop_, db) = build_loop_with_sink(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+        sink,
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "terminal, not retried");
+
+    // The premise: the truncated reply really IS in the transcript (Decision 3).
+    assert_eq!(
+        loop_
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Assistant))
+            .count(),
+        1,
+        "the truncated turn persisted its text, got {:?}",
+        loop_.messages
+    );
+
+    // The prompt alone (what `begin_turn` measured) is 1 token; the transcript is
+    // bigger, and the difference is the reply this route persisted.
+    let prompt_only = compact::estimate_context(&loop_.messages[..1]);
+    let whole_transcript = compact::estimate_context(&loop_.messages);
+    assert!(
+        whole_transcript > prompt_only,
+        "the fixture must have grown the transcript, prompt {prompt_only} vs \
+         whole {whole_transcript}"
+    );
+
+    let frame = last_context_usage_frame(&updates)
+        .expect("a context_usage_update frame was emitted for the truncated turn");
+    assert_eq!(
+        frame["usedTokens"].as_u64(),
+        Some(whole_transcript),
+        "the LAST count a truncated turn leaves behind includes the text it \
+         persisted ({whole_transcript} = prompt {prompt_only} + the reply) — the \
+         clean-stop path re-anchors after persisting (`loop.rs:1473`) and this \
+         route must too, or the bar and the threshold read a number that predates \
+         a real transcript row. Without the refresh the last frame is the \
+         prompt-only {prompt_only}."
+    );
+    assert_eq!(
+        db.context_usage(),
+        vec![("s1".to_string(), whole_transcript, 128_000)],
+        "and the SAME number reaches the `sessions` row the reload reads back"
+    );
+    assert_eq!(
+        loop_.compactor.context_tokens(),
+        whole_transcript,
+        "one number, two consumers: the tracked count and the frame agree"
+    );
+}

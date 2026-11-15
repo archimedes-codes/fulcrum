@@ -2542,3 +2542,146 @@ async fn a_claimed_tool_calls_turn_with_a_spent_budget_announces_the_retry_and_p
         "and NOTHING persisted to the store a reload reads back, got {loaded:?}",
     );
 }
+
+/// (issue #190 follow-up, F3) A `Length` turn must RETIRE the retry report the
+/// turn's own abandoned attempt left pending — otherwise the NEXT ordinary
+/// successful prompt announces `auto_retry_end { success: true }` for the
+/// truncated turn, i.e. a "Retry succeeded" banner for a turn that did not
+/// succeed.
+///
+/// The mechanism is `RetryPolicy::reported` (`retry.rs:40`): set ONLY by
+/// `note_success()` and cleared ONLY by `next_retry_delay()`. Turn 1 here retries
+/// (the empty turn consumes an attempt, so `attempt == 2`, `reported == false`)
+/// and its next response ends `Done(Length)`. The truncation gate sits BEFORE
+/// `note_success()`, so the pending report survives the settle — and turn 2, a
+/// clean stop, walks into `note_success()`, gets `Some(2)`, and emits the
+/// success frame for turn 1.
+///
+/// The fix closes the pending report on the truncation route the way
+/// `retry_abandoned_attempt`'s budget-exhausted arm closes it (`turn.rs:530`):
+/// one `auto_retry_end { success: false }` whose `final_error` names the
+/// truncation, emitted before the settle, and the report retired so no later
+/// turn can report it as a success.
+#[tokio::test]
+async fn a_truncated_turn_does_not_leave_a_retry_report_for_the_next_prompt_to_call_success() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![
+        // Turn 1, attempt 1: the #64 empty turn — nothing streamed, no tool call.
+        Some(vec![ProviderEvent::Done(FinishReason::Stop)]),
+        // Turn 1, attempt 2: the cap ends it. The budget is NOT spent, so
+        // `reported` is still false when this settles.
+        Some(vec![
+            ProviderEvent::TextDelta("half a sentence, then the cap".to_string()),
+            ProviderEvent::Done(FinishReason::Length),
+        ]),
+        // Turn 2: an ordinary clean stop. This is the prompt that must NOT
+        // inherit turn 1's retry.
+        Some(vec![
+            ProviderEvent::TextDelta("all good".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let first_turn: Vec<RpcEvent> = drain_events(&mut events_rx);
+    let first_kinds: Vec<String> = first_turn.iter().map(|e| e.kind().to_string()).collect();
+    assert!(
+        first_kinds.iter().any(|k| k == "auto_retry_start"),
+        "precondition: turn 1 DID retry (that is what leaves `reported == false` \
+         pending), got {first_kinds:?}",
+    );
+    assert!(
+        first_kinds.iter().any(|k| k == "turn_truncated"),
+        "precondition: turn 1 ended as a truncation, got {first_kinds:?}",
+    );
+
+    loop_.handle_prompt(&text_prompt("and now?")).await;
+    let second_turn: Vec<RpcEvent> = drain_events(&mut events_rx);
+    let second_kinds: Vec<String> = second_turn.iter().map(|e| e.kind().to_string()).collect();
+
+    // THE FINDING: turn 2 is a clean stop on a fresh prompt. It has no retry of
+    // its own, so it has no report to make — and it must not speak for turn 1.
+    assert!(
+        !second_kinds.iter().any(|k| k == "auto_retry_end"),
+        "the prompt AFTER a truncated turn emits NO `auto_retry_end` at all: \
+         turn 1's retry was closed on the truncation route, so there is nothing \
+         left for turn 2 to report. A `success: true` here is the false \
+         \"Retry succeeded\" banner for a turn the output cap cut off, got \
+         {second_kinds:?}",
+    );
+    assert!(
+        !second_turn
+            .iter()
+            .any(|e| matches!(e, RpcEvent::auto_retry_end { success: true, .. })),
+        "explicitly: never `success: true` for the truncated turn, got {second_kinds:?}",
+    );
+    assert!(
+        second_kinds.iter().any(|k| k == "agent_settled"),
+        "turn 2 still settles normally (this pin is about the retry frame only), \
+         got {second_kinds:?}",
+    );
+
+    // AND the close itself: the pending report is retired ON TURN 1, as a
+    // `success: false` naming the truncation — the same shape the
+    // budget-exhausted arm of `retry_abandoned_attempt` uses, so a peer that
+    // opened a retry card sees it CLOSE rather than hang.
+    let closed: Vec<&RpcEvent> = first_turn
+        .iter()
+        .filter(|e| matches!(e, RpcEvent::auto_retry_end { success: false, .. }))
+        .collect();
+    assert_eq!(
+        closed.len(),
+        1,
+        "the truncated turn closes its own pending retry exactly once, got \
+         {first_kinds:?}",
+    );
+    let RpcEvent::auto_retry_end {
+        attempt,
+        final_error,
+        ..
+    } = closed[0]
+    else {
+        unreachable!("the filter keeps only auto_retry_end {{ success: false, .. }}");
+    };
+    assert_eq!(
+        *attempt, 2,
+        "the close names the attempt the retry reached (the empty turn + the \
+         truncated one)"
+    );
+    let reason = final_error.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("truncat"),
+        "the close says WHY the retry ended in a truncation rather than a \
+         success, got {final_error:?}"
+    );
+    // The close precedes the settle, so a peer sees the retry resolved before
+    // the turn is over (the same ordering the budget-exhausted arm keeps).
+    let settle_at = first_kinds
+        .iter()
+        .position(|k| k == "agent_settled")
+        .expect("turn 1 settles");
+    let close_at = first_kinds
+        .iter()
+        .position(|k| k == "auto_retry_end")
+        .expect("the close is emitted");
+    assert!(
+        close_at < settle_at,
+        "the retry close at {close_at} precedes `agent_settled` ({settle_at}), got \
+         {first_kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the empty attempt, the truncated one, and turn 2's — the truncation is \
+         still terminal (Decision 1: no re-issue)"
+    );
+}
