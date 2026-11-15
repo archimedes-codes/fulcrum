@@ -595,10 +595,44 @@ impl Stream for AnthropicStream {
     }
 }
 
-/// The default `max_tokens` for the Anthropic wire (Anthropic REQUIRES
-/// `max_tokens` on every request — a generous default when the caller did
-/// not set one).
-pub const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 32768;
+/// The hard CEILING on `max_tokens` for this wire — requested
+/// UNCONDITIONALLY, never gated on the Claude-family model prefix.
+///
+/// Anthropic's own synchronous ceiling is 128,000 on current models and
+/// 64,000 on the 4.5 generation, and an over-cap value is a **400, NOT a
+/// silent clamp** — so the conservative end of that range is the only end
+/// that cannot 400. A gateway with a LOWER cap silently clamps down rather
+/// than rejecting, so asking for 64,000 is safe behind one. A family-prefix
+/// gate would silently disable the ceiling for LiteLLM-routed Claude traffic
+/// (issue #196's whole finding: the model id survives LiteLLM routing but the
+/// routing changes what the far end will accept, so the prefix identifies the
+/// family and NOT the ceiling that applies to it).
+const ANTHROPIC_OUTPUT_CEILING_TOKENS: u32 = 64_000;
+
+/// The answer's FLOOR: the minimum output left for visible text PLUS the
+/// whole `tool_use` block once a `thinking` budget has been clamped.
+///
+/// The number this replaces is 1,024 — identical in goose and pi — and our
+/// tokenized traffic exceeds it outright: 62% of final reports and 65% of
+/// writes are longer than 1,024 tokens, so that reservation truncates the
+/// deliverable at the point where the model is emitting it. 16,384 is the
+/// SMALLEST power of two clearing both measurements. It is affordable: at
+/// [`ANTHROPIC_OUTPUT_CEILING_TOKENS`] it still leaves 47,616 tokens for
+/// thinking, which is MORE than the `xhigh` level (40,000) spends — so
+/// `low`/`medium`/`high`/`xhigh` keep their budgets untouched and only `max`
+/// (128,000) shrinks, which is precisely the level whose request is a 400
+/// today.
+const MIN_ANSWER_TOKENS: u32 = 16_384;
+
+/// Anthropic's own minimum legal `budget_tokens` (below it the request is a
+/// 400).
+///
+/// This is the **DROP THRESHOLD**, not a floor on the budget: when the room
+/// the ceiling leaves after [`MIN_ANSWER_TOKENS`] falls under it there is NO
+/// legal budget at all, and `thinking` is omitted entirely rather than
+/// emitting a `budget_tokens` the API would reject. It never raises a budget
+/// toward this value — see [`clamp_thinking_budget`].
+const MIN_THINKING_BUDGET_TOKENS: u32 = 1_024;
 
 /// A client for the Anthropic Messages API (`POST {base_url}/messages`,
 /// the `event:`-tagged SSE response parsed by [`AnthropicStream`]; ADR
@@ -842,6 +876,106 @@ fn anthropic_thinking(level: &str) -> Value {
     json!({ "type": "enabled", "budget_tokens": budget })
 }
 
+/// Fit a thinking budget under the output ceiling, leaving
+/// [`MIN_ANSWER_TOKENS`] for the answer.
+///
+/// `Some(b)` = use this budget (possibly shrunk). `None` = emit NO `thinking`
+/// key: no legal budget fits, because Anthropic's minimum will not fit in the
+/// room the floor leaves.
+///
+/// ONLY EVER REDUCES — it never raises a budget toward the minimum. Three
+/// outcomes: SHRINK (at the current 64,000 ceiling, `128000 → 47616` — the
+/// `max` level is shrunk, not dropped), PASS THROUGH (`4096 → Some(4096)`;
+/// exactly at room is inclusive, so `47616 → Some(47616)` and `47617` clamps
+/// to `Some(47616)`), and DROP — which happens **only** when the room itself
+/// is under [`MIN_THINKING_BUDGET_TOKENS`].
+///
+/// Deliberately NOT `room.max(MIN_THINKING_BUDGET_TOKENS)`: that looks like
+/// the defensive move and it is dead code with a trap in it. Applied first it
+/// lifts `room` to exactly 1,024 at any ceiling under 17,408, which makes the
+/// `room < MIN_THINKING_BUDGET_TOKENS` test unreachable forever — so a
+/// low-ceiling model would emit a 1,024-token budget where the design says
+/// drop `thinking`, and at a ceiling of 1,024 or lower it would emit
+/// `budget_tokens >= max_tokens`, a 400. [`MIN_THINKING_BUDGET_TOKENS`] has
+/// exactly one job: the drop threshold.
+fn clamp_thinking_budget(budget: u32) -> Option<u32> {
+    let room = ANTHROPIC_OUTPUT_CEILING_TOKENS.saturating_sub(MIN_ANSWER_TOKENS);
+    if room < MIN_THINKING_BUDGET_TOKENS {
+        None
+    } else {
+        Some(budget.min(room))
+    }
+}
+
+/// The (`max_tokens`, `thinking`) pair for a request.
+///
+/// `max_tokens` is the CEILING and the budget is what moves to fit under it —
+/// the inverse of the `max_tokens.max(budget + 1024)` clamp this replaced.
+/// `thinking` in is the [`anthropic_thinking`] output (or `None` for no
+/// level); `thinking` out is what goes on the wire: passed through when it
+/// carries no budget (the `adaptive` mode), rebuilt with the clamped budget
+/// when it does, or dropped when the clamp returns `None`.
+///
+/// The clamp runs BEFORE the arms split, and it feeds BOTH arms — the
+/// caller-cap arm does not leave the budget alone. The naive transcription of
+/// the upstream reference shape (`min(caller_cap + budget, ceiling)` with the
+/// RAW budget) is illegal in 23 of the 144 reachable inputs, because our
+/// callers' caps — `Some(100)` from the desktop's titling request, `Some(8192)`
+/// from the summariser — sit far below the level table's budgets, and
+/// Anthropic requires **strict** `max_tokens > budget_tokens` (`cap = Some(0)`
+/// with any budget gives `max_tokens == budget_tokens`, a 400). The sum
+/// therefore adds the CLAMPED budget, and `c.max(1)` is the same class of
+/// guard one size lower (a caller sending `Some(0)` with a 1,024 budget would
+/// otherwise tie) — `compact.rs:617` already writes `cap.max(1)` for this
+/// reason, but the wire builder cannot rely on every caller doing so, so it
+/// applies its own.
+///
+/// The DROP arm (`(Some(_), None)`) fires only when the ceiling is below
+/// [`MIN_ANSWER_TOKENS`] + [`MIN_THINKING_BUDGET_TOKENS`] = 17,408, and it is
+/// a function of the ceiling ALONE — no caller cap and no thinking level can
+/// trigger it, because the clamp has already run by the time the arms split.
+/// At today's 64,000 it is **unreachable from every input**, and it is
+/// implemented anyway because it is the clause that keeps the shape legal once
+/// per-model ceilings land. Even a 32,000-ceiling model does not reach it: it
+/// has 15,616 of room, so `xhigh` would merely be SHRUNK to that.
+fn anthropic_output_budget(
+    caller_cap: Option<u32>,
+    thinking: Option<Value>,
+) -> (u32, Option<Value>) {
+    // Read the budget back out of the object with the existing idiom rather
+    // than duplicating `anthropic_thinking`'s five-arm match: a second match
+    // is a second place the level table lives and the two would drift. An
+    // `adaptive` object simply has no `budget_tokens` key, so it reads as
+    // `None` and passes through untouched.
+    let budget = thinking
+        .as_ref()
+        .and_then(|t| t.get("budget_tokens"))
+        .and_then(|b| b.as_u64())
+        .map(|b| b as u32);
+    let clamped = budget.and_then(clamp_thinking_budget);
+    let max_tokens = match caller_cap {
+        None => ANTHROPIC_OUTPUT_CEILING_TOKENS,
+        Some(c) => c
+            .max(1)
+            .saturating_add(clamped.unwrap_or(0))
+            .min(ANTHROPIC_OUTPUT_CEILING_TOKENS),
+    };
+    let thinking = match (budget, clamped) {
+        // `adaptive` (or no level at all) passes through UNTOUCHED — this arm
+        // is what keeps that mode byte-identical.
+        (None, _) => thinking,
+        // Rebuilt rather than mutated in place: a `budget_tokens` key exists
+        // ONLY on the `enabled` object (that is all `anthropic_thinking` can
+        // produce), so these arms can name `type: "enabled"` without reading
+        // the mode back.
+        (Some(_), Some(b)) => Some(json!({ "type": "enabled", "budget_tokens": b })),
+        // No legal budget fits under the ceiling — drop `thinking` entirely
+        // (unreachable at today's ceiling; see the docs above).
+        (Some(_), None) => None,
+    };
+    (max_tokens, thinking)
+}
+
 /// The Claude-family model-id prefix (T3b / #131): a Claude model keeps its
 /// model id when it is routed through LiteLLM, so the prefix alone identifies
 /// the family (the `anthropic-messages` WIRE is gated at the caller — this
@@ -964,20 +1098,17 @@ fn anthropic_request_body(req: &ModelRequest) -> Value {
     if let Some(t) = req.options.temperature {
         body["temperature"] = json!(t);
     }
-    // `max_tokens` is ALWAYS present (Anthropic requires it): the caller's
-    // value or the default, clamped UP over the `thinking` budget (the
-    // API requires `max_tokens > budget_tokens`).
-    let mut max_tokens = req
+    // `max_tokens` is ALWAYS present (Anthropic requires it) and it is the
+    // CEILING: the caller's cap or [`ANTHROPIC_OUTPUT_CEILING_TOKENS`], with
+    // the `thinking` budget clamped DOWN to fit beneath it (the API requires
+    // `max_tokens > budget_tokens`).
+    let thinking = req
         .options
-        .max_tokens
-        .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
-    if let Some(level) = &req.options.reasoning_effort {
-        let thinking = anthropic_thinking(level);
-        // The API requires `max_tokens > budget_tokens` — clamp UP over
-        // the budget (the `adaptive` mode has no budget — no clamp).
-        if let Some(budget) = thinking.get("budget_tokens").and_then(|b| b.as_u64()) {
-            max_tokens = max_tokens.max(budget as u32 + 1024);
-        }
+        .reasoning_effort
+        .as_deref()
+        .map(anthropic_thinking);
+    let (max_tokens, thinking) = anthropic_output_budget(req.options.max_tokens, thinking);
+    if let Some(thinking) = thinking {
         body["thinking"] = thinking;
     }
     body["max_tokens"] = json!(max_tokens);
@@ -2716,7 +2847,7 @@ mod tests {
         // NO `reasoning_effort` + NO `max_tokens` → the default, NO
         // `thinking` field.
         let body = req(None, None);
-        assert_eq!(body["max_tokens"], ANTHROPIC_DEFAULT_MAX_TOKENS);
+        assert_eq!(body["max_tokens"], ANTHROPIC_OUTPUT_CEILING_TOKENS);
         assert!(body.get("thinking").is_none());
     }
 
