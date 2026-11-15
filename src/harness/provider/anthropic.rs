@@ -607,6 +607,19 @@ impl Stream for AnthropicStream {
 /// (issue #196's whole finding: the model id survives LiteLLM routing but the
 /// routing changes what the far end will accept, so the prefix identifies the
 /// family and NOT the ceiling that applies to it).
+///
+/// Asking for the full 64,000 on EVERY turn — the no-cap arm is what every
+/// loop turn takes, and titling reaches it too whenever a naming reasoning
+/// level is configured — costs nothing: Anthropic documents that `max_tokens`
+/// does NOT factor into the OTPM rate-limit calculation (OTPM is evaluated in
+/// real time on the tokens actually generated), and output is billed on the
+/// tokens generated, not on the cap requested. The ask therefore spends none
+/// of the bucket a smaller cap would have reserved. The contrast is the trap:
+/// on the OpenAI side the same field is NOT free — its rate limit is the max
+/// of `max_tokens` and the estimated prompt size, and a LiteLLM gateway doing
+/// budget reservation estimates from the value — which is why the OpenAI
+/// builders (`openai.rs`, `responses.rs`) still OMIT the field when it is
+/// `None`. This ceiling is Anthropic-wire-only for exactly that reason.
 const ANTHROPIC_OUTPUT_CEILING_TOKENS: u32 = 64_000;
 
 /// The answer's FLOOR: the minimum output left for visible text PLUS the
@@ -622,6 +635,18 @@ const ANTHROPIC_OUTPUT_CEILING_TOKENS: u32 = 64_000;
 /// `low`/`medium`/`high`/`xhigh` keep their budgets untouched and only `max`
 /// (128,000) shrinks, which is precisely the level whose request is a 400
 /// today.
+///
+/// PROVENANCE of those two percentages, carried here because this comment is
+/// the ONLY surviving copy of them: they come from a live-tokenizer
+/// measurement over real database traffic that is NOT recorded in this repo
+/// (the plan that chose 16,384 flagged it as unverified and its source report
+/// had no tokenizer installed, deriving its own figures at bytes ÷ 3.7 ±20%).
+/// Treat them as REPORTED, not as reproducible here. The load-bearing
+/// decision is the FLOOR — 16,384 is the smallest power of two clearing both
+/// populations while still leaving more room than `xhigh` spends — NOT the
+/// two percentages, which only justify the size. If the measurement is ever
+/// re-taken and disagrees, `MIN_ANSWER_TOKENS` is the number to re-open, not
+/// the SHAPE of the ceiling/clamp design above.
 const MIN_ANSWER_TOKENS: u32 = 16_384;
 
 /// Anthropic's own minimum legal `budget_tokens` (below it the request is a
@@ -920,10 +945,13 @@ fn clamp_thinking_budget(budget: u32) -> Option<u32> {
 /// caller-cap arm does not leave the budget alone. The naive transcription of
 /// the upstream reference shape (`min(caller_cap + budget, ceiling)` with the
 /// RAW budget) is illegal in 23 of the 144 reachable inputs, because our
-/// callers' caps — `Some(100)` from the desktop's titling request, `Some(8192)`
-/// from the summariser — sit far below the level table's budgets, and
-/// Anthropic requires **strict** `max_tokens > budget_tokens` (`cap = Some(0)`
-/// with any budget gives `max_tokens == budget_tokens`, a 400). The sum
+/// callers' caps — `Some(100)` from the desktop's titling request, and
+/// `min(0.8 × reserve_tokens, 8_192).max(1)` from the summariser, i.e.
+/// anything in `1..=8_192` including `Some(1)` at a zero reserve — sit far
+/// below the level table's budgets, and Anthropic requires **strict**
+/// `max_tokens > budget_tokens` (`cap = Some(0)` with any budget gives
+/// `max_tokens == budget_tokens`, a 400 — and `Some(1)` is a value a real
+/// caller produces TODAY, so the guard below it is not paranoia). The sum
 /// therefore adds the CLAMPED budget, and `c.max(1)` is the same class of
 /// guard one size lower (a caller sending `Some(0)` with a 1,024 budget would
 /// otherwise tie) — `compact.rs:617` already writes `cap.max(1)` for this
@@ -2871,7 +2899,9 @@ mod tests {
 
         // ── a caller cap is HONOURED, never raised to the ceiling ─────────
         // The desktop's titling request sends `Some(100)` and the summariser
-        // sends `Some(8192)`; both want a SHORT answer. This is the assertion
+        // sends `min(0.8 × reserve_tokens, 8_192).max(1)` — anything in
+        // `1..=8_192`, `Some(8192)` at a roomy reserve and `Some(1)` at a zero
+        // one; both want a SHORT answer. This is the assertion
         // that stops a future reader "simplifying" the ceiling into an
         // unconditional write of `ANTHROPIC_OUTPUT_CEILING_TOKENS`, which
         // would make titling pay for 64,000 tokens of title.
@@ -2879,7 +2909,8 @@ mod tests {
             req(Some(64), None)["max_tokens"],
             64,
             "a caller cap is honoured, not raised to the ceiling — titling \
-             (Some(100)) and the summariser (Some(8192)) both cap on purpose"
+             (Some(100)) and the summariser (anything in 1..=8192) both cap \
+             on purpose"
         );
         // The caller-cap ARM: the cap plus the CLAMPED budget. 64 + 4096 =
         // 4160. This pin CHANGES from the old `5120`, and deliberately so: the
@@ -3198,6 +3229,18 @@ mod tests {
         // `req(Some("weird"))["thinking"] == json!({"type":"adaptive"})`. It
         // proves a budget-less `thinking` object passes through the switch
         // untouched rather than being mistaken for a zero budget and dropped.
+        //
+        // That witness runs with `max_tokens: None`, so it only covers the
+        // no-cap arm. This is the CALLER-CAP half of the pass-through the
+        // sweep's docblock claims but cannot assert (the sweep checks only
+        // legality — ordering and the ceiling — never pass-through): an
+        // `adaptive` object under a real cap must come back byte-identical,
+        // not read as a zero budget and dropped.
+        assert_eq!(
+            anthropic_output_budget(Some(8_192), Some(json!({ "type": "adaptive" }))),
+            (8_192, Some(json!({ "type": "adaptive" })),),
+            "a caller cap must not disturb the `adaptive` pass-through"
+        );
     }
 
     // ── prompt caching on Claude models (T3b / #131) ────────────────────
