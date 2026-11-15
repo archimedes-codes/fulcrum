@@ -1013,7 +1013,7 @@ fn is_gpt_5_5_or_newer_completions_quirk(model: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::{chat_message, collect};
+    use super::super::test_util::{chat_message, collect, keys_of_names};
     use super::super::types::{ChatMessage, ChatRole, MessageContent, ModelOptions, ToolSpec};
     use super::*;
     use crate::tools::{ContentBlock, ImageRef};
@@ -1880,6 +1880,30 @@ mod tests {
         // usage-less session freezes the context bar and NEVER trips the
         // compaction threshold.
         assert_eq!(body["stream_options"]["include_usage"], true);
+
+        // ── EXACT-FIELD-SET PINS (the leak guard) ───────────────────────
+        // Same pin as in `request_body_serializes_tool_calls_in_the_openai_wire_shape`,
+        // on the fixture that carries ALL THREE roles. A transcript-only field
+        // (e.g. a future `finish_reason` on `ChatMessage`) must never appear
+        // here — `ChatMessage` is both the transcript type and the type the
+        // request body is built from.
+        assert_eq!(
+            keys_of_names(&body["messages"][0]),
+            vec!["content", "role"],
+            "the folded `system` message is exactly `role` + `content`"
+        );
+        assert_eq!(
+            keys_of_names(&body["messages"][1]),
+            vec!["role", "tool_calls"],
+            "an assistant carrying `tool_calls` with empty `Text` is exactly \
+             `role` + `tool_calls` (issue #122 omits the empty `content`)"
+        );
+        assert_eq!(
+            keys_of_names(&body["messages"][2]),
+            vec!["content", "role", "tool_call_id"],
+            "a `tool` message is exactly `role` + `content` + `tool_call_id` \
+             — a transcript-only field must not appear here"
+        );
     }
 
     /// A `Text`-content `ChatMessage` test literal (the request-body
@@ -2109,6 +2133,37 @@ mod tests {
         // The `tool` message keeps its `tool_call_id` (no `tool_calls`).
         assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
         assert!(body["messages"][1].get("tool_calls").is_none());
+
+        // ── EXACT-FIELD-SET PINS (the leak guard) ───────────────────────
+        // `request_body` is a field-by-field WHITELIST (`role` / `content` /
+        // `tool_call_id` / `tool_calls`), but nothing tested that. A
+        // transcript-only field (e.g. a future `finish_reason` on
+        // `ChatMessage`) must NEVER appear here: the transcript and the
+        // request body share `ChatMessage`, and a strict proxy rejects the
+        // unknown field with a 400 — a Fatal on EVERY model call.
+        // (NousResearch/hermes-agent#48523, xberg-io/liter-llm#292,
+        // run-llama/llama_index#14701.)
+        assert_eq!(
+            keys_of_names(&body),
+            vec!["messages", "model", "stream", "stream_options"],
+            "the OpenAI body carries exactly these keys (`stream_options` \
+             because this fixture asks for usage on a streaming request — \
+             it is OpenAI-only; the Anthropic / Responses builders take no \
+             `ask_usage`)"
+        );
+        assert_eq!(
+            keys_of_names(&body["messages"][0]),
+            vec!["role", "tool_calls"],
+            "an assistant message carrying `tool_calls` and empty `Text` \
+             content is exactly `role` + `tool_calls` (issue #122 omits the \
+             empty `content`) — a transcript-only field must not appear here"
+        );
+        assert_eq!(
+            keys_of_names(&body["messages"][1]),
+            vec!["content", "role", "tool_call_id"],
+            "a `tool` message is exactly `role` + `content` + `tool_call_id` \
+             — a transcript-only field must not appear here"
+        );
     }
 
     // ── (issue #122) the outbound empty-content guard ──────────────────

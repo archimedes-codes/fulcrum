@@ -7,8 +7,22 @@
 //! the module that owns the parser — their return type is private there.)
 
 use futures_util::{Stream, StreamExt};
+use serde_json::Value;
 
 use super::types::{ChatMessage, ChatRole, MessageContent, ProviderEvent, ToolCall};
+
+/// The sorted key set of a JSON object — the exact-field-set pin.
+///
+/// The provider request-body tests pin a wire message object to EXACTLY the
+/// keys its builder names, so a transcript-only field can never ride out onto
+/// a provider request. Sorted explicitly rather than relying on `serde_json`'s
+/// default `BTreeMap` ordering — the pin must not encode a feature choice
+/// (`preserve_order` would make the raw iteration order insertion order).
+pub(crate) fn keys_of_names(v: &Value) -> Vec<String> {
+    let mut ks: Vec<String> = v.as_object().expect("an object").keys().cloned().collect();
+    ks.sort();
+    ks
+}
 
 /// Collect the whole stream (generic over the parser — the `SseStream`
 /// and the `AnthropicStream` suites share it).

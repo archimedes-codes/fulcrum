@@ -1037,7 +1037,7 @@ impl Provider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::{chat_message, collect};
+    use super::super::test_util::{chat_message, collect, keys_of_names};
     use super::super::types::{ChatMessage, ModelOptions, ToolSpec};
     use super::*;
     use crate::tools::ImageRef;
@@ -2029,6 +2029,51 @@ mod tests {
         );
         assert_eq!(body["stream"], true);
         assert!(body.get("thinking").is_none());
+
+        // ── EXACT-FIELD-SET PINS (the leak guard) ───────────────────────
+        // `anthropic_messages` is a field-by-field WHITELIST, but nothing
+        // tested that. `ChatMessage` is BOTH the transcript type AND the type
+        // this body is built from, so a transcript-only field (e.g. a future
+        // `finish_reason`) must NEVER appear here — a strict proxy rejects the
+        // unknown field with a 400, which is a Fatal on EVERY model call.
+        // Pinned at BOTH levels: the message object AND its content blocks
+        // (on this wire `tool_calls` became `tool_use` BLOCKS, not a message key).
+        assert_eq!(
+            keys_of_names(&body),
+            vec![
+                "max_tokens",
+                "messages",
+                "model",
+                "stream",
+                "system",
+                "temperature",
+                "tools"
+            ],
+            "the Anthropic body carries exactly these keys (`max_tokens` is \
+             always present; no `thinking` — no `reasoning_effort`)"
+        );
+        assert_eq!(
+            keys_of_names(&messages[1]),
+            vec!["content", "role"],
+            "an assistant message object is exactly `role` + `content` on this \
+             wire — a transcript-only field must not appear here"
+        );
+        assert_eq!(
+            keys_of_names(&content[0]),
+            vec!["id", "input", "name", "type"],
+            "a `tool_use` block is exactly `type` + `id` + `name` + `input` \
+             — a transcript-only field must not appear here"
+        );
+        assert_eq!(
+            keys_of_names(&messages[2]),
+            vec!["content", "role"],
+            "the merged `user` (tool_result) message is exactly `role` + `content`"
+        );
+        assert_eq!(
+            keys_of_names(tool_result),
+            vec!["content", "tool_use_id", "type"],
+            "a `tool_result` block is exactly `type` + `tool_use_id` + `content`"
+        );
     }
 
     #[test]
@@ -2471,6 +2516,24 @@ mod tests {
         assert!(
             !content.iter().any(|b| b["type"] == "text"),
             "no text block should be present"
+        );
+
+        // ── EXACT-FIELD-SET PINS (the leak guard) ───────────────────────
+        // Both levels of this wire: the assistant MESSAGE object and its
+        // `tool_use` BLOCK. A transcript-only field (e.g. a future
+        // `finish_reason` on `ChatMessage`) must never appear in either.
+        assert_eq!(
+            keys_of_names(&body["messages"][1]),
+            vec!["content", "role"],
+            "an assistant message object is exactly `role` + `content` on this \
+             wire (its `tool_calls` became BLOCKS, never a message key) — a \
+             transcript-only field must not appear here"
+        );
+        assert_eq!(
+            keys_of_names(&content[0]),
+            vec!["id", "input", "name", "type"],
+            "a `tool_use` block is exactly `type` + `id` + `name` + `input` — \
+             a transcript-only field must not appear here"
         );
     }
 
