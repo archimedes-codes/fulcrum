@@ -949,10 +949,10 @@ fn clamp_thinking_budget(budget: u32) -> Option<u32> {
 /// `min(0.8 × reserve_tokens, 8_192).max(1)` from the summariser, i.e.
 /// anything in `1..=8_192` including `Some(1)` at a zero reserve — sit far
 /// below the level table's budgets, and Anthropic requires **strict**
-/// `max_tokens > budget_tokens` (`cap = Some(0)` with any budget gives
-/// `max_tokens == budget_tokens`, a 400 — and `Some(1)` is a value a real
-/// caller produces TODAY, so the guard below it is not paranoia). The sum
-/// therefore adds the CLAMPED budget, and `c.max(1)` is the same class of
+/// `max_tokens > budget_tokens` (`cap = Some(0)` with any positive budget
+/// gives `max_tokens == budget_tokens`, a 400 — and `Some(1)` is a value a
+/// real caller produces TODAY, so the guard below it is not paranoia). The
+/// sum therefore adds the CLAMPED budget, and `c.max(1)` is the same class of
 /// guard one size lower (a caller sending `Some(0)` with a 1,024 budget would
 /// otherwise tie) — `compact.rs:617` already writes `cap.max(1)` for this
 /// reason, but the wire builder cannot rely on every caller doing so, so it
@@ -3077,9 +3077,10 @@ mod tests {
     fn the_wire_never_asks_for_more_than_the_ceiling_and_always_outranks_its_budget() {
         // The caps span both arms' interesting edges: `None` (the ceiling
         // arm), 0 and 1 (the `c.max(1)` guard), the real caller caps
-        // (`64`-ish titling, `100`, `8192` summarising), the values the
-        // constants derive to (13,312 / 17,408 / 47,616), the ceiling itself,
-        // and values above it including `u32::MAX` (the saturating add).
+        // (`64`-ish titling, `100`, `8192`-or-less summarising), the values
+        // the constants derive to (13,312 / 17,408 / 47,616), the ceiling
+        // itself, and values above it including `u32::MAX` (the saturating
+        // add).
         let caps: [Option<u32>; 16] = [
             None,
             Some(0),
