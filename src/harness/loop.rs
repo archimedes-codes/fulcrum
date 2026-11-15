@@ -1267,7 +1267,7 @@ impl AgentLoop {
 
         loop {
             if turn.is_cancelled() {
-                // Site 5 of the eight (`loop.rs`, top-of-loop cancel): VACUOUS,
+                // Site 5 of the nine (`loop.rs`, top-of-loop cancel): VACUOUS,
                 // and the emptiness is derived, not assumed. No `TurnAccumulator`
                 // exists yet at this point in the iteration — `acc` is declared
                 // below, after the model call. And a PREVIOUS iteration cannot
@@ -1307,7 +1307,7 @@ impl AgentLoop {
                     &mut emit,
                 ) => s,
                 _ = turn.cancelled() => {
-                    // Site 6 of the eight (the model call races the cancel):
+                    // Site 6 of the nine (the model call races the cancel):
                     // VACUOUS. The stream has not been opened, let alone
                     // consumed — `acc` is declared below this `select!` — so no
                     // `ProviderEvent::ToolCall` can have reached
@@ -1334,7 +1334,7 @@ impl AgentLoop {
                 }
                 Err(e) => {
                     eprintln!("harness: model call failed: {e}");
-                    // Site 7 of the eight (the model call returned `Err`):
+                    // Site 7 of the nine (the model call returned `Err`):
                     // VACUOUS for the same reason as site 6 — `complete` failed,
                     // so there is no stream to consume and `acc` (declared below)
                     // does not exist; `consume_stream`'s `ToolCall` arm never ran,
@@ -1356,7 +1356,7 @@ impl AgentLoop {
 
             let mid_stream_error = self.consume_stream(&mut stream, turn, &mut acc).await;
             if turn.is_cancelled() {
-                // Site 8 of the eight (Stop pressed while the model streams tool
+                // Site 8 of the nine (Stop pressed while the model streams tool
                 // calls): NOT vacuous — this is the exit the field report is
                 // about, and it was missing from the issue's list of four.
                 // `consume_stream` has just run, so `acc.tool_calls` holds every
@@ -1379,34 +1379,71 @@ impl AgentLoop {
                 }
             }
 
-            // A `stop` that streamed NEITHER text NOR a tool call is not a
+            // (issue #190) The provider's output cap ended this turn. Mapped by
+            // all three wires (`map_anthropic_stop_reason`'s `"max_tokens"`,
+            // `map_finish_reason`'s `"length"`, the Responses API's
+            // `incomplete_details.reason == "max_output_tokens"`) and read by
+            // NOTHING here until now: pre-fix the attempt fell through the gate
+            // below (whose first conjunct demanded `Some(Stop)`) straight into
+            // the SUCCESS triple — `agent_end` / `turn_end` / `agent_settled` —
+            // so a half-finished "I'm going to write it now" settled as a
+            // completed turn, nothing ran, no error surfaced, and the user
+            // re-prompted forever. The only place `Length` was handled in the
+            // engine was `compact.rs`: the summariser understood truncation and
+            // the turn did not.
+            //
+            // FIRST, before the emptiness gate and before `note_success`: a turn
+            // the cap cut off is neither a successful call nor a retryable one
+            // (Decision 1 — replaying it can duplicate a non-idempotent tool
+            // call), and it RETURNS, so the gate below never sees `Length`.
+            if acc.finish == Some(FinishReason::Length) {
+                match self
+                    .handle_truncated_turn(std::mem::take(&mut state.turn_tool_results), &acc)
+                    .await
+                {
+                    turn::TurnFlow::Continue => continue,
+                    turn::TurnFlow::Return => return,
+                }
+            }
+
+            // An attempt that produced NEITHER text NOR a tool call is not a
             // turn — it is the signature of a model that emitted its tool call
             // as literal `<invoke name="…">` text INSIDE the reasoning channel,
             // so the API reports `content: ""` / `tool_calls: null` and the
             // stream reads as a clean stop. The reasoning text is streamed to
-            // the UI but NEVER persisted (this site persists `acc.text` alone),
-            // so the intended call is invisible everywhere downstream: pre-fix
-            // this arm accepted the attempt, wrote the 33-byte empty assistant
-            // row and settled as a clean stop, and the user re-prompted every
-            // time. It is therefore retried on the SHARED budget, and the empty
-            // message is never pushed / persisted; with the budget spent the
-            // turn settles as a VISIBLE failure. `acc.thinking` deliberately
-            // does NOT gate this — non-empty reasoning IS the shape of the
-            // failure — and `handle_empty_turn`'s `eprintln` is the only trace
-            // it leaves, since the reasoning text itself is lost.
+            // the UI and it IS persisted — but in the DISPLAY table
+            // (`agent_thought_chunk` → `messages.kind = 'agent-thought'`), never
+            // in the transcript this site writes `acc.text` into, so the
+            // intended call is missing from everything that feeds the next model
+            // request: pre-fix this arm accepted the attempt, wrote the 33-byte
+            // empty assistant row and settled as a clean stop, and the user
+            // re-prompted every time. It is therefore retried on the SHARED
+            // budget, and the empty message is never pushed / persisted; with the
+            // budget spent the turn settles as a VISIBLE failure. `acc.thinking`
+            // deliberately does NOT gate this — non-empty reasoning IS the shape
+            // of the failure — and `handle_empty_turn`'s `eprintln` is mandatory
+            // (the Worker never initialises `debuglog`, so `log` is a no-op
+            // there) but it is NOT the turn's only trace: the reasoning text is
+            // readable in the display table, which is where a lost `<invoke>`
+            // block actually is.
             //
-            // `Some(Stop)` keeps this disjoint from `consume_stream`, which has
-            // already turned a stream that ended with NO `finish_reason` into a
-            // `Retryable` error handled above.
+            // The gate is keyed on "nothing was produced", NOT on the finish
+            // reason. It used to demand `Some(Stop)`, on the claim that this kept
+            // it disjoint from `consume_stream` — true, but only because every
+            // wire synthesizes `Done(Error)` at stream end, which is what
+            // `consume_stream`'s fabrication guard turns into a `Retryable`;
+            // `consume_stream` checks nothing about the reason itself. Dropping
+            // the conjunct costs no overlap and catches the rest of the shape:
+            // `finish == None`, and `Some(ToolCalls)` from a provider that
+            // CLAIMED tool calls while dispatching none — both of which used to
+            // settle clean on an empty reply. `Length` is already handled above
+            // and returned, so it cannot reach here.
             //
             // BEFORE `note_success` (and so before `message_end` / the push /
             // the persist) for the same reason the mid-stream arm above is: an
             // abandoned attempt is not a successful call, so it must not report
             // `auto_retry_end { success: true }` a moment before retrying again.
-            if acc.finish == Some(FinishReason::Stop)
-                && acc.text.is_empty()
-                && acc.tool_calls.is_empty()
-            {
+            if acc.text.is_empty() && acc.tool_calls.is_empty() {
                 match self.handle_empty_turn(turn, &mut state, &acc).await {
                     turn::TurnFlow::Continue => continue,
                     turn::TurnFlow::Return => return,

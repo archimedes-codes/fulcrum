@@ -59,6 +59,13 @@
 //!   held OPEN for ~3.0 s before its `tool_execution_end` +
 //!   `agent_settled` (the "child inside a tool call, producing NOTHING"
 //!   state — legitimately silent, so a duration bound must never cut it).
+//! - a `prompt` whose text is `"__truncated__"` / `"__truncated_partial__"`:
+//!   the real `Length` route (issue #190) as a CHILD's turn — the announce,
+//!   the child's real usage + cost, `turn_truncated`, the abandoned close,
+//!   `turn_end`, `agent_settled` — with NO streamed text (`__truncated__`, the
+//!   exact bug route: an empty capture whose announce exempts it from the #122
+//!   reclassification) or WITH a half-sentence (`__truncated_partial__`, the
+//!   salvage the parent must still receive).
 //! - a `prompt` whose text is `"__stream_then_silence__"`: a SHORT
 //!   `agent_message_chunk` stream + a `message_update` `usage` frame (real
 //!   capture text AND real tokens), then ~10 s of SILENCE and NO
@@ -296,6 +303,122 @@ fn emit_crash_burst<W: Write>(stdout: &mut W, session_id: &str) {
                     "delta": "burst"
                 }),
             },
+        },
+    );
+}
+
+/// The TRUNCATED child both `__truncated*__` scenarios emit (issue #190's
+/// follow-up): the real `Length` route's frame order, frame for frame, as
+/// `handle_truncated_turn` + `settle_truncated` write it —
+/// `tool_execution_start` (the ANNOUNCE, which is what sets
+/// `SubagentCapture::saw_tool_activity`), the `message_update` usage and the
+/// child's own `cost_update` (the money the parent must not forfeit), then
+/// `turn_truncated`, then the abandoned close, `turn_end`, `agent_settled`.
+///
+/// The `tool_execution_end` is the `abandoned_tool_result()` shape with
+/// `is_error: true` — Decision 2 never dispatches the announced call, so the
+/// close is the only thing that can end that row. The `agent_settled` stays
+/// LAST (the invariant: nothing the `SubagentCapture` reads arrives after it).
+///
+/// `partial` is the text the child streamed before the cap: `None` is the
+/// exact bug route (an ANNOUNCED call, NO text — the capture hands `""` to the
+/// settle), `Some` carries the salvage the parent must still receive. A real
+/// `messageId` (`m11`, no bookkeeping word) so `captured_text()` reads it.
+fn emit_truncated_turn<W: Write>(stdout: &mut W, session_id: &str, partial: Option<&[&str]>) {
+    // The ANNOUNCE (during the stream, exactly where `consume_stream`'s
+    // `ProviderEvent::ToolCall` arm emits it — BEFORE the cap ends the turn).
+    emit(
+        stdout,
+        &Outbound::Event {
+            event: RpcEvent::tool_execution_start {
+                tool_call_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
+                args: serde_json::json!({ "command": "cargo test" }),
+            },
+        },
+    );
+    // The child's real tokens and money (the `Failed` path must carry them).
+    emit(
+        stdout,
+        &Outbound::Event {
+            event: RpcEvent::message_update {
+                usage: serde_json::json!({ "inputTokens": 77, "outputTokens": 21 }),
+                assistant_message_event: serde_json::json!({
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": ""
+                }),
+            },
+        },
+    );
+    emit(
+        stdout,
+        &Outbound::SinkFrame {
+            event: "interactive-event".to_string(),
+            payload: serde_json::json!({
+                "sessionId": session_id,
+                "seq": 0,
+                "event": "cost_update",
+                "payload": { "costUsd": 0.0042, "source": "main" },
+            }),
+        },
+    );
+    // The half-sentence the cap cut off (BEFORE the notice — the notice is a
+    // bookkeeping line on `{stamp}:truncate:N`, which `is_bookkeeping_message_id`
+    // answers true for, so the capture never reads it as the child's answer).
+    for text in partial.unwrap_or_default() {
+        emit(
+            stdout,
+            &Outbound::SinkFrame {
+                event: "session-update".to_string(),
+                payload: serde_json::json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "m11",
+                        "content": { "type": "text", "text": text }
+                    }
+                }),
+            },
+        );
+    }
+    // The disposition — BEFORE the settle, per `RpcEvent::turn_truncated`'s contract.
+    emit(
+        stdout,
+        &Outbound::Event {
+            event: RpcEvent::turn_truncated,
+        },
+    );
+    // The abandoned close (`settle_truncated` closes what was announced and
+    // will never dispatch), then the settle.
+    emit(
+        stdout,
+        &Outbound::Event {
+            event: RpcEvent::tool_execution_end {
+                tool_call_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
+                result: serde_json::json!({
+                    "content": [{ "type": "text", "text": "discarded — the model call that asked for this tool was abandoned" }],
+                    "details": null,
+                    "isError": true
+                }),
+                is_error: true,
+            },
+        },
+    );
+    emit(
+        stdout,
+        &Outbound::Event {
+            event: RpcEvent::turn_end {
+                message: serde_json::Value::Null,
+                tool_results: Vec::new(),
+            },
+        },
+    );
+    emit(
+        stdout,
+        &Outbound::Event {
+            event: RpcEvent::agent_settled,
         },
     );
 }
@@ -834,6 +957,23 @@ pub fn worker_main() {
                         line.clear();
                     }
                 }
+                // The TRUNCATED child, no text (issue #190 follow-up / the #122
+                // guard's new enemy): the real `Length` route with an ANNOUNCED
+                // tool call and NO streamed text, then `agent_settled`. The
+                // announce sets `saw_tool_activity`, which used to EXEMPT the
+                // child from the #122 reclassification — but Decision 2 never
+                // dispatches that call, so the child produced NOTHING and the
+                // parent must not receive `Completed { output: "" }`.
+                "__truncated__" => emit_truncated_turn(&mut stdout, &sid, None),
+                // The same truncated child WITH a partial answer: the fix
+                // reclassifies the disposition, not the salvage — the parent
+                // must still get the text the child streamed, on the `Failed`
+                // path's `output`.
+                "__truncated_partial__" => emit_truncated_turn(
+                    &mut stdout,
+                    &sid,
+                    Some(&["Half a sentence, then the cap."]),
+                ),
                 // The slow settle (the **Dead bound** tests — a 10 s
                 // sleep before settling; the **Dead bound** is
                 // shorter, so the child is reaped as Dead).

@@ -66,6 +66,11 @@ pub enum RpcEvent {
     },
     agent_settled,
     turn_start,
+    /// (issue #190) The turn's reply was cut off by the provider's output cap
+    /// (`FinishReason::Length`). Additive: an older peer ignores it. Emitted
+    /// BEFORE `turn_end` so a peer can stash the disposition before the settle
+    /// resolves the turn.
+    turn_truncated,
     #[serde(rename_all = "camelCase")]
     turn_end {
         message: Value,
@@ -238,6 +243,7 @@ impl RpcEvent {
             RpcEvent::agent_end { .. } => std::borrow::Cow::Borrowed("agent_end"),
             RpcEvent::agent_settled => std::borrow::Cow::Borrowed("agent_settled"),
             RpcEvent::turn_start => std::borrow::Cow::Borrowed("turn_start"),
+            RpcEvent::turn_truncated => std::borrow::Cow::Borrowed("turn_truncated"),
             RpcEvent::turn_end { .. } => std::borrow::Cow::Borrowed("turn_end"),
             RpcEvent::message_start { .. } => std::borrow::Cow::Borrowed("message_start"),
             RpcEvent::message_end { .. } => std::borrow::Cow::Borrowed("message_end"),

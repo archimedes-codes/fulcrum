@@ -123,7 +123,7 @@ impl AgentLoop {
             // the indicator clear and typing "continue", the symptom ADR 0045
             // exists to end.
             if t.reason == CompactionReason::Overflow && ran == CompactionRan::Skipped {
-                // Site 1 of the eight in
+                // Site 1 of the nine in
                 // `docs/features/abandoned-tool-rows.md` §2: there is NO
                 // `TurnAccumulator` in this function's scope — the compaction
                 // check runs at the TOP of the turn loop, before the model call
@@ -335,7 +335,7 @@ impl AgentLoop {
         }
 
         eprintln!("harness: mid-stream model error: {err}");
-        // Site 2 of the eight: `acc` IS in scope — this attempt announced rows
+        // Site 2 of the nine: `acc` IS in scope — this attempt announced rows
         // and is about to be abandoned without dispatching them, so its calls
         // close before the settle.
         self.settle_error(
@@ -351,10 +351,17 @@ impl AgentLoop {
     /// channel, so the API answers `content: ""` / `tool_calls: null` and the
     /// stream reads as a clean stop.
     ///
-    /// The reasoning text is streamed to the UI but is NEVER persisted (the loop
-    /// persists `acc.text` alone), so what the model actually asked for is
-    /// invisible downstream: pre-fix the loop accepted this attempt, persisted
-    /// the identical 33-byte row `{"role":"assistant","content":"","tool_calls":[]}`
+    /// The reasoning text is streamed to the UI and it IS persisted — but in the
+    /// DISPLAY table, not in the transcript the model reads. `thinking_delta`
+    /// becomes an `agent_thought_chunk` frame (`normalize.rs`), which
+    /// `compute_display_rows` turns into a `messages.kind = 'agent-thought'`
+    /// row, and this loop persists `acc.text` alone into the transcript. So the
+    /// intended call is not invisible — it is in the wrong table: nothing that
+    /// feeds the next model request, or a transcript reload, ever reads it (the
+    /// live database holds 126 713 `agent-thought` rows, 12 of them carrying a
+    /// literal `<invoke` block, one of them 11 ms before the empty assistant row
+    /// of the SAME session). Pre-fix the loop also accepted this attempt,
+    /// persisted the identical 33-byte row `{"role":"assistant","content":"","tool_calls":[]}`
     /// and settled as a clean stop — nothing executed, nothing reported, and the
     /// user re-prompted every single time (13 such turns in 23 519 assistant
     /// rows; ALL 13 followed by a `user` row, 6 of them ending the session).
@@ -364,9 +371,12 @@ impl AgentLoop {
     /// ([`Self::retry_abandoned_attempt`]) — the same shared budget, the same
     /// retraction, the same `Continue`; with the budget spent, a VISIBLE
     /// failure. `thinking` deliberately does not gate the detection: non-empty
-    /// reasoning IS the shape of this failure, and it is exactly what the DB
-    /// cannot show, which is why the `eprintln` below is mandatory — it is the
-    /// only trace this turn ever leaves behind.
+    /// reasoning IS the shape of this failure. The `eprintln` below is still
+    /// mandatory — the Worker never calls `debuglog::init_from_env`, so
+    /// `debuglog::log` is a silent no-op in exactly this process — but it is NOT
+    /// the only trace the turn leaves: the reasoning text survives in the
+    /// display table, and saying otherwise is what stops the next reader from
+    /// looking there.
     pub(super) async fn handle_empty_turn(
         &mut self,
         turn: &CancellationToken,
@@ -376,7 +386,8 @@ impl AgentLoop {
         eprintln!(
             "harness: empty model turn: `stop` with no text and no tool call \
              (the signature of a tool call emitted as reasoning text — that text is \
-             never persisted, so this line is the only trace of the lost call)"
+             persisted in the DISPLAY table as an `agent-thought` row and never in \
+             the transcript, so the display is where the lost call can still be read)"
         );
         self.retry_abandoned_attempt(
             "the model returned an empty reply with no tool call",
@@ -385,6 +396,132 @@ impl AgentLoop {
             acc,
         )
         .await
+    }
+
+    /// (issue #190) The turn's reply was CUT OFF by the provider's output cap
+    /// (`FinishReason::Length`) — a terminal disposition, never a retry.
+    ///
+    /// All three wires map the cap (`map_anthropic_stop_reason`'s `"max_tokens"`,
+    /// `map_finish_reason`'s `"length"`, the Responses API's
+    /// `incomplete_details.reason == "max_output_tokens"`) and until this function
+    /// existed the turn loop read it nowhere: the attempt fell through the #64
+    /// gate (whose first conjunct demanded `Some(Stop)`) into the SUCCESS triple,
+    /// so the user watched the model's half-sentence — "OK, plans good, I'm going
+    /// to write it now" — settle as a completed turn, the composer unlocked, and
+    /// nothing happened.
+    ///
+    /// Not retried, deliberately (Decision 1, ADR 0108): Anthropic documents
+    /// re-issuing with a higher `max_tokens`, and that is rejected because
+    /// replaying the assistant turn can duplicate a non-idempotent tool call.
+    /// openai/codex made the same call (`ResponseIncomplete` →
+    /// `RetryPolicy::Never`) for the same stated reason — "blindly replaying a
+    /// partially completed response can duplicate tool side effects."
+    ///
+    /// And its tool calls are NEVER dispatched (Decision 2, see
+    /// [`Self::settle_truncated`]). What is kept is the TEXT: it is real content
+    /// the model produced, so it is announced, pushed and persisted like any
+    /// other reply — a display that shows it while the transcript lacks it
+    /// recreates the crash-time display/transcript split
+    /// the DESKTOP repo's `docs/roadmap/compaction-recovery-hardening-follow-ups.md` §4
+    /// records.
+    /// With NO text streamed, nothing is pushed and nothing is persisted: that
+    /// is precisely the 33-byte empty row issue #64 exists to prevent, and the
+    /// `Length` route has no more claim on it than `Stop` ever had.
+    pub(super) async fn handle_truncated_turn(
+        &mut self,
+        tool_results: Vec<Value>,
+        acc: &TurnAccumulator,
+    ) -> TurnFlow {
+        // `eprintln!`, never `debuglog::log`: the Worker never calls
+        // `debuglog::init_from_env`, so `log` is a SILENT NO-OP in exactly the
+        // process whose verdict this is (`hostenv.rs` documents the asymmetry).
+        eprintln!(
+            "harness: turn truncated by the provider's output cap: finish_reason \
+             `length` with {} chars of streamed text and {} announced tool call(s) \
+             — terminal, not retried (ADR 0108)",
+            acc.text.chars().count(),
+            acc.tool_calls.len(),
+        );
+        // BEFORE the settle, so a peer stashes the disposition while it is still
+        // listening (`RpcEvent::turn_truncated`'s contract).
+        self.emit(RpcEvent::turn_truncated);
+        if !acc.text.is_empty() {
+            let message_value = self.assistant_message_value(acc);
+            self.emit(RpcEvent::message_end {
+                message: message_value,
+            });
+            self.messages.push(ChatMessage {
+                role: ChatRole::Assistant,
+                content: MessageContent::Text(acc.text.clone()),
+                tool_call_id: None,
+                // NEVER `acc.tool_calls`: a truncated call is an argument list
+                // the cap cut off, and replaying it to the provider as a
+                // request the model finished making would invite the same call
+                // back.
+                tool_calls: None,
+            });
+            self.persist_transcript_message();
+        }
+        // (issue #190 follow-up, F3) Retire a retry report this turn left
+        // pending, and CLOSE it honestly. `RetryPolicy::reported` is set only by
+        // `note_success()` and cleared only by `next_retry_delay()`, and this
+        // route returns before `note_success()` is ever reached (deliberately — a
+        // truncated attempt is not a success), so a turn that retried to get here
+        // would leave the report outstanding for the NEXT prompt to call a
+        // success.
+        //
+        // THE SHAPE CHOSEN: one `auto_retry_end { success: false }` whose
+        // `final_error` names the truncation — the same close
+        // `retry_abandoned_attempt`'s budget-EXHAUSTED arm emits (its
+        // `self.emit(RpcEvent::auto_retry_end { success: false, .. })` immediately
+        // before its `settle_error`), for the same reason: a peer that opened a
+        // retry card on the `auto_retry_start` must see it CLOSE, and `normalize`
+        // renders the close as the "Retry failed" line. The alternative — retiring
+        // the flag silently — would leave that card spinning until some later turn
+        // happened to close it, which is the same class of dangling-row bug this
+        // file's tool-row discipline refuses elsewhere.
+        //
+        // Emitted BEFORE the settle for the same ordering reason as
+        // `turn_truncated` above: nothing a peer still needs arrives after
+        // `agent_settled`.
+        if let Some(attempt) = self.retry.retire_pending_report() {
+            self.emit(RpcEvent::auto_retry_end {
+                success: false,
+                attempt,
+                final_error: Some(
+                    "the retried turn was truncated by the provider's output cap \
+                     (finish_reason `length`) — terminal, not retried"
+                        .to_string(),
+                ),
+            });
+        }
+        // Site 9 of the nine in `docs/features/abandoned-tool-rows.md` §2:
+        // NOT vacuous. `consume_stream` has just run and this route reaches no
+        // batch, so `acc.tool_calls` holds every row the cut-off attempt opened
+        // at `in_progress` and will never dispatch — Decision 2 forbids the
+        // dispatch, so the close is the only thing that can end those rows.
+        self.settle_truncated(tool_results, &acc.tool_calls);
+        // (issue #190 follow-up, F2) Re-anchor the context count, in the SAME
+        // position the clean-stop path uses it: AFTER the assistant row is
+        // persisted (`loop.rs:1473`, which follows its own
+        // `push` + `persist_transcript_message`). This route is the fourth site
+        // that persists an assistant row — Decision 3 keeps the streamed text —
+        // and without the refresh the displayed/saved count still described the
+        // transcript as it was BEFORE the reply landed, so the context bar and
+        // the `sessions` row a reload reads both under-reported a real row until
+        // some later turn happened to refresh. It sits after the settle (and so
+        // after `settle_truncated`'s `turn_abandoned`) for the same reason the
+        // clean stop puts it after its own transcript write: the number emitted
+        // must be the one the transcript now actually has — on the no-text half
+        // that is the corrected anchor `turn_abandoned` just produced, and
+        // emitting the pre-correction figure would show the phantom output this
+        // branch's other fix exists to remove.
+        //
+        // `note_context` emits only when the estimate MOVED, so the half where
+        // the provider reported usage and the anchor already covers the reply
+        // emits nothing (the guard in `emit.rs:274`'s doc).
+        self.note_context();
+        TurnFlow::Return
     }
 
     /// The ONE "abandon this attempt and re-run the turn" recovery, shared by
@@ -421,7 +558,7 @@ impl AgentLoop {
             // the delay, up to 8 s).
             tokio::select! {
                 _ = turn.cancelled() => {
-                    // Site 3 of the eight — the asymmetry issue #11 is about.
+                    // Site 3 of the nine — the asymmetry issue #11 is about.
                     // This arm used to settle and RETURN, skipping the close
                     // loop a few statements below: the path where the backoff
                     // COMPLETED closed this same attempt's announced rows and
@@ -448,7 +585,7 @@ impl AgentLoop {
             attempt: self.retry.attempt(),
             final_error: Some(error_message.to_string()),
         });
-        // Site 4 of the eight: the budget is spent and this attempt is
+        // Site 4 of the nine: the budget is spent and this attempt is
         // abandoned for good — `acc` is in scope and its announced rows are
         // never dispatched, so they close before the settle.
         self.settle_error(
@@ -659,20 +796,24 @@ impl AgentLoop {
     /// - **Frames only, never transcript rows.** No `ChatMessage { role: Tool }`
     ///   is pushed and nothing is appended to `turn_tool_results`: an abandoned
     ///   attempt persists NO assistant row, because the abandon path reaches
-    ///   none of the three `persist_transcript_message()` call sites — the user
-    ///   prompt (`begin_turn`), the dispatched tool result (`run_tool_batch`)
-    ///   and the accepted assistant message (`handle_turn` over in `loop.rs`)
-    ///   — and neither `compactor.turn_abandoned` (watermark arithmetic) nor
-    ///   `message_retracted` (an outbound frame to the Client) writes the
-    ///   transcript. So a tool-result message here would dangle with no
+    ///   none of the `persist_transcript_message()` call sites — the user
+    ///   prompt (`begin_turn`), the dispatched tool result (`run_tool_batch`),
+    ///   the accepted assistant message (`handle_turn` over in `loop.rs`)
+    ///   and the truncated reply ([`Self::handle_truncated_turn`], the fourth,
+    ///   issue #190) — and neither `compactor.turn_abandoned` (watermark
+    ///   arithmetic) nor `message_retracted` (an outbound frame to the Client)
+    ///   writes the transcript. So a tool-result message here would dangle with no
     ///   preceding assistant `tool_calls` for the provider to pair against —
-    ///   the orphan the provider 400s on.
+    ///   the orphan the provider 400s on. The fourth site does NOT weaken that:
+    ///   a truncated turn persists its assistant row with `tool_calls: None`, so
+    ///   even on the route that DOES write an assistant row there is nothing for
+    ///   a tool result to pair against.
     /// - **The result text is `abandoned_tool_result()`, unchanged.** Several
     ///   tests pin it byte-for-byte; it is honest about the reason — the tool did
     ///   not FAIL, it was discarded.
     ///
     /// This stays a private `fn`, not `pub(super)`, and that visibility is part
-    /// of the invariant: the parent module reaches a close only through the two
+    /// of the invariant: the parent module reaches a close only through the
     /// `pub(super)` settle functions, so it cannot open a close without settling.
     fn close_announced_tool_calls(&self, tool_calls: &[ToolCall]) {
         for tc in tool_calls {
@@ -692,7 +833,7 @@ impl AgentLoop {
     ///
     /// `announced` is the abandoned attempt's `acc.tool_calls` — the calls it
     /// opened rows for and will never dispatch. It is `&[]` wherever no attempt
-    /// is in scope (see the eight-site table in
+    /// is in scope (see the nine-site table in
     /// `docs/features/abandoned-tool-rows.md` §2); the close MUST precede
     /// `turn_end`, because `normalize` closes a row on `tool_execution_end` and
     /// on nothing that follows it.
@@ -717,5 +858,82 @@ impl AgentLoop {
             tool_results,
         });
         self.emit(RpcEvent::agent_settled);
+    }
+
+    /// Settle a TRUNCATED turn (issue #190): close what the cut-off attempt
+    /// announced, then `turn_end` followed by `agent_settled`. See
+    /// [`Self::settle_cancelled`] for what `announced` is and why the close comes
+    /// first.
+    ///
+    /// **The body is `settle_error`, delegated.** It used to be `settle_error`
+    /// MINUS `compactor.turn_abandoned`, and the docblock justified the omission
+    /// with two claims. Both are false, and the arithmetic that says so is in
+    /// `compact.rs`: `record_usage` (`:72`) writes `usage_watermark =
+    /// messages.len() + 1` — the `+1` anticipates the reply the caller is about
+    /// to append — and `turn_abandoned` (`:104`) early-returns on
+    /// `usage_watermark <= messages.len()`. So the call does different things on
+    /// the two halves of this route, and neither is what the old text claimed:
+    ///
+    /// * **text streamed** — [`Self::handle_truncated_turn`] pushes the reply
+    ///   BEFORE settling, so `watermark == len`, the guard fires, and the call is
+    ///   a NO-OP: Δ = 0 on `context_tokens`, `usage_base`, `usage_watermark` and
+    ///   `pending_output`. The harm the old docblock predicted — "discount a real
+    ///   message and reset the count to the bare anchor" — is unreachable. That
+    ///   is what `turn_abandoned`'s own guard exists to prevent, and
+    ///   `compact.rs:83-85` says in terms that the call is "safe to call on
+    ///   EVERY turn exit" precisely BECAUSE it is a no-op when the append
+    ///   happened (`:99-103` is the guard that buys that). This function
+    ///   inverted that.
+    ///   Pinned as the Δ = 0 fact by
+    ///   `a_truncation_that_streamed_text_leaves_the_context_count_where_usage_put_it`.
+    /// * **nothing streamed** — nothing is pushed, so `watermark == len + 1 >
+    ///   len`, the guard does NOT fire, and the call ACTS. This is the half the
+    ///   old text dismissed as "a no-op anyway", and acting on it is the whole
+    ///   point. Leaving the call out left `context_tokens` at **150** instead of
+    ///   **100** for a `Usage { input: 100, output: 50 }` + `Done(Length)` with no
+    ///   text — 50 output tokens for a reply that was never persisted, with **0**
+    ///   assistant rows in the transcript and the watermark still pointing at
+    ///   index 1. The next turn then reads the threshold against that number: at
+    ///   a window whose threshold sits between 100 and 150 it emitted **1
+    ///   `compaction_start` and 3 model calls instead of 0 and 2** — a spurious
+    ///   compaction, an extra summary call, the transcript rewritten. And the
+    ///   inflation is self-perpetuating, because the watermark window swallows
+    ///   that next prompt too (`refresh` estimates only `messages[watermark..]`).
+    ///   Pinned by
+    ///   `a_truncation_that_streamed_nothing_does_not_leave_phantom_output_tokens`
+    ///   (the counter) and
+    ///   `a_truncation_that_streamed_nothing_does_not_compact_the_next_turn`
+    ///   (the spurious compaction — the pin that would have caught this).
+    ///
+    /// The wrapper therefore stays for its NAME and its docs, not for its body:
+    /// the nine-site settle table in `docs/features/abandoned-tool-rows.md` §2
+    /// names `settle_truncated` at site 9, and the `announced`-column discipline
+    /// there depends on that name existing to carry a derivation. Two divergent
+    /// copies of the same settle is what this function was, and the divergence
+    /// was the bug.
+    ///
+    /// What does NOT change is the other half of this function's reason to exist.
+    /// It NEVER dispatches. A truncated call's `arguments` arrived cut off
+    /// mid-object, so `parse_arguments` hands back `{}`, `unknown_param_error`
+    /// passes (it checks only EXTRANEOUS keys), the permission gate has no
+    /// `path` to judge and returns `Allow`, and the executor then refuses with
+    /// ``write: missing `path` or `content` parameter`` — a red card blaming the
+    /// model for a parameter the output cap never let it send (566 such rows are
+    /// measured in this machine's DB). Industry is unanimous that a length stop
+    /// never executes — `vercel/ai`'s `isToolExecutionAllowedFinishReason`, pi's
+    /// `failToolCallsFromTruncatedMessage`, opencode's `pendingCalls()` returning
+    /// `[]`, codex never dispatching `partial_output`, and Anthropic's own SDK
+    /// Tool Runner, which maps `max_tokens → "stop"` with the docstring "its
+    /// tool_use blocks must not be executed." The gate is therefore per-turn, and
+    /// the per-call refinement (cline's "a closed JSON object cannot be the
+    /// prefix of a longer one") buys nothing, because
+    /// [`Self::close_announced_tool_calls`] already gives each call its own
+    /// precise error either way. Decision 2 / ADR 0108.
+    pub(super) fn settle_truncated(&mut self, tool_results: Vec<Value>, announced: &[ToolCall]) {
+        // Identical to an errored exit — INCLUDING the `turn_abandoned` this used
+        // to skip. See the docblock: skipping it was measured to inflate the
+        // count by the phantom reply's output and to buy a spurious compaction on
+        // the NEXT turn.
+        self.settle_error(tool_results, announced);
     }
 }

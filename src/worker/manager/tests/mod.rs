@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::events::EventSink;
+use crate::events::{EventSink, RpcEvent};
 use crate::harness::catalog::{Model, ModelCatalog};
 use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentFailureReason, SubagentOutcome};
 use crate::worker::client::{WorkerError, WorkerHandle, WorkerInboundEvent};
@@ -749,6 +749,155 @@ async fn a_silent_child_that_settled_is_not_completed_empty() {
             assert!(
                 output.is_empty(),
                 "no partial to salvage — the child produced nothing, got {output:?}"
+            );
+        }
+    }
+}
+
+/// (issue #190 follow-up, F1) A child whose turn was CUT OFF by the output cap
+/// is a FAILURE to its parent even though it ANNOUNCED a tool call.
+///
+/// This is a NEW route into the #122 shape, created by this branch: Decision 2
+/// means a `Length` turn's announced call is closed and NEVER dispatched, while
+/// `consume_stream` still emits `tool_execution_start` when the model finishes
+/// NAMING it — and `SubagentCapture::observe_event` sets `saw_tool_activity` on
+/// that frame. So the flag no longer implies real work happened, and the
+/// `!capture.saw_tool_activity()` half of the #122 guard exempted a truncated
+/// child with no text: the parent received `Completed { output: "" }`, which is
+/// precisely the empty-`Completed` that puts `"content": ""` on the parent's next
+/// request (dispatch.rs's `Completed` arm has no `salvage_text` shield).
+///
+/// The route is reachable: `pump.rs:119` feeds EVERY child `RpcEvent` through
+/// `observe_event`, so `turn_truncated` is visible to the capture — which is why
+/// the fix is a flag on the capture rather than anything inferred from captured
+/// text (the `truncate` notice is deliberately NOT captured: `is_bookkeeping_message_id`
+/// answers true for `{stamp}:truncate:N`, and a parent must not read the notice
+/// as its child's answer).
+///
+/// The fixture path is the REAL settle (`__truncated__` emits the real route's
+/// frame order), and the observation point is the requester's
+/// `subagent-result-ack`, so the assertion runs on the outcome the parent actually gets.
+#[tokio::test]
+async fn a_truncated_child_that_streamed_nothing_is_not_completed_empty() {
+    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    manager
+        .attach("p1", &test_env("p1", Some(vec!["bash".to_string()])))
+        .await
+        .expect("the parent attach completes");
+    dispatch_child_task(&manager, "p1", "__truncated__");
+    let outcome = subagent_result_outcome_after_ack(&events, "p1").await;
+    match outcome {
+        SubagentOutcome::Completed { output, metrics } => panic!(
+            "a truncated child is never `Completed` — its announced call was \
+             closed WITHOUT being dispatched (Decision 2), so `saw_tool_activity` \
+             does not mean work happened, and an empty `Completed` puts \
+             `\"content\": \"\"` on the parent's next request. Got output \
+             {output:?} with metrics {metrics:?}",
+        ),
+        SubagentOutcome::Failed {
+            reason,
+            error,
+            output,
+            metrics,
+        } => {
+            assert_ne!(
+                reason,
+                SubagentFailureReason::Cancelled,
+                "`Cancelled` is the parent/user-Stop meaning (ADR 0055) — this \
+                 child was stopped by the PROVIDER's output cap, not by a Stop"
+            );
+            assert_eq!(
+                reason,
+                SubagentFailureReason::Other,
+                "the machine-readable why is `Other` (settled, not reaped, not \
+                 crashed, not cancelled) — the same spelling the #122 guard uses, \
+                 got {reason:?}"
+            );
+            assert!(
+                error.contains("truncat"),
+                "the error names the truncation so the parent knows what happened, \
+                 got {error:?}"
+            );
+            assert!(
+                output.is_empty(),
+                "nothing streamed, so there is nothing to salvage, got {output:?}"
+            );
+            // The child's REAL tokens and money ride the `Failed` path — the
+            // same non-forfeiture the #122 guard already guarantees, and the
+            // reason the guard copies `metrics` instead of building a default.
+            assert_eq!(
+                (metrics.input_tokens, metrics.output_tokens),
+                (77, 21),
+                "the child's real usage is NOT forfeited by its truncation \
+                 (a dead child's tokens used to be reported as 0 for work that \
+                 really cost money)"
+            );
+            assert_eq!(
+                metrics.cost,
+                Some(0.0042),
+                "the child's real cost rides the `Failed` path unchanged"
+            );
+        }
+    }
+}
+
+/// The same truncated child WITH a partial answer: the fix reclassifies the
+/// DISPOSITION, not the salvage. `failed_with_salvage` already carries the
+/// captured text on every other failure path, and the parent's `salvage_text`
+/// renders it under an honest "its partial output follows" banner — so the
+/// half-sentence the cap cut off must still reach the parent, and the child's
+/// money must still ride.
+#[tokio::test]
+async fn a_truncated_child_keeps_its_partial_text_on_the_failed_path() {
+    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    manager
+        .attach("p2", &test_env("p2", Some(vec!["bash".to_string()])))
+        .await
+        .expect("the parent attach completes");
+    dispatch_child_task(&manager, "p2", "__truncated_partial__");
+    let outcome = subagent_result_outcome_after_ack(&events, "p2").await;
+    match outcome {
+        SubagentOutcome::Completed { output, .. } => panic!(
+            "a truncated turn is NOT a success, with text or without — the \
+             provider said `length`, and Decision 1 makes that terminal. Got \
+             {output:?}",
+        ),
+        SubagentOutcome::Failed {
+            reason,
+            error,
+            output,
+            metrics,
+        } => {
+            assert_ne!(
+                reason,
+                SubagentFailureReason::Cancelled,
+                "the cap stopped this child, not a Stop"
+            );
+            assert_eq!(
+                output, "Half a sentence, then the cap.",
+                "the text the child DID stream is salvaged onto the `Failed` \
+                 path (the discard notice on `{{stamp}}:truncate:N` is excluded \
+                 from `captured_text()` by `is_bookkeeping_message_id`, so what \
+                 arrives here is ONLY the child's own words), got {output:?}"
+            );
+            assert!(
+                !output.contains("truncated before completion"),
+                "the harness's own notice must never be quoted back as the \
+                 child's answer, got {output:?}"
+            );
+            assert!(
+                error.contains("truncat"),
+                "the error names the truncation, got {error:?}"
+            );
+            assert_eq!(
+                (metrics.input_tokens, metrics.output_tokens),
+                (77, 21),
+                "real tokens on the `Failed` path"
+            );
+            assert_eq!(
+                metrics.cost,
+                Some(0.0042),
+                "real money on the `Failed` path"
             );
         }
     }
@@ -3813,5 +3962,41 @@ async fn an_exited_after_detach_is_handled_as_expected_and_a_registered_one_fire
         c2.iter().filter(|(id, _, _)| id == "c2").count(),
         1,
         "the cleanup detach does not re-fire `on_crash`: {c2:?}"
+    );
+}
+/// The capture half of the same fix (the input-level pin, beside
+/// `a_settled_placeholder_only_capture_is_captured_text_placeholder`): the
+/// disposition must be carried as a FLAG on the capture, because the text it
+/// would otherwise be inferred from is deliberately invisible there.
+#[test]
+fn observe_event_records_a_truncation_and_defeats_the_tool_activity_exemption() {
+    let capture = SubagentCapture::new();
+    // The real route's frame order: the announce (which sets the #122
+    // exemption), then the truncation notice.
+    capture.observe_event(&RpcEvent::tool_execution_start {
+        tool_call_id: "t1".to_string(),
+        tool_name: "bash".to_string(),
+        args: serde_json::json!({ "command": "cargo test" }),
+    });
+    assert!(
+        capture.saw_tool_activity(),
+        "the announce still sets the #122 marker (that behaviour is pinned by \
+         `a_child_inside_a_tool_call_is_never_reaped` and stays)"
+    );
+    assert!(
+        !capture.saw_truncation(),
+        "precondition: nothing has truncated yet"
+    );
+    capture.observe_event(&RpcEvent::turn_truncated);
+    assert!(
+        capture.saw_truncation(),
+        "`turn_truncated` is recorded on the capture — the ONLY place the \
+         disposition can live, because the notice frame's `{{stamp}}:truncate:N` \
+         id is bookkeeping and its text is never captured"
+    );
+    assert!(
+        capture.captured_text().is_empty(),
+        "and the notice is STILL not captured as the child's answer (Decision 5 \
+         / `is_bookkeeping_message_id`)"
     );
 }

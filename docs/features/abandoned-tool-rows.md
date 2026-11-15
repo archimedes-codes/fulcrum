@@ -2,17 +2,27 @@
 
 Landed on `feature/11-settle-announced-tool-calls` against
 [issue #11](https://github.com/archimedes-codes/fulcrum/issues/11), in two commits: the fix
-(`close_announced_tool_calls`, `src/harness/loop/turn.rs`, reached from both settle functions) and the module that pins
+(`close_announced_tool_calls`, `src/harness/loop/turn.rs`, reached from both settle functions as they then stood) and the
+module that pins
 each exit (`src/harness/loop/tests/tool_row_settle.rs`, 7 tests). This file is the permanent residue — the invariant,
 the derivation behind the exits that close nothing, the three constraints that break if the helper is tidied, and the
 residual this crate cannot reach. The plan that drove it (`docs/roadmap/settle-announced-tool-rows.md`) went at ship
-like every plan in this family; `git log` has it. §2 below is that plan's eight-site table, which is why three code
+like every plan in this family; `git log` has it. §2 below is that plan's settle-site table, which is why the code
 comments cite this file and not the plan.
+
+**§2 gained a ninth site later.** [issue #190](https://github.com/archimedes-codes/archimedes/issues/190) added
+`settle_truncated` (`turn.rs`), the third settle — a turn the provider's output cap cut off. It is the only settle whose
+`announced` argument is neither a hand-written `&[]` nor an abandoned attempt's calls: the calls it closes were
+ANNOUNCED NORMALLY and are never dispatched because Decision 2 forbids dispatching them, not because the attempt died.
+That is why §1's "one close implementation" still holds and why §2's vacuity derivation needed no repair.
 
 Every line number below was read in the tree this note lands in, with the fix already committed (`a245180`, tests in
 `2334d83`). The plan's references were written against `45e576d` — the commit it verified its problem statement against —
 and they have all drifted; nothing here is copied from it. Line numbers rot, so each citation names the function it sits
-in beside the number. Where a claim came from the desktop repo it says so and names the commit.
+in beside the number. Where a claim came from the desktop repo it says so and names the commit. The #190 pass RE-READ
+every engine-side number in §1–§4 against its own tree, because its own edits shifted `normalize.rs`, `turn.rs` and
+`loop.rs`, and it re-verified §6's desktop claims from the desktop repo; the daemon-side citations in §5 and §9 were not
+re-read and may have drifted again.
 
 Statuses: **open work** = someone must do it · **recorded** = a known limit, deliberately not fixed ·
 **accepted** = decided, will not change here.
@@ -24,23 +34,31 @@ Statuses: **open work** = someone must do it · **recorded** = a known limit, de
 **A turn never settles with an announced tool row left open.**
 
 The frames that carry it, in order. A `tool_call` ANNOUNCE frame opens a row at `status: "in_progress"` when the model
-finishes NAMING a call: `consume_stream`'s `ProviderEvent::ToolCall` arm (`turn.rs:233-248`) pushes the call onto
-`acc.tool_calls` (`:235`), emits `toolcall_end` (`:236-242`) and emits `tool_execution_start` (`:243-247`) — and
-`normalize` renders EITHER one into a `tool_call` frame at `in_progress` (`normalize.rs:312-352`, `:367-398`). The row
-leaves `in_progress` on exactly one frame: the `tool_call_update` carrying `completed`/`failed` that `normalize`
-derives from `tool_execution_end` alone (`normalize.rs:413-423`). `normalize` has no arm for `turn_end` or
-`agent_settled` — grep over that file finds neither variant named anywhere in its `match`, only in the module docs that
-list the no-frame events (`:181-186`) — so both fall into the catch-all `_ => Vec::new()` (`normalize.rs:586`), which is
-also the arm the display-row scanner carries (`:804`). A settle therefore says nothing about the rows the attempt
-opened, and the row spins forever: in the desktop, a Subagent frozen on a stale tool name with a climbing duration while
-its tool count and cost keep rising.
+finishes NAMING a call: `consume_stream`'s `ProviderEvent::ToolCall` arm (`turn.rs:233-248`, `consume_stream`) pushes
+the call onto `acc.tool_calls` (`:235`), emits `toolcall_end` (`:236-242`) and emits `tool_execution_start`
+(`:243-247`) — and `normalize` renders EITHER one into a `tool_call` frame at `in_progress` (the `toolcall_end` arm,
+`normalize.rs:344-385`, and the `tool_execution_start` arm, `:399-430`). The row leaves `in_progress` on exactly one
+frame: the `tool_call_update` carrying `completed`/`failed` that `normalize` derives from `tool_execution_end` alone
+(`normalize.rs:445-455`). `normalize` has no arm for `turn_end` or `agent_settled` — grep over that file finds neither
+variant named anywhere in its `match`, only in the module docs that list the no-frame events (`:213-218`) — so both fall
+into the catch-all `_ => Vec::new()` (`normalize.rs:630`, the arm of `normalize`'s own `match`), which is also the shape
+the display-row scanner carries (`:848`). A settle therefore says nothing about the rows the attempt opened, and the row
+spins forever: in the desktop, a Subagent frozen on a stale tool name with a climbing duration while its tool count and
+cost keep rising.
 
-The close now lives in ONE function — `close_announced_tool_calls` (`turn.rs:677-688`), which emits
-`tool_execution_end { tool_call_id, tool_name, result: abandoned_tool_result(), is_error: true }` per call — and it is
-called from four places: both settle functions, BEFORE `turn_end` (`turn.rs:700`, `:713`), and the two abandon paths
-that `Continue` instead of settling (`:327` the mid-stream overflow recovery, `:439` the retry whose backoff
-completed). The ordering is the whole content of the invariant: `normalize` closes a row on `tool_execution_end` and on
+The close now lives in ONE function — `close_announced_tool_calls` (`turn.rs:818-829`, `close_announced_tool_calls`),
+which emits `tool_execution_end { tool_call_id, tool_name, result: abandoned_tool_result(), is_error: true }` per call
+— and it is reached from five places: FOUR direct calls — `settle_cancelled` (`turn.rs:841`) and `settle_error`
+(`:854`), each BEFORE its own `turn_end`, plus the two abandon paths that `Continue` instead of settling (`:327` the
+mid-stream overflow recovery, `:576` the retry whose backoff completed) — and, through `settle_error`, the third settle
+`settle_truncated` (`:932`, a delegation; see §10). Every one of the five emits its close BEFORE `turn_end`. The
+ordering is the whole content of the invariant: `normalize` closes a row on `tool_execution_end` and on
 nothing that follows it, so a close emitted after `turn_end` would be a close that never lands.
+
+The helper stays a private `fn` (`:765`, not `pub(super)`) and that visibility is the invariant: a child module's
+private method is invisible to its parent, so `loop.rs` cannot reach a close at all — it must go through a
+`pub(super)` settle, and it therefore cannot open a close without settling. Adding a fourth settle costs nothing in
+reachability, which is exactly what kept site 9 from becoming a second close implementation.
 
 The bug's clearest statement was an asymmetry inside one function. `retry_abandoned_attempt`'s cancel arm called
 `settle_cancelled` and returned, skipping the close loop a few statements below: the path where the backoff COMPLETED
@@ -48,110 +66,142 @@ closed this same attempt's rows and the path where it was CANCELLED did not. Sam
 `acc`. `both_paths_of_retry_abandoned_attempt_close_the_announced_tool_calls_identically` is the pin, written as a PAIR
 over one shared assertion so an edit that reintroduces the asymmetry reddens whichever arm it broke, by name.
 
-## 2. The eight settle sites, which four are non-vacuous, and the derivation of the other four
+## 2. The nine settle sites, which five are non-vacuous, and the derivation of the other four
 
-`settle_cancelled` / `settle_error` are the only two settles, and grep finds exactly eight call sites — four in
-`turn.rs`, four in `loop.rs`. Four pass the abandoned attempt's real `acc.tool_calls`; four pass `&[]`, and each of
+`settle_cancelled` / `settle_error` / `settle_truncated` are the three settles, and there are exactly nine settle SITES
+— five in `turn.rs`, four in `loop.rs`. Five pass the attempt's real `acc.tool_calls`; four pass `&[]`, and each of
 those carries its derivation at the call site so the emptiness stays a fact rather than becoming a hope a new call
-site can invalidate.
+site can invalidate. `grep` over `src/harness/` finds TEN call lines behind those nine: the nine, plus the one inside
+`settle_truncated` that delegates to `settle_error` (§10) — the tenth is not a site, it is how site 9 gets its close,
+and it passes `announced` through untouched.
 
 | # | Site | Announced rows possible? | Why |
 | - | ---- | ------------------------ | --- |
 | 1 | `turn.rs:142` `compact_if_due`, overflow `Skipped` | no | no accumulator in scope |
 | 2 | `turn.rs:341` `handle_mid_stream_error` fall-through | **yes** | non-retryable mid-stream error |
-| 3 | `turn.rs:431` `retry_abandoned_attempt`, cancel arm | **yes** | cancelled inside the backoff |
-| 4 | `turn.rs:454` `retry_abandoned_attempt`, budget exhausted | **yes** | the attempt is abandoned for good |
-| 5 | `loop.rs:1254` top-of-loop cancel | no | no accumulator in scope |
-| 6 | `loop.rs:1293` model call races the cancel | no | the stream was never opened |
-| 7 | `loop.rs:1314` model call returned `Err` | no | no stream to consume |
-| 8 | `loop.rs:1337` cancel after `consume_stream` | **yes** | Stop pressed mid-stream — the field report |
+| 3 | `turn.rs:568` `retry_abandoned_attempt`, cancel arm | **yes** | cancelled inside the backoff |
+| 4 | `turn.rs:591` `retry_abandoned_attempt`, budget exhausted | **yes** | the attempt is abandoned for good |
+| 5 | `loop.rs:1283` top-of-loop cancel | no | no accumulator in scope |
+| 6 | `loop.rs:1322` model call races the cancel | no | the stream was never opened |
+| 7 | `loop.rs:1343` model call returned `Err` | no | no stream to consume |
+| 8 | `loop.rs:1366` cancel after `consume_stream` | **yes** | Stop pressed mid-stream — the field report |
+| 9 | `turn.rs:503` `handle_truncated_turn` → `settle_truncated` → `settle_error` | **yes** | output-cap truncation — issue #190; the same close discipline as site 4, one delegation further down |
 
 Site 8 is the exit the report is about, and it was NOT in the issue's list of four; site 2 is the same shape reached by
 error rather than by Stop.
 
+**Site 9 is non-vacuous for a different reason than 2, 3, 4 and 8, and the difference matters to the derivation.** The
+other four pass `&acc.tool_calls` because their attempt was ABANDONED — it died, or it was cancelled, or its budget ran
+out, and the rows it opened would otherwise never be closed. Site 9's attempt did none of those: `consume_stream` ran to
+completion (`loop.rs:1357`) and announced each call normally, and the calls are never dispatched because Decision 2
+(ADR 0108) FORBIDS dispatching a call whose `arguments` the output cap cut off mid-object — dispatching it would produce
+the executor's misleading ``missing `path` or `content` parameter`` refusal rather than an honest one. So the close is
+not a leak-repair here, it is the ONLY legitimate ending those rows can get, and `announced` cannot be `&[]`:
+`handle_truncated_turn` reaches no batch at all (it `return`s from `handle_turn` at `loop.rs:1405`, ahead of
+`run_tool_batch` at `:1490`), so nothing else emits a `tool_execution_end` for them. Pinned by
+`a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatched` (`turn_lifecycle.rs:1946-2053`), which
+carries a counting `SubagentDispatcher` and asserts the counter is ZERO — the close is proven, and the non-dispatch is
+proven, in the same run.
+
 The vacuity of 1, 5, 6 and 7 is structural, and stronger than the argument the plan carried. `acc` is declared at
-`loop.rs:1320` — after the compaction check (`:1259`), after the model-call `select!` (`:1271-1296`) and after the
-`Err` arm (`:1306`) — so at those four sites there is no accumulator to pass, and `consume_stream`, the ONLY place a
+`loop.rs:1349` — after the compaction check (`:1288-1293`), after the model-call `select!` (`:1300-1325`) and after the
+`Err` arm (`:1335-1343`) — so at those four sites there is no accumulator to pass, and `consume_stream`, the ONLY place a
 `tool_call` row is opened, has not run. A previous iteration cannot have left a row open either, for two independent
 reasons, both checked in the source rather than assumed:
 
-* **`run_tool_batch`'s dispatch loop has no early exit.** The loop runs `turn.rs:526`–`:629` and scanning that range
+* **`run_tool_batch`'s dispatch loop has no early exit.** The loop runs `turn.rs:662`–`:765` and scanning that range
   finds no `break`, no `return`, no `continue`, no `?`: every iteration reaches the `tool_execution_end` emit at
-  `:616-621`, so the batch closes every call it was handed. That includes a cancelled turn — a cancelled call still
-  gets a result, `cancelled_tool_result()` at `:553` (a `subagent` whose child never ran) and `:564-566` (the
+  `:752-757`, so the batch closes every call it was handed. That includes a cancelled turn — a cancelled call still
+  gets a result, `cancelled_tool_result()` at `:689` (a `subagent` whose child never ran) and `:700-702` (the
   sequential tools) — and a result reaches the same unconditional emit. The rule "cancellation beats rejection" is what
   keeps this true: the cancel arms precede the rejection arm, so a cancelled call produces `cancelled` rather than
   producing nothing.
 * **`acc.tool_calls` is emptied before the batch runs, and `acc` is re-declared every iteration.**
-  `std::mem::take(&mut acc.tool_calls)` at `loop.rs:1399`; the batch runs on the taken vec at `:1424`. Nothing between
-  the take and the loop's end (`:1427`) refills the accumulator — `acc.tool_calls` is pushed to in exactly one place,
-  `turn.rs:235` — and the only exit in that range is `loop.rs:1420`, the clean-stop return, which is gated on
-  `tool_calls.is_empty()` at `:1410`. The next iteration gets a fresh `TurnAccumulator::default()` at `:1320` anyway.
+  `std::mem::take(&mut acc.tool_calls)` at `loop.rs:1465`; the batch runs on the taken vec at `:1490`. Nothing between
+  the take and the loop's end (`:1493`) refills the accumulator — `acc.tool_calls` is pushed to in exactly one place,
+  `turn.rs:235` — and the only exit in that range is `loop.rs:1486`, the clean-stop return, which is gated on
+  `tool_calls.is_empty()` at `:1476`. The next iteration gets a fresh `TurnAccumulator::default()` at `:1349` anyway.
 
 The paths into a later iteration are exhaustible and each is covered: the pre-stream overflow `continue`
-(`loop.rs:1304`, before any stream exists), `handle_mid_stream_error`'s `Continue` (`:1348` → closes at
-`turn.rs:327` or `:439`), `handle_empty_turn`'s `Continue` (`:1382` → `retry_abandoned_attempt`, `turn.rs:381-387` →
-closes at `:439`; and its own batch is empty by the gate at `:1377-1380`), and the fall-through after the batch.
+(`loop.rs:1333`, before any stream exists), `handle_mid_stream_error`'s `Continue` (`:1377` → closes at
+`turn.rs:327` or `:523`), `handle_empty_turn`'s `Continue` (`:1448` → `retry_abandoned_attempt`, `turn.rs:392-397` →
+closes at `:523`; and its own batch is empty by the gate at `:1446`), the Length gate's `Continue` arm
+(`:1404` — DEAD today, because `handle_truncated_turn` ends in `settle_truncated` + `TurnFlow::Return` unconditionally,
+and covered even if it were live because the close has already run by the time `settle_truncated` returns — through
+`settle_error`, per §10), and the fall-through after the batch.
 
-**Three more `agent_settled` emissions are not among the eight, and they are empty too.** Production emits
-`agent_settled` at five places (`loop.rs:1117`, `:1209`, `:1419`, plus `turn.rs:706` and `:719` inside the two settle
-functions), so a reader auditing "every settle" by grepping that frame finds five emissions behind eight call sites and
-should not have to re-derive which are which. `loop.rs:1419` is the accepted clean stop, gated on
-`tool_calls.is_empty()` (`:1410`); `loop.rs:1117` settles prompts the Stop drained from the queue in `run()`'s cancel
-arm, and `loop.rs:1209` settles the prompt `handle_prompt` skipped on an already-cancelled token — in both, no turn body
-ran, so nothing was announced.
+**Three more `agent_settled` emissions are not among the nine, and they are empty too.** Production emits
+`agent_settled` at five source lines (`loop.rs:1146`, `:1238`, `:1485`, plus `turn.rs:847` and `:860` inside
+`settle_cancelled` and `settle_error`), behind NINE call sites — the ninth, `settle_truncated`, emits it through
+`settle_error` rather than from a line of its own (§10), so a reader auditing "every settle" by grepping that frame
+finds five emissions behind nine call sites and should not have to re-derive which are which.
+`loop.rs:1485` is the accepted clean stop, gated on
+`tool_calls.is_empty()` (`:1476`); `loop.rs:1146` settles prompts the Stop drained from the queue in `run()`'s cancel
+arm, and `loop.rs:1238` settles the prompt `handle_prompt` skipped on an already-cancelled token — in both, no turn body
+ran, so nothing was announced. `loop.rs:1485` is also the emission a `Length` turn NO LONGER reaches: pre-#190 a
+truncated turn fell through the emptiness gate (whose first conjunct then demanded `Some(Stop)`) and settled there as a
+success triple, which is the bug — see §8.
 
 **The pointer this note flagged for retargeting has been retargeted.** `settle_cancelled`'s doc comment used to send a
-reader to the eight-site table "in `docs/roadmap/settle-announced-tool-rows.md`" (`turn.rs:695-696`), and that plan
-file is deleted on ship, as every plan in this repo family is. This file is its successor, so all three code comments
-that cited the plan (`turn.rs` twice, `tool_row_settle.rs` once) now cite §2 here instead.
+reader to the settle-site table "in `docs/roadmap/settle-announced-tool-rows.md`", and that plan
+file is deleted on ship, as every plan in this repo family is. This file is its successor, so every comment that cited
+the plan cites §2 here instead: `turn.rs` three times (`compact_if_due`'s site-1 derivation, `handle_truncated_turn`'s
+site-9 note, `settle_cancelled`'s `announced` paragraph), `tool_row_settle.rs` once (its module docs) and
+`worker/manager/subagent_flow.rs` once (its liveness-set residual note).
 
 ## 3. Three constraints on the helper that are load-bearing — **recorded**
 
 Each is here because of what breaks if the helper is tidied, not because the shape is pretty. All three are stated on
-the helper itself (`turn.rs:634-676`) and each has a test that reddens when it is violated.
+the helper itself (`turn.rs:770-816`, `close_announced_tool_calls`'s docblock) and each has a test that reddens when it
+is violated.
 
 * **Iterate the ordered `Vec<ToolCall>`, never `TurnState::announced_tool_calls`.** That field is a `HashSet<String>`
-  (`normalize.rs:72`) and it is insert-only: the only writes anywhere in the crate are `:259`, `:344`, `:389` and `:456`
-  — the only `.remove(` calls in `normalize.rs` hit `toolcall_args` (`:323`) and the display-store accumulators (`:722`,
-  `:739`). Nothing clears it per attempt or per turn either: the production `TurnState` is built once, at
-  `loop.rs:783`, and lives for the whole Worker (the only other construction is the nested-call sink's own fresh state,
+  (`normalize.rs:72`) and it is insert-only: the only writes anywhere in the crate are `:291`, `:376`, `:421` and `:488`
+  — the only `.remove(` calls in `normalize.rs` hit `toolcall_args` (`:355`) and the display-store accumulators (`:766`,
+  `:783`). Nothing clears it per attempt or per turn either: the production `TurnState` is built once, at
+  `loop.rs:797`, and lives for the whole Worker (the only other construction is the nested-call sink's own fresh state,
   `loop/emit.rs:143`). And it does not hold only tool calls — `compaction_start` mints a `compact:{n}` card id
-  (`normalize.rs:454`) and inserts it into the same set (`:456`), because a compaction renders as a tool card. Closing
+  (`normalize.rs:486`) and inserts it into the same set (`:488`), because a compaction renders as a tool card. Closing
   from the set would therefore fake a failed tool close for every compaction card the session ever opened, in an
-  arbitrary order, and `compute_display_rows`' `tool_call_update` arm `merge_json`s onto the card (`:772-803`) — so the
+  arbitrary order, and `compute_display_rows`' `tool_call_update` arm `merge_json`s onto the card (`:816-846`) — so the
   forged close would overwrite the summary `compaction_end` had put there. The `Vec` is transcript order, which is what
   the desktop reads these frames as; `the_closes_arrive_in_accumulator_order_and_every_one_precedes_the_settle` declares
   its ids `zzz-`/`mmm-`/`aaa-` so declaration order is the REVERSE of sorted order and no set, hash, sort or reverse can
   produce the asserted sequence.
 * **Frames only, never transcript rows.** No `ChatMessage { role: Tool }` is pushed and nothing is appended to
-  `turn_tool_results` — contrast `run_tool_batch`, which pushes at `turn.rs:622-627` and persists at `:628`. An
+  `turn_tool_results` — contrast `run_tool_batch`, which pushes at `turn.rs:758-763` and persists at `:765`. An
   abandoned attempt persists NO assistant row, so a tool-result message would dangle with nothing for the provider to
   pair it against — the orphan a provider 400s on. Pinned by `an_abandoned_tool_call_appends_no_tool_message`
-  (`compaction_overflow.rs:657-723`), which reloads the transcript from the store and asserts both that no `Tool` row
-  exists and that the persisted assistant row's `tool_calls` is `None`.
-* **`abandoned_tool_result()`'s text stays byte-identical** (`loop/tools.rs:20-30`). Four places pin it verbatim —
-  `compaction_overflow.rs:624-631` and `:778-785`, `turn_lifecycle.rs:743-747`, and `tool_row_settle.rs`'s
-  `const ABANDONED` (`:55`) — and the no-double-close pin asserts the ABSENCE of that string on a batch that ran for
-  real (`tool_row_settle.rs:1056-1060`), which is how a re-close would announce itself. The wording is the point: the
-  tool did not FAIL, it was discarded.
+  (`compaction_overflow.rs:634-695`), which reloads the transcript from the store and asserts both that no `Tool` row
+  exists and that the persisted assistant row's `tool_calls` is `None`. Site 9 is the one route that DOES persist an
+  assistant row, and it does not weaken this: `handle_truncated_turn` pushes its row with `tool_calls: None`
+  (`turn.rs:460`), so there is still nothing a tool result could pair against, and the same test's `None` assertion is
+  what keeps that honest rather than incidental.
+* **`abandoned_tool_result()`'s text stays byte-identical** (`loop/tools.rs:20-30`). Five places pin it verbatim —
+  `compaction_overflow.rs:596-603` and `:750-757`, `tool_row_settle.rs`'s `const ABANDONED` (`:55`, asserted at `:167`,
+  `:418`, `:662` and `:774`), and `turn_lifecycle.rs`'s own `const ABANDONED` (`:1758`, asserted at `:2026`, added with
+  site 9) — and the no-double-close pin asserts the ABSENCE of that string on a batch that ran for
+  real (`tool_row_settle.rs:1018-1022`, inside `a_settle_after_a_completed_batch_does_not_re_close_its_rows`), which is
+  how a re-close would announce itself. The wording is the point: the tool did not FAIL, it was discarded — which on the
+  truncation route is also the difference between an honest card and the executor's misleading
+  ``missing `path` or `content` parameter`` refusal.
 
 ## 4. `message_retracted` does not close rows — **accepted, two reasons**
 
 **Reason one: both emit sites already close first, and the ordering is pinned.** `turn.rs:327` closes and `:329`
-retracts; `turn.rs:439` closes and `:441` retracts. Those two are the only `message_retracted` emissions in production
+retracts; `turn.rs:576` closes and `:577` retracts. Those two are the only `message_retracted` emissions in production
 source. `a_retried_reply_closes_the_tool_calls_it_abandoned` pins the order by construction rather than by inspection:
 it waits for the close first, so a retraction emitted BEFORE the close would be missing from what follows and the
-count assertion fails. `a_mid_stream_overflow_closes_the_abandoned_tool_call` (`:797-802`) pins the same order on the
-second path.
+count assertion fails. `a_mid_stream_overflow_closes_the_abandoned_tool_call` (`compaction_overflow.rs:769-774`) pins
+the same order on the second path.
 
-**Reason two: `normalize`'s retraction arm could not do it correctly at all.** That arm (`normalize.rs:544-559`) knows
+**Reason two: `normalize`'s retraction arm could not do it correctly at all.** That arm (`normalize.rs:576-591`) knows
 one thing — `st.current_message_id`, the id the retried call REUSES, which is why the retraction is a protocol event.
 It has no tool-call id, and `announced_tool_calls` is a flat set with no per-message attribution, so the best such an
 arm could do is close EVERY announced id of the turn, including the rows belonging to the same turn's other messages —
 a batch that ran and closed legitimately, or an earlier attempt's cards. The display side has the same split: the
-retraction arm there (`:713-750`) overwrites rows keyed by `messageId`, while tool-call rows are keyed by `toolCallId`
-(`:765-769`, `:797-802`) — two key spaces, no join. Redundant at both sites, unimplementable in the one place someone
+retraction arm there (`:757-794`) overwrites rows keyed by `messageId`, while tool-call rows are keyed by `toolCallId`
+(`:795-815`, `:816-846`) — two key spaces, no join. Redundant at both sites, unimplementable in the one place someone
 would think to write it.
 
 ## 5. The dropped-frame residual — **recorded, and not fixable in this crate**
@@ -201,6 +251,10 @@ That commit names three producers of orphans, all in this crate. **This fix remo
 agent text but never the tool row is covered too, and by §4's reason one rather than by any change to the retraction:
 both retraction sites close first, so a retracted attempt's rows are already settled.
 
+The count is still three, not four: the settle this note later gained (§2 site 9) never became a producer, because
+`settle_truncated` was written with the close in it — and after §10 it gets that close from `settle_error`, so the
+statement holds for a second reason.
+
 **It does not remove the third.** A close dropped by `Lagged` (§5) is still unfixable downstream, and position remains
 the only signal the transcript carries in that case — the desktop's own commit records the matching residual: an orphan
 followed only by open rows is byte-identical to a legitimate mid-batch transcript, so it still wins there, and `at` does
@@ -208,22 +262,65 @@ not separate them because a batch's announces share a stamp. The engine-side cur
 for the two producers it owns; it does not make the reader's discriminator unnecessary.
 
 And the cure does not reach a user yet — **but not for the reason this paragraph used to give.** It cited the desktop's
-pin (`archimedes/src-tauri/Cargo.toml`, then `78e595436…`, a rev whose `turn.rs` has no `close_announced_tool_calls`).
-That evidence is stale: the desktop's `origin/main` now pins a rev that DOES contain this fix (`2ed5f5a6`, verified with
-`merge-base --is-ancestor 33e3ea7 2ed5f5a6`), and since fulcrum's `v0.1.0` the pin is `tag = "v0.1.0", version = "0.1.0"`
-on a branch of that repo. So the cure is compiled into the desktop's `main` today.
+pin (`archimedes/src-tauri/Cargo.toml`, then `78e595436…`, a rev whose `turn.rs` has no `close_announced_tool_calls`),
+and then, when that moved, a per-commit rev on the desktop's `main`. Both readings were the wrong axis and the second
+was unfalsifiable: this repo family squash-merges, so a pre-squash hash goes unreachable the moment its branch is
+cleaned up, and a note that cites one cannot be re-checked by the next reader. Cite tags and PRs.
 
-What still keeps it from a user is the **release**, not the pin: the newest desktop tag is `v0.11.0` (2026-11-02), which
-predates this fix (2026-11-08) and predates the extraction — its engine was in-tree at
-`src-tauri/src/agent/harness/loop/turn.rs`, and `git show v0.11.0:…/turn.rs` has no `close_announced_tool_calls`. No
-desktop tag contains the cure, so no installed build runs it. **Open work:** the next desktop release. Until that
-ships, `744aac23`'s reader is the only thing standing between this bug and a user — which is the conclusion this bullet
-has always drawn, now resting on the release boundary rather than on a pin that has since moved.
+**The cure ships in a desktop release.** Desktop `v0.13.0` (`e0f3811e`, 2026-11-11 — the newest tag as of this note)
+carries `fulcrum-harness = "0.2.0"` at `src-tauri/Cargo.toml:121`, and fulcrum's `v0.2.0` contains this fix:
+`git merge-base --is-ancestor 33e3ea7 v0.2.0` is true in THIS repo (that commit is
+`fix: close announced tool rows on every settle, not just some (#11)` — PR #11, the commit that introduced
+`close_announced_tool_calls`). So the sentence this paragraph used to end with — "no desktop tag contains the cure, so
+no installed build runs it" — is FALSE, and the residual it was drawing is smaller than it claimed: the reader's
+discriminator is now a belt, not the only brace. What remains of the concern is the version, not the presence: a desktop
+older than `v0.13.0` still runs an engine without the close, and `v0.11.0` and earlier predate the extraction entirely
+(their engine was in-tree at `src-tauri/src/agent/harness/loop/turn.rs`, where
+`git show v0.11.0:…/turn.rs` has no `close_announced_tool_calls`). **Recorded, no open work on the engine side.**
 
-## 7. Rows orphaned before the fix stay orphaned — **recorded**
+## 7. What a truncated turn does with its text, and why it is not this note's orphan — **accepted**
+
+Issue #190's `Length` route persists an assistant row where every other non-success route persists nothing, so it is
+worth stating here why that does not create the orphan §2 exists to prevent. `handle_truncated_turn` pushes exactly one
+`ChatMessage { role: Assistant }` with `tool_calls: None` (`turn.rs:452-461`) and persists it (`:462`);
+`settle_truncated` then closes the announced rows as FRAMES only. The provider therefore sees a reply with no tool
+calls and no tool result — a consistent transcript — which is the pairing discipline §3's second bullet guards, held by
+construction rather than by luck.
+
+Persisting is deliberate: the streamed text is real content the model produced, and a display that shows it while the
+transcript does not is the display/transcript split
+the DESKTOP repo's `docs/roadmap/compaction-recovery-hardening-follow-ups.md` §4 ("A crashed Worker leaves a
+reply on screen that the model never had") documents for crashes. And the counter-case is the #64
+row: when NOTHING streamed, `handle_truncated_turn` pushes nothing and persists nothing (the `!acc.text.is_empty()`
+guard at `turn.rs:447`), so the 33-byte `{"role":"assistant","content":"","tool_calls":[]}` row is gone on the
+`Length` route too (`a_truncated_turn_with_no_text_persists_no_assistant_row`, `turn_lifecycle.rs:2060-2111`).
+
+## 8. Why the `Length` route reached a success triple at all — **recorded, the mechanism**
+
+`FinishReason::Length` was mapped by all three wires (`map_anthropic_stop_reason`'s `"max_tokens"`,
+`map_finish_reason`'s `"length"`, the Responses API's `incomplete_details.reason == "max_output_tokens"`) and read by
+nobody in the turn loop: `grep -rn "FinishReason::Length" src/harness/loop.rs src/harness/loop/` found nothing outside
+tests at `7f21099` (checked: zero hits in both files), and `acc.finish` had exactly two production readers — `turn.rs`
+on `Some(Error)` (`consume_stream`'s fabrication guard) and `loop.rs` on `Some(Stop)` (the #64 gate).
+So a `Done(Length)` stream failed the emptiness gate's `Some(Stop)` conjunct and fell through to the success triple at
+`loop.rs:1477-1486`: `agent_end`, `turn_end`, `agent_settled`. The user watched a confident half-sentence settle as a
+completed turn, the composer unlocked, nothing ran, and no error surfaced. The only place in the engine that understood
+truncation was `compact.rs` — the summariser.
+
+The gate now sits ahead of that one (`loop.rs:1399-1407`), and the emptiness gate is keyed on "nothing was produced"
+rather than on the reason (`:1446`), which also catches `finish == None` and a provider that answers
+`Done(ToolCalls)` while dispatching no call. `a_provider_that_claims_tool_calls_and_dispatches_none_is_retried`
+(`turn_lifecycle.rs:2408-2471`) is that pin and
+`a_claimed_tool_calls_turn_with_a_spent_budget_announces_the_retry_and_persists_nothing` (`:2479-2544`) its
+budget-spent half — the pair proves the catch routes to the RETRY (an `auto_retry_start` is announced) and that neither
+arm leaves a 33-byte row behind. `acc.finish`'s production readers are now `Some(Error)` (unchanged) and
+`Some(Length)`; the `Some(Stop)` reader is deliberately GONE, and that removal is what the generalisation is — the
+reason is no longer what the gate keys on.
+
+## 9. Rows orphaned before the fix stay orphaned — **recorded**
 
 The fix is forward-only, and it is worth naming exactly what is on disk. Each frame persists a display row —
-`normalize`'s announce persists a `tool-call` row (`normalize.rs:765-770`) and each update re-persists it (`:797-802`) —
+`normalize`'s announce persists a `tool-call` row (`normalize.rs:795-815`) and each update re-persists it (`:816-846`) —
 and in production that write travels: `IpcStore::persist_display` turns it into a `DisplayUpsert` frame
 (`worker/store.rs:103-109`), the daemon's `TranscriptPersister` upserts it into `messages` keyed
 `(session_id, kind, message_key)` (`src/persist.rs:172-184`). So an `in_progress` payload written by a pre-fix attempt is
@@ -242,3 +339,121 @@ production reader in either member. Hydration is therefore the desktop's, and it
 session close (`src/store/sessions.ts:2392`) rather than on load. So a session orphaned before this fix and never closed
 keeps its spinner; a session closed after the fix gets the repair the desktop already had. Rewriting those rows at
 hydration is a desktop decision and belongs in its notes, not here.
+
+## 10. Why site 9's settle is a delegation, and the watermark claim it reverses — **recorded, the correction**
+
+`settle_truncated` (`turn.rs:932`) used to be a fourth body of its own: `settle_error`'s three statements minus
+`compactor.turn_abandoned`, with a docblock arguing the omission was the whole difference. Two claims carried that
+argument — that calling `turn_abandoned` here would "discount a real message and reset the count to the bare anchor",
+and that on the no-text half it "would be a no-op anyway". **Both are false**, and `compact.rs`'s own arithmetic is what
+says so: `record_usage` (`:72`) writes `usage_watermark = messages.len() + 1` — the `+1` anticipates the reply the
+caller is about to append — and `turn_abandoned` (`:104`) early-returns on `usage_watermark <= messages.len()`. So:
+
+* **Text streamed.** `handle_truncated_turn` pushes the reply BEFORE the settle (`turn.rs:448-463`), so the transcript
+  reached the watermark, `watermark == len`, the guard fires, and the call is a **no-op on every field** — Δ = 0 on
+  `context_tokens`, `usage_base`, `usage_watermark` and `pending_output`. The predicted harm is unreachable. That guard
+  exists precisely to make the call safe unconditionally, and `compact.rs:83-85` says so in those words ("safe to call
+  on EVERY turn exit"), with `:99-103` naming the guard that buys it; `settle_truncated` inverted that reading.
+* **Nothing streamed.** Nothing is pushed, `watermark == len + 1 > len`, the guard does NOT fire, and the call **acts**
+  — which is correct, and is the half the old text dismissed as free.
+
+Measured cost of leaving it out (`Usage { input_tokens: 100, output_tokens: 50 }` then `Done(Length)`, no `TextDelta`):
+`context_tokens` stays **150** instead of **100**, `pending_output` stays 50, and `usage_watermark` stays 2 with **0**
+assistant rows in the transcript — the loop believes in a reply that was never persisted. Driven end-to-end at a window
+whose threshold falls between the honest 100 and the inflated 150, the NEXT turn emitted **1 `compaction_start` and 3
+model calls instead of 0 and 2**: a spurious compaction, an extra summary call, the transcript rewritten for context
+pressure that did not exist. The inflation also self-perpetuates — the watermark window swallows the next prompt too,
+because `refresh` (`:197`) estimates only `messages[watermark..]`.
+
+The fix is therefore the call, and the body is then `settle_error`'s verbatim, so it IS `settle_error` — one delegation
+(`turn.rs:937`), not two copies of the same settle that had quietly diverged. `settle_truncated` survives as the named
+entry point for two reasons that are not implementation details: §2's table names it at site 9 and the `announced`
+column's derivation is written against that name, and `handle_truncated_turn` calls it, so the truncation route keeps a
+name a reader can grep for. Decision 2 / ADR 0108's no-dispatch discipline is untouched — that half of the docblock was
+verified true and is the point of the function.
+
+Three pins, all in `turn_lifecycle.rs`:
+`a_truncation_that_streamed_nothing_does_not_leave_phantom_output_tokens` (the counter, and the 0-assistant-row half of
+the same lie), `a_truncation_that_streamed_nothing_does_not_compact_the_next_turn` (the spurious compaction — the pin
+that would have caught this), and `a_truncation_that_streamed_text_leaves_the_context_count_where_usage_put_it`, which
+pins the Δ = 0 fact as an invariant so nobody "fixes" the no-text case back the other way.
+
+## 11. The `RetryPolicy::reported` leak — every settle that never reaches `note_success` — **open work, one route fixed**
+
+**Status: open work.** Issue #190's follow-up closed ONE route into this class (the `Length` settle) and deliberately
+left the rest alone, because the other routes have tests pinning their current event streams and this PR does not own
+them. This section is the whole class, written so the next reader does not have to re-derive it.
+
+### The mechanism, in one paragraph
+
+`RetryPolicy` (`src/harness/retry.rs`) carries one bit, `reported` (`:40`). It is SET in exactly two places —
+`note_success()` (`:101`) and the new `retire_pending_report()` (`:136`) — and CLEARED in exactly ONE:
+`next_retry_delay()` (`:90`). `note_success()` returns `Some(attempt)` when `attempt > 1 && !reported`, and the loop
+turns that into `auto_retry_end { success: true }` (`loop.rs:1453-1459`), which `normalize` renders as the shared
+system line **"Retry succeeded"** (`normalize.rs`, the `auto_retry_end` arm). So the bit means "this retry's success
+frame has been emitted", and it is the ONLY thing standing between a retried-but-never-settled attempt and a success
+banner. Every path that abandons an attempt and settles WITHOUT reaching `note_success()` therefore leaves a report
+pending, and the next ordinary successful prompt — a fresh turn, an unrelated prompt, minutes later — walks into
+`note_success()`, gets `Some(attempt)` for the PREVIOUS turn's retry, and announces that retry a success.
+
+Two properties make this worse than a cosmetic banner. `attempt` is per-turn-but-never-reset-to-zero (both
+`call_with_retry` and `note_success` do `attempt.max(1)`, and only a fresh `next_retry_delay` moves it up), so the
+stale `attempt` number rides the frame; and the success line is a `system_chunk` on the SHARED `{stamp}:system` key,
+so it APPENDS onto whatever system line the session last wrote rather than landing under the turn it describes.
+
+### Which settle sites leave it pending
+
+All eight sites of §2's table that settle without falling through to `note_success()`. The four marked *measured* were
+driven end-to-end (two prompts, one `AgentLoop`, scripted provider; the assertion is the count of
+`auto_retry_end { success: true }` frames on the SECOND turn — every one of them was `1`, i.e. the leak fires):
+
+| Site | Function | Settle | Evidence |
+| --- | --- | --- | --- |
+| `turn.rs:142` | `compact_if_due` (overflow `Skipped`) | `settle_error` | mechanism (same predicate; needs a retry earlier in the turn) |
+| `turn.rs:341` | `handle_mid_stream_error` (non-retryable mid-stream) | `settle_error` | *measured* — Retryable attempt, then mid-stream `Auth`: turn 1 emits `auto_retry_start` and NO close, turn 2 emits `success: true` |
+| `turn.rs:568` | `retry_abandoned_attempt`, backoff CANCELLED arm | `settle_cancelled` | *measured* — turn 1 `auto_retry_start` → `turn_end`/`agent_settled`, turn 2 `success: true` |
+| `turn.rs:591` | `retry_abandoned_attempt`, budget EXHAUSTED arm | `settle_error` | *measured* — turn 1 emits `auto_retry_start` + `auto_retry_end { success: false }` and STILL leaks: the close emits the frame without consuming `reported` |
+| `loop.rs:1283` | `handle_turn`, top-of-loop cancel | `settle_cancelled` | mechanism |
+| `loop.rs:1322` | `handle_turn`, model call races the cancel | `settle_cancelled` | mechanism |
+| `loop.rs:1343` | `handle_turn`, the model call returned `Err` | `settle_error` | *measured* — a pre-stream `Retryable` then a pre-stream `Auth`: turn 1 `auto_retry_start` + settle, turn 2 `success: true` |
+| `loop.rs:1366` | `handle_turn`, Stop mid-stream | `settle_cancelled` | mechanism |
+
+The budget-exhausted row is the sharpest of the four, because that arm already emits
+`auto_retry_end { success: false }` (`turn.rs:583-588`) — so the user sees "Retry failed" for the turn and, on the next
+prompt, "Retry succeeded" for the SAME retry. The two frames disagree because the close was emitted without retiring
+the report.
+
+### The user-visible symptom
+
+A turn that retried and then failed (or was stopped) prints no verdict of its own — or a "Retry failed" line — and the
+session looks settled. The user types the next thing they wanted, that prompt succeeds normally, and the transcript
+prints **"Retry succeeded"** under the NEW turn: a claim that the failed/stopped attempt recovered, attached to a turn
+that never retried anything. Nothing corrects it afterwards; there is no counter-frame.
+
+### What #190's follow-up did, and the shape it chose
+
+`handle_truncated_turn` now calls `RetryPolicy::retire_pending_report()` (`retry.rs:136`) and emits
+`auto_retry_end { success: false }` with a `final_error` naming the truncation, before the settle
+(`turn.rs:465-497`). The shape is `retry_abandoned_attempt`'s budget-exhausted arm's own (`turn.rs:583`), for its
+stated reason: a peer that opened a retry card on the `auto_retry_start` must see it CLOSE. The alternative — flipping
+`reported` with no frame — was rejected as the same dangling-card class §1 refuses elsewhere. The unit pin is
+`harness::retry::tests::retire_pending_report_consumes_the_report_without_reporting_success`; the end-to-end pin is
+`harness::r#loop::tests::turn_lifecycle::a_truncated_turn_does_not_leave_a_retry_report_for_the_next_prompt_to_call_success`.
+
+`retire_pending_report` is the SAME predicate as `note_success` minus the `attempt.max(1)` raise, and that omission is
+deliberate: a settle that never made a call must not manufacture an attempt number to report.
+
+### The open work, stated for whoever takes it
+
+Closing the class is a per-site decision, not a one-liner in `settle_error`/`settle_cancelled`: those two functions are
+reached by sites that have NO `error_message` in scope (the overflow-`Skipped` settle, the three cancel settles), so a
+close emitted there needs a reason string invented at the settle — which is exactly what §3's discipline about honest
+close text warns against. The candidate shapes are (a) pass an `Option<&str>` reason into the two settle functions and
+close-when-pending inside them, or (b) close in each CALLER, where the reason is already in scope, as
+`handle_truncated_turn` does. (b) keeps the settle functions as pure event triples and is what the #190 route chose.
+Either way the tests to re-check first are the ones that pin these paths' event streams today:
+`tool_row_settle.rs` (all nine sites), `turn_lifecycle::a_cancel_during_the_retry_backoff_settles_fast`,
+`turn_lifecycle::an_empty_turn_shares_the_retry_budget_with_the_ladder`,
+`turn_lifecycle::an_empty_stop_with_an_exhausted_budget_settles_as_an_error`, and
+`context_usage::a_failed_turn_still_measures_the_next_prompt` /
+`context_usage::a_cancelled_turn_still_measures_the_next_prompt`.

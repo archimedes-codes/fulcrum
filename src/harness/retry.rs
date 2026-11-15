@@ -106,6 +106,41 @@ impl RetryPolicy {
         }
     }
 
+    /// Retire a PENDING retry report WITHOUT reporting a success: `Some(attempt)`
+    /// when a retry is outstanding and its `auto_retry_end` was never reported
+    /// (the same predicate [`Self::note_success`] reads), and the report is
+    /// CONSUMED so no later call can report it — the caller emits the closing
+    /// `auto_retry_end { success: false }` for the reason it knows.
+    ///
+    /// WHY THIS EXISTS (`reported` is otherwise cleared ONLY by
+    /// `next_retry_delay()`): a turn that retried and then settled on a route
+    /// that returns BEFORE `note_success()` leaves the report pending, and the
+    /// NEXT ordinary successful prompt walks into `note_success()`, gets
+    /// `Some(attempt)` for the PREVIOUS turn's retry, and emits
+    /// `auto_retry_end { success: true }` — a "Retry succeeded" banner for a turn
+    /// that did not succeed. Issue #190's `Length` route is such a route (its gate
+    /// sits ahead of `note_success()` deliberately, so the truncated attempt is
+    /// never called a success), so it closes its own report here.
+    ///
+    /// `reported = true` is the retirement, and it is honest: the report HAS been
+    /// made — as the `success: false` close the caller emits from this return
+    /// value. A later `next_retry_delay()` re-arms it exactly as it does for
+    /// `note_success`, so a genuinely retried turn after this one still reports.
+    ///
+    /// SCOPE, deliberately narrow: the cancel settles and the mid-stream-error
+    /// settle reach the same pending-report state and are NOT changed here —
+    /// that is a pre-existing class this PR does not own, recorded as an open item
+    /// in `docs/features/abandoned-tool-rows.md` §11 rather than silently widened
+    /// into (those paths have tests pinning their current event streams).
+    pub fn retire_pending_report(&mut self) -> Option<u64> {
+        if self.attempt > 1 && !self.reported {
+            self.reported = true;
+            Some(self.attempt)
+        } else {
+            None
+        }
+    }
+
     /// Attempt the call with retries: on `Retryable`, an exponential
     /// backoff (recording the attempt + emitting `auto_retry_start`),
     /// re-calling `f`; on `Fatal` / `Auth` / `ContextOverflow`, return the
@@ -420,6 +455,52 @@ mod tests {
         assert_eq!(policy.note_success(), Some(2));
         // A second successful call (no new retry) reports nothing.
         assert_eq!(policy.note_success(), None);
+    }
+
+    /// (issue #190 follow-up, F3) `retire_pending_report` consumes the pending
+    /// `auto_retry_end { success: true }` WITHOUT reporting one: it fires on the
+    /// same predicate `note_success` reads, reports nothing a second time, and is
+    /// re-armed by the next retry exactly as `note_success` is.
+    ///
+    /// The contract's other half — the loop emits the `success: false` close from
+    /// this return value, and the NEXT prompt then reports nothing — is pinned
+    /// end-to-end by
+    /// `harness::loop::tests::turn_lifecycle::a_truncated_turn_does_not_leave_a_retry_report_for_the_next_prompt_to_call_success`.
+    #[test]
+    fn retire_pending_report_consumes_the_report_without_reporting_success() {
+        let mut policy = RetryPolicy::new_with(5, Duration::from_millis(1));
+        assert_eq!(
+            policy.retire_pending_report(),
+            None,
+            "no retry, nothing to retire (the same gate `note_success` reads)"
+        );
+        // The loop's own shape: `call_with_retry` raises `attempt` to 1 on the
+        // FIRST call (the same `attempt.max(1)` `note_success` applies), so the
+        // first DELAY names attempt 2 — the pending-report state is
+        // `attempt > 1 && !reported`, exactly what a turn that retried holds.
+        policy.attempt = policy.attempt.max(1);
+        assert!(policy.next_retry_delay().is_some()); // attempt 2
+        assert_eq!(
+            policy.retire_pending_report(),
+            Some(2),
+            "a pending report IS retired, naming the attempt it belongs to"
+        );
+        assert_eq!(
+            policy.retire_pending_report(),
+            None,
+            "and it is retired ONCE — a second call reports nothing"
+        );
+        assert_eq!(
+            policy.note_success(),
+            None,
+            "THE POINT: the NEXT successful call reports nothing for the retired \
+             retry — no `auto_retry_end {{ success: true }}` for a turn that did \
+             not succeed"
+        );
+        // A LATER retry re-arms the report, so this retirement does not mute the
+        // success frame for a genuinely retried turn afterwards.
+        assert!(policy.next_retry_delay().is_some()); // attempt 3
+        assert_eq!(policy.note_success(), Some(3));
     }
 
     #[test]
