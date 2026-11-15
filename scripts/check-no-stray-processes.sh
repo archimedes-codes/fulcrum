@@ -257,17 +257,18 @@
 #                    says why the gap is tolerated. See the skip section below for why
 #                    this is a flag and never an env var.
 #
-# THE SELF-TEST SKIPS, AND WHAT A SKIP COSTS. Four cases plant real processes and so
-# need real tooling: I (ps -eo, a copyable sleep, setsid), M (the same, plus python3),
-# L (a renamable bash), R (L's plant, plus /proc). Where a dependency is missing the
-# case records itself in the skip ledger and says so on STDERR; it does NOT fail (a
-# missing tool is not a census defect) and it does NOT pass (an unproven case is not a
-# behaved one). Under CI=true a skip is exit 1 — on a runner an unproven case is
+# THE SELF-TEST SKIPS, AND WHAT A SKIP COSTS. Five cases plant real processes and so
+# need real tooling: I (ps -eo, a renamable bash, setsid, mkfifo), M (the same, plus
+# python3), L (a renamable bash), R (L's plant, plus /proc), U (ps -eo and a renamable
+# bash — plain background jobs, NO setsid, so it runs where I cannot). Where a dependency is
+# missing the case records itself in the skip ledger and says so on STDERR; it does NOT
+# fail (a missing tool is not a census defect) and it does NOT pass (an unproven case is
+# not a behaved one). Under CI=true a skip is exit 1 — on a runner an unproven case is
 # indistinguishable from a deleted one. Off CI it stays a loud note. The summary line
 # `skip summary: N case(s) …` prints EVERY run, including N=0, so "which cases did not
 # run" is answerable from any log. Cases are gated INDIVIDUALLY: macOS has no setsid,
-# so I and M skip there while L and R still run, and a blanket guard would have thrown
-# away the lineage coverage that macOS genuinely can provide.
+# so I and M skip there while L, R and U still run, and a blanket guard would have
+# thrown away the lineage coverage that macOS genuinely can provide.
 #
 # WHY `--allow-skips` EXISTS, AND WHY IT IS A FLAG. `setsid` is absent BY PLATFORM
 # DESIGN on macOS and on Git-for-Windows bash (measured on real runners: macOS has
@@ -1546,8 +1547,474 @@ plant_was_alive() {
   return 1
 }
 
+# plant_blocking <image> <fifo> <token> <marker> <via-setsid> — the ONE way this harness
+# starts a plant that must STAY alive. Run it backgrounded: `( plant_blocking … ) &`.
+# stdin is /dev/null so a plant can never hold the self-test's output pipe; stdout and
+# stderr are left ALONE so the caller can capture what the plant printed on its way out
+# (see report_plant_exit) — a plant that swallows its own error text is a plant whose
+# death cannot be diagnosed from the log.
+#
+# WHY A BASH COPY BLOCKING ON A FIFO, AND NOT A COPY OF `sleep`: a `sleep` copy is a
+# binary whose behaviour depends on argv[0] and on which coreutils the runner ships, and
+# this harness paid for that assumption with a permanently red ubuntu leg — the plant
+# exited on its own, so the census correctly reported `clean: … 0 candidate(s)` about a
+# process the case still believed it had to kill, and the case reported the kill as a
+# success. bash is the copy this repo has ALREADY MEASURED as plantable on all three
+# runners: Case L names a bash copy `fulcrum` and depends on it surviving the census, on
+# ubuntu, macOS and Git-for-Windows bash alike. Naming that copy `fake_worker_core` keeps
+# argv[0] EXACTLY the watched image name — which is the thing the census matches (full
+# basename of the FIRST argv element; Cases B2/B3/J) — so the plant stays visible and the
+# case stays non-vacuous.
+#
+# The block itself: `exec 3<>fifo` on a FIFO never blocks (an O_RDWR open does not wait
+# for a writer) and a `read` from it never sees EOF, so the plant parks in `read` at 0.0%
+# CPU and leaves ONLY when something signals it. Nothing here depends on any external
+# binary's argument handling, which is the property the `sleep` copy did not have.
+#
+# The marker is passed explicitly and never inherited by accident: a plant that must NOT
+# look like this run (Case U's props, the decoy) is given an empty one, because the
+# harness's own marker is exported into every child by default and a prop carrying it
+# would be a real leak for the next live census to chase.
+# Whether THIS platform's setsid understands `-w`. Probed, not assumed, and the probe
+# decides a FALLBACK rather than a skip: `-w` is a diagnostic nicety (it makes setsid stay
+# as the plant's parent and exit with the plant's status, so report_plant_exit can name the
+# reason a plant left), not a capability the case needs. Skipping on a setsid too old for
+# `-w` would turn a missing nicety into a red ubuntu leg, which is the same mistake this
+# file keeps making in other people's code.
+SETSID_SUPPORTS_W=0
+setsid_supports_w() {
+  [[ $SETSID_SUPPORTS_W == 1 ]] && return 0
+  command -v setsid >/dev/null 2>&1 || return 1
+  # `setsid -w true` must actually RUN `true` and come back 0. A setsid without `-w`
+  # prints a usage error and exits non-zero, which is the answer we want.
+  if setsid -w true >/dev/null 2>&1; then
+    SETSID_SUPPORTS_W=1
+    return 0
+  fi
+  return 1
+}
+
+plant_blocking() {
+  local image="$1" fifo="$2" token="$3" marker="$4" via_setsid="$5" out="${6-/dev/null}"
+  if [[ "$via_setsid" == 1 ]] && setsid_supports_w; then
+    FULCRUM_CI_RUN_MARKER="$marker" setsid -w "$image" \
+      -c 'exec 3<>"$1"; read -r plant_wait <&3' fake_worker "$fifo" "$token" \
+      </dev/null >"$out" 2>&1
+  else
+    FULCRUM_CI_RUN_MARKER="$marker" "$image" \
+      -c 'exec 3<>"$1"; read -r plant_wait <&3' fake_worker "$fifo" "$token" \
+      </dev/null >"$out" 2>&1
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STOPPING A PLANT — two reapers, and why the SECOND one uses no tools at all
+# ─────────────────────────────────────────────────────────────────────────────
+# Everything here exists to keep a plant out of the process table after the harness is
+# done with it, because a surviving plant is named `fake_worker_core` — a WATCHED image
+# — so the NEXT live census in the same run reports it as a leak of THIS run and the
+# self-test has manufactured the exact defect it is supposed to detect. That is not a
+# hypothetical; it is what the Windows leg of run 43649430601 did: the kill path asked
+# `pgrep` for the children of a pid, Git-for-Windows bash has no `pgrep`, the plant was
+# never signalled, and `wait` then sat on the blocked plant until the leg was cancelled
+# at 15 minutes. A reaper that depends on a binary the platform may not ship is not a
+# reaper, so the signal path below is `ps`-based and behind it sits a reaper that needs
+# nothing but a FIFO this harness owns and a shell builtin.
+#
+# MEASURED, AND IT CONTRADICTS THE OBVIOUS ASSUMPTION. The plant opens its own FIFO
+# `3<>fifo` (O_RDWR) and then reads it, so THE PLANT IS ITS OWN WRITER. Nothing about
+# the harness exiting closes that write end: measured by starting a plant, recording no
+# pid, letting the harness exit, and finding the plant STILL parked in `read` three
+# seconds later having written nothing. So "the harness holds the writer fd, so the plant
+# sees EOF when the harness exits" is FALSE for this plant shape, and the harness exiting
+# is NOT a backstop. The same measurement shows what is: writing ONE LINE into the FIFO
+# makes the plant's `read` return, its script run off the end, and the process exit 0 —
+# with no pid, no `ps`, no `pgrep` and no `kill` involved. That is the only reaper here
+# that a missing binary cannot defeat, which is why `self_test_cleanup` does it
+# FIRST and the signal tree SECOND.
+#
+# plant_release_fifo <fifo> — release every plant blocked on <fifo>, using no process
+# tool at all. Best-effort and never fatal: a FIFO whose plant has already gone is not
+# an error.
+#
+# WHY A BURST OF LINES AND NOT ONE: one line wakes exactly ONE reader. Measured — two
+# plants blocked on the same FIFO, one write, and only the second one left. That is what
+# left a `fake_worker_core` alive in the simulated-Git-Bash run: the three plant-probe
+# arms used to share `probe.fifo`, so the trap's single release line freed one of them and
+# abandoned the rest. Each plant now has its OWN FIFO (probe-copy / probe-ctrl /
+# probe-setsid), which is the right shape, and the burst is the belt that keeps the reaper
+# correct even if a future plant shares one — with one FIFO per plant the extra lines
+# cannot wake a different plant, so the burst costs nothing and removes the class.
+plant_release_fifo() {
+  local fifo="$1" n=0
+  [[ -p "$fifo" ]] || return 0
+  # `<>` (O_RDWR) and not `>`: opening a FIFO for WRITE alone blocks until a reader
+  # appears, and a cleanup path that can block is the same class of bug this section
+  # exists to fix. O_RDWR never waits, and if the plant is gone the bytes simply sit in
+  # a buffer inside a scratch dir that is about to be removed. The subshell closes the
+  # fd on the way out.
+  ( exec 9<>"$fifo" 2>/dev/null || exit 0
+    while ((n < 8)); do
+      printf 'self-test cleanup: release\n' >&9 2>/dev/null || break
+      n=$((n + 1))
+    done ) >/dev/null 2>&1 || true
+  return 0
+}
+
+# plant_child_pids <pid> — the pids whose PARENT is <pid>, printed one per line. Empty
+# and return 0 when there are none OR when the table will not answer.
+#
+# `ps -eo pid=,ppid=` and nothing else: `pid=` and `ppid=` are two of the five columns
+# `unix_enumeration_works` has already proved answer on this machine, so this asks
+# nothing the capability probe has not already vetted — the same argument `find_planted`
+# makes for its `pid=,args=`. It is also the technique Case M already uses to find a
+# child by ppid. This is deliberately NOT `pgrep`: the header at the top of this file
+# records that Windows has no `pgrep` at all, and a helper that needs it strands the kill
+# path there (measured — that is the 15-minute hang above).
+plant_child_pids() {
+  local parent="$1"
+  [[ "$parent" =~ ^[0-9]+$ ]] || return 0
+  ps -eo pid=,ppid= 2>/dev/null | awk -v p="$parent" '$2 == p {print $1}' 2>/dev/null || true
+  return 0
+}
+
+# How far plant_kill_tree descends. Eight is far past any plant this harness can build
+# (a wrapper, a plant, maybe a bash child), and the bound is what makes the walk safe to
+# run against a `ps` that lies: a table that reports a pid as its own ancestor cannot
+# spin here forever.
+PLANT_KILL_MAX_DEPTH=8
+
+# plant_kill_tree <pid> — signal <pid> AND every process under it.
+#
+# Needed because the plant is not always the pid the shell reported. Through
+# `setsid -w` the reported pid is setsid, which is the plant's PARENT; killing only the
+# parent would orphan the plant, and an orphaned fake_worker_core outlives the self-test
+# and is then a real leak the next census correctly reports. Measured on the ubuntu leg
+# of run 43649430601 the same shape appears WITHOUT setsid: a backgrounded `plant_blocking`
+# reported pid 2674138 and the plant lived at 2674140, so a pid-only kill there would
+# have signalled a wrapper and left the watched image running.
+#
+# The tree walk is repeated (children of children) rather than one level deep, because
+# that depth is a property of setsid and bash's exec optimisation, not of this harness,
+# and a one-level assumption that stops holding on some runner shows up as a leaked
+# plant rather than as a failure. Descendants go first and the pid itself goes last, so
+# a parent is never killed in a way that orphans a child we have not yet reached.
+#
+# NEVER FATAL, and that is load-bearing rather than tidy: this runs inside the EXIT trap
+# and inside the plant probe, both under `set -euo pipefail`, where one failing command
+# mid-way through a kill sequence is precisely how a plant gets left behind. Every
+# command here is guarded, and the function always returns 0.
+plant_kill_tree() {
+  local pid="$1" depth="${2-0}" child
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  # Never turn the reaper on the harness itself or on init, whatever a lying `ps` says.
+  if [[ "$pid" == "$$" || "$pid" == "1" ]]; then
+    return 0
+  fi
+  if ((depth < PLANT_KILL_MAX_DEPTH)); then
+    while IFS= read -r child; do
+      [[ "$child" =~ ^[0-9]+$ ]] || continue
+      plant_kill_tree "$child" $((depth + 1))
+    done < <(plant_child_pids "$pid")
+  fi
+  kill -KILL "$pid" 2>/dev/null || true
+  return 0
+}
+
+# plant_is_running <pid> — 0 when <pid> can still RUN, 1 when it cannot (exited, or a
+# zombie waiting to be reaped).
+#
+# `kill -0` is a SHELL BUILTIN, which is why liveness is asked of it and not of `ps`: the
+# whole point of this section is that the reaper must still work where `ps` is the cygwin
+# stub that exits 1. `kill -0` does succeed for a zombie, and this file already knows that
+# (env_from_procfs re-probes with `ps` for exactly that reason), so the zombie case is
+# resolved from `ps -o stat=` when ps can answer. WHEN IT CANNOT, the answer is "running"
+# — the safe direction, because a false "running" costs one bounded wait and a warning,
+# while a false "gone" leads straight to the unconditional `wait` that hangs.
+plant_is_running() {
+  local pid="$1" st
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  st="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')" || st=""
+  case "$st" in
+    Z*) return 1 ;;
+  esac
+  return 0
+}
+
+# plant_wait_until_gone <pid> — bounded (3 s) poll for <pid> to stop being runnable.
+# Returns 0 when it is gone OR is a zombie awaiting reap, 1 when it is STILL RUNNING after
+# the budget.
+#
+# The bound is the point. `wait` on a plant that nobody successfully signalled does not
+# return, and that is the second half of the Windows hang above: the kill path left the
+# plant blocked, and `wait` on it hung for 15 minutes. Nothing in this harness may block
+# on a process it has not first proved is gone, so callers poll here and then say so out
+# loud rather than going quiet forever.
+#
+# WHY A ZOMBIE COUNTS AS GONE HERE: a killed child of this shell stays in the table until
+# it is reaped, so a poll that demanded the pid VANISH would report every successfully
+# killed plant as a survivor. "Gone" means "can no longer run", which is what the census
+# cares about — and plant_reap collects it immediately afterwards, so it does not linger
+# to be misread as a leak (an unreaped zombie of a watched image would rightly be reported
+# via its parent's marker, and the parent here is this very shell).
+plant_wait_until_gone() {
+  local pid="$1" attempt=0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  while ((attempt < 30)); do
+    plant_is_running "$pid" || return 0
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+# plant_reap <pid> — collect the status of a plant this shell has PROVEN is gone, so a
+# killed plant does not linger in the table as a zombie.
+#
+# Gated on the pid being a JOB OF THIS SHELL, which is what makes it safe to keep: `wait`
+# on a still-running, FIFO-blocked child never returns (the Windows hang again), and
+# `wait` on a pid that is not our child is just noise. `jobs` is a builtin, so the gate
+# itself needs no tool. Callers must still poll first.
+plant_reap() {
+  local pid="$1" job
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  for job in $(jobs -p 2>/dev/null); do
+    if [[ "$job" == "$pid" ]]; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+  done
+  return 0
+}
+
+PLANT_PROBE_STATUS="not-run"
+# plant_image_stays_alive_blocking <image> <outfile> <fifo> <token> [via-setsid] — does
+# the plant this harness ACTUALLY uses stay alive? Returns 0 if it was still up a second
+# after being started (then kills it), 1 if it exited inside that second. Sets
+# PLANT_PROBE_STATUS to the status it exited with, or `ran`.
+#
+# This probes `plant_blocking` and nothing else, on purpose: a probe of some other plant
+# shape would answer a question no case asks. It exists because of what the ubuntu runner
+# said back when Case I was finally made to look at its own plant — with `$!` gone
+# entirely, the plant's pid was FOUND by a `ps` scan of its path (pid 5775, so the exec
+# happened and the locator works) and the plant was then GONE for the whole three seconds
+# that followed, with nothing left at that path in the table; the decoy never appeared at
+# all (run 43644621082). A plant that starts and leaves is a DIFFERENT bug from a plant
+# that is mis-located, and only the second is the census's business. Probing the real
+# plant shape is how the two are told apart before seven assertions are staked on it.
+#
+# `$!` is legitimate HERE and does not contradict the rule this branch put in Case I:
+# there is no intermediate that may fork between this shell and the child in the plain
+# arm, so the pid the shell reports IS the exec'd process. The rule was never "never read
+# $!" — it was "never read $! THROUGH something that may fork".
+plant_image_stays_alive_blocking() {
+  local image="$1" out="$2" fifo="$3" token="$4" via="${5-0}"
+  if [[ "$via" == 1 ]] && ! command -v setsid >/dev/null 2>&1; then
+    PLANT_PROBE_STATUS="no-setsid"
+    return 0
+  fi
+  local pid rc=0 i=0
+  PLANT_PROBE_STATUS="ran"
+  plant_blocking "$image" "$fifo" "$token" "selftest-probe-$$" "$via" >"$out" 2>&1 &
+  pid=$!
+  # Registered with the trap FIRST, before anything can fail or return. A probe that
+  # leaves a plant behind is not a cosmetic leak: the plant IS one of the watched images,
+  # so the next live census in the same run reports it as a leak of THIS run and the
+  # self-test has manufactured the very defect it is supposed to detect. The trap is the
+  # guarantee; the explicit kill below is only the tidy version.
+  self_test_planted+=("$pid")
+  while ((i < 10)); do
+    ps -p "$pid" >/dev/null 2>&1 || break
+    i=$((i + 1))
+    sleep 0.1
+  done
+  if ps -p "$pid" >/dev/null 2>&1; then
+    # Signal the pid AND every descendant (re-parenting can orphan children). This is
+    # `plant_kill_tree` and not `pgrep -P`: Git-for-Windows bash has no `pgrep`, the
+    # child lookup there found nothing, the plant was never signalled, and the `wait`
+    # that followed hung the Windows leg until it was cancelled at 15 minutes
+    # (run 43649430601, `line 1654: pgrep: command not found`). The file's own header had
+    # ALREADY recorded "Windows has neither setsid nor pgrep"; this helper ignored it.
+    plant_kill_tree "$pid"
+    # Release the plant through its FIFO UNCONDITIONALLY, before asking whether the kill
+    # worked — and this ordering is the fix for a leak the harsher simulation caught. The
+    # pid the shell recorded is often NOT the plant (setsid, or a backgrounded job whose
+    # exec optimisation did not happen), so killing it can succeed while the plant is
+    # orphaned and still blocked. On the simulated Git-Bash leg, where `ps -eo` will not
+    # answer and the descendant walk therefore finds nothing, exactly that happened: the
+    # wrapper died, "is the pid gone?" answered yes, and a `fake_worker_core` was left
+    # running. "The recorded pid is gone" is NOT evidence the plant is gone.
+    plant_release_fifo "$fifo"
+    plant_kill_tree "$pid"
+    # Bounded, and that is not a style choice — `wait` on a plant that was never
+    # successfully signalled never returns, and that is the half of the hang the kill
+    # fix alone would not have removed.
+    if plant_wait_until_gone "$pid"; then
+      plant_reap "$pid"
+    else
+      printf 'WARNING plant probe: pid %s survived the kill AND its FIFO release\n' "$pid" >&2
+    fi
+    return 0
+  fi
+  wait "$pid" 2>/dev/null || rc=$?
+  PLANT_PROBE_STATUS="$rc"
+  return 1
+}
+
+# plant_probe_words <status> — the exit status of a plant probe, in words a human reads
+# once at 2 a.m. `ran` is the healthy answer; 0 means the plant RETURNED BY ITSELF, which
+# is the shape that turns every live plant case into a lie about the census.
+plant_probe_words() {
+  case "${1:-}" in
+    ran)   printf 'still alive after 1s (healthy)\n' ;;
+    no-setsid)  printf 'not probed (no setsid on this platform)\n' ;;
+    no-control) printf 'not probed (the control copy could not be made)\n' ;;
+    0)     printf 'EXITED, status 0 — it returned on its own\n' ;;
+    126)   printf 'EXITED, status 126 — could not be executed\n' ;;
+    127)   printf 'EXITED, status 127 — file not found or not executable\n' ;;
+    1*)    printf 'EXITED, status %s — killed by signal %s\n' "$1" "$((${1} - 128))" ;;
+    "")    printf 'EXITED, status unknown\n' ;;
+    *)     printf 'EXITED, status %s\n' "$1" ;;
+  esac
+}
+
+# find_planted <path> <token> — the pid of a LIVE process whose argv[0] is EXACTLY <path>
+# and which carries <token> as one of its later argv FIELDS; printed. Nothing and exit 1
+# if the table never showed one.
+#
+# This exists because `"$!"` is not the plant. Case I used to record `$!` from a
+# backgrounded `setsid "$live/fake_worker_core" 300` and then grade the census
+# against THAT pid. `setsid` forks when it is already a process-group leader — which
+# is exactly what a backgrounded job of a script shell is — so the pid the shell
+# reports is `setsid`'s own, and it exits the moment it has forked the real plant,
+# which lives on under a different pid. The case then reported "the planted process
+# was never OBSERVED alive" for a plant that was sitting in the table the whole time
+# under a pid nobody was looking at. Measured on the ubuntu runner across two runs of
+# ONE commit (7f21099): run 43638510359 saw NEITHER plant and both recorded pids were
+# dead within the poll window; run 43639574382 saw the recorded pid alive for ~50 ms
+# and gone before the census ran, so the census reported `clean: … 0 candidate(s)`
+# and the case STILL printed "the planted process was alive, and is gone after the
+# census" — a green assertion about a kill that never happened, which is the exact
+# vacuity `plant_was_alive` was written to make impossible.
+#
+# Case M has never had this bug, on the same runner, because it does not trust `$!`:
+# it scans `ps` for the plant's own path. The technique that works and the technique
+# that fails were both in this file; Case I is now on the side that works.
+#
+# WHY THE SCAN KEYS ON (path, token) AND NOT ON THE IMAGE NAME: `fake_worker_core` is one
+# of MATCH_IMAGES and the census matches the FULL basename of the FIRST argv element, so a
+# plant renamed to make it findable is a plant the census cannot see at all, and the case
+# becomes vacuous. Case I needs TWO plants of that same image — its own, and a decoy
+# carrying another run's marker — so something other than the name has to tell them apart,
+# and the token is a plain argv FIELD of each, unique per run, sitting in the same
+# untruncated `args=` column the census itself classifies on.
+#
+# Polls for the same reason plant_was_alive does: fork+exec races this shell.
+#
+# NO SEPARATE CAPABILITY PROBE IS NEEDED for its `ps -eo pid=,args=` spelling, and that
+# is an argument rather than an oversight: `pid=` and `args=` are two of the five columns
+# unix_enumeration_works already proves answer on this machine, so cap_ps==1 means every
+# keyword find_planted asks for has been measured here. A probe for a proven subset would
+# only add a second place to be wrong about the same `ps`.
+find_planted() {
+  local base="$1" token="$2" attempt=0 hit=""
+  [[ -n "$base" && -n "$token" ]] || return 1
+  while ((attempt < 30)); do
+    # argv[0] must be EXACTLY the plant's path (field 2 — field 1 is ps's pid column) and
+    # the token must be one of the fields AFTER it, compared with `==` and never as a
+    # substring, so a longer path that merely CONTAINS the token cannot match. Scanning
+    # every later field rather than a fixed position is what lets one locator serve both
+    # the setsid arm and the plain arm: the plant's argv is
+    #     <image> -c <script> fake_worker <fifo> <token>
+    # and pinning a column index would break the moment the script grows an argument.
+    hit="$(ps -eo pid=,args= 2>/dev/null \
+      | awk -v b="$base" -v t="$token" '
+          $2 == b { for (i = 3; i <= NF; i++) if ($i == t) { print $1; exit } }
+        ')"
+    if [[ -n "$hit" ]]; then
+      printf '%s' "$hit"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+# report_plant_exit <status-file> <output-file> — when a plant could not be observed,
+# say what it EXITED with, and what it printed on the way out.
+#
+# The whole point of this is to refuse to guess. A plant that vanishes is either the
+# enumerator failing to see a live process (the census's bug, and what Case I exists to
+# catch) or the plant having RUN AND LEFT (the harness's bug, and nothing the census
+# should be graded for). Those two look identical in a `ps` that finds nothing, and the
+# only thing that tells them apart is the exit status of the process itself. A status of
+# 0 means the plant returned on its own — a plant binary that will not stay alive; 128+N
+# means signal N ended it — something in this run killed it; 126/127 means it never
+# exec'd at all. Guessing between those cost this branch a full CI cycle.
+#
+# Prints nothing when the recorder never ran (the plant is still up, or never started),
+# so the green path and the never-started path stay as quiet as they were.
+report_plant_exit() {
+  local status_file="$1" out_file="$2" status=""
+  [[ -r "$status_file" ]] || return 0
+  status="$(cat "$status_file" 2>/dev/null || true)"
+  [[ -n "$status" ]] || return 0
+  printf '       the plant process EXITED, with status %s' "$status"
+  case "$status" in
+    0)   printf ' — it returned on its own; this plant binary will not stay alive\n' ;;
+    126) printf ' — it could not be executed (not a valid program for this shell)\n' ;;
+    127) printf ' — the file was not found or not executable\n' ;;
+    1*)  printf ' — killed by signal %s (something in this run signalled it)\n' "$((status - 128))" ;;
+    *)   printf '\n' ;;
+  esac
+  if [[ -r "$out_file" ]] && [[ -s "$out_file" ]]; then
+    printf '       what the plant printed before it left:\n'
+    sed 's/^/         /' "$out_file" | head -5
+  fi
+}
+
+# describe_plant_table <path> — on a FAIL, print what the process table actually
+# held for this self-test's plant path, plus the `setsid` this runner really has.
+# A plant that cannot be found is a claim about the table, and a claim about a table
+# nobody printed is not debuggable: the two runs of 7f21099 disagreed about whether
+# the plant existed AT ALL, and the FAIL line alone could not say which of them saw a
+# real absence and which saw a lookup that was aimed at the wrong pid. Only ever
+# called from a failure branch, so the green path stays quiet.
+describe_plant_table() {
+  local base="$1" setsid_path="" setsid_version=""
+  printf '       the table, for %s:\n' "$base"
+  # The needle goes through the ENVIRONMENT and not through awk's -v: awk's own argv
+  # carries `-v b=<path>`, so a -v form would report the scan itself as a row of the
+  # table it is describing — a diagnostic that invents the process it was asked about.
+  # The assignment is on AWK, not on `ps`: an env prefix binds to the command it
+  # precedes, and on the pipeline HEAD it would set nothing the matcher can see,
+  # leaving an EMPTY needle that matches every row on the box (measured — that is
+  # exactly what the first draft of this printed). Only pid/ppid/stat/args, the columns
+  # this file has MEASURED on every runner; a column BSD ps rejects would make the
+  # whole `ps` fail and this would report "nothing was in the table" about a table it
+  # never read.
+  local rows=""
+  rows="$(ps -eo pid=,ppid=,stat=,args= 2>/dev/null \
+    | PLANT_NEEDLE="$base" awk '
+      ENVIRON["PLANT_NEEDLE"] != "" && index($0, ENVIRON["PLANT_NEEDLE"]) { print "         " $0 }
+    ' || true)"
+  if [[ -n "$rows" ]]; then
+    printf '%s\n' "$rows"
+  else
+    printf '       (NOTHING in the table at that path — the plant is not there)\n'
+  fi
+  setsid_path="$(command -v setsid 2>/dev/null || true)"
+  if [[ -n "$setsid_path" ]]; then
+    setsid_version="$("$setsid_path" --version 2>/dev/null | head -1)"
+  fi
+  printf '       setsid: %s%s\n' "${setsid_path:-<absent — setsid cannot be the plant here>}" \
+    "${setsid_version:+ — $setsid_version}"
+}
+
 # unix_enumeration_works — does the exact `ps` spelling enumerate_unix uses actually
-# answer HERE? This is a CAPABILITY probe, not an opinion about the platform: the
+# answer HERE? This is a CAPABILITY PROBE, not an opinion about the platform: the
 # live-census cases (I, L, R, M) are all unix-shaped, and on Git-Bash/MSYS the cygwin
 # `ps` exists but `ps -eo …` EXITS 1, so `command -v ps` alone would let every one of
 # them run against an empty table and grade a look that was never taken.
@@ -1563,20 +2030,141 @@ unix_enumeration_works() {
 # with, which is exactly the misattribution this branch just fixed for the message.
 # So probe it with a throwaway marker (nothing in the table can carry it, so the
 # answer is 0 or 2 and never 1) and skip rather than fail when the census cannot look.
+#
+# It RUNS THE CENSUS MORE THAN ONCE, and that is not hedging — it is the difference
+# between grading the census and grading a race. On a CI runner the table this probe
+# reads also holds the `cargo test` that finished seconds earlier, and that suite
+# spawns `target/debug/fake_worker_core` BY PATH. One of those, exiting inside the
+# census's own list-then-read window, makes the census refuse with gone-before-read —
+# which is the RIGHT answer for the guard, and a wrong reason to conclude "this
+# platform cannot read provenance". Measured on macos-latest, two runs of one commit:
+# 43638510359 refused here and Case H2 went red; 43639574382 refused and the probe
+# answered "cannot answer", so I, L, R and M were SKIPPED — the same foreign transient
+# candidate flipping between a false FAIL and a silent UNPROVEN. A bounded retry rides
+# through the race; a census that refuses on EVERY attempt is still refused, and the
+# refusal is what gets reported.
 live_census_can_answer() {
   local probe_marker="selftest-capability-$$-$RANDOM"
-  local rc=0
-  env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-    FULCRUM_CI_RUN_MARKER="$probe_marker" bash "$script" >/dev/null 2>&1 || rc=$?
-  ((rc == 0))
+  local attempt=1 rc=0 out
+  while ((attempt <= LIVE_CENSUS_ATTEMPTS)); do
+    rc=0
+    out="$(env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+      FULCRUM_CI_RUN_MARKER="$probe_marker" bash "$script" 2>&1)" || rc=$?
+    if ((rc == 0)); then
+      return 0
+    fi
+    if ! census_refusal_is_a_foreign_transient "$out"; then
+      # A refusal this harness cannot blame on somebody else's vanishing process — a
+      # blocked env read, an unreadable candidate, a ps that will not answer. That is
+      # the real answer and the retry must not bury it.
+      return 1
+    fi
+    printf 'NOTE live-census probe: attempt %s/%s refused because a candidate this self-test\n' "$attempt" "$LIVE_CENSUS_ATTEMPTS" >&2
+    printf '     does not own vanished mid-read (%s) — retrying\n' "$(first_declined_pid "$out")" >&2
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  return 1
 }
 
-self_test_cleanup() {
-  local pid
-  for pid in ${self_test_planted[@]+"${self_test_planted[@]}"}; do
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+# How many times a live census whose ONLY complaint is somebody else's vanishing
+# candidate is re-run before the harness accepts the refusal as the platform's answer.
+# Three, with half a second between: the race is a millisecond window, so a real
+# block reproduces on every attempt and a race does not.
+LIVE_CENSUS_ATTEMPTS=3
+
+# census_refusal_is_a_foreign_transient <census output> — 0 only when the census
+# refused AND every candidate it could not resolve is named by pid AND none of those
+# pids is a process this self-test planted. The harness owns its plants and nothing
+# else in the table, so "I could not read pid X" is somebody else's business only when
+# X is not ours; the same sentence about a pid we planted is a finding about THIS
+# census and stays a failure. A refusal that names no candidate at all (the macOS
+# control probe, a ps that failed) is NOT forgiven by this predicate — nothing about it
+# is attributable to a race.
+census_refusal_is_a_foreign_transient() {
+  local out="$1" pid seen=0 owned=" "
+  case "$out" in
+    *"gone-before-read: "* | *"unreadable: "*) : ;;
+    *) return 1 ;;
+  esac
+  # `${arr[@]+"${arr[@]}"}` and not `${arr[*]}`: this file runs under `set -u` on macOS's
+  # bash 3.2, where an empty array is UNBOUND and the plain form dies. The idiom is the
+  # one self_test_cleanup already uses for the same array.
+  local owned_pid
+  for owned_pid in ${self_test_planted[@]+"${self_test_planted[@]}"}; do
+    owned="$owned$owned_pid "
   done
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    seen=1
+    case "$owned" in
+      *" $pid "*) return 1 ;;
+    esac
+  done < <(printf '%s\n' "$out" \
+    | sed -n 's/^\(gone-before-read\|unreadable\): \([0-9][0-9]*\) .*/\2/p')
+  ((seen == 1)) || return 1
+  return 0
+}
+
+# first_declined_pid <census output> — the first candidate pid the census could not
+# resolve, for the retry note. Purely cosmetic; empty if the refusal names none.
+first_declined_pid() {
+  printf '%s\n' "$1" | sed -n 's/^\(gone-before-read\|unreadable\): \([0-9][0-9]*\) .*/\2/p' | head -1
+}
+
+# self_test_cleanup — the EXIT trap. Its one job is to leave NO plant in the process
+# table, because every plant is named after a watched image and a survivor is reported by
+# the NEXT live census as a leak this run made.
+#
+# IT DELIBERATELY DOES NOT DEPEND ON ANY EXTERNAL TOOL IT HAS NOT PROVEN. The old shape
+# was `kill -KILL` then `wait` per recorded pid, and it had two holes. (1) `wait` on a
+# plant nobody had successfully signalled never returns — a cleanup that can block is not
+# a cleanup, and on the Windows leg of run 43649430601 it is what turned a broken kill
+# path into a 15-minute hang. (2) It could only reach a pid that had been RECORDED: a
+# plant whose pid was lost (the whole reason `find_planted` exists) was unrecoverable
+# here. So the trap now releases the plants through their FIFOs FIRST — a shell builtin,
+# a redirect and a path, no `ps`, no `pgrep`, no `kill` — and only then does the pid-based
+# signal tree as the tidy version. The FIFO release is the real backstop; the kill is the
+# fast path. (Measured: the plant holds its OWN O_RDWR fd on the FIFO, so it is its own
+# writer and the harness exiting releases nothing — see the "STOPPING A PLANT" section.)
+#
+# Nothing in here may be able to fail the run: the trap runs under `set -euo pipefail`,
+# and a trap that dies halfway would abandon the rest of the plants.
+self_test_cleanup() {
+  local pid fifo
+
+  # 1. THE TOOL-FREE REAPER, and why it comes first: a line into a FIFO ends the plant's
+  #    `read`, its script runs off the end, and it exits 0. That needs no binary the
+  #    platform might be missing, so it is the step that still works when `ps` is a cygwin
+  #    stub and `pgrep` does not exist at all. The glob is a shell builtin, not `find`.
+  #    Every FIFO under the scratch dir goes, including one whose plant was never located.
+  if [[ -n "$self_test_root" && -d "$self_test_root" ]]; then
+    for fifo in "$self_test_root"/*.fifo "$self_test_root"/*/*.fifo; do
+      [[ -p "$fifo" ]] || continue
+      plant_release_fifo "$fifo"
+    done
+  fi
+
+  # 2. The tidy version, for anything the release did not get (a plant that had already
+  #    moved on from its FIFO read, or a descendant that was never blocked on one).
+  for pid in ${self_test_planted[@]+"${self_test_planted[@]}"}; do
+    # The "remove one pid" idiom the cases use — `${arr[@]/$pid/}` — BLANKS the element
+    # rather than deleting it, so a retired plant leaves an empty slot in the registry.
+    # That is not a pid and nothing may be claimed about it: the old trap no-op'd on it by
+    # accident (`kill -KILL ""` fails), and a warning here would blame the harness for a
+    # slot that holds no process.
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    plant_kill_tree "$pid"
+    if plant_wait_until_gone "$pid"; then
+      plant_reap "$pid"
+    else
+      # Loud, because this is the harness failing at its own housekeeping — and it is a
+      # WARNING rather than a verdict, since the trap runs after the verdict is decided
+      # and must not be able to rewrite one.
+      printf 'WARNING self-test cleanup: planted pid %s is STILL RUNNING after the FIFO release and the kill\n' "$pid" >&2
+    fi
+  done
+
   if [[ -n "$self_test_root" && -d "$self_test_root" ]]; then
     if ((self_test_keep_temp_dir == 1)); then
       printf 'self-test: kept scratch dir at %s\n' "$self_test_root"
@@ -1584,6 +2172,7 @@ self_test_cleanup() {
       rm -rf -- "$self_test_root"
     fi
   fi
+  return 0
 }
 
 expect_exit() {
@@ -1594,6 +2183,15 @@ expect_exit() {
   # read in the then-branch is 0, which would report a working guard as broken.
   local got=0 output
   output="$("$@" 2>&1)" || got=$?
+  report_exit "$what" "$want" "$got" "$output"
+}
+
+# report_exit <what> <want> <got> <output> — the ONE reporter for exit-code claims.
+# It exists so expect_live_census can retry a census without growing a second copy of
+# this pass/fail wording: a verdict printed by a paraphrase proves nothing about the
+# path that actually runs.
+report_exit() {
+  local what="$1" want="$2" got="$3" output="$4"
   if [[ "$got" == "$want" ]]; then
     printf 'ok   %s (exit %s)\n' "$what" "$got"
     LAST_OUTPUT="$output"
@@ -1607,6 +2205,75 @@ expect_exit() {
 }
 
 LAST_OUTPUT=""
+
+# run_live_census <marker> [mode] — the LIVE census, spelled ONCE, with the bounded
+# retry a case that does not own the whole process table needs.
+#
+# WHAT IS NEVER TOUCHED: no seam variable survives, not even CENSUS_PLATFORM (the live
+# path derives it from `uname` and REFUSES it from the environment — see
+# refuse_self_test_only_env_seams). The marker is the only thing a live run is allowed
+# to be told. `mode` exists for exactly one caller, Case H2, which is testing that
+# `CENSUS_MODE=live` — the HONEST spelling of the mode, not a seam — is accepted; every
+# other case runs with it unset, which is what the CI step does.
+#
+# THE RETRY, and its deliberately microscopic scope: it fires only when the census
+# refused (exit 2) AND named every candidate it could not resolve AND none of those pids
+# is one this self-test planted. That is the shape a FOREIGN process takes when it dies
+# inside the census's own list-then-read window, and on a CI runner that window is
+# shared with a `cargo test` that finished seconds earlier and spawns
+# `target/debug/fake_worker_core` BY PATH. The census is RIGHT to refuse over it ("I
+# could not tell" is not "nothing leaked") — but a case must not grade its own claim on
+# a table it does not own, and the measured fact is that this commit's self-test flips
+# on exactly that: run 43638510359's macOS leg went red at H2 over `gone-before-read:
+# 8329 fake_worker_core`, and run 43639574382, same SHA minutes later, never hit it.
+#
+# WHY IT COSTS NO TEETH. A refusal this may ride through can only name pids the harness
+# does NOT own; every pid Case I planted is in `self_test_planted`, so a census that
+# cannot read one of OUR plants is never retried — it fails, loudly. A census that
+# reports clean when it must report a leak (exit 1 ≠ 2) is never retried either. The
+# teeth stay where the CI step puts them: in Case I, graded against pids it observed.
+#
+# Sets LAST_CENSUS_OUT / LAST_CENSUS_RC (globals, because a retrying capture cannot
+# return a status and a body from one command substitution — and a caller that read the
+# body through `$(…)` would lose the status, which is the bug class expect_exit exists
+# to avoid).
+capture_live_census() {
+  local marker="$1" mode="${2-}"
+  local attempt=1 got=0 output=""
+  LAST_CENSUS_OUT=""
+  LAST_CENSUS_RC=0
+  while :; do
+    got=0
+    if [[ -n "$mode" ]]; then
+      output="$(env -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+        CENSUS_MODE="$mode" FULCRUM_CI_RUN_MARKER="$marker" bash "$script" 2>&1)" || got=$?
+    else
+      output="$(env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
+        FULCRUM_CI_RUN_MARKER="$marker" bash "$script" 2>&1)" || got=$?
+    fi
+    if ((got != 2)) || ((attempt >= LIVE_CENSUS_ATTEMPTS)) \
+        || ! census_refusal_is_a_foreign_transient "$output"; then
+      break
+    fi
+    printf 'NOTE the live census refused on attempt %s/%s over pid %s — a candidate this\n' \
+      "$attempt" "$LIVE_CENSUS_ATTEMPTS" "$(first_declined_pid "$output")" >&2
+    printf '     self-test does not own vanished mid-read. The census is right to refuse;\n' >&2
+    printf '     the claim being graded is not about it, so the census is re-run.\n' >&2
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  LAST_CENSUS_OUT="$output"
+  LAST_CENSUS_RC="$got"
+}
+LAST_CENSUS_OUT=""
+LAST_CENSUS_RC=0
+
+# expect_live_census <what> <want-exit> <marker> [mode] — expect_exit over capture_live_census.
+expect_live_census() {
+  local what="$1" want="$2"
+  capture_live_census "$3" "${4-}"
+  report_exit "$what" "$want" "$LAST_CENSUS_RC" "$LAST_CENSUS_OUT"
+}
 
 # Assert the previous expect_exit case also SAID the thing it must say — an exit
 # code alone cannot tell "refused because unreadable" from "refused for another
@@ -1664,6 +2331,94 @@ expect_file_lacks() {
   fi
 }
 
+# harness_code_lines <file> — the file's CODE, with whole-line comments and trailing
+# comments removed and with every QUOTED segment blanked, so a scan for a forbidden
+# binary finds an actual INVOCATION and not a sentence about it.
+#
+# This exists because the rule it serves cannot be written with a plain grep. This file
+# must contain the WORD `pgrep` in numbers of places — the header explains at length why
+# the census never uses it, and Cases B2/B3/J assert that `pgrep -x` would be BLIND to the
+# very images this guard hunts. A `grep -c pgrep` is therefore either always red or
+# tuned to a magic number that a future comment breaks. Blanking quoted segments kills
+# the other half of the problem: a forbidden name inside a case NAME or an error message
+# is text, not a call.
+#
+# `grep`/`sed` only, both already load-bearing elsewhere in this file. Note that the
+# patterns below are written with a bracket (`p[g]rep`) precisely so this helper cannot
+# match itself.
+harness_code_lines() {
+  local file="$1"
+  grep -vE '^[[:space:]]*#' -- "$file" 2>/dev/null \
+    | sed -e 's/"[^"]*"/""/g' -e "s/'[^']*'/{}/g" -e 's/[[:space:]]#.*$//'
+}
+
+# harness_function_body <file> <name> — the body of <name>(), from its definition to the
+# first column-zero `}`. Comments are stripped, so a needle can only be satisfied by CODE.
+#
+# This exists because a whole-file count is too weak a pin. `expect_code_line_count_at_least
+# "…the EXIT trap releases plants…" plant_release_fifo 3` stayed GREEN after the release
+# call was DELETED from the trap, because the helper's own definition and the probe's call
+# still made the total high enough. A count over the whole file proves a name is used
+# SOMEWHERE; it does not prove the one place that matters uses it. Scope the claim to the
+# function it is about and it stops being satisfiable by an unrelated caller.
+harness_function_body() {
+  local file="$1" name="$2"
+  awk -v fn="$name" '
+    $0 ~ "^" fn "\\(\\) \\{" { inside = 1; next }
+    inside { if ($0 == "}") exit; print }
+  ' "$file" 2>/dev/null | grep -vE '^[[:space:]]*#' \
+    | sed -e 's/"[^"]*"/""/g' -e "s/'[^']*'/{}/g" -e 's/[[:space:]]#.*$//'
+}
+
+# expect_function_calls <what> <file> <function> <needle> — fail unless <function>'s body
+# contains <needle> on a CODE line.
+expect_function_calls() {
+  local what="$1" file="$2" fn="$3" needle="$4" body
+  body="$(harness_function_body "$file" "$fn")"
+  if [[ -z "$body" ]]; then
+    printf 'FAIL %s\n' "$what"
+    printf '       could not find a definition for %s() to inspect\n' "$fn"
+    self_test_failures=$((self_test_failures + 1))
+  elif printf '%s\n' "$body" | grep -qF -- "$needle"; then
+    printf 'ok   %s\n' "$what"
+  else
+    printf 'FAIL %s\n' "$what"
+    printf '       %s() does not contain: %s\n' "$fn" "$needle"
+    self_test_failures=$((self_test_failures + 1))
+  fi
+}
+
+# expect_no_code_line <what> <file> <ERE> — fail if <ERE> matches any CODE line.
+expect_no_code_line() {
+  local what="$1" file="$2" ere="$3" hits
+  hits="$(harness_code_lines "$file" | grep -nE -- "$ere" || true)"
+  if [[ -n "$hits" ]]; then
+    printf 'FAIL %s\n' "$what"
+    printf '       offending code lines:\n'
+    printf '%s\n' "$hits" | while IFS= read -r line; do printf '       %s\n' "$line"; done
+    self_test_failures=$((self_test_failures + 1))
+  else
+    printf 'ok   %s\n' "$what"
+  fi
+}
+
+# expect_code_line_count_at_least <what> <file> <fixed-needle> <min> — the WIRING half of
+# a claim about a helper: that the code actually calls it, counted over code lines so a
+# comment mentioning the name cannot satisfy it.
+expect_code_line_count_at_least() {
+  local what="$1" file="$2" needle="$3" min="$4" count
+  count="$(harness_code_lines "$file" | grep -cF -- "$needle" || true)"
+  count="${count:-0}"
+  if [[ "$count" =~ ^[0-9]+$ ]] && ((count >= min)); then
+    printf 'ok   %s (%s code lines, >= %s)\n' "$what" "$count" "$min"
+  else
+    printf 'FAIL %s\n' "$what"
+    printf '       expected at least %s code lines containing: %s\n' "$min" "$needle"
+    printf '       found: %s\n' "$count"
+    self_test_failures=$((self_test_failures + 1))
+  fi
+}
+
 # new_fixture <name> — a fresh fixture dir; echoes its path
 new_fixture() {
   local dir="$self_test_root/$1"
@@ -1691,16 +2446,69 @@ run_self_test() {
   # assert an OUTCOME on a platform that can produce one.
   local live="$self_test_root/live" bin
   mkdir -p "$live"
+  # THE PLANT IS A COPY OF BASH, RENAMED — not a copy of `sleep`, which is what this
+  # harness used to plant, and which is why it was red on ubuntu and green on the Linux
+  # box that wrote it. A copy of `sleep` is a binary whose behaviour depends on argv[0]
+  # and on which `sleep` the runner happens to ship; measured, the same bytes that sleep
+  # for ten minutes on one machine exit in under a tenth of a second on another. When the
+  # plant exits by itself, EVERY live assertion downstream is about a process that is
+  # already gone: the census reports `clean: … 0 candidate(s)`, the case reports "it was
+  # alive and is gone after the census", and the guard certifies a kill that never
+  # happened. That is the vacuity this whole file exists to refuse, arriving from the
+  # other direction — not a lookup aimed at the wrong pid, but a subject that cannot be
+  # kept alive long enough to be looked at at all.
+  #
+  # bash is the image this repo has ALREADY MEASURED as plantable on all three runners:
+  # Case L copies bash, names it `fulcrum`, and relies on it staying alive while its child
+  # runs the census — on ubuntu, macOS and Git-for-Windows bash alike. Naming a bash copy
+  # `fake_worker_core` gives the same durability while keeping argv[0] EXACTLY the watched
+  # image name, which is what the census matches (full basename of the FIRST argv element,
+  # Cases B2/B3/J), so the plant stays visible and the case stays non-vacuous. Blocking on
+  # a FIFO costs no CPU and takes no dependency on any coreutils binary's argument
+  # handling; the plant leaves only when the harness (or the census) makes it.
   for bin in fake_worker_core fulcrum; do
-    if cp "$(command -v sleep 2>/dev/null || echo /nonexistent)" "$live/$bin" 2>/dev/null; then
+    if cp "$(command -v bash 2>/dev/null || echo /nonexistent)" "$live/$bin" 2>/dev/null; then
       chmod +x "$live/$bin"
     fi
   done
+  # The plants block on these (see plant_blocking), so they are created HERE — before the
+  # plant probe or any case can reach them. A plant whose FIFO does not exist cannot open
+  # it, exits at once, and the harness would then report its OWN ordering bug as a census
+  # defect (which is exactly what the first draft of this did). mkfifo is probed rather
+  # than assumed: where it is absent the live plant cases skip with that reason instead of
+  # planting something that cannot be held alive.
+  local live_fifo
+  for live_fifo in own other u-a u-b probe-copy probe-ctrl probe-setsid \
+                   q-orphan q-root q-mid q-leaf; do
+    mkfifo -- "$live/$live_fifo.fifo" 2>/dev/null || true
+  done
+  # The probe's CONTROL image: the SAME BYTES as the plant, under a name the census does
+  # not watch. If the control dies too, this platform cannot host a blocked bash plant at
+  # all; if the control lives and the watched-name copy dies, something is doing that to
+  # that specific image NAME, and the census is not the thing to blame.
+  if [[ -x "$live/fake_worker_core" ]]; then
+    cp -- "$live/fake_worker_core" "$live/control_image" 2>/dev/null && chmod +x "$live/control_image"
+  fi
   local cap_ps=1 cap_setsid=1 cap_plant=1 cap_live_env=1 cap_proc_env=1 cap_python3=1
+  local cap_plant_block=1 cap_control=1
   unix_enumeration_works || cap_ps=0
   command -v setsid >/dev/null 2>&1 || cap_setsid=0
   command -v python3 >/dev/null 2>&1 || cap_python3=0
+  command -v mkfifo >/dev/null 2>&1 || cap_plant_block=0
   [[ -x "$live/fake_worker_core" ]] || cap_plant=0
+  [[ -x "$live/control_image" ]] || cap_control=0
+  # THE PLANT MUST BE PROVEN TO RUN, not assumed to. `cap_plant` above only asks whether
+  # the copy is executable, and that is not the question Case I stakes its assertions on
+  # — the question is whether the copy STAYS ALIVE long enough to be a subject. This is
+  # measured, not theorised: on ubuntu-latest, with `$!` removed from Case I entirely and
+  # the plant located by a `ps` scan of its own path, the plant's pid WAS found and the
+  # plant was GONE three seconds later, with nothing left at that path in the table (run
+  # 43644621082); the decoy never appeared at all, and neither did either of Case U's
+  # plants, which are plain background jobs with no `setsid` anywhere near them. A plant
+  # that starts and dies in milliseconds is a DIFFERENT bug from a plant that is
+  # mis-located, and only the second one is the enumerator's business — so the harness now
+  # proves its own subject before grading anything about it, and if the subject cannot be
+  # kept alive it says so with the binary's own words rather than blaming the census.
   # Can the LIVE census read provenance here at all? Where it cannot, the live cases
   # must SKIP (the census is right to refuse; the case is just not gradeable) rather
   # than FAIL — see live_census_can_answer.
@@ -1712,8 +2520,9 @@ run_self_test() {
   # and go red for having no Linux procfs.
   [[ -r "/proc/$$/environ" ]] || cap_proc_env=0
   # Whether `$live/fulcrum` ends up being a real BASH (Case L's parent) — Case R
-  # depends on L's plant, and `-x` alone cannot tell a bash copy from the sleep copy
-  # the loop above left there, so L sets this itself.
+  # depends on L's plant, and `-x` alone cannot tell L's bash copy from the
+  # fake_worker_core copy the loop above also leaves in that directory, so L sets this
+  # itself when it has actually replaced the file with bash.
   local live_fulcrum_is_bash=0
   # A `ps` that cannot enumerate makes every live case ungradeable by construction: the
   # plant is unobservable and the census reads nothing. This is the Windows/Git-Bash
@@ -1724,6 +2533,74 @@ run_self_test() {
   local cap_why=""
   ((cap_ps == 0)) && cap_why="ps -eo pid=,ppid=,stat=,comm=,args= does not answer here (the cygwin ps on Git-Bash exits 1)"
   ((cap_live_env == 0)) && cap_why="${cap_why:+$cap_why; }the live census cannot read process provenance on this platform (it refuses, exit 2), which is correct for the census and ungradeable for a case that asserts a verdict"
+
+  # ── THE PLANT PROBE, run BEFORE any case that stakes an assertion on a plant ──────
+  # Three shapes, because the three answers name three DIFFERENT bugs with three
+  # different owners:
+  #   copy                       — can the copied binary run at all, and stay up?
+  #   pristine `sleep`, same shape — the CONTROL. If the original lives and the copy dies,
+  #                                  the defect is in the COPY (its name, or its path), not
+  #                                  in the shape of the plant.
+  #   copy, through `setsid -w`    — the EXACT shape Case I plants with. If the plain copy
+  #                                  lives and this one dies, `setsid` is what loses it.
+  # Measured reason this exists: on ubuntu-latest, with `$!` gone from Case I entirely and
+  # the plant located by a `ps` scan of its own path, the scan FOUND the plant (pid 5775,
+  # so the exec happened and the locator works) and the plant was then GONE for the whole
+  # three seconds that followed, with NOTHING at that path in the table; the decoy never
+  # appeared at all (run 43644621082). A plant that starts and leaves in under a poll
+  # interval is a DIFFERENT bug from a plant that is mis-located, and only the second is
+  # the census's business. Guessing between them cost this branch a CI cycle, so the
+  # harness now measures it and prints the answer.
+  #
+  # A NOTE, never a skip: a plant that cannot be kept alive is not a platform limitation
+  # another matrix leg covers, and on the ubuntu leg a skip is fatal anyway. Laundering it
+  # into a skip would trade a truthful FAIL for a vague one. Printed only when something
+  # actually failed to stay up, so the healthy path — every developer's machine, and
+  # hopefully every runner — stays quiet.
+  if ((cap_plant == 1)); then
+    local p_probe_out="$self_test_root/plant-probe.out"
+    local p_copy p_ctrl p_setsid
+    plant_image_stays_alive_blocking "$live/fake_worker_core" "$p_probe_out" "$live/probe-copy.fifo" p-copy || true
+    p_copy="$PLANT_PROBE_STATUS"
+    # CONTROL: a bash copy named something the census does NOT watch, blocked the same
+    # way. If this one dies too, the platform cannot host a blocked bash plant at all; if
+    # it lives and the watched-name copy dies, the runner is doing something to that
+    # specific image name and the census — not the harness — is the thing to believe.
+    if ((cap_control == 1)); then
+      plant_image_stays_alive_blocking "$live/control_image" "$p_probe_out" "$live/probe-ctrl.fifo" p-ctrl || true
+      p_ctrl="$PLANT_PROBE_STATUS"
+    else
+      p_ctrl="no-control"
+    fi
+    plant_image_stays_alive_blocking "$live/fake_worker_core" "$p_probe_out" "$live/probe-setsid.fifo" p-setsid 1 || true
+    p_setsid="$PLANT_PROBE_STATUS"
+    # `no-setsid` is a healthy answer for the third arm only — the first two never call
+    # setsid, so anything other than `ran` from them is a real failure.
+    # `no-setsid` and `no-control` are HEALTHY absences, not failures: macOS and
+    # Git-for-Windows bash have no setsid at all, and a control copy that could not be
+    # made is a missing prop. Only `ran` versus a real exit status is news.
+    if [[ "$p_copy" != ran ]] || { [[ "$p_ctrl" != ran ]] && [[ "$p_ctrl" != no-control ]]; } \
+        || { [[ "$p_setsid" != ran ]] && [[ "$p_setsid" != no-setsid ]]; }; then
+      printf 'NOTE plant probe — a plant that EXITS cannot be graded, whoever killed it:\n' >&2
+      printf '       copy    %s\n           -> %s\n' "$live/fake_worker_core" "$(plant_probe_words "$p_copy")" >&2
+      printf '       control %s (same bytes, UNWATCHED name)\n           -> %s\n' "$live/control_image" "$(plant_probe_words "$p_ctrl")" >&2
+      printf '       copy via setsid\n           -> %s\n' "$(plant_probe_words "$p_setsid")" >&2
+      printf '       status 0 = the plant RETURNED ON ITS OWN; 126/127 = it never execd;\n' >&2
+      printf '       128+N = signal N ended it. Every LIVE plant case below is at risk of\n' >&2
+      printf '       reporting a plant that LEFT as though the census could not SEE it.\n' >&2
+      # Byte sizes, not `file`: if the copy is not the same BYTES as the bash it was
+      # copied from, the runner's `cp` is the defect and everything downstream is noise.
+      # `wc -c` is portable; `file` is not installed on every runner, and a diagnostic
+      # that depends on a tool the script never probed is a diagnostic that prints
+      # nothing exactly when it is most needed.
+      printf '       byte sizes — copy %s vs %s %s\n' \
+        "$(wc -c <"$live/fake_worker_core" 2>/dev/null || echo '?')" \
+        "$(command -v bash 2>/dev/null || echo '<no bash>')" \
+        "$(wc -c <"$(command -v bash 2>/dev/null || echo /dev/null)" 2>/dev/null || echo '?')" >&2
+      printf '       runner uname: %s\n' "$(uname -a 2>/dev/null || echo '<uname failed>')" >&2
+    fi
+  fi
+
 
   local d
   # ---- Case A: a table with nothing of ours in it -----------------------------
@@ -1869,7 +2746,16 @@ run_self_test() {
   # always (CENSUS_MODE must not appear in the refusal's offender list, and no
   # fabricated clean), and the outcome half only where a census can actually reach one.
   local h2_live_out h2_live_rc=0
-  h2_live_out="$(env CENSUS_MODE=live bash "$script" 2>&1)" || h2_live_rc=$?
+  # The marker is this run's OWN (the harness exported it at the top of run_self_test).
+  # It used to be `live_census_can_answer`'s throwaway probe marker, and that is what
+  # turned a foreign process's exit into a false FAIL here: a throwaway marker means
+  # NOTHING in the table is attributable to this census, so the census is guaranteed to
+  # classify every candidate it meets — including a `cargo test` worker that dies
+  # inside its list-then-read window — and to refuse over it. With the run's real marker
+  # the census is answering its actual production question instead of an artificial one.
+  capture_live_census "$marker" live
+  h2_live_out="$LAST_CENSUS_OUT"
+  h2_live_rc="$LAST_CENSUS_RC"
   LAST_OUTPUT="$h2_live_out"
   # Match the seam-refusal's own signature, not the bare variable name: an unrelated
   # message that merely mentions CENSUS_MODE must not fail this.
@@ -1887,12 +2773,31 @@ run_self_test() {
   # (CENSUS_MODE=fixture and friends), which the loop above pins one variable at a
   # time; conflating the two would mean this case could only pass by refusing to run a
   # census it is asking for by name.
+  #
+  # THE OUTCOME HALF ASKS A QUESTION THIS CASE CAN ANSWER. It used to demand exit 0 —
+  # "the census certifies this machine clean" — which is not H2's claim (H2 is about
+  # seams) AND is not this case's property to own: the table belongs to the runner, and
+  # on a CI runner it holds the `cargo test` that just ran, whose fixture workers this
+  # census is expressly designed to catch. Measured, one commit, two macOS legs:
+  # 43638510359 refused over `gone-before-read: 8329 fake_worker_core` and H2 went red
+  # for a process it had nothing to do with; 43639574382 exited 0. So the assertion is
+  # now the one that is actually invariant: the live path must reach a VERDICT — 0
+  # clean, or 1 naming leaks — and must never be unable to look. Exit 2 stays red here,
+  # because "could not classify" is exactly what this guard refuses to paper over.
   if ((cap_enumerable == 1)); then
-    if [[ "$h2_live_rc" == 0 ]]; then
-      printf 'ok   H2 CENSUS_MODE=live reaches a real verdict on a platform that can read the table (exit 0)\n'
+    if [[ "$h2_live_rc" == 0 || "$h2_live_rc" == 1 ]]; then
+      printf 'ok   H2 CENSUS_MODE=live reaches a real verdict on a platform that can read the table (exit %s)\n' "$h2_live_rc"
+      if [[ "$h2_live_rc" == 1 ]]; then
+        # Loud, not hidden: a red census here is a real leak in the runner's table and
+        # H2 must not be the place that gets to swallow that. The run still goes red —
+        # from the census step, which is the step that owns the question.
+        printf 'NOTE H2 the live census reported LEAKS (exit 1) — H2 is satisfied (it reached a\n' >&2
+        printf '     verdict), the stray-process step is the one that must go red over these.\n' >&2
+      fi
     else
-      printf 'FAIL H2 CENSUS_MODE=live should have completed here, got exit %s\n' "$h2_live_rc"
+      printf 'FAIL H2 CENSUS_MODE=live could not reach a verdict here, got exit %s\n' "$h2_live_rc"
       printf '       output: %s\n' "$(printf '%s' "$h2_live_out" | tr '\n' '|')"
+      describe_plant_table "$live/fake_worker_core"
       self_test_failures=$((self_test_failures + 1))
     fi
   else
@@ -1938,9 +2843,10 @@ run_self_test() {
   # find it through `ps`, classify it through /proc/<pid>/environ, report it, and
   # kill it. If the enumeration were `--input`-only, or matched on comm, this fails.
   #
-  # THREE THINGS THIS CASE NEEDS, and it used to assume all three: a `ps` whose
+  # FOUR THINGS THIS CASE NEEDS, and it used to assume all four: a `ps` whose
   # `-eo` spelling answers (cygwin's `ps` exists on Git-Bash and EXITS 1 on `-eo`),
-  # a copyable `sleep` to plant, and `setsid` to detach the plant. `setsid` is not
+  # a binary it may copy and rename to the watched image, an mkfifo to make that plant
+  # block, and `setsid` to detach it. `setsid` is not
   # installed on macOS OR on Windows Git-Bash — measured — so on both legs the plant
   # never started, every downstream assertion ran against an empty table, 7
   # assertions went red on a machine that had nothing wrong with its census, and one
@@ -1955,9 +2861,9 @@ run_self_test() {
   # and the ledger then UNDERSTATES what this machine failed to prove; but exactly one
   # entry per case, because two entries for the same case would double-count one gap
   # as two. Each live case is gated on what IT needs:
-  #   I  ps -eo, a copyable sleep, setsid, and a census that can read provenance
-  #   M  the same four, plus python3
-  #   L  a renamable bash + a census that can read provenance (NOT setsid, NOT sleep)
+  #   I  ps -eo, a renamable bash, setsid, mkfifo, and a census that can read provenance
+  #   M  the same five, plus python3
+  #   L  a renamable bash + a census that can read provenance (NOT setsid, NOT mkfifo)
   #   R  whatever L managed to plant, plus /proc (it forces the linux-shaped reader)
   if ((cap_enumerable == 0)); then
     self_test_skip "I" "$cap_why — the live planted-process path is UNPROVEN"
@@ -1965,18 +2871,22 @@ run_self_test() {
     self_test_skip "R" "$cap_why — the portable lineage arm is UNPROVEN"
     self_test_skip "M" "$cap_why — the zombie path is UNPROVEN"
   else
-    if ((cap_plant == 0)) || ((cap_setsid == 0)); then
+    if ((cap_plant == 0)) || ((cap_setsid == 0)) || ((cap_plant_block == 0)); then
       local missing=""
-      ((cap_plant == 0)) && missing="no sleep binary to copy as fake_worker_core"
+      ((cap_plant == 0)) && missing="no bash binary to copy as fake_worker_core"
       ((cap_setsid == 0)) && missing="${missing:+$missing, }setsid is not installed (absent on macOS and on Git-Bash)"
+      # mkfifo is a dependency of THIS case and of no earlier one: the plant holds itself
+      # open by blocking on a FIFO, so without mkfifo there is no way to plant something
+      # that stays alive, and a plant that cannot be held is not a census defect.
+      ((cap_plant_block == 0)) && missing="${missing:+$missing, }no mkfifo, so a plant cannot be made to block and stay alive"
       self_test_skip "I" "$missing — the live planted-process path is UNPROVEN"
     fi
     local m_missing=""
-    ((cap_plant == 0)) && m_missing="no sleep binary to name as the zombie's parent"
+    ((cap_plant == 0)) && m_missing="no bash binary to copy as the zombie's image"
     ((cap_setsid == 0)) && m_missing="${m_missing:+$m_missing, }setsid is not installed (absent on macOS and on Git-Bash)"
     ((cap_python3 == 0)) && m_missing="${m_missing:+$m_missing, }no python3 to act as a non-reaping parent"
     [[ -n "$m_missing" ]] && self_test_skip "M" "$m_missing — the zombie path is UNPROVEN"
-    # L and R need neither setsid nor sleep nor python3 — they plant through
+    # L and R need neither setsid nor mkfifo nor python3 — they plant through
     # `env … "$live/fulcrum" -c …` — so on a macOS leg, where Case I cannot run, they
     # still can. Their own guards are at the bottom of each case.
   fi
@@ -1984,22 +2894,60 @@ run_self_test() {
   # Case I runs only when every one of its dependencies is present; a missing one is
   # already in the ledger above, so the case stays SILENT rather than adding a FAIL
   # that would double-count the same gap as a census defect.
-  if ((cap_ps == 1)) && ((cap_plant == 1)) && ((cap_setsid == 1)) && ((cap_live_env == 1)); then
+  if ((cap_ps == 1)) && ((cap_plant == 1)) && ((cap_setsid == 1)) \
+      && ((cap_plant_block == 1)) && ((cap_live_env == 1)); then
     local live_marker="selftest-live-$$-$RANDOM"
+    # The two plants share an image path, so each carries a UNIQUE TOKEN in its argv and
+    # `find_planted` keys on (image path, token). The alternative the file might instead
+    # have reached for is forbidden, not merely worse: the IMAGE NAME cannot be the
+    # discriminator, because `fake_worker_core` is a MATCH_IMAGE matched on the exact
+    # basename of the FIRST argv element, so a plant renamed to make it findable is a plant
+    # the census cannot see at all and the case grades a look that was never taken (the
+    # trap AGENTS.md documents for the daemon's bin name). A token is the other half of the
+    # pair the census itself reads — unique per run, and in the same untruncated `args=`
+    # column the census classifies on.
+    local plant_token_own="selftest-own-$$-$RANDOM"
+    local plant_token_other="selftest-other-$$-$RANDOM"
+
     # setsid + full stdio redirection: the planted process must not hold the
     # self-test's output pipe, and must not die with the census's process group.
-    ( CENSUS_LIVE_MARKER="$live_marker" FULCRUM_CI_RUN_MARKER="$live_marker" \
-        setsid "$live/fake_worker_core" 300 </dev/null >/dev/null 2>&1 &
-      printf '%s' "$!" >"$live/planted.pid" )
-    local planted=""
-    [[ -r "$live/planted.pid" ]] && planted="$(cat "$live/planted.pid")"
-    [[ -n "$planted" ]] && self_test_planted+=("$planted")
+    #
+    # NO `$!` ANYWHERE BELOW THIS LINE. `setsid` forks when it is already a
+    # process-group leader — which a backgrounded job of a script shell is — so the pid
+    # the shell reports is setsid's own, and it dies the instant it has forked the real
+    # plant, which lives on under a pid nobody recorded. This commit's own ubuntu logs
+    # show both shapes of that, on the same SHA: 43638510359 never saw either plant
+    # ("never OBSERVED alive", pids 5792 / 6024 both long dead), and 43639574382 caught
+    # the recorded pid alive for one poll and then lost it, so the census printed
+    # `clean: … 0 candidate(s)` about a plant that was in the table under another pid,
+    # and the case STILL reported "the planted process was alive, and is gone after the
+    # census" — a GREEN for a kill that never happened. Case M has always been immune on
+    # the same runner because it scans `ps` for the plant's own path instead of trusting
+    # `$!`; Case I now does the same thing (see find_planted).
+    # `setsid -w` and NOT a bare `setsid &`: -w makes setsid stay as the plant's parent
+    # and exit with the plant's status, so the subshell below can record WHY the plant
+    # left. That record is the difference between "the enumerator cannot see it" and
+    # "the plant ran for 0.1 s and left on its own", and on ubuntu-latest those two are
+    # not hypothetical — see plant_image_stays_alive_blocking. The wait costs nothing: this whole
+    # subshell is itself backgrounded, so the case does not block on it.
+    ( plant_blocking "$live/fake_worker_core" "$live/own.fifo" "$plant_token_own" \
+        "$live_marker" 1 >"$live/planted.out" 2>&1
+      printf '%s' "$?" >"$live/planted.status" ) &
 
-    # PRECONDITION, OBSERVED: the plant is in the table before any assertion about it.
-    # Everything below is gated on this, so a plant that never started can only be a
-    # FAILURE of this line — never a green "it was killed" three lines later.
+    # PRECONDITION, OBSERVED: the plant is in the table before any assertion about it,
+    # and the pid that goes into every assertion below came OUT of the table. A plant
+    # that never started can only ever be a FAILURE of this line — never a green "it was
+    # killed" three lines later.
+    local planted=""
+    if planted="$(find_planted "$live/fake_worker_core" "$plant_token_own")"; then
+      self_test_planted+=("$planted")
+    else
+      planted=""
+    fi
     if ! plant_was_alive "$planted"; then
-      printf 'FAIL I  the planted process was never OBSERVED alive (pid %s) — nothing below this line can be graded\n' "${planted:-<no pid>}"
+      printf 'FAIL I  the planted process was never OBSERVED alive (pid %s) — nothing below this line can be graded\n' "${planted:-<no process at $live/fake_worker_core carrying $plant_token_own>}"
+      describe_plant_table "$live/fake_worker_core"
+      report_plant_exit "$live/planted.status" "$live/planted.out"
       self_test_failures=$((self_test_failures + 1))
     else
       printf 'ok   I  the planted process %s was OBSERVED alive before any verdict about it\n' "$planted"
@@ -2015,59 +2963,382 @@ run_self_test() {
       else
         printf 'FAIL I  the enumerated stream does not contain the planted pid %s\n' "$planted"
         printf '       enumerated: %s\n' "$(tr '\n' '|' <"$enum_out" 2>/dev/null || echo '<missing>')"
+        describe_plant_table "$live/fake_worker_core"
         self_test_failures=$((self_test_failures + 1))
       fi
 
-      # NOTE: these three invoke the LIVE census, so they must set NO seam variable —
-      # not even CENSUS_PLATFORM, which the live path now derives from `uname` alone
-      # (see refuse_self_test_only_env_seams). The marker is the only thing a live run
-      # is allowed to be told.
-      expect_exit "I  the LIVE census reports the planted process as a leak" 1 \
-        env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-        FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
+      # NOTE: these three run the LIVE census through capture_live_census, so they set
+      # NO seam variable — not even CENSUS_PLATFORM, which the live path now derives
+      # from `uname` alone (see refuse_self_test_only_env_seams). The marker is the only
+      # thing a live run is allowed to be told.
+      expect_live_census "I  the LIVE census reports the planted process as a leak" 1 "$live_marker"
       expect_output_has "I  the live leak line names the pid and the image" "leak: $planted fake_worker_core"
 
       # Reachable ONLY from the observed-alive branch above, which is what makes the
       # negative `ps -p` below evidence of a KILL rather than evidence of a typo.
       if ps -p "$planted" >/dev/null 2>&1; then
         printf 'FAIL I  the census did not kill the planted process (pid %s is still alive)\n' "$planted"
+        describe_plant_table "$live/fake_worker_core"
         self_test_failures=$((self_test_failures + 1))
       else
         printf 'ok   I  the planted process %s was alive, and is gone after the census\n' "$planted"
       fi
     fi
 
-    # And the discriminator, live: a DIFFERENT run's marker must not be touched.
-    ( FULCRUM_CI_RUN_MARKER="some-other-run-$$" setsid "$live/fake_worker_core" 300 </dev/null >/dev/null 2>&1 &
-      printf '%s' "$!" >"$live/other.pid" )
+    # And the discriminator, live: a DIFFERENT run's marker must not be touched. Same
+    # locate-by-ps rule (token $plant_token_other) — for exactly the same
+    # reason, and this one had no green to lose: it just printed "the discriminator is
+    # UNPROVEN" on a runner where the decoy was sitting in the table the whole time.
+    # The decoy carries a DIFFERENT run's marker value — that is the whole discriminator
+    # this half of the case exists to grade, and it is the reason the marker is an
+    # argument to plant_blocking rather than something the plants inherit.
+    ( plant_blocking "$live/fake_worker_core" "$live/other.fifo" "$plant_token_other" \
+        "some-other-run-$$" 1 >"$live/other.out" 2>&1
+      printf '%s' "$?" >"$live/other.status" ) &
     local other=""
-    [[ -r "$live/other.pid" ]] && other="$(cat "$live/other.pid")"
-    [[ -n "$other" ]] && self_test_planted+=("$other")
+    if other="$(find_planted "$live/fake_worker_core" "$plant_token_other")"; then
+      self_test_planted+=("$other")
+    else
+      other=""
+    fi
     if plant_was_alive "$other"; then
-      expect_exit "I  a live process with ANOTHER run's marker is left alone" 0 \
-        env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-        FULCRUM_CI_RUN_MARKER="$live_marker" bash "$script"
+      expect_live_census "I  a live process with ANOTHER run's marker is left alone" 0 "$live_marker"
       if ps -p "$other" >/dev/null 2>&1; then
         printf 'ok   I  the other-run process %s is still alive (untouched)\n' "$other"
-        kill -KILL "$other" 2>/dev/null || true
-        wait "$other" 2>/dev/null || true
+        # The TREE, not just the pid: `$other` is located by find_planted, but the plant
+        # it names can itself have a child, and a leftover fake_worker_core is a real leak
+        # for every later live census in this run.
+        plant_kill_tree "$other"
+        plant_wait_until_gone "$other" && plant_reap "$other"
         self_test_planted=("${self_test_planted[@]/$other/}")
       else
         printf "FAIL I  the census killed a process that was NOT this run's (pid %s)\n" "$other"
+        describe_plant_table "$live/fake_worker_core"
         self_test_planted=("${self_test_planted[@]/$other/}")
         self_test_failures=$((self_test_failures + 1))
       fi
     else
-      printf 'FAIL I  the OTHER-run plant was never observed alive (pid %s) — the discriminator is UNPROVEN\n' "${other:-<no pid>}"
+      printf 'FAIL I  the OTHER-run plant was never observed alive (pid %s) — the discriminator is UNPROVEN\n' "${other:-<no process at $live/fake_worker_core carrying $plant_token_other>}"
+      describe_plant_table "$live/fake_worker_core"
+      report_plant_exit "$live/other.status" "$live/other.out"
       self_test_failures=$((self_test_failures + 1))
     fi
 
     # The census must also survive being run from a checkout whose directory is
     # named `fulcrum` (this repo's own CI): the census skips its own lineage.
-    expect_exit "I  a clean live census passes and proves it read the table" 0 \
-      env -u CENSUS_MODE -u CENSUS_FIXTURE_DIR -u CENSUS_INPUT -u CENSUS_PLATFORM \
-      FULCRUM_CI_RUN_MARKER="selftest-clean-$$-$RANDOM" bash "$script"
+    expect_live_census "I  a clean live census passes and proves it read the table" 0 "selftest-clean-$$-$RANDOM"
     expect_output_has "I  the clean census reports the candidate count it looked at" "the process table was read"
+  fi
+
+  # ---- Case U: the plant is LOCATED, and only what the harness owns is forgiven --
+  # Two rules this branch introduced and this case owns, both of which run on EVERY
+  # leg — including the macOS and Windows legs where Case I is skipped, because a rule
+  # that is only exercised where the case it serves runs cannot catch a regression on
+  # the leg that loses the case. Neither needs `setsid`: these plants are ordinary
+  # background jobs, which is the same trick Case L already uses for its parent.
+  #
+  # 1. `find_planted` locates a real process by (its own path, a token in its argv) and
+  #    tells TWO plants of the SAME image path apart. That discriminator is what lets
+  #    Case I still assert "kill ours, leave theirs" without renaming the image — and
+  #    renaming it is the trap: `fake_worker_core` is matched on the exact basename of
+  #    the first argv element, so a renamed plant is invisible to the census and Case I
+  #    becomes vacuous. A pin on this rule is therefore a pin on Case I's teeth, not on
+  #    a helper.
+  # 2. The live-census retry forgives a refusal ONLY when the census named the pid it
+  #    could not read AND that pid is not one the harness planted. If that predicate
+  #    were loosened to "any refusal", the retry would ride through the census's own
+  #    failure to read OUR plant — which is the exact vacuous green this whole file
+  #    exists to refuse.
+  if ((cap_ps == 1)) && ((cap_plant == 1)); then
+    local u_a="" u_b=""
+    # NO run marker on these two: they are props for a locating rule, not leaks, and a
+    # marker-bearing plant left alive would make the LATER live censuses (Case L's,
+    # Case M's) red for a reason that has nothing to do with them. They are killed at
+    # the end of this case regardless; the missing marker is the belt to that braces.
+    # NO setsid here, on purpose: this case exists to prove the locating rule on the legs
+    # where Case I cannot run. And the marker is the EMPTY string, not inherited — a prop
+    # that carried the harness's own marker would be a genuine leak for every later live
+    # census. `env -u …` is NOT the way to drop it: `env` would sit in argv[0] and the
+    # path-keyed scan would then miss the very plants this case is testing (measured on
+    # ubuntu, run 43644621082 — that is how the first draft of this case failed).
+    ( plant_blocking "$live/fake_worker_core" "$live/u-a.fifo" u-token-alpha "" 0 ) &
+    ( plant_blocking "$live/fake_worker_core" "$live/u-b.fifo" u-token-beta "" 0 ) &
+    if u_a="$(find_planted "$live/fake_worker_core" u-token-alpha)"; then
+      self_test_planted+=("$u_a")
+    else
+      u_a=""
+    fi
+    if u_b="$(find_planted "$live/fake_worker_core" u-token-beta)"; then
+      self_test_planted+=("$u_b")
+    else
+      u_b=""
+    fi
+
+    if plant_was_alive "$u_a" && plant_was_alive "$u_b"; then
+      printf 'ok   U  find_planted located BOTH plants by path+token (pids %s and %s)\n' "$u_a" "$u_b"
+      if [[ "$u_a" != "$u_b" ]]; then
+        printf 'ok   U  the two plants of the SAME image path got DISTINCT pids (the token discriminates)\n'
+      else
+        printf 'FAIL U  both tokens resolved to pid %s — the discriminator is NOT separating them\n' "$u_a"
+        describe_plant_table "$live/fake_worker_core"
+        self_test_failures=$((self_test_failures + 1))
+      fi
+      # A claim about a table must be graded against the table, so the negative half is
+      # asserted too: a token nobody planted must resolve to NOTHING. A locator that
+      # returned "the first fake_worker_core it saw" whenever its key missed would pass
+      # the two assertions above and then hand Case I a pid belonging to the OTHER plant
+      # — grading the census's kill against the wrong process.
+      if find_planted "$live/fake_worker_core" u-token-nobody-planted-this; then
+        printf 'FAIL U  find_planted invented a pid for a token nobody planted (got %s)\n' "$u_a"
+        describe_plant_table "$live/fake_worker_core"
+        self_test_failures=$((self_test_failures + 1))
+      else
+        printf 'ok   U  a token nobody planted resolves to NOTHING (no pid is invented)\n'
+      fi
+    else
+      # Every dependency was present and the plant still produced nothing: that IS a
+      # finding about this machine's `ps`, and it stays a failure — same rule Case M
+      # holds.
+      printf 'FAIL U  could not locate the two plants (bash copyable, ps answers, plain background jobs)\n'
+      describe_plant_table "$live/fake_worker_core"
+      self_test_failures=$((self_test_failures + 1))
+    fi
+
+    # Both props die here. Leaving one alive past this point would put a watched image
+    # in the table for every later live census to reason about.
+    local u_pid
+    for u_pid in "$u_a" "$u_b"; do
+      [[ -n "$u_pid" ]] || continue
+      plant_kill_tree "$u_pid"
+      plant_wait_until_gone "$u_pid" && plant_reap "$u_pid"
+      self_test_planted=("${self_test_planted[@]/$u_pid/}")
+    done
+
+    # 2. THE WIRING PINS. Behaviourally forcing "the census could not read OUR plant"
+    # needs a plant that dies inside the census's own read window, which is a race and
+    # not a test — so this half is pinned the way Case O pins its own wiring.
+    #
+    # EVERY NEEDLE IS ASSEMBLED AT RUNTIME. expect_file_has greps THIS FILE, so a needle
+    # written literally appears in the file as this assertion's own argument — and the pin
+    # matches itself, staying green after the branch it guards is deleted. Case O's
+    # `note M sk""ipped` trick is the house answer; concatenation, not a literal.
+    local u_dollar='$'
+    local u_needle_owned="for owned_pid in ${u_dollar}{self_test_planted[@]+\"${u_dollar}{self_test_planted[@]}\"}"
+    local u_needle_retry='if ((got !='
+    u_needle_retry="${u_needle_retry} 2)) ||"
+    local u_needle_own='planted="$(find_planted "$live/fake_worker_core" "$plant_token'
+    u_needle_own="${u_needle_own}_own\")\""
+    local u_needle_other='other="$(find_planted "$live/fake_worker_core" "$plant_token'
+    u_needle_other="${u_needle_other}_other\")\""
+    # Assembled at runtime for the opposite reason: written literally it would appear in
+    # this file as the assertion's own argument and expect_file_lacks would then ALWAYS
+    # fail. This is the exact statement the old Case I used to record a plant from `$!`.
+    local old_pidfile_shape='printf '"'"'%s'"'"' "$!"'
+
+    expect_file_has "U  the retry asks which pids the harness planted (our own plant is never forgiven)" \
+      "$script" "$u_needle_owned"
+    expect_file_has "U  only a REFUSAL (exit 2) is ever retried — a wrong verdict fails immediately" \
+      "$script" "$u_needle_retry"
+    expect_file_lacks "U  no case records a plant from \$! again (setsid sits in between)" \
+      "$script" "$old_pidfile_shape"
+    expect_file_has "U  Case I locates its own plant through the table, not through the shell" \
+      "$script" "$u_needle_own"
+    expect_file_has "U  Case I locates the DECOY the same way (the discriminator is graded on a real pid)" \
+      "$script" "$u_needle_other"
+  else
+    local u_missing=""
+    ((cap_ps == 0)) && u_missing="ps -eo does not answer here"
+    ((cap_plant == 0)) && u_missing="${u_missing:+$u_missing, }no bash binary to copy as fake_worker_core"
+    ((cap_plant_block == 0)) && u_missing="${u_missing:+$u_missing, }no mkfifo to block the props on"
+    self_test_skip "U" "$u_missing — the plant-locating rule and the retry's ownership rule are UNPROVEN"
+  fi
+
+  # ---- Case Q: the HARNESS may not depend on a tool the platform may lack ----------
+  # This case is about the harness, not the census, and it exists because of what this
+  # branch did to the Windows leg of run 43649430601. `plant_image_stays_alive_blocking`
+  # asked `pgrep -P` for a plant's children; Git-for-Windows bash has no `pgrep`; the
+  # lookup returned nothing; the plant was never signalled; and the `wait` that followed
+  # sat on a FIFO-blocked process until the leg was cancelled at 15 minutes. Windows had
+  # been GREEN on main minutes earlier, so this was a regression this branch introduced
+  # into a file whose own header (line 275) already said "Windows has neither setsid nor
+  # pgrep" and whose section at line 56 is titled WHY `pgrep -x` IS NOT USED.
+  #
+  # WHY A CASE AND NOT A FIX-AND-HOPE. Three separate defects were in that one function:
+  # a forbidden tool, a doc comment promising a `plant_kill_tree` that did not exist, and
+  # a cleanup whose only backstop was a `wait` that could hang. Any of the three can come
+  # back the same way — by someone reaching for the obvious tool. These assertions are
+  # cheap, they run on EVERY leg (none of them needs setsid, mkfifo or python3, so
+  # Windows and macOS grade them rather than skipping), and on ubuntu — which runs with no
+  # `--allow-skips` — they can never be satisfied by a skip.
+  #
+  # 1. THE TOOL BANS. Over CODE lines, so the header's long explanation of why `pgrep` is
+  #    wrong and B2/B3's assertions that `pgrep -x` is BLIND do not trip it.
+  expect_no_code_line "Q  the harness never INVOKES pgrep (Windows has none; see the header at line 56)" \
+    "$script" 'p[g]rep'
+  expect_no_code_line "Q  the harness never INVOKES pkill (same family, same absence, and it kills the caller's shell)" \
+    "$script" 'pk[i]ll'
+
+  # 2. THE HELPER THE COMMENT PROMISES. The bug class here is a doc comment describing a
+  #    guarantee no code provides: lines 1664-1672 documented `plant_kill_tree <pid>` for
+  #    a whole release while `grep "plant_kill_tree()"` found nothing and nothing called
+  #    it. So pin the DEFINITION, and pin that it is actually CALLED.
+  expect_file_has "Q  plant_kill_tree is DEFINED, not merely documented" "$script" "plant_kill_tree() {"
+  # The definition line, the recursive call inside it, and at least two real call sites
+  # (the probe, the EXIT trap, and the cases that plant). Four is the honest floor for
+  # "wired in", and it is what a re-introduced orphaned comment would fail: a comment
+  # alone yields zero code lines.
+  # …and that the paths that must use it actually DO, scoped per function rather than
+  # counted over the file (see harness_function_body for why a count is too weak).
+  expect_function_calls "Q  the plant probe kills through plant_kill_tree (the pgrep site)" \
+    "$script" "plant_image_stays_alive_blocking" "plant_kill_tree"
+  expect_function_calls "Q  the EXIT trap kills through plant_kill_tree (the tree, not a bare kill)" \
+    "$script" "self_test_cleanup" "plant_kill_tree"
+  # The trap must not depend on a tool at all, and the claim must be about THE TRAP — not
+  # "is plant_release_fifo used somewhere", which a call from the probe would satisfy while
+  # the trap went back to `kill`-then-`wait`. Hence a scoped, structural pin.
+  expect_function_calls "Q  the EXIT trap itself releases plants through their FIFOs (no tool can defeat it)" \
+    "$script" "self_test_cleanup" "plant_release_fifo"
+  # And the trap must not go back to waiting on a pid it has not proved stopped running:
+  # an unconditional `wait` in the trap is the 15-minute hang in another dress.
+  expect_function_calls "Q  the EXIT trap bounds its wait instead of blocking on a plant" \
+    "$script" "self_test_cleanup" "plant_wait_until_gone"
+  expect_code_line_count_at_least "Q  nothing waits on a plant without first proving it stopped running" \
+    "$script" "plant_wait_until_gone" 4
+
+  # 3-4. THE BEHAVIOURAL HALF, and what it may legitimately depend on. Both tests below
+  # locate a plant through the table, so they need `ps -eo` to answer — which is the
+  # cygwin gap this file already records for Git-Bash (cap_ps), NOT a harness helper
+  # missing a tool. The distinction is the one this branch exists to keep honest, so the
+  # static pins above run EVERYWHERE (they are greps of this file and need nothing) and
+  # only the behavioural half skips, with the already-recorded reason, on a leg that
+  # cannot read the table. ubuntu has cap_ps==1, so it grades both — and ubuntu runs with
+  # no `--allow-skips`, so it cannot buy its green.
+  if ((cap_ps == 1)) && ((cap_plant == 1)) && [[ -p "$live/q-root.fifo" ]]; then
+  # 3. THE REAPER, BEHAVIOURALLY. A wiring pin cannot show that a plant with NO recorded
+  #    pid dies — and an unlocated pid is exactly the case the old trap could not reach,
+  #    which is why `find_planted` exists at all. So plant something and then THROW AWAY
+  #    its pid: the only thing that can get it back is a line into the FIFO it is blocked
+  #    on. MEASURED FIRST, and it is the reason this reaper exists rather than a hunch:
+  #    the plant opens its own FIFO `3<>fifo` (O_RDWR) and is therefore its own writer, so
+  #    the harness EXITING releases nothing — the plant was still parked in `read` three
+  #    seconds after its harness was gone. Writing one line is what ends it.
+  local q_fifo="$live/q-orphan.fifo" q_orphan=""
+  if [[ -p "$q_fifo" ]]; then
+    # Detached, and no pid is captured anywhere. NO marker: an orphan that carried this
+    # run's marker would be a genuine leak for every later live census if the reap failed.
+    ( plant_blocking "$live/fake_worker_core" "$q_fifo" q-orphan-token "" 0 \
+        </dev/null >/dev/null 2>&1 & )
+    if q_orphan="$(find_planted "$live/fake_worker_core" q-orphan-token)"; then
+      printf 'ok   Q  planted an ORPHAN whose pid was deliberately never recorded (pid %s)\n' "$q_orphan"
+      # Deliberately NOT appended to self_test_planted: if it ever were, this would be
+      # testing the pid loop instead of the thing it is meant to test.
+      plant_release_fifo "$q_fifo"
+      if plant_wait_until_gone "$q_orphan"; then
+        printf 'ok   Q  the orphan was reaped by a FIFO write alone — no pid lookup, no ps, no pgrep, no kill\n'
+      else
+        printf 'FAIL Q  the orphan survived the FIFO write (pid %s still running) — the tool-free backstop is not a backstop\n' "$q_orphan"
+        plant_kill_tree "$q_orphan"
+        self_test_failures=$((self_test_failures + 1))
+      fi
+    else
+      printf 'FAIL Q  could not plant the orphan (bash copyable, mkfifo present, plain background job)\n'
+      describe_plant_table "$live/fake_worker_core"
+      self_test_failures=$((self_test_failures + 1))
+    fi
+  else
+    printf 'FAIL Q  %s is not a FIFO, so the tool-free reaper could not be tested\n' "$q_fifo"
+    self_test_failures=$((self_test_failures + 1))
+  fi
+
+  # 4. THE TREE, BEHAVIOURALLY, AND GENUINELY DEEP. The comment claimed a walk that
+  #    reaches children of children, so the test must have a GRANDCHILD: root, child, and
+  #    a third level as the child's child. Killing the root must stop all three. The
+  #    first draft of this had only root+child and stayed GREEN after the recursion was
+  #    deleted from plant_kill_tree — a one-level walk still kills the direct child, so a
+  #    two-level tree cannot tell one level from two. Mutating the function and watching
+  #    the case stay green is how that was found.
+  #
+  # EVERY LEVEL BLOCKS ON A FIFO OF ITS OWN rather than sitting in `sleep 999`, and that
+  # is not cosmetic: the first draft used `sleep 300` for the upper levels, and when the
+  # walk could not reach them it left seven `sleep` processes behind — the harness
+  # manufacturing the exact class of debris this section exists to prevent. A FIFO-blocked
+  # level is releasable by plant_release_fifo, which the EXIT trap runs over every FIFO in
+  # the scratch dir, so a level the pid walk cannot reach still cannot outlive the run.
+  #
+  # The chain is a SCRIPT FILE rather than a nest of `bash -c` strings — three levels of
+  # quoting inside a bash string inside this file is how a plant silently fails to start,
+  # and a level that never started makes the assertion below about nothing.
+  local q_tree_root="" q_tree_mid="" q_tree_leaf=""
+  cat >"$live/q-level.sh" <<'QLEVEL'
+#!/usr/bin/env bash
+# One level of the plant tree: fork the level below us (if any), then block on our OWN
+# fifo. $1 own fifo, $2 child fifo (empty = leaf), $3 grandchild fifo, $4 this level's
+# token. Blocking rather than sleeping is deliberate — see the note above: a level the
+# pid walk fails to reach must still be releasable through its fifo by the EXIT trap.
+if [[ -n "${2:-}" ]]; then
+  bash "$0" "$2" "$3" "" "$4-child" </dev/null >/dev/null 2>&1 &
+fi
+exec 3<>"$1"
+read -r q_wait <&3
+QLEVEL
+  chmod +x "$live/q-level.sh"
+  # Detached, so no level is a job of this shell. Tokens are unique per level, so the
+  # table tells the three apart — the same (path, token) idea find_planted uses.
+  ( bash "$live/q-level.sh" "$live/q-root.fifo" "$live/q-mid.fifo" "$live/q-leaf.fifo" qtok7x \
+      </dev/null >/dev/null 2>&1 & )
+  sleep 1.2
+  # The needle goes through the ENVIRONMENT, exactly as describe_plant_table does: an
+  # `awk -v` form puts the token in awk's own argv, and the scan then reports itself as a
+  # row of the table it was asked to describe.
+  q_tree_root="$(ps -eo pid=,args= 2>/dev/null | QNEEDLE="qtok7x" awk \
+    'ENVIRON["QNEEDLE"] != "" && $NF == ENVIRON["QNEEDLE"] {print $1; exit}' || true)"
+  q_tree_mid="$(ps -eo pid=,args= 2>/dev/null | QNEEDLE="qtok7x-child" awk \
+    'ENVIRON["QNEEDLE"] != "" && $NF == ENVIRON["QNEEDLE"] {print $1; exit}' || true)"
+  q_tree_leaf="$(ps -eo pid=,args= 2>/dev/null | QNEEDLE="qtok7x-child-child" awk \
+    'ENVIRON["QNEEDLE"] != "" && $NF == ENVIRON["QNEEDLE"] {print $1; exit}' || true)"
+  if [[ -n "$q_tree_root" && -n "$q_tree_mid" && -n "$q_tree_leaf" ]] \
+      && plant_was_alive "$q_tree_root" && plant_was_alive "$q_tree_mid" \
+      && plant_was_alive "$q_tree_leaf"; then
+    # The shape the claim is about, OBSERVED before it is graded: the leaf really is the
+    # CHILD of the mid, and the mid the child of the root. Without this the walk could be
+    # "passing" on three unrelated processes.
+    local q_mid_ppid="" q_leaf_ppid=""
+    q_mid_ppid="$(parent_of "$q_tree_mid" 2>/dev/null || true)"
+    q_leaf_ppid="$(parent_of "$q_tree_leaf" 2>/dev/null || true)"
+    if [[ "$q_mid_ppid" == "$q_tree_root" && "$q_leaf_ppid" == "$q_tree_mid" ]]; then
+      printf 'ok   Q  built a THREE-level plant tree (root %s, child %s, grandchild %s) and OBSERVED the parentage\n' \
+        "$q_tree_root" "$q_tree_mid" "$q_tree_leaf"
+      plant_kill_tree "$q_tree_root"
+      if plant_wait_until_gone "$q_tree_root" && plant_wait_until_gone "$q_tree_mid" \
+          && plant_wait_until_gone "$q_tree_leaf"; then
+        printf 'ok   Q  plant_kill_tree reached the GRANDCHILD two levels down (the walk is really recursive)\n'
+      else
+        printf 'FAIL Q  plant_kill_tree left %s (root %s) running — the walk does not reach children of children\n' "$q_tree_leaf" "$q_tree_root"
+        self_test_failures=$((self_test_failures + 1))
+      fi
+    else
+      printf 'FAIL Q  the plant chain is not the shape it claims (mid %s has parent %s, want root %s; leaf %s has parent %s, want mid %s)\n' \
+        "$q_tree_mid" "${q_mid_ppid:-<none>}" "$q_tree_root" \
+        "$q_tree_leaf" "${q_leaf_ppid:-<none>}" "$q_tree_mid"
+      self_test_failures=$((self_test_failures + 1))
+    fi
+  else
+    printf 'FAIL Q  could not build a three-level plant tree (root %s, child %s, grandchild %s)\n' \
+      "${q_tree_root:-<none>}" "${q_tree_mid:-<none>}" "${q_tree_leaf:-<none>}"
+    self_test_failures=$((self_test_failures + 1))
+  fi
+  # Release every level the walk may have missed. These FIFOs are also covered by the
+  # EXIT trap's glob; doing it here keeps debris out of the REST of the run rather than
+  # only out of the machine.
+  local q_level_fifo
+  for q_level_fifo in "$live/q-root.fifo" "$live/q-mid.fifo" "$live/q-leaf.fifo"; do
+    plant_release_fifo "$q_level_fifo"
+  done
+  else
+    local q_missing=""
+    ((cap_ps == 0)) && q_missing="ps -eo does not answer here, so a planted level cannot be located by (path, token)"
+    ((cap_plant == 0)) && q_missing="${q_missing:+$q_missing, }no bash binary to copy as fake_worker_core"
+    self_test_skip "Q" "$q_missing — the tool-free reaper and the recursive walk are UNPROVEN (the static pins above still ran)"
   fi
 
   # ---- Case P: gone-before-read is DECLINED, never silently dropped -----------
@@ -2405,9 +3676,12 @@ PYEOF
         FULCRUM_CI_RUN_MARKER="$z_marker" bash "$script"
       expect_output_has "M  the zombie is named as a leak" "leak: $z_pid"
       expect_output_has "M  the report says ZOMBIE and names the parent" "ZOMBIE"
-      # Killing the parent is the ONLY way a zombie is reaped. Do it, then require the
-      # zombie to be actually gone — otherwise this case would leave debris behind.
-      kill -KILL "$z_parent_pid" 2>/dev/null || true
+      # Killing the parent is the ONLY way a zombie is reaped. Do it through the tree
+      # helper — signalling a zombie is a harmless no-op, and reaching any other child
+      # the python parent forked is the point — then require the zombie to be actually
+      # gone, otherwise this case would leave debris behind.
+      plant_kill_tree "$z_parent_pid"
+      plant_wait_until_gone "$z_parent_pid" && plant_reap "$z_parent_pid"
       sleep 0.5
       if ps -p "$z_pid" >/dev/null 2>&1; then
         printf 'FAIL M  the zombie %s is still listed after its parent was killed\n' "$z_pid"
