@@ -737,7 +737,7 @@ impl Provider for OpenAiResponsesProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_util::{chat_message, collect};
+    use super::super::test_util::{chat_message, collect, keys_of_names};
     use super::super::types::{ModelOptions, ToolSpec};
     use super::*;
     use crate::tools::ImageRef;
@@ -1611,6 +1611,38 @@ mod tests {
         assert!(
             input.iter().all(|item| item.get("role").is_none()),
             "an EMPTY `Text` → `function_call` items ONLY, no `message` item: {input:?}"
+        );
+
+        // ── EXACT-FIELD-SET PINS (the leak guard) ───────────────────────
+        // `responses_input` is a field-by-field WHITELIST, but nothing tested
+        // that. `ChatMessage` is BOTH the transcript type AND the type this
+        // body is built from, so a transcript-only field (e.g. a future
+        // `finish_reason`) must NEVER appear here. On THIS wire an assistant
+        // with calls has no `message` item at all — the pin goes on the
+        // `function_call` / `function_call_output` items it became.
+        assert_eq!(
+            keys_of_names(&body),
+            vec!["input", "model", "stream"],
+            "the Responses body carries exactly these keys (no `instructions` \
+             — no system text; no `tools` / `temperature` / `max_output_tokens` \
+             / `reasoning` — this fixture sets none of them)"
+        );
+        assert_eq!(
+            keys_of_names(&input[0]),
+            vec!["arguments", "call_id", "name", "type"],
+            "a `function_call` item is exactly `type` + `call_id` + `name` + \
+             `arguments` — a transcript-only field must not appear here"
+        );
+        assert_eq!(
+            keys_of_names(&input[1]),
+            vec!["arguments", "call_id", "name", "type"],
+            "the second `function_call` item carries the same exact set"
+        );
+        assert_eq!(
+            keys_of_names(&input[2]),
+            vec!["call_id", "output", "type"],
+            "a `function_call_output` item is exactly `type` + `call_id` + \
+             `output` — a transcript-only field must not appear here"
         );
     }
 }
