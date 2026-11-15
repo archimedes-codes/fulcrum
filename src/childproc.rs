@@ -1,14 +1,30 @@
 //! Who owns a child process's Windows console, and its stdin.
 //!
-//! The shipped Windows build is a GUI-subsystem process
-//! (`src/main.rs:2` — `#![cfg_attr(not(debug_assertions), windows_subsystem =
-//! "windows")]`), so it has no console for a console-subsystem child
-//! (`cmd.exe`, `fd`, `rg`, an `npx.cmd` shim) to inherit; Windows then
-//! allocates a console per child, and creating a console creates a window —
-//! one blank `cmd.exe` window per shell command. `CREATE_NO_WINDOW` is the
-//! documented lever that suppresses the window; mechanism, citations and the
-//! triage are in `docs/research/windows-child-console-window.md`, the choice
-//! of a constructor as the owner is ADR 0060.
+//! The bug this module exists for was observed in the **desktop app**, whose
+//! shipped Windows build is a GUI-subsystem process
+//! (`src-tauri/src/main.rs:2` in `archimedes-codes/archimedes` —
+//! `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`): with no
+//! console to inherit, a console-subsystem child (`cmd.exe`, `fd`, `rg`, an
+//! `npx.cmd` shim) gets a console allocated per child, and creating a console
+//! creates a window — one blank `cmd.exe` window per shell command.
+//! `CREATE_NO_WINDOW` is the documented lever that suppresses the window;
+//! mechanism, citations and the triage are in that repo's
+//! `docs/research/windows-child-console-window.md`, and the choice of a
+//! constructor as the owner is that repo's
+//! `docs/decisions/0060-child-console-policy-owned-by-a-constructor.md`.
+//!
+//! **Those two documents, and the `main.rs` above, are in the desktop repo, not
+//! here** — this repo has no `docs/research/` or `docs/decisions/` at all (it
+//! carries `docs/features/` and `docs/roadmap/` only), so a path to them written
+//! bare reads as a dangling link. Name the repo when citing them.
+//!
+//! And the reason the policy lives in a **library** rather than in the app that
+//! found the bug: this crate has no binary and no subsystem attribute of its own,
+//! so the attribute belongs to whichever executable consumes it, and every
+//! consumer must get the flag from the constructor. That includes this repo's own
+//! `fulcrum` daemon member, whose `fulcrum/src/main.rs` deliberately carries NO
+//! such attribute — its stderr is the operator's console — and which reaches a
+//! child only through [`crate::worker::client::WorkerHandle::spawn`].
 //!
 //! Two invariants this module exists to hold:
 //!
@@ -33,8 +49,8 @@
 //! `CREATE_NO_WINDOW` is documented as ignored for a child that is not a
 //! console application, so the two sites that spawn **our own exe** — the
 //! `--worker` self-exec (`worker/client.rs`, in this crate since T8/S8.3) and the
-//! updater relaunch
-//! (`src/commands/update.rs`) — could never pop a window in the shipped build,
+//! updater relaunch (the desktop's `src-tauri/src/commands/update.rs`, NOT a file
+//! in this repo) — could never pop a window in the shipped build,
 //! where the exe is GUI-subsystem. They still route through here, for two
 //! reasons: in a *debug* build the attribute is off and the exe is
 //! console-subsystem, so the flag is live there; and a site added later
@@ -582,9 +598,30 @@ mod tests {
     // policy, in the spirit of `hostenv::configured_env` ("the only honest
     // introspection available" for the same class of reason).
     //
-    // Scanned: BOTH packages' `src/**/*.rs` — `crates/fulcrum-core/src` and
-    // `src-tauri/src` (see `source_roots`; since T5/S2 the policed code spans
-    // two packages and a one-root scan would certify the other half unseen).
+    // Scanned: this crate's own `src/**/*.rs`, PLUS the desktop's `src-tauri/src`
+    // — but the second root exists ONLY in the workspace-member layout, i.e. only
+    // while this package is a member of the desktop's workspace (see
+    // `source_roots` and `detect_layout`). In THIS repo's checkout the layout is
+    // `SinglePackage` and exactly ONE root is walked; the `archimedes/` floor is
+    // then not asserted at all, because a floor for a tree that was never opened
+    // would be the vacuous green this file refuses everywhere else. Since T5/S2
+    // the policed code has spanned two packages, which is why the walk is a list
+    // and not one path.
+    //
+    // **The third tree, which NEITHER layout walks: `fulcrum/src/`.** The daemon
+    // member is a sibling of this crate, not a subdirectory of it, so
+    // `source_roots` never opens it and invariants A and B are silent about it —
+    // a `Command::new` there would get no `CREATE_NO_WINDOW` and this census
+    // would report clean. That gap is closed by
+    // `fulcrum/tests/boundary.rs::the_daemon_builds_no_child_outside_the_engine_constructor`,
+    // which walks the daemon's tree for the same three call forms — its flag
+    // needle is deliberately BROADER than invariant B's, dropping the leading `.`
+    // so a UFCS call fires too. Do not "fix" the
+    // gap by widening this walk to `../fulcrum/src`: the daemon's `rusqlite` is
+    // legal (ADR 0091) and the engine's pins forbid it, so a shared walk needs an
+    // allowlist that weakens the engine's pin — the same reasoning that keeps the
+    // two pin sets separate in `boundary_pins`.
+    //
     // `tests/*.rs` is deliberately NOT scanned —
     // those integration fixtures build raw `Command`s ON PURPOSE (they launch
     // the built binary, and a fixture that wanted the policy opts in

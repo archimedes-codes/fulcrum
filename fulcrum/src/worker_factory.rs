@@ -99,10 +99,20 @@ impl WorkerFactory for DaemonWorkerFactory {
     /// Spawn `<exe> --worker` for one session.
     ///
     /// Deliberately a one-line delegation. `WorkerHandle::spawn` is the engine's
-    /// only child constructor and the census in `childproc.rs` exists to keep it
-    /// the only one; a daemon-side `Command::new(exe).arg("--worker")` here would
+    /// only child constructor, and a daemon-side raw `Command::new(exe)` here would
     /// silently skip the env scrub, the process-group `pre_exec`, and the stderr
-    /// drain, and nothing outside this line would notice for weeks.
+    /// drain.
+    ///
+    /// **What actually catches that is NOT the census.** The census in
+    /// `childproc.rs` walks the engine's `src/` and, in the workspace-member
+    /// layout, the desktop's — never this member, which is a sibling directory of
+    /// the engine rather than a subdirectory of either. Measured: a raw
+    /// constructor planted in `fulcrum/src/serve.rs` leaves every census
+    /// invariant green. The witness for this line is
+    /// `fulcrum/tests/boundary.rs::the_daemon_builds_no_child_outside_the_engine_constructor`,
+    /// which walks `fulcrum/src` with the same needles. Do not re-attach this
+    /// comment to the census: an earlier revision of it did, and it named a guard
+    /// that cannot see this file.
     fn spawn(&self) -> Result<WorkerHandle, WorkerError> {
         WorkerHandle::spawn(&self.exe)
     }

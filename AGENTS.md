@@ -185,10 +185,23 @@ change either half of that pairing, re-run the guard and check it still sees the
 `fulcrum/src/` is outside the walk and `fulcrum/Cargo.toml` is never opened. The daemon may import `rusqlite` —
 intended, it owns the disk and ADR 0091 keeps the disk out of the engine — and a `tauri` import there would be invisible
 to *these* pins. That is the shape, not an open hole: **the daemon carries its own pins over its own tree**, in
-`fulcrum/tests/boundary.rs` (10 tests), which forbid the UI framework, its `_plugin` crates, the desktop package and
+`fulcrum/tests/boundary.rs` (12 tests), which forbid the UI framework, its `_plugin` crates, the desktop package and
 `crate::config::`/`crate::storage::` paths inside `fulcrum/src/`, while naming the SQLite driver as legal here. So do
 not widen `boundary_pins` to walk the sibling: it would fail on the daemon's legitimate `rusqlite`, and the fix for that
 would be an allowlist that weakens the engine's pin. Two pin sets, two trees, neither reading the other.
+
+**The same one-tree blindness applies to `childproc`'s census, and there it WAS an open hole.** The census walks the
+engine's `src/` and — only in the workspace-member layout — the desktop's `src-tauri/src`, so invariants A (one
+constructor) and B (one owner of the creation flags) never opened `fulcrum/src/` either. `worker_factory.rs` cited that
+census as the witness for its own one-line delegation, and measured, the citation was false: a raw constructor plus a
+second `creation_flags` caller planted in `fulcrum/src/serve.rs` left every census test green — all 10 in
+`childproc::tests`, invariants A and B included. The daemon's share
+of the invariant is now pinned by `the_daemon_builds_no_child_outside_the_engine_constructor` in that same file, over
+three call forms (the raw constructor, the creation flags, `raw_arg`), with a positive half asserting the Worker is
+still spawned by delegation so the absence pin cannot be satisfied by deleting the capability. Its flag needle is
+deliberately BROADER than invariant B's — no leading `.`, so a UFCS call fires too. When you add a pin here, note the
+file's own trap: it is the scanner, so a needle written out in prose fires on itself (`the_scanner_source_contains_no_needle`
+audits this file's whole source, comments included, and it caught exactly that during this change).
 
 **The schema-shape pin is the fulcrum↔desktop contract — `schema-sha.txt` is an artifact, not a build output.** The
 daemon's four tables are a transcription of the desktop's and the daemon opens a different file, so a DDL change on
