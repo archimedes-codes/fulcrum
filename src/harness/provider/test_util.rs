@@ -18,6 +18,9 @@ use super::types::{ChatMessage, ChatRole, MessageContent, ProviderEvent, ToolCal
 /// a provider request. Sorted explicitly rather than relying on `serde_json`'s
 /// default `BTreeMap` ordering — the pin must not encode a feature choice
 /// (`preserve_order` would make the raw iteration order insertion order).
+///
+/// Deliberately duplicated by a private twin in `seams.rs`'s `#[cfg(test)]` mod — the
+/// suites are unrelated, and a provider `test_util` import there is worse coupling.
 pub(crate) fn keys_of_names(v: &Value) -> Vec<String> {
     let mut ks: Vec<String> = v.as_object().expect("an object").keys().cloned().collect();
     ks.sort();
