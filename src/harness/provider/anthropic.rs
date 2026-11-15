@@ -3000,18 +3000,48 @@ mod tests {
     /// ceiling, and it always outranks its own budget (Anthropic requires
     /// **strict** `max_tokens > budget_tokens` — a tie is a 400).
     ///
-    /// Driven through the pure switch (`anthropic_output_budget(cap,
-    /// anthropic_thinking(level))`) rather than the body builder, so the real
-    /// level-table output feeds in and no request shape is involved.
+    /// Driven through the pure switch (`anthropic_output_budget(cap, ...)`)
+    /// rather than the body builder, so no request shape is involved, and over
+    /// **both** driver shapes — they do not reach the same inputs:
     ///
-    /// The `>` half is read off the returned object's `budget_tokens` KEY: the
-    /// `adaptive` mode carries no such key, so it is exempt **by construction,
-    /// not by a special case** — there is no `if level == "weird"` here, and
-    /// adding a budget to `adaptive` would automatically bring it under the
-    /// assertion.
+    /// **16 caps × 9 budgets = 144** — the plan's exhaustive legality set. The
+    /// numeric budgets are turned into `thinking` objects DIRECTLY here, not
+    /// driven through [`anthropic_thinking`]: the level table can only ever
+    /// produce five budgets (`{4096, 10000, 20000, 40000, 128000}`), so the
+    /// clamp's own boundaries are unreachable from a level name. `1024`
+    /// (exactly Anthropic's legal minimum), `47616` (exactly `room`) and
+    /// `47617` (one over `room`) are three of the nine and none of the five.
+    ///
+    /// **16 caps × 7 levels = 112** — the set reachable from a level NAME, kept
+    /// because it is the only shape that produces the `adaptive` object (an
+    /// unrecognized level → `{"type":"adaptive"}` with **no** `budget_tokens`),
+    /// the case that must pass through untouched rather than be mistaken for a
+    /// zero budget.
+    ///
+    /// The `>` half is read off the returned object's `budget_tokens` KEY in
+    /// both loops: the `adaptive` mode carries no such key, so it is exempt
+    /// **by construction, not by a special case** — there is no
+    /// `if level == "weird"` here, and adding a budget to `adaptive` would
+    /// automatically bring it under the assertion.
     ///
     /// Deliberately NOT the floor: see the scope note on
     /// [`the_answer_floor_holds_under_every_level`].
+    ///
+    /// What this invariant CANNOT see, so nobody mistakes 256 inputs for full
+    /// coverage of the clamp: both halves constrain only the PAIR's ordering
+    /// and the ceiling, never the budget's VALUE. Enumerating every shipped
+    /// budget the code could emit against every cap, the two halves are
+    /// violated **iff a budget ≥ the ceiling reaches the wire** — so a clamp
+    /// that returns `min(budget, MIN_ANSWER_TOKENS)` instead of
+    /// `min(budget, room)`, one that returns `min(budget, room - 1)`, or one
+    /// that raises small budgets to 1,024 all stay legal at every one of these
+    /// 256 inputs and pass here. That is not a gap to plug by weakening an
+    /// assertion; it is why [`the_clamp_shrinks_and_only_drops_when_no_legal_budget_fits`]
+    /// and the two body-builder tests pin the shipped VALUES (47,616 and the
+    /// 128,000 → 47,616 shrink) directly. What this sweep owns is legality
+    /// across the cross-product, and the 144 half is what proves no cap/budget
+    /// combination is illegal — including the three the level vocabulary can
+    /// never generate.
     #[test]
     fn the_wire_never_asks_for_more_than_the_ceiling_and_always_outranks_its_budget() {
         // The caps span both arms' interesting edges: `None` (the ceiling
@@ -3037,28 +3067,16 @@ mod tests {
             Some(100000),
             Some(u32::MAX),
         ];
-        // The full level vocabulary, `None` (no `thinking` at all) and the
-        // unrecognized level (→ `adaptive`) included.
-        let levels: [Option<&str>; 7] = [
-            None,
-            Some("low"),
-            Some("medium"),
-            Some("high"),
-            Some("xhigh"),
-            Some("max"),
-            Some("weird"),
-        ];
-        let mut inputs = 0usize;
-        for cap in caps {
-            for level in levels {
-                inputs += 1;
-                let thinking = level.map(anthropic_thinking);
-                let (max_tokens, thinking) = anthropic_output_budget(cap, thinking);
+        // The two halves, shared by both sweeps so neither loop can drift
+        // away from the other. `driver` names what fed the switch so a failure
+        // points at the input, not just at the numbers.
+        let check_legal =
+            |cap: Option<u32>, driver: String, max_tokens: u32, thinking: &Option<Value>| {
                 // Half one: the ceiling is never exceeded, in either arm.
                 assert!(
                     max_tokens <= ANTHROPIC_OUTPUT_CEILING_TOKENS,
-                    "cap {cap:?} level {level:?}: max_tokens {max_tokens} exceeds \
-                     the ceiling {ANTHROPIC_OUTPUT_CEILING_TOKENS}"
+                    "cap {cap:?} {driver}: max_tokens {max_tokens} exceeds \
+                 the ceiling {ANTHROPIC_OUTPUT_CEILING_TOKENS}"
                 );
                 // Half two: strictly greater than the budget it ships. The
                 // `if let` on the KEY is the whole exemption story.
@@ -3069,20 +3087,81 @@ mod tests {
                 {
                     assert!(
                         max_tokens as u64 > budget,
-                        "cap {cap:?} level {level:?}: max_tokens {max_tokens} does \
-                         not outrank budget {budget} (Anthropic requires strict \
-                         `max_tokens > budget_tokens`; a tie is a 400)"
+                        "cap {cap:?} {driver}: max_tokens {max_tokens} does \
+                     not outrank budget {budget} (Anthropic requires strict \
+                     `max_tokens > budget_tokens`; a tie is a 400)"
                     );
                 }
+            };
+
+        // ── Sweep one: the plan's exhaustive budget cross-product ─────────
+        //
+        // The numeric budgets are turned into `thinking` objects HERE, not
+        // driven through `anthropic_thinking`, because the level table can only
+        // produce five budgets — `{4096, 10000, 20000, 40000, 128000}` — and so
+        // can never reach the clamp's own boundaries: `1024` (exactly
+        // Anthropic's legal minimum), `47616` (exactly `room`, the inclusive
+        // edge) and `47617` (one over `room`, the shrink edge). A sweep driven
+        // by level name silently omits all three.
+        let budgets: [Option<u32>; 9] = [
+            None,
+            Some(1024),
+            Some(4096),
+            Some(10000),
+            Some(20000),
+            Some(40000),
+            Some(47616),
+            Some(47617),
+            Some(128000),
+        ];
+        let mut budget_inputs = 0usize;
+        for cap in caps {
+            for budget in budgets {
+                budget_inputs += 1;
+                // `None` is no `thinking` at all; a number is the `enabled`
+                // object the wire would carry, built directly.
+                let thinking = budget.map(|b| json!({ "type": "enabled", "budget_tokens": b }));
+                let (max_tokens, thinking) = anthropic_output_budget(cap, thinking);
+                check_legal(cap, format!("budget {budget:?}"), max_tokens, &thinking);
             }
         }
-        // The cross-product's cardinality, pinned so a dropped cap or level is
-        // visible rather than silently narrowing coverage: 16 caps × 7 levels
-        // = 112 inputs. (The plan's prose rounds this to "144"; the lists it
-        // names are the ones above and they multiply to 112 — the lists are
-        // what matters, this line is what proves none went missing.)
-        assert_eq!(inputs, caps.len() * levels.len());
-        assert_eq!(inputs, 112);
+        // 16 caps × 9 budgets = 144: the plan's exhaustive legality set, the
+        // one its claim rests on. Pinned so a dropped cap or budget is visible
+        // rather than silently narrowing coverage.
+        assert_eq!(budget_inputs, caps.len() * budgets.len());
+        assert_eq!(budget_inputs, 144);
+
+        // ── Sweep two: the real level vocabulary ──────────────────────────
+        // The full level vocabulary, `None` (no `thinking` at all) and the
+        // unrecognized level (→ `adaptive`) included. Kept even though it is
+        // narrower than sweep one on budgets, because it is the ONLY shape that
+        // produces the `adaptive` object — an unrecognized level yields
+        // `{"type":"adaptive"}` with no `budget_tokens` key, the case that must
+        // pass through untouched rather than be read as a zero budget.
+        let levels: [Option<&str>; 7] = [
+            None,
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some("xhigh"),
+            Some("max"),
+            Some("weird"),
+        ];
+        let mut level_inputs = 0usize;
+        for cap in caps {
+            for level in levels {
+                level_inputs += 1;
+                let thinking = level.map(anthropic_thinking);
+                let (max_tokens, thinking) = anthropic_output_budget(cap, thinking);
+                check_legal(cap, format!("level {level:?}"), max_tokens, &thinking);
+            }
+        }
+        // 16 caps × 7 levels = 112: the set reachable from a level NAME. Also
+        // pinned — sweep one does not subsume this one (it cannot make
+        // `adaptive`), and this one does not subsume sweep one (it cannot make
+        // 1024 / 47616 / 47617).
+        assert_eq!(level_inputs, caps.len() * levels.len());
+        assert_eq!(level_inputs, 112);
     }
 
     /// `clamp_thinking_budget` pinned DIRECTLY, separate from the body's view
