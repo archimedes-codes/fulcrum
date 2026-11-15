@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::method;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::support::{build_loop_with_db, build_loop_with_headers_and_db, fake_model, text_prompt};
@@ -340,5 +340,124 @@ async fn a_loop_switched_to_a_model_without_levels_sends_no_reasoning_effort() {
     assert!(
         body.get("reasoning_effort").is_none(),
         "a no-levels model must not receive a stale reasoning_effort, got {body}"
+    );
+}
+
+/// Anthropic's own SSE happy path (`event:`-tagged, unlike the OpenAI wires —
+/// the shape [`AnthropicStream`] parses). Carries a `text_delta` so the
+/// stream reaches completion instead of stalling the turn.
+const ANTHROPIC_SSE: &str = "event: message_start\n\
+     data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n\
+     event: content_block_delta\n\
+     data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+     event: message_stop\n\
+     data: {\"type\":\"message_stop\"}\n\n";
+
+/// Issue #196, WIRE-LEVEL: the `max_tokens` the loop sends on a live
+/// `POST …/messages` is the output CEILING, with the `max` level's thinking
+/// budget clamped DOWN beneath it.
+///
+/// The builder-level shape is Task 1's own unit pin; this is the proof that
+/// it survives the trip through the loop. Every other loop test provider
+/// takes `_req` (and the one recording provider records only `session_id`),
+/// so before this test NOTHING pinned the loop's own `max_tokens` — a sized
+/// value would have shipped untested.
+///
+/// The `max` level is the one worth driving: its table budget (128,000) used
+/// to be sent verbatim, which is a 400 from Anthropic, and it is the only
+/// level the clamp actually moves. `set_thinking_level` is a plain assignment
+/// (the level-membership check lives in the session layer, not the loop), so
+/// a `fake_model` with no levels still puts `max` on the wire.
+#[tokio::test]
+async fn a_loop_turn_on_the_anthropic_wire_sends_the_output_ceiling() {
+    let server = MockServer::start().await;
+    // The Anthropic Messages path (issue #196's whole point is WHICH wire the
+    // bytes land on): `build_provider` hands `AnthropicProvider` the ROOT and
+    // the client normalises to `…/v1` before appending `/messages`, so a
+    // `server.uri()` base posts to `/v1/messages`.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ANTHROPIC_SSE.to_string(), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut model = fake_model("claude-fake");
+    model.provider = "prov".to_string();
+    model.base_url = server.uri();
+    // The routing switch: `anthropic-messages` is what sends this model
+    // through `AnthropicProvider` — the ONLY place the ceiling exists.
+    model.api = Some("anthropic-messages".to_string());
+
+    let models = vec![model.clone()];
+    let provider = build_provider(&model);
+
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+    let (settle_tx, _settle_rx) = watch::channel(0u64);
+    let retry = RetryPolicy::new_with(0, Duration::from_millis(1));
+
+    let (_space, mut loop_, _db) = build_loop_with_db(
+        provider,
+        events_tx,
+        turn_cancel,
+        settle_tx,
+        retry,
+        models,
+        None,
+    );
+
+    loop_.set_thinking_level(Some("max".to_string()));
+
+    loop_.handle_prompt(&text_prompt("hello")).await;
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1, "one model request was sent");
+    assert_eq!(
+        requests[0].url.path(),
+        "/v1/messages",
+        "the turn reached the Anthropic Messages wire, not an OpenAI one"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("a JSON request body");
+
+    // (1) PRESENT before anything else. The silent-omit failure mode of this
+    // whole area is that the OpenAI builders drop `max_tokens` entirely when
+    // it is `None` — so a test that routed to the wrong provider could pass
+    // every value assertion vacuously having tested nothing. This assertion
+    // makes that impossible.
+    assert!(
+        body.get("max_tokens").is_some(),
+        "`max_tokens` must be PRESENT on the Anthropic wire (Anthropic \
+         requires it) — an absent field means this request did not go through \
+         `AnthropicProvider` at all, so the pins below would be vacuous. \
+         The loop must route an `anthropic-messages` model there. Body: {body}"
+    );
+
+    // (2) The CEILING, with no caller cap in the way — the live shape the
+    //     loop produces (`ModelOptions::max_tokens` is `None` from
+    //     `AgentLoop::model_request`).
+    assert_eq!(
+        body["max_tokens"], 64000,
+        "the loop sends the output CEILING, never the sum it used to send \
+         (129024 was a 400), got {body}"
+    );
+
+    // (3) The `max` level's budget is SHRUNK to fit beneath the ceiling, not
+    //     sent as the table's 128,000.
+    assert_eq!(
+        body["thinking"]["budget_tokens"], 47616,
+        "the `max` budget (128000) is clamped to ceiling - MIN_ANSWER_TOKENS \
+         (64000 - 16384), got {body}"
+    );
+
+    // (4) The API's OWN invariant, named on its own so a future change to
+    //     either constant reddens something that says why: Anthropic requires
+    //     STRICT `max_tokens > budget_tokens`.
+    assert!(
+        body["max_tokens"].as_u64().unwrap() > body["thinking"]["budget_tokens"].as_u64().unwrap(),
+        "Anthropic requires max_tokens > thinking.budget_tokens (an \
+         over-budget request is a 400, not a clamp), got {body}"
     );
 }
