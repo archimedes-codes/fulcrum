@@ -60,7 +60,17 @@ pub(crate) async fn run_pump_loop(
             // process is reaped — the loop ends).
             match result {
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    crate::debuglog::log(&format!(
+                    // ALWAYS-ON (`diagnostics`, not `debuglog`): this is the one
+                    // place a frame is DISCARDED, and a dropped `agent_end` is how
+                    // a session ends up untitled or a turn looks hung — for the
+                    // rest of the session's life, with no other trace. A line
+                    // behind `ARCHIMEDES_DEBUG` cannot answer "why did nothing
+                    // happen" for a user who never set the var.
+                    //
+                    // The content is a count and a session id: no prompt, no
+                    // transcript, no credential — which is the rule `diagnostics`
+                    // states for its call sites.
+                    crate::diagnostics::record(&format!(
                         "worker pump lagged {n} frames for session {session_id}"
                     ));
                     continue;
