@@ -17,6 +17,10 @@
 // Moved by `git mv` with every `mod`/`#[cfg(test)]` block verbatim; the desktop
 // reaches them through the re-export seam in `src-tauri/src/agent/mod.rs`.
 pub mod debuglog;
+/// The ALWAYS-ON diagnostics channel — separate from `debuglog` because `debuglog`
+/// is the `ARCHIMEDES_DEBUG` protocol transcript (every `→`/`←` frame, prompts
+/// included) and must stay behind its opt-in switch. See the module docs.
+pub mod diagnostics;
 pub mod events;
 pub mod fs_backend;
 pub mod hostenv;
