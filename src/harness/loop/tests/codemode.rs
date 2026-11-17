@@ -185,8 +185,10 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
 
     // (b) The batch pre-pass REJECTS a non-advertised top-level key before dispatch
     //     (`param_rejection.rs`'s pattern: `run_tool_batch` returns the same
-    //     `serde_json::to_value(&result)` the `tool_execution_end` carries).
-    let results = loop_
+    //     `serde_json::to_value(&result)` the `tool_execution_end` carries, plus
+    //     the rejection vector the turn-bound guard reads — destructured here,
+    //     unused).
+    let (results, _rejected) = loop_
         .run_tool_batch(
             &[ToolCall {
                 id: "t3".to_string(),
@@ -606,9 +608,13 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
     );
 
     // The equality in the other direction, against the DIRECT wire result.
+    // (`run_tool_batch`'s second tuple element — the rejection vector the
+    // turn-bound guard reads — is not what this asserts, so it is dropped with
+    // the `into_iter()` that already projects the results.)
     let direct_batch = loop_
         .run_tool_batch(&[nested], &CancellationToken::new())
         .await
+        .0
         .into_iter()
         .next()
         .expect("one result");

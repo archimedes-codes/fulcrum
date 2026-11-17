@@ -71,6 +71,25 @@ pub enum RpcEvent {
     /// BEFORE `turn_end` so a peer can stash the disposition before the settle
     /// resolves the turn.
     turn_truncated,
+    /// (the turn-loop bound) The turn was stopped by the AGENT's own turn limit
+    /// — the round ceiling (`MAX_MODEL_ROUNDS_PER_PROMPT`) or a run of identical
+    /// refused tool batches (`MAX_IDENTICAL_REFUSAL_RUNS`) — before it finished.
+    /// Emitted BEFORE `turn_end` so a peer can stash the disposition before the
+    /// settle resolves the turn.
+    ///
+    /// NOT additive in the way `turn_truncated`'s note claims a new frame is:
+    /// `RpcEvent` is a plain `#[serde(tag = "type")]` derive with no
+    /// `#[serde(other)]`, so a peer built against an older crate does not ignore
+    /// this frame, it HARD-ERRORS on it and drops that one frame (the permissive
+    /// reader routes on `type` and only an unknown `type` becomes
+    /// `unknown { raw }` — a KNOWN tag whose variant the older enum lacks
+    /// fails to deserialize). What actually happens is narrower and worth
+    /// stating: the older peer loses the disposition and the turn resolves as
+    /// its DEFAULT disposition. Nothing else about the turn changes — `turn_end`
+    /// and `agent_settled` still land, so the turn settles, it just settles
+    /// unlabelled. `PROTOCOL_VERSION` stays 1 for that reason: this is a frame a
+    /// stale peer drops, not a change to the shape of the exchange.
+    turn_capped,
     #[serde(rename_all = "camelCase")]
     turn_end {
         message: Value,
@@ -244,6 +263,7 @@ impl RpcEvent {
             RpcEvent::agent_settled => std::borrow::Cow::Borrowed("agent_settled"),
             RpcEvent::turn_start => std::borrow::Cow::Borrowed("turn_start"),
             RpcEvent::turn_truncated => std::borrow::Cow::Borrowed("turn_truncated"),
+            RpcEvent::turn_capped => std::borrow::Cow::Borrowed("turn_capped"),
             RpcEvent::turn_end { .. } => std::borrow::Cow::Borrowed("turn_end"),
             RpcEvent::message_start { .. } => std::borrow::Cow::Borrowed("message_start"),
             RpcEvent::message_end { .. } => std::borrow::Cow::Borrowed("message_end"),

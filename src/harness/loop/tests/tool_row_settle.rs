@@ -13,13 +13,18 @@
 //! count and cost keep rising.
 //!
 //! Task 1 shipped the fix (`close_announced_tool_calls`, reached from both
-//! settle functions; the eight-site table and its vacuity derivations live in
+//! settle functions; the settle-site table — eight sites when Task 1 landed, ten
+//! today — and its vacuity derivations live in
 //! `docs/features/abandoned-tool-rows.md` §2). This module pins the exits
 //! Task 1 did not itself test: site 2 (mid-stream `Fatal`), site 3 asserted as
 //! the PAIR its asymmetry was the bug, site 4 (budget exhausted), site 8 (Stop
 //! pressed mid-stream — the exit the field report is about), the emission
 //! ORDER, the no-double-close property, and the vacuity of the new settle path
-//! when nothing was announced.
+//! when nothing was announced. Site 10 (the turn-loop bound) is pinned here too,
+//! and its test is written individually rather than through
+//! `assert_closed_before_the_settle`: that helper's first two assertions demand
+//! two announced opens and two closes, and a vacuous site has neither — which is
+//! also why the pre-existing vacuous-site test below stands on its own.
 //!
 //! Every test here carries a WITNESS that the exit it names was actually
 //! walked, before it asserts that a row closed (the house pattern at
@@ -1261,5 +1266,175 @@ async fn a_settle_with_nothing_announced_emits_no_tool_execution_end() {
             .any(|m| matches!(m.role, ChatRole::Tool)),
         "and no `tool` row is pushed, got {:?}",
         loop_s.messages
+    );
+}
+
+/// SITE 10 — the turn-bound settle (`loop.rs`, the top-of-loop round / identical-
+/// refusal guard) closes NOTHING of its own, and carries every PRIOR batch's
+/// results.
+///
+/// The shape is the vacuous-`announced` one, for the site-5 reason verbatim: no
+/// `TurnAccumulator` exists at the point in the iteration where the guard fires,
+/// and no earlier iteration can have left a row open (a completed batch closes
+/// every call it processed). So `settle_error` gets `&[]` and `
+/// close_announced_tool_calls` iterates nothing.
+///
+/// **This test deliberately does NOT use `assert_closed_before_the_settle`.**
+/// That helper's first two assertions demand TWO announced opens and TWO closes
+/// with `abandoned_tool_result()`'s text, and a vacuous site has neither — the
+/// other vacuous-site tests in this file (`a_settle_with_nothing_announced_emits_no_tool_execution_end`)
+/// are each written individually for exactly that reason.
+///
+/// Nor can it assert a literally EMPTY close set, and the reason is worth
+/// recording because it is a property of the route, not of this test: a capped
+/// turn is only reachable by a turn that keeps making tool calls (every other
+/// route back to the loop top is budget-limited or terminal), and
+/// `run_tool_batch` emits a real `tool_execution_end` for EVERY call it
+/// processes — including the refused ones (issue #93: a rejection is a result the
+/// model can read, not a silent drop). So closes EXIST on this route; what the
+/// settle must add is NONE. That is what "closes nothing" means here, and it is
+/// pinned by count and by text: every close carries the batch's own rejection,
+/// and not one carries the abandoned-attempt text the settle would have invented.
+///
+/// THE PIN THAT MATTERS MOST is the third assertion. `state.turn_tool_results`
+/// accumulates across iterations and a bounded turn is by construction the LONGEST
+/// one a prompt can produce, so a `Vec::new()` instead of
+/// `std::mem::take(&mut state.turn_tool_results)` would silently drop every tool
+/// result the turn ever earned out of `turn_end.tool_results` — on exactly the
+/// shape the cap fires on.
+#[tokio::test]
+async fn a_capped_turn_closes_nothing_and_carries_the_prior_results() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // The identical-refusal run: ONE refused call per round, so every count below
+    // is exactly the round count and nothing else.
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "write".to_string(),
+            arguments: json!({
+                "path": "never-written.txt",
+                "content": "legal",
+                "contentt": "typo",
+            }),
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ])]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let events =
+        collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
+    let kinds = kinds(&events);
+
+    // ── witness: the guard really fired, and this is not some other settle ──
+    assert!(
+        kinds.iter().any(|k| k == "turn_capped"),
+        "the turn settled on the BOUND (the witness frame), got {kinds:?}",
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "auto_retry_start"),
+        "nothing was retried — this is the bound's settle, not a budget-exhausted \
+         `settle_error` (site 4), got {kinds:?}",
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "turn_truncated"),
+        "and not the output-cap route (site 9), got {kinds:?}",
+    );
+    // The both-armed witness, at the provider: the run reached the ceiling and
+    // the turn stopped there, so the batches demonstrably ran BEFORE the settle.
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 1;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        rounds,
+        "{rounds} rounds ran (one refused batch each) before the guard fired, got \
+         {kinds:?}",
+    );
+
+    // ── the settle closed NOTHING of its own ──
+    //
+    // Every close that exists is the BATCH's own rejection, and not one carries
+    // `abandoned_tool_result()`'s text. A settle that passed the calls instead of
+    // `&[]` would add a second close per call carrying ABANDONED.
+    let closed = closes(&events);
+    assert_eq!(
+        closed.len(),
+        rounds as usize,
+        "exactly one close per REFUSED call the batches processed — the settle \
+         adds none, got {kinds:?}",
+    );
+    for (id, _name, result, is_error) in &closed {
+        assert!(*is_error, "a refused call is a failed card, got {id}");
+        assert_ne!(
+            close_text(result),
+            Some(ABANDONED),
+            "the settle invented no abandoned-attempt close — a capped turn's calls \
+             were refused by the param checker, not discarded with the attempt, \
+             got {result}"
+        );
+        assert!(
+            close_text(result)
+                .unwrap_or_default()
+                .starts_with("unknown param(s) for `write`"),
+            "every close is the batch's own rejection sentence, got {result}"
+        );
+    }
+
+    // ── THE `std::mem::take` PIN: the PRIOR batches' results survive ──
+    let turn_end_at = kinds
+        .iter()
+        .position(|k| k == "turn_end")
+        .unwrap_or_else(|| panic!("the capped turn settled with `turn_end`, got {kinds:?}"));
+    let settled_at = kinds
+        .iter()
+        .position(|k| k == "agent_settled")
+        .unwrap_or_else(|| panic!("the capped turn settled with `agent_settled`, got {kinds:?}"));
+    assert!(
+        turn_end_at < settled_at,
+        "`turn_end` at {turn_end_at} precedes `agent_settled` ({settled_at}), got {kinds:?}",
+    );
+    let RpcEvent::turn_end { tool_results, .. } = &events[turn_end_at] else {
+        unreachable!("the event at {turn_end_at} is `turn_end` by the position above")
+    };
+    assert_eq!(
+        tool_results.len(),
+        rounds as usize,
+        "`turn_end.tool_results` carries EVERY prior batch's result — this is the \
+         pin that reddens a `Vec::new()` where `std::mem::take(&mut \
+         state.turn_tool_results)` belongs, because a bounded turn is the LONGEST \
+         a prompt can get and a `Vec::new()` would drop all {rounds} of them, got \
+         {tool_results:?}",
+    );
+    for (i, result) in tool_results.iter().enumerate() {
+        assert_eq!(
+            result["isError"].as_bool(),
+            Some(true),
+            "result {i} is the rejection result the batch produced, got {result}"
+        );
+    }
+
+    // ── `agent_settled` follows, and the settle pushed no transcript row ──
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("agent_settled"),
+        "the settle is the turn's last emission, got {kinds:?}",
+    );
+    // The batches pushed one `tool` row per refused call (issue #93 — a rejection
+    // IS a result the model reads). The settle's half of the invariant is that it
+    // adds none, which the count says exactly.
+    assert_eq!(
+        loop_
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Tool))
+            .count(),
+        rounds as usize,
+        "one `tool` row per REFUSED call the batches processed, and none from the \
+         settle (`close_announced_tool_calls` pushes no transcript row), got {:?}",
+        loop_.messages
     );
 }
