@@ -54,9 +54,49 @@ pub use types::{cost_usd_from_usage, parse_error_chunk, WireToolCall};
 /// [`build_provider_with_headers`] is the header-carrying form the two
 /// production construction sites use.
 pub fn build_provider(m: &crate::harness::catalog::Model) -> Box<dyn Provider> {
-    match crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
-        .unwrap_or_default()
-    {
+    // The wire is resolved ONCE into a local and the `match` below runs on the
+    // local, so the line and the dispatch cannot disagree.
+    //
+    // WHY `eprintln!` AND `diagnostics::record`, not one of them:
+    //
+    // * `debuglog::log` is out. It is the GATED full protocol transcript
+    //   (`ARCHIMEDES_DEBUG=1` only) and it returns at its first statement without
+    //   that var, so it is a no-op for a user who never set it — which is the
+    //   whole population this line is for.
+    // * `diagnostics::record` is always on (no env var, `<datadir>/archimedes/
+    //   diagnostics.log`), but **the Worker never arms it** — ADR 0110 files that
+    //   under "What this does not fix" — so a `record` reached inside a Worker
+    //   process is a silent no-op. The Supervisor-side construction (the naming
+    //   pass, whose stderr is inherited and never persisted) is the case this
+    //   half covers.
+    // * The `eprintln!` half is what covers the WORKER: the Worker's stderr is
+    //   drained by a dedicated task in `worker/client.rs`
+    //   (`debuglog::log_truncated("worker-stderr:", &line)`), so it is the ONLY
+    //   Worker-side sink that survives at all. DO NOT delete it as redundant
+    //   with the `record` line — that would make the Worker-side wire
+    //   unobservable again. Readable only with `ARCHIMEDES_DEBUG=1` set before
+    //   launch; no gated surface is on by default.
+    //
+    // The `record` payload is `m.id` and `m.base_url` — configuration, not user
+    // content, so this call site satisfies the rule `diagnostics` states for its
+    // call sites ("a model id, a session id, a provider id … are what belong").
+    // Recorded here as the reviewed decision the module doc asks for, not as a
+    // convenience.
+    let wire = crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
+        .unwrap_or_default();
+    eprintln!(
+        "harness: provider wire={} model={} base={}",
+        wire.as_str(),
+        m.id,
+        m.base_url
+    );
+    crate::diagnostics::record(&format!(
+        "provider wire={} model={} base={}",
+        wire.as_str(),
+        m.id,
+        m.base_url
+    ));
+    match wire {
         crate::harness::WireApi::AnthropicMessages => Box::new(AnthropicProvider {
             // T3b (#131): the Messages wire wants the ROOT — the client appends
             // its own `/v1/messages`, so a `{root}/v1` base (the Settings'
@@ -143,9 +183,29 @@ pub fn build_provider_with_headers(
     m: &crate::harness::catalog::Model,
     custom_headers: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Box<dyn Provider> {
-    match crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
-        .unwrap_or_default()
-    {
+    // THE production construction entry (`worker/core.rs`'s loop construction and
+    // `AgentLoop::set_model`), so this is the site whose wire a user's session
+    // actually ran on. The same two lines and the same resolved-once local as
+    // [`build_provider`] — see that builder's comment for why BOTH sinks are
+    // needed and what each one covers. Reached in the Worker, where the
+    // `record` half is a no-op (never armed) and the `eprintln!` half survives
+    // only through the stderr drain, and in the Supervisor, where the `record`
+    // half is the only one with a reader.
+    let wire = crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
+        .unwrap_or_default();
+    eprintln!(
+        "harness: provider wire={} model={} base={}",
+        wire.as_str(),
+        m.id,
+        m.base_url
+    );
+    crate::diagnostics::record(&format!(
+        "provider wire={} model={} base={}",
+        wire.as_str(),
+        m.id,
+        m.base_url
+    ));
+    match wire {
         crate::harness::WireApi::AnthropicMessages => Box::new(AnthropicProvider {
             // T3b (#131): the SAME root-for-Messages pass as `build_provider`
             // (the idempotent strip; the client re-appends `/v1/messages` at
@@ -473,6 +533,122 @@ mod tests {
         // The loop-accept server never exits on its own — abort it (an
         // `await` would hang on the `accept()` loop).
         server.abort();
+    }
+
+    // ── the construction-time wire line ──────────────────────────────
+
+    /// The wire `build_provider` resolves is the wire the construction line
+    /// prints, and the rule it prints is the DOUBLE fallback
+    /// (`WireApi::parse(m.api.as_deref().unwrap_or("openai-completions")).unwrap_or_default()`):
+    /// all four known `api` strings resolve to their own spelling, and an
+    /// unknown string AND `None` both fold onto `openai-completions` — which is
+    /// exactly why the wire was undecidable after the fact (a configured
+    /// `openai-completions` and an unparseable `api` are the same provider, the
+    /// same request bytes, and until this line, the same silence).
+    ///
+    /// This half is an ABSENCE PIN and is green BEFORE and AFTER this change: it
+    /// asserts the VALUE the line prints, not the printing of it, and it goes
+    /// through `build_provider` so a builder that panicked on one of these
+    /// inputs would redden it rather than silently skip it. None of the four
+    /// tests above can pin it — they assert recorded HTTP traffic, and traffic
+    /// cannot tell `openai-completions` from `litellm` (ADR 0026: same wire) nor
+    /// either from an unknown string; there is no `Provider::as_any` to ask.
+    ///
+    /// The SECOND half is the real observable, not a proxy: `build_provider`
+    /// reaches `diagnostics::record`, whose target is a file, so the emitted
+    /// line is asserted against a scratch dir — armed per the contract
+    /// `diagnostics` documents (`init(Some(temp_dir))` before the first
+    /// `record`, under `env_lock()` because the target is process-global, and
+    /// `init(None)` restoring the unarmed default on the way out).
+    ///
+    /// What this CANNOT reach: the `eprintln!` half. A lib unit test runs in
+    /// cargo's test harness, whose stderr goes to the harness and is not
+    /// capturable from inside the process without replacing the global sink —
+    /// and the only production reader of a Worker's stderr is the drain task in
+    /// `worker/client.rs`, which needs a real spawned Worker process. That drain
+    /// is what makes the `eprintln!` half worth writing, so the honest statement
+    /// is that the stderr line is pinned here only by sharing the `wire=` value
+    /// this test resolves, not by an assertion on its bytes.
+    #[test]
+    fn the_chosen_wire_is_logged_at_construction() {
+        // Taken FIRST, before any `build_provider` call: every one of them
+        // reaches `record`, so an unarmed-phase call racing a sibling test's
+        // armed scratch dir would pollute THAT test's line count (e.g.
+        // `a_line_is_timestamped_and_terminated` asserts exactly two lines).
+        // The lock the module doc prescribes covers the whole test, not just the
+        // asserted phase.
+        let _guard = crate::test_support::env_lock();
+
+        // A port nothing listens on: construction opens no connection, so this
+        // never needs a server (and never could race one).
+        let base_url = "http://127.0.0.1:9/v1";
+
+        for api in [
+            "openai-completions",
+            "anthropic-messages",
+            "openai-responses",
+            "litellm",
+        ] {
+            let m = model(base_url, Some(api));
+            let _provider = build_provider(&m);
+            let resolved =
+                crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
+                    .unwrap_or_default();
+            assert_eq!(
+                resolved.as_str(),
+                api,
+                "`api = {api:?}` resolves to its own spelling — the string the line prints"
+            );
+        }
+
+        for api in [Some("google-generative-ai"), Some(""), None] {
+            let m = model(base_url, api);
+            let _provider = build_provider(&m);
+            let resolved =
+                crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
+                    .unwrap_or_default();
+            assert_eq!(
+                resolved.as_str(),
+                "openai-completions",
+                "the double fallback folds `{api:?}` onto the default wire — the line \
+                 therefore reports `wire=openai-completions` for it, indistinguishably \
+                 from an explicit one (the limit the commit body states)"
+            );
+        }
+
+        // ── the emitted line, against the real sink ──────────────────
+        // The `diagnostics` test contract: the target starts UNARMED, so a test
+        // that wants a line must `init` a scratch dir BEFORE its first `record`
+        // — the `_guard` taken at the top of this test is the `env_lock()` the
+        // contract requires (the target is process-global, so a sibling test's
+        // `init` would otherwise race this assertion) and it is held across
+        // EVERY `build_provider` call above for the same reason. Leave the
+        // channel unarmed again on the way out so no later test inherits this
+        // scratch dir.
+        let dir = crate::test_support::ScratchDir::in_env_temp("provider-wire-test-", "dir");
+        crate::diagnostics::init(Some(dir.to_path_buf()));
+
+        // The unknown string is the case the line exists for: it is the one
+        // input whose wire was previously indistinguishable from a configured
+        // one in EVERY observable.
+        for (api, expected) in [
+            (Some("openai-responses"), "openai-responses"),
+            (Some("google-generative-ai"), "openai-completions"),
+            (None, "openai-completions"),
+        ] {
+            build_provider(&model(base_url, api));
+            let content = std::fs::read_to_string(dir.join(crate::diagnostics::FILE_NAME))
+                .expect("arming the channel makes the construction line land with no env var");
+            let want = format!("provider wire={expected} model=m/1 base={base_url}");
+            assert!(
+                content.contains(&want),
+                "`api = {api:?}` records {want:?}; got:\n{content}"
+            );
+        }
+
+        // Restore the unarmed default BEFORE the scratch dir is dropped, so the
+        // channel never points at a removed directory.
+        crate::diagnostics::init(None);
     }
 
     // ── the per-wire base-URL pass (T3b / #131) ───────────────────────
