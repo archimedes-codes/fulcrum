@@ -42,6 +42,61 @@ pub(super) struct TurnLoopState {
     pub(super) turn_tool_results: Vec<Value>,
     pub(super) message_started: bool,
     pub(super) overflow_recovered: bool,
+    /// Rounds through the turn loop for THIS prompt (the round ceiling; see
+    /// `MAX_MODEL_ROUNDS_PER_PROMPT` in `loop.rs` — its unit is one model call
+    /// plus its tool batch, NOT one provider request).
+    ///
+    /// It lives here and not on `RetryPolicy` because `TurnLoopState` is built
+    /// once per prompt at the single construction site in `handle_turn`, which
+    /// is exactly the lifetime a per-prompt ceiling needs. `RetryPolicy.attempt`
+    /// cannot host it: it is built once per Worker, never reset between prompts,
+    /// and its value is already on the wire as the `auto_retry_*` attempt number.
+    ///
+    /// Deliberately NOT reset on the accepted-attempt path (unlike
+    /// `overflow_recovered` below): a round ceiling that forgot the overflow
+    /// retries and the empty-turn retries would not bound the thing it exists to
+    /// bound.
+    pub(super) model_rounds: u32,
+    /// How many consecutive batches have been refused with the SAME signature
+    /// (see `MAX_IDENTICAL_REFUSAL_RUNS` in `loop.rs` — 3 is the consecutive
+    /// run, not a total). Reset to 0 by any batch that is not an exact repeat of
+    /// the one before it, which includes any batch with an accepted call.
+    pub(super) identical_refusal_runs: u32,
+}
+
+/// The signature of a batch that was refused WHOLESALE — `Some` only when EVERY
+/// call in it was rejected, `None` the moment one call was accepted.
+///
+/// The `None`-on-any-accepted rule is what makes a mixed batch RESET the run
+/// rather than extend it: an agent that fixes one key and re-sends the rest is
+/// making progress, and a guard that counts that as a repeat punishes exactly
+/// the behaviour the rejection sentence asks for.
+///
+/// The parts are sorted and joined with `\n`, each spelled
+/// `name + "\u{0}" + arguments`, so the join is unambiguous: `\u{0}` cannot
+/// appear in a tool name (the names come from `tool_specs()`), so no pair of
+/// `(name, arguments)` can be re-split into a different pair that hashes the
+/// same way. Sorting makes the signature independent of the order the provider
+/// happened to emit the calls in, which is the difference between catching a
+/// model that repeats itself and missing one that permutes.
+///
+/// Takes `&[bool]`, NOT `&[Option<String>]`: the caller must not have to keep
+/// the rejection SENTENCES alive merely to ask whether a call was refused. The
+/// vector is index-aligned with `tool_calls`, straight off `run_tool_batch`.
+pub(super) fn batch_signature(tool_calls: &[ToolCall], rejected: &[bool]) -> Option<String> {
+    if tool_calls
+        .iter()
+        .zip(rejected)
+        .any(|(_, was_rejected)| !*was_rejected)
+    {
+        return None;
+    }
+    let mut parts: Vec<String> = tool_calls
+        .iter()
+        .map(|tc| format!("{}\u{0}{}", tc.name, tc.arguments))
+        .collect();
+    parts.sort();
+    Some(parts.join("\n"))
 }
 
 impl AgentLoop {
@@ -123,7 +178,7 @@ impl AgentLoop {
             // the indicator clear and typing "continue", the symptom ADR 0045
             // exists to end.
             if t.reason == CompactionReason::Overflow && ran == CompactionRan::Skipped {
-                // Site 1 of the nine in
+                // Site 1 of the ten in
                 // `docs/features/abandoned-tool-rows.md` §2: there is NO
                 // `TurnAccumulator` in this function's scope — the compaction
                 // check runs at the TOP of the turn loop, before the model call
@@ -335,7 +390,7 @@ impl AgentLoop {
         }
 
         eprintln!("harness: mid-stream model error: {err}");
-        // Site 2 of the nine: `acc` IS in scope — this attempt announced rows
+        // Site 2 of the ten: `acc` IS in scope — this attempt announced rows
         // and is about to be abandoned without dispatching them, so its calls
         // close before the settle.
         self.settle_error(
@@ -495,7 +550,7 @@ impl AgentLoop {
                 ),
             });
         }
-        // Site 9 of the nine in `docs/features/abandoned-tool-rows.md` §2:
+        // Site 9 of the ten in `docs/features/abandoned-tool-rows.md` §2:
         // NOT vacuous. `consume_stream` has just run and this route reaches no
         // batch, so `acc.tool_calls` holds every row the cut-off attempt opened
         // at `in_progress` and will never dispatch — Decision 2 forbids the
@@ -558,7 +613,7 @@ impl AgentLoop {
             // the delay, up to 8 s).
             tokio::select! {
                 _ = turn.cancelled() => {
-                    // Site 3 of the nine — the asymmetry issue #11 is about.
+                    // Site 3 of the ten — the asymmetry issue #11 is about.
                     // This arm used to settle and RETURN, skipping the close
                     // loop a few statements below: the path where the backoff
                     // COMPLETED closed this same attempt's announced rows and
@@ -585,7 +640,7 @@ impl AgentLoop {
             attempt: self.retry.attempt(),
             final_error: Some(error_message.to_string()),
         });
-        // Site 4 of the nine: the budget is spent and this attempt is
+        // Site 4 of the ten: the budget is spent and this attempt is
         // abandoned for good — `acc` is in scope and its announced rows are
         // never dispatched, so they close before the settle.
         self.settle_error(
@@ -596,11 +651,27 @@ impl AgentLoop {
     }
 
     /// Dispatch tool calls (concurrent subagents + sequential tools) and append tool messages.
+    ///
+    /// Returns `(results, rejected)`, BOTH index-aligned with `tool_calls`:
+    /// `rejected[i]` is true exactly where `unknown_param_error` refused call
+    /// `i` (the same `param_errors` vector the dispatch arms below consult — it
+    /// is NOT recomputed here, and a caller must not recompute it either,
+    /// because two independent readings of the checker is the drift the plan's
+    /// Decision 2 rejects). `rejected` exists so the caller can build
+    /// [`batch_signature`]: `param_errors` is a local of this function and a
+    /// signature computed from a second pass would be a second source of truth.
+    ///
+    /// Note what `rejected[i]` does NOT claim: it is "the checker refused this
+    /// call's params", not "this call produced an error result". A call that was
+    /// ACCEPTED and then DENIED by the permission gate, or one that ran and
+    /// failed, is `false` — the repeat guard is about the model re-sending a
+    /// call the engine told it to fix, and a denied or failing tool is a
+    /// different problem with a different remedy.
     pub(super) async fn run_tool_batch(
         &mut self,
         tool_calls: &[ToolCall],
         turn: &CancellationToken,
-    ) -> Vec<Value> {
+    ) -> (Vec<Value>, Vec<bool>) {
         let mut turn_tool_results = Vec::new();
         // (issue #93) The unknown-param check runs HERE, before the `join_all`
         // below, and NOT inside `dispatch_tool`: a `subagent` call is dispatched
@@ -765,7 +836,16 @@ impl AgentLoop {
             self.persist_transcript_message();
         }
         self.note_context();
-        turn_tool_results
+        // (the turn-loop bound) The rejection vector, index-aligned with
+        // `tool_calls`, read off the SAME `param_errors` the dispatch arms above
+        // consulted — NOT a second `unknown_param_error` pass (see this
+        // function's docblock for why a recompute is the drift). `.get(i)` so a
+        // short vector reads as "not rejected" rather than panicking, matching
+        // the arms above.
+        let rejected: Vec<bool> = (0..tool_calls.len())
+            .map(|i| param_errors.get(i).is_some_and(Option::is_some))
+            .collect();
+        (turn_tool_results, rejected)
     }
 
     /// Close every tool row an ABANDONED attempt announced — the ONE close
@@ -833,7 +913,7 @@ impl AgentLoop {
     ///
     /// `announced` is the abandoned attempt's `acc.tool_calls` — the calls it
     /// opened rows for and will never dispatch. It is `&[]` wherever no attempt
-    /// is in scope (see the nine-site table in
+    /// is in scope (see the ten-site table in
     /// `docs/features/abandoned-tool-rows.md` §2); the close MUST precede
     /// `turn_end`, because `normalize` closes a row on `tool_execution_end` and
     /// on nothing that follows it.
@@ -906,7 +986,7 @@ impl AgentLoop {
     ///   (the spurious compaction — the pin that would have caught this).
     ///
     /// The wrapper therefore stays for its NAME and its docs, not for its body:
-    /// the nine-site settle table in `docs/features/abandoned-tool-rows.md` §2
+    /// the ten-site settle table in `docs/features/abandoned-tool-rows.md` §2
     /// names `settle_truncated` at site 9, and the `announced`-column discipline
     /// there depends on that name existing to carry a derivation. Two divergent
     /// copies of the same settle is what this function was, and the divergence

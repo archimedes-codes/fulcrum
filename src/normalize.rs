@@ -80,6 +80,12 @@ pub struct TurnState {
     /// (`{stamp}:system`) weld into one bubble — and a truncated turn can
     /// happen more than once in a session that keeps hitting the cap.
     pub truncate_seq: u64,
+    /// How many turn-cap notices this session has announced (the turn-loop
+    /// bound). Same role as `truncate_seq`, same reason: the notice needs a
+    /// messageId UNIQUE per notice, because two lines on the shared `system` key
+    /// (`{stamp}:system`) weld into one bubble — and a session that keeps
+    /// launching turns that hit the ceiling gets one notice per turn.
+    pub cap_seq: u64,
     /// The card id of the compaction currently in flight, set by
     /// `compaction_start` and taken by `compaction_end` (issue #90: a
     /// compaction renders as a `ToolCallCard`, so the settle must land on the
@@ -127,6 +133,21 @@ impl TurnState {
         self.truncate_seq += 1;
         self.id(&format!("truncate:{n}"))
     }
+
+    /// Mint the id of the NEXT turn-cap notice (the turn-loop bound):
+    /// `{stamp}:cap:N`.
+    ///
+    /// Copies [`Self::truncate_id`] exactly — stamped (ADR 0049; an EMPTY stamp
+    /// is a test artifact), unique per notice, and the counter is read BEFORE it
+    /// advances so the FIRST notice of a session is `cap:0`. That order is the
+    /// one that must hold here: the whole-frame pins assert `t:cap:0`, and it is
+    /// deliberately NOT `retract`'s pre-increment (which starts at `retract:1`)
+    /// — the two mints differ by one and neither is a typo for the other.
+    pub fn cap_id(&mut self) -> String {
+        let n = self.cap_seq;
+        self.cap_seq += 1;
+        self.id(&format!("cap:{n}"))
+    }
 }
 
 /// The machine-readable disposition the truncation notice frame carries
@@ -144,6 +165,27 @@ impl TurnState {
 /// disposition) must introduce its OWN value rather than reuse this constant.
 const TRUNCATION_DISPOSITION: &str = "length";
 
+/// The machine-readable disposition the turn-cap notice frame carries (the
+/// turn-loop bound).
+///
+/// **The vocabulary asymmetry with [`TRUNCATION_DISPOSITION`] is deliberate and
+/// must not be "unified".** That constant is a TRANSLATION: the engine's own
+/// `FinishReason::Length` becomes the OTel GenAI `gen_ai.response.finish_reasons`
+/// spelling `"length"`, because a provider stop reason has a standard name and
+/// the client reads that name. This one is NOT a translation — it is
+/// **byte-identical to the client's own spelling**, `"max_turn_requests"`,
+/// because the client invented the word first (its `StopReason` enum already
+/// carries a `MaxTurnRequests` variant) and there is NO OTel counterpart for a
+/// guard that lives entirely client-side: no provider ever reports it, so no
+/// standard vocabulary has a name for it. Writing `"max_turn_requests"` is
+/// therefore the one spelling that needs no mapping table on either side.
+///
+/// Like `TRUNCATION_DISPOSITION`, this frame is emitted from exactly ONE path
+/// (the turn-bound settle), so the value is a fact about the emitter, not a
+/// lookup. A second emitter (another bound) must introduce its OWN value rather
+/// than reuse this constant.
+const TURN_CAPPED_DISPOSITION: &str = "max_turn_requests";
+
 /// A one-line `agent_message_chunk` carrying a UNIQUE messageId — for a line
 /// that must survive being adjacent to another line. `system_chunk`'s shared
 /// key (the stamped `system` key, `{stamp}:system`) APPENDS (that is its
@@ -159,31 +201,36 @@ fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
 
 /// Is this messageId a harness bookkeeping line rather than model output?
 /// The bookkeeping WORDS are `system` (the shared one-liner key), `retract`
-/// (a discard line, ADR 0048) and `truncate` (the output-cap notice, issue
-/// #190 — Decision 5). The third is here for the SAME reason as the second:
-/// the Subagent capture hands its text to the PARENT as the tool result, so a
-/// notice the harness wrote about its own turn would otherwise be quoted back
-/// as if the child had said it. The predicate matches any of them as a
+/// (a discard line, ADR 0048), `truncate` (the output-cap notice, issue
+/// #190 — Decision 5) and `cap` (the turn-loop-bound notice — the same
+/// reasoning as `truncate`: a Subagent's parent-facing captured text must not
+/// quote a notice the harness wrote about its own turn). The fourth is here for
+/// that SAME reason as the second and third: the Subagent capture hands its text
+/// to the PARENT as the tool result, so a notice the harness wrote about its own
+/// turn would otherwise be quoted back as if the child had said it. The
+/// predicate matches any of them as a
 /// `:`-separated word ANYWHERE in the id — deliberately a word-set, not a
 /// position: the id
 /// `normalize` mints today is `{stamp}:system` / `{stamp}:retract:N` /
-/// `{stamp}:truncate:N` (ADR 0049), and the BARE shape (`system`, `retract:1`)
-/// is accepted as well
+/// `{stamp}:truncate:N` / `{stamp}:cap:N` (ADR 0049), and the BARE shape
+/// (`system`, `retract:1`)
 /// because that is the id shape WITH NO stamp — the test fixtures that
 /// hand-write these ids, and `TurnState::default()`, whose EMPTY stamp mints
 /// `:system` / `:retract:1` (a "strip a leading 6-hex field, then match" rule
 /// would misclassify those). A stamp is SIX HEX CHARS
 /// (`types::mint_incarnation`), and no bookkeeping word is spelled from the hex
 /// alphabet (`system` carries `s`/`y`/`t`/`m`; `retract` is seven chars and
-/// carries `r`/`t`; `truncate` is eight and carries `r`/`u`/`n`), so a stamp can
+/// carries `r`/`t`; `truncate` is eight and carries `r`/`u`/`n`; `cap` is three
+/// and carries `p`), so a stamp can
 /// never EQUAL one. `default` is deliberately NOT here: it is the
 /// no-id-open fallback over REAL model text, and the subagent capture must
 /// still hand it to the parent. Anything that must capture ONLY what the model
 /// said — the subagent capture, whose text becomes the PARENT's tool result —
 /// asks this instead of re-deciding the convention.
 pub fn is_bookkeeping_message_id(id: &str) -> bool {
-    id.split(':')
-        .any(|field| field == "system" || field == "retract" || field == "truncate")
+    id.split(':').any(|field| {
+        field == "system" || field == "retract" || field == "truncate" || field == "cap"
+    })
 }
 
 /// The transcript title of a compaction's card (issue #90 item 2). Not a real
@@ -620,6 +667,26 @@ pub fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             "content": { "type": "text", "text": "Response was truncated before completion" },
             "messageId": st.truncate_id(),
             "disposition": TRUNCATION_DISPOSITION,
+        })],
+        // (the turn-loop bound) The agent stopped its own turn at the round /
+        // identical-refusal ceiling. The SAME shape as the truncation notice
+        // immediately above, for the SAME reasons: a line of its own on a UNIQUE
+        // id (the shared `{stamp}:system` key APPENDS, so a cap notice that
+        // follows a retry one-liner or a second cap welds into one bubble), and
+        // NOT via `unique_system_chunk` — that helper is shared with the
+        // Retraction line, which must not gain a disposition key. The frame is
+        // built by hand here, exactly as `turn_truncated`'s arm is.
+        //
+        // This arm is the easy way to ship the feature wrong: the match below
+        // ends in `_ => Vec::new()`, so OMITTING it compiles clean, emits
+        // nothing, and the disposition never reaches a row — no other test in
+        // the engine notices. `a_capped_turn_emits_one_line_on_its_own_message_id`
+        // is the pin that reddens on it.
+        RpcEvent::turn_capped => vec![json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "The turn was stopped by the agent's own turn limit before it finished." },
+            "messageId": st.cap_id(),
+            "disposition": TURN_CAPPED_DISPOSITION,
         })],
         RpcEvent::auto_retry_start {
             attempt,
@@ -1544,6 +1611,61 @@ mod normalize_tests {
         );
     }
 
+    /// (the turn-loop bound) A CAPPED turn says so on the transcript, on its OWN
+    /// messageId — the same shape as the truncation notice above, for the same
+    /// reasons: `turn_end` cannot carry the fact (its `message` is `Value::Null`
+    /// at every settle site and read by nobody), and the shared `system` key
+    /// would weld the notice onto whatever one-liner preceded it. The frame is a
+    /// one-line `agent_message_chunk` on `{stamp}:cap:N` carrying the
+    /// machine-readable `"disposition": "max_turn_requests"` the persistence
+    /// layer forwards into the row's payload (see
+    /// `a_capped_row_carries_the_max_turn_requests_disposition`). This is a
+    /// WHOLE-FRAME equality pin: it reddens when the frame's key set changes.
+    ///
+    /// It also catches the `_ => Vec::new()` trap: the `normalize` match ends in
+    /// a catch-all, so an OMITTED `turn_capped` arm compiles, emits nothing, and
+    /// no other test in the engine would notice — the disposition would simply
+    /// never reach a row. The empty frame vector is that failure made visible.
+    #[test]
+    fn a_capped_turn_emits_one_line_on_its_own_message_id() {
+        // The unit variant must also PARSE off the wire (the enum is
+        // internally tagged by `type`, and the permissive reader routes on that
+        // field — `ev(...)` is the real `serde_json::from_value`, so this is the
+        // decode path an older/newer peer actually travels).
+        let from_wire = ev(json!({ "type": "turn_capped" }));
+        assert_eq!(from_wire, RpcEvent::turn_capped);
+        assert_eq!(from_wire.kind(), "turn_capped");
+        let mut st = TurnState::stamped("t");
+        let frames = normalize(&from_wire, &mut st);
+        assert_eq!(
+            frames,
+            vec![json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "The turn was stopped by the agent's own turn limit before it finished." },
+                "messageId": "t:cap:0",
+                "disposition": "max_turn_requests",
+            })],
+            "exactly ONE frame, on the first minted id"
+        );
+    }
+
+    /// Two caps in one session must not weld (the same reason the truncation
+    /// notice gets its own id): two lines on the shared `system` key become one
+    /// bubble, so the cap line's id increments per notice.
+    #[test]
+    fn a_second_cap_gets_its_own_line_id() {
+        let mut st = TurnState::stamped("t");
+        let first = normalize(&RpcEvent::turn_capped, &mut st);
+        let second = normalize(&RpcEvent::turn_capped, &mut st);
+        assert_eq!(first[0]["messageId"], "t:cap:0");
+        assert_eq!(second[0]["messageId"], "t:cap:1");
+        assert_ne!(
+            first[0]["messageId"], second[0]["messageId"],
+            "two notices on one id weld into one bubble"
+        );
+        assert_eq!(st.cap_seq, 2, "the counter advanced once per notice");
+    }
+
     /// A stamp is a NAMESPACE, not a suffix to sort by: the same counter value
     /// in two incarnations must produce two different ids, or a resumed Worker
     /// is back in its predecessor's rows (ADR 0049 — the Resume restarts the
@@ -1577,8 +1699,9 @@ mod normalize_tests {
         );
     }
 
-    /// The bookkeeping set is `system`, `retract` and `truncate`, in either id
-    /// shape — and `default` is NOT in it: that id carries real model text (a
+    /// The bookkeeping set is `system`, `retract`, `truncate` and `cap`, in
+    /// either id shape — and `default` is NOT in it: that id carries real model
+    /// text (a
     /// `message_update` before any assistant `message_start`), and the subagent
     /// capture must still hand it to the parent (ADR 0048's fourth consumer).
     #[test]
@@ -1587,9 +1710,11 @@ mod normalize_tests {
             "system",
             "retract:1",
             "truncate:0",
+            "cap:0",
             "a3f9c1:system",
             "a3f9c1:retract:1",
             "a3f9c1:truncate:0",
+            "a3f9c1:cap:0",
         ] {
             assert!(is_bookkeeping_message_id(id), "{id} is bookkeeping");
         }
@@ -1633,6 +1758,23 @@ mod normalize_tests {
         );
         assert!(
             is_bookkeeping_message_id(":retract:1"),
+            "the EMPTY-stamp shape (`TurnState::default()`) is bookkeeping too \
+             — a position-based rule would miss it"
+        );
+        // `cap` (the turn-loop bound) joins the set for the same reason the
+        // other three did: the notice is harness bookkeeping, and a Subagent's
+        // parent-facing captured text must not carry it. `cap` is safe on the
+        // hex-alphabet rule too — it carries `p`.
+        assert!(
+            is_bookkeeping_message_id("cap"),
+            "the bare pre-stamp cap id is bookkeeping"
+        );
+        assert!(
+            is_bookkeeping_message_id("anything:cap:9"),
+            "the predicate matches a WORD, not a position"
+        );
+        assert!(
+            is_bookkeeping_message_id(":cap:0"),
             "the EMPTY-stamp shape (`TurnState::default()`) is bookkeeping too \
              — a position-based rule would miss it"
         );
@@ -2090,6 +2232,62 @@ mod compute_display_rows_tests {
             json!({
                 "text": "Response was truncated before completion",
                 "disposition": "length",
+            }),
+            "the payload is EXACTLY the prose plus the key",
+        );
+    }
+
+    /// (the turn-loop bound) The cap notice's row carries a MACHINE-READABLE
+    /// disposition, so a client can hydrate "this turn hit the agent's own round
+    /// ceiling" from disk instead of string-matching English prose (the desktop's
+    /// in-memory `stopReasons` map is lost on restart) — and, because the value
+    /// is the CLIENT's own spelling `max_turn_requests`, the desktop needs no
+    /// translation table to read it (see `TURN_CAPPED_DISPOSITION`'s docblock on
+    /// the vocabulary asymmetry).
+    ///
+    /// Driven through `normalize` — NOT a hand-written update object — because
+    /// the feature is the FRAME→ROW path: `compute_display_rows`'
+    /// `agent_message_chunk` arm reads only `content.text` and `messageId`, so
+    /// any extra key on the frame is silently dropped unless the arm forwards
+    /// it. A test that hand-built the frame would pass with the frame key
+    /// missing AND with the row key missing (the silent-green trap).
+    #[test]
+    fn a_capped_row_carries_the_max_turn_requests_disposition() {
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
+        let mut st = TurnState::stamped("t");
+
+        let frames = normalize(&RpcEvent::turn_capped, &mut st);
+        assert_eq!(frames.len(), 1, "one notice frame per cap");
+        assert_eq!(
+            frames[0]["disposition"],
+            json!("max_turn_requests"),
+            "the FRAME carries the disposition (the row cannot, if it does not)"
+        );
+
+        let rows: Vec<_> = frames
+            .iter()
+            .flat_map(|f| compute_display_rows(f, &text_acc, &tool_state, &thought_state))
+            .collect();
+        assert_eq!(rows.len(), 1, "the notice persists exactly one row");
+        assert_eq!(rows[0].kind, "agent-text");
+        assert!(
+            rows[0].message_key.ends_with("cap:0"),
+            "the row is the FIRST minted notice id, got {}",
+            rows[0].message_key
+        );
+        assert_eq!(
+            rows[0].payload_json["disposition"],
+            json!("max_turn_requests"),
+            "the ROW payload carries the disposition, got {}",
+            rows[0].payload_json
+        );
+        assert_eq!(
+            rows[0].payload_json,
+            json!({
+                "text": "The turn was stopped by the agent's own turn limit before it finished.",
+                "disposition": "max_turn_requests",
             }),
             "the payload is EXACTLY the prose plus the key",
         );

@@ -510,10 +510,14 @@ async fn a_cancelled_subagent_call_reports_cancelled_and_not_a_rejection() {
     ];
     let cancel = CancellationToken::new();
     cancel.cancel(); // the turn is already stopped when the batch starts
-                     // The return value is the SAME `serde_json::to_value(&result)` the
+                     // The FIRST return value is the SAME `serde_json::to_value(&result)` the
                      // `tool_execution_end` payload carries, so this pins the emitted shape
-                     // without an event channel.
-    let results = loop_.run_tool_batch(&tool_calls, &cancel).await;
+                     // without an event channel. The SECOND (the rejection vector the turn-bound
+                     // guard reads) is NOT what this test asserts: on a cancelled batch the
+                     // guard's CANCELLATION-BEATS-REJECTION precedence means the results say
+                     // `cancelled` whatever `rejected` says, so pinning `rejected` here would
+                     // pin the wrong thing. See `MAX_IDENTICAL_REFUSAL_RUNS` for the guard.
+    let (results, _rejected) = loop_.run_tool_batch(&tool_calls, &cancel).await;
     assert_eq!(results.len(), 2, "one result per call");
     for (i, result) in results.iter().enumerate() {
         assert_eq!(

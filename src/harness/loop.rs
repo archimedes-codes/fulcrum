@@ -472,6 +472,68 @@ impl PermissionContext {
     }
 }
 
+/// The ceiling on rounds through the turn loop for ONE prompt (the turn-loop
+/// bound; the producer of `RpcEvent::turn_capped`).
+///
+/// **The unit is a ROUND — one model call plus its tool batch — NOT an
+/// HTTP-request ceiling.** The two come apart in two places, both of which sit
+/// INSIDE a single round: `RetryPolicy::call_with_retry` can issue up to
+/// `DEFAULT_MAX_ATTEMPTS` provider calls for one round (the transport retries
+/// are invisible to this counter, and they are separately bounded by that
+/// constant), and `compact_if_due` issues its own summary call through the
+/// summariser, which is not counted here at all. A test that asserts this number
+/// of PROVIDER calls is therefore only valid for a provider that never retries
+/// and never compacts — which is what `ScriptedProvider` is, and why
+/// `a_turn_that_hits_the_round_ceiling_settles_as_capped` pins the ROUND unit and
+/// must not be re-described as a provider-call ceiling.
+///
+/// 64 is a magnitude taken from the upstream band, not a match to measured
+/// traffic in this engine: opencode 32, kiro 50, crush 64, cline 1000. The band
+/// is three orders of wide, which is the honest state of the art — the number
+/// has to be far above any legitimate turn (a real multi-tool turn is a
+/// handful of rounds) and far below "forever", and 64 sits in that gap. Nothing
+/// here has measured our round distribution, and no claim is made that 64 is
+/// right for it; the constant is a starting value, and the only thing pinned is
+/// that a runaway turn ENDS.
+///
+/// It accumulates across the whole prompt — including overflow retries and
+/// empty-turn retries — deliberately, and that is the point: those retries are
+/// the loop the field report describes, and a guard that reset when an attempt
+/// was accepted would not see them.
+const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
+
+/// The ceiling on CONSECUTIVE tool batches refused with an identical signature
+/// (the second producer of `RpcEvent::turn_capped`).
+///
+/// **3 is the consecutive RUN, not a total.** `state.identical_refusal_runs`
+/// resets to 0 on any batch that is not an exact repeat of the one before it —
+/// including a batch where a single call was accepted — so an agent that fixes
+/// one key per turn is never bounded, however many rejections it accumulates
+/// over a long prompt.
+///
+/// The shape this exists for is measured, and it is exact: one subagent made
+/// **303** `{}`-argument `bash` calls in 19 minutes. Each was refused BEFORE
+/// dispatch, each refusal was delivered to the model as its tool result, and the
+/// model answered with the identical call every time. Nothing in either repo
+/// could see it — `grep` for a loop detector, a dedup, a consecutive-error or a
+/// repeated-call guard returns zero production hits — because each individual
+/// round is a well-formed turn: a call, a rejection, a new attempt. Only the RUN
+/// is pathological.
+///
+/// Like the round ceiling, 3 is a STARTING value and is NOT a measurement of our
+/// traffic. The upstream band ("stop after 2–3 identical consecutive failures")
+/// is where it comes from, and whether that band transfers to this engine's
+/// model mix is unverified here — a model that legitimately re-sends one rejected
+/// call twice before it reads the sentence would be bounded at 3. The constant is
+/// the knob to turn if that shows up.
+///
+/// And note WHERE it can fire: at the TOP of a loop iteration, never mid-batch.
+/// `run_tool_batch`'s `join_all` is awaited without a bound of its own, so a
+/// batch already in flight — including a `subagent` batch whose children are
+/// themselves looping — runs to completion before the guard is consulted again.
+/// The bound is on the number of ROUNDS, not on the wall-clock cost of one.
+const MAX_IDENTICAL_REFUSAL_RUNS: u32 = 3;
+
 /// The native agent loop (one tokio task per native session — spawned
 /// via `tokio::spawn(loop.run())`).
 pub struct AgentLoop {
@@ -1263,11 +1325,19 @@ impl AgentLoop {
             turn_tool_results: Vec::new(),
             message_started: false,
             overflow_recovered: false,
+            model_rounds: 0,
+            identical_refusal_runs: 0,
         };
+        // (the turn-loop bound) The signature of the PREVIOUS batch, for the
+        // identical-refusal run. Declared beside `state` rather than inside it
+        // because it is a one-step memory, not turn state: the run counter lives
+        // in `state` (it is what the guard reads) and the signature it compares
+        // against lives here (it is what the counter was built from).
+        let mut previous_signature: Option<String> = None;
 
         loop {
             if turn.is_cancelled() {
-                // Site 5 of the nine (`loop.rs`, top-of-loop cancel): VACUOUS,
+                // Site 5 of the ten (`loop.rs`, top-of-loop cancel): VACUOUS,
                 // and the emptiness is derived, not assumed. No `TurnAccumulator`
                 // exists yet at this point in the iteration — `acc` is declared
                 // below, after the model call. And a PREVIOUS iteration cannot
@@ -1283,6 +1353,73 @@ impl AgentLoop {
                 self.settle_cancelled(std::mem::take(&mut state.turn_tool_results), &[]);
                 return;
             }
+
+            // (the turn-loop bound) The round ceiling and the identical-refusal
+            // run, checked at the TOP of every iteration — deliberately AFTER the
+            // cancellation guard above, so a Stop still wins (a user who pressed
+            // Stop gets `settle_cancelled`'s disposition, never the cap: telling
+            // the desktop `Cancelled` is what lets `attention.ts` treat the turn
+            // as a user-initiated stop, and the reverse — checking the bound
+            // first — would mislabel a Stop as an agent failure on exactly the
+            // turn the user just stopped).
+            //
+            // Both guards are checked HERE rather than where they are produced,
+            // and that placement is a real limitation, not a simplification:
+            // `run_tool_batch`'s `join_all` is awaited with no bound of its own,
+            // so a bound that becomes true mid-batch cannot fire until the batch
+            // returns and the NEXT iteration begins. A `subagent` batch whose
+            // children are themselves looping is the shape that costs the most
+            // under this, and it is unmeasured here — see
+            // `MAX_IDENTICAL_REFUSAL_RUNS`' docblock.
+            if state.model_rounds >= MAX_MODEL_ROUNDS_PER_PROMPT
+                || state.identical_refusal_runs >= MAX_IDENTICAL_REFUSAL_RUNS
+            {
+                eprintln!(
+                    "harness: turn bound reached (rounds={}, identical_refusal_runs={}) — settling as capped",
+                    state.model_rounds, state.identical_refusal_runs
+                );
+                // BEFORE the settle, so a peer can stash the disposition while
+                // the turn is still unresolved (the same ordering contract
+                // `turn_truncated` has, and for the same consumer reason: the
+                // settle resolves the turn and the driver stops listening).
+                self.emit(RpcEvent::turn_capped);
+                // Site 10 of the ten (`loop.rs`, the turn-bound settle): the
+                // `announced` half is VACUOUS for the site-5 reason verbatim — no
+                // `TurnAccumulator` exists yet at this point in the iteration
+                // (`acc` is declared below the model call), and no previous
+                // iteration can have left a row open, because the only paths into
+                // a later iteration are a completed batch (which closes every
+                // call it processed) or a `TurnFlow::Continue` from an abandon
+                // path (which closes first).
+                //
+                // The RESULTS are NOT the same story and are NOT empty. They are
+                // every prior batch's results: `state.turn_tool_results`
+                // accumulates across iterations, and a bounded turn is by
+                // construction the LONGEST one a prompt can produce — a
+                // `Vec::new()` here would drop every tool result the turn ever
+                // earned out of `turn_end.tool_results`, on exactly the shape the
+                // cap fires on. All three sibling no-attempt sites (the loop-top
+                // cancel, the post-stream cancel, the model-error guard) pass it
+                // through with `std::mem::take`, and this is the fourth.
+                let results = std::mem::take(&mut state.turn_tool_results);
+                // `settle_error`, NOT `settle_cancelled` and NOT
+                // `settle_truncated`. A bound is a FAILURE, and `Cancelled` is
+                // the user-Stop meaning (ADR 0055) — reporting it would let
+                // `attention.ts` suppress the turn as a stop the user asked for.
+                // `settle_truncated` is the wrong NAME, not the wrong behaviour:
+                // it is named for the output-cap route and it merely DELEGATES to
+                // this function and emits no frame of its own — the
+                // `turn_truncated` frame comes from `handle_truncated_turn`, a
+                // different function — so routing the cap through it would put
+                // this site in the output-cap row of the settle-site table while
+                // buying nothing.
+                self.settle_error(results, &[]);
+                return;
+            }
+            // Counted AFTER the guards, so the number this guard reads is the
+            // number of rounds COMPLETED and the ceiling is a ceiling on rounds,
+            // not an off-by-one index into them.
+            state.model_rounds += 1;
 
             // (1) Compaction check
             if let turn::TurnFlow::Return = self
@@ -1307,7 +1444,7 @@ impl AgentLoop {
                     &mut emit,
                 ) => s,
                 _ = turn.cancelled() => {
-                    // Site 6 of the nine (the model call races the cancel):
+                    // Site 6 of the ten (the model call races the cancel):
                     // VACUOUS. The stream has not been opened, let alone
                     // consumed — `acc` is declared below this `select!` — so no
                     // `ProviderEvent::ToolCall` can have reached
@@ -1334,7 +1471,7 @@ impl AgentLoop {
                 }
                 Err(e) => {
                     eprintln!("harness: model call failed: {e}");
-                    // Site 7 of the nine (the model call returned `Err`):
+                    // Site 7 of the ten (the model call returned `Err`):
                     // VACUOUS for the same reason as site 6 — `complete` failed,
                     // so there is no stream to consume and `acc` (declared below)
                     // does not exist; `consume_stream`'s `ToolCall` arm never ran,
@@ -1356,7 +1493,7 @@ impl AgentLoop {
 
             let mid_stream_error = self.consume_stream(&mut stream, turn, &mut acc).await;
             if turn.is_cancelled() {
-                // Site 8 of the nine (Stop pressed while the model streams tool
+                // Site 8 of the ten (Stop pressed while the model streams tool
                 // calls): NOT vacuous — this is the exit the field report is
                 // about, and it was missing from the issue's list of four.
                 // `consume_stream` has just run, so `acc.tool_calls` holds every
@@ -1487,7 +1624,23 @@ impl AgentLoop {
             }
 
             // (4) Tool execution
-            let batch_results = self.run_tool_batch(&tool_calls, turn).await;
+            let (batch_results, rejected) = self.run_tool_batch(&tool_calls, turn).await;
+            // (the turn-loop bound) Update the identical-refusal run from the
+            // batch's signature. `batch_signature` answers `None` the moment ONE
+            // call was accepted, so a mixed batch resets the run to 0 rather than
+            // extending it — an agent that fixes one key and re-sends the rest is
+            // doing what the rejection sentence asked. The comparison is against
+            // the PREVIOUS batch only (a run, not a total), so a model that
+            // alternates between two bad calls is bounded by the ROUND ceiling
+            // instead, and not by this one.
+            let signature = turn::batch_signature(&tool_calls, &rejected);
+            state.identical_refusal_runs = if signature.is_some() && signature == previous_signature
+            {
+                state.identical_refusal_runs + 1
+            } else {
+                0
+            };
+            previous_signature = signature;
             state.turn_tool_results.extend(batch_results);
             state.message_started = false;
         }
