@@ -92,6 +92,7 @@ async fn the_persisted_ask_row_and_the_emitted_request_carry_the_same_payload() 
             id: "t1".to_string(),
             name: "ask".to_string(),
             arguments: raw.clone(),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
@@ -215,11 +216,13 @@ async fn a_cancel_stops_the_remaining_tool_calls_in_a_batch() {
                 arguments: json!({
                     "questions": [{ "id": "q1", "question": "Which?", "options": [{ "label": "A" }] }]
                 }),
+                defect: None,
             }),
             ProviderEvent::ToolCall(ToolCall {
                 id: "t2".to_string(),
                 name: "read".to_string(),
                 arguments: json!({ "path": "/nonexistent-file" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -450,6 +453,7 @@ async fn a_cancel_stops_a_sudo_flow_blocking_on_its_confirm_prompt() {
             id: "t1".to_string(),
             name: "sudo_exec".to_string(),
             arguments: json!({ "command": "echo never-runs", "reason": "test" }),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
@@ -939,6 +943,7 @@ async fn an_empty_text_tool_calls_turn_is_not_treated_as_empty() {
                 id: "t1".to_string(),
                 name: "ls".to_string(),
                 arguments: json!({ "path": "." }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1248,6 +1253,7 @@ async fn a_tool_result_image_reaches_the_model_transcript() {
                 id: "t1".to_string(),
                 name: "read".to_string(),
                 arguments: json!({ "path": "img.png" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1405,6 +1411,7 @@ async fn model_requests_carry_the_session_id_across_turns_and_tool_calls() {
                     id: "t1".to_string(),
                     name: "ls".to_string(),
                     arguments: json!({ "path": "." }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ],
@@ -1503,6 +1510,7 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
                 id: "m1".to_string(),
                 name: "mcp".to_string(),
                 arguments: json!({ "tool": "echo", "args": { "text": "hi" } }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1592,6 +1600,7 @@ async fn a_stop_mid_mcp_call_cancels() {
                 id: "m1".to_string(),
                 name: "mcp".to_string(),
                 arguments: json!({ "tool": "hang", "args": {} }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1954,6 +1963,7 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
             // the executor and produce the misleading refusal.
             name: "write".to_string(),
             arguments: json!({}),
+            defect: None,
         }),
         ProviderEvent::ToolCall(ToolCall {
             id: "t2".to_string(),
@@ -1962,6 +1972,7 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
             // the concurrent `join_all` ahead of the sequential loop.
             name: "subagent".to_string(),
             arguments: json!({}),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::Length),
     ])]);
@@ -2723,6 +2734,7 @@ fn refused_write_call() -> ToolCall {
             "content": "legal content",
             "contentt": "typo",
         }),
+        defect: None,
     }
 }
 
@@ -2852,6 +2864,7 @@ async fn a_mixed_batch_resets_the_identical_refusal_run() {
             id: "a1".to_string(),
             name: "list_agents".to_string(),
             arguments: json!({}),
+            defect: None,
         }),
         // REFUSED: the same trigger as the test above.
         ProviderEvent::ToolCall(refused_write_call()),
@@ -2916,6 +2929,7 @@ async fn a_turn_that_hits_the_round_ceiling_settles_as_capped() {
             id: "a1".to_string(),
             name: "list_agents".to_string(),
             arguments: json!({}),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
@@ -3054,6 +3068,7 @@ async fn a_cancel_beats_the_turn_bound() {
             id: "s1".to_string(),
             name: "subagent".to_string(),
             arguments: json!({ "task": "loop forever" }),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
@@ -3119,5 +3134,82 @@ async fn a_cancel_beats_the_turn_bound() {
     assert!(
         !loop_.messages.is_empty(),
         "the bounded-and-then-stopped turn's transcript is intact"
+    );
+}
+
+/// (issue #193) `batch_signature` compares `(name, arguments)` ONLY — a pair of
+/// batches whose calls differ **solely in `defect`** still sign as identical.
+///
+/// This is deliberate and it is the stuck case: the defect is preserved, the
+/// arguments are still `{}`, so the refusal the model reads back is still the
+/// same refusal, and re-sending the same truncated payload produces the same
+/// result. A signature that folded `defect` in would call that a NEW batch and
+/// reset the run — which would un-bound exactly the 303-calls-in-19-minutes loop
+/// this guard exists to stop, for the very defect this change introduces.
+///
+/// The behaviour was already true (the `format!` names `tc.name` and
+/// `tc.arguments` and nothing else); it had no pin, and the field this commit
+/// adds is the first thing that could plausibly be added to that `format!` for
+/// a good reason. This test is what makes that edit loud.
+#[test]
+fn batch_signature_ignores_the_defect_field() {
+    let clean = ToolCall {
+        id: "t1".to_string(),
+        name: "write".to_string(),
+        arguments: json!({}),
+        defect: None,
+    };
+    let mut defective = clean.clone();
+    defective.defect = Some(crate::harness::provider::ArgumentDefect {
+        error: "EOF while parsing an object at line 1 column 41".to_string(),
+        raw: r#"{"path": "/x", "content": "truncated he"#.to_string(),
+    });
+    let mut other_defect = defective.clone();
+    other_defect.defect = Some(crate::harness::provider::ArgumentDefect {
+        error: "expected value at line 1 column 1".to_string(),
+        raw: "{not json".to_string(),
+    });
+
+    let rejected = [true];
+    let clean_sig = turn::batch_signature(std::slice::from_ref(&clean), &rejected)
+        .expect("a fully refused batch signs");
+    let defect_sig =
+        turn::batch_signature(&[defective], &rejected).expect("a defective batch signs too");
+    let other_sig = turn::batch_signature(&[other_defect], &rejected).expect("and so does another");
+    assert_eq!(
+        clean_sig, defect_sig,
+        "the same (name, arguments) with and without a defect is the SAME batch"
+    );
+    assert_eq!(
+        defect_sig, other_sig,
+        "and two DIFFERENT defects on the same (name, arguments) are the same \
+         batch too — the refusal is identical either way, so the run counts"
+    );
+
+    // The half that keeps the pin honest: a differing name or argument set still
+    // signs DIFFERENTLY, so the equality above is not a constant function.
+    let renamed = ToolCall {
+        name: "read".to_string(),
+        ..clean.clone()
+    };
+    assert_ne!(
+        clean_sig,
+        turn::batch_signature(&[renamed], &rejected).expect("a refused batch signs"),
+        "a different NAME still changes the signature"
+    );
+    let reargued = ToolCall {
+        arguments: json!({ "path": "/x" }),
+        ..clean.clone()
+    };
+    assert_ne!(
+        clean_sig,
+        turn::batch_signature(&[reargued], &rejected).expect("a refused batch signs"),
+        "different ARGUMENTS still change the signature"
+    );
+    // And the `None`-on-any-accepted rule is untouched.
+    assert_eq!(
+        turn::batch_signature(std::slice::from_ref(&clean), &[false]),
+        None,
+        "one accepted call and there is no signature at all"
     );
 }

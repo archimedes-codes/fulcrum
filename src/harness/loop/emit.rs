@@ -365,6 +365,16 @@ impl AgentLoop {
     /// SAME pure function, which is why the `interactive-request` event and the
     /// persisted `tool-call` row this feeds are byte-identical rather than
     /// merely similar.
+    ///
+    /// (issue #193) `defect: None` here is DELIBERATE, not an oversight. This is
+    /// what produces `display_tc`, and `tool_execution_start` carries
+    /// `args: display_tc.arguments` — so a defective call still shows `{}` in
+    /// the tool card. The honest sentence rides `rawOutput` (the tool result
+    /// text), which is the only carrier that reaches a failure tooltip; widening
+    /// the display wire to carry the defect is out of scope and not done here.
+    /// (The non-`ask` path below is `tc.clone()`, so a defect DOES ride the
+    /// clone for non-`ask` tools — harmless, because only `.arguments` ever
+    /// reaches the wire.)
     pub(super) fn normalized_for_display(&self, tc: &ToolCall) -> ToolCall {
         if tc.name != "ask" {
             return tc.clone();
@@ -373,6 +383,7 @@ impl AgentLoop {
             id: tc.id.clone(),
             name: tc.name.clone(),
             arguments: crate::harness::ask::normalize_ask_params(&tc.arguments),
+            defect: None,
         }
     }
 

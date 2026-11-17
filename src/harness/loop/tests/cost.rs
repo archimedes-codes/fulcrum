@@ -985,6 +985,7 @@ fn subagent_tool_call(id: &str) -> ProviderEvent {
         id: id.to_string(),
         name: "subagent".to_string(),
         arguments: serde_json::json!({ "task": "delegate" }),
+        defect: None,
     })
 }
 

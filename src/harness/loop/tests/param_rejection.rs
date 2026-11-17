@@ -4,6 +4,11 @@
 //! loop-level pins for that contract (the checker itself is
 //! `tool_specs::unknown_param_error`; its unit tests live in that file).
 //!
+//! (issue #193) The same pre-dispatch pass also rejects a call whose arguments
+//! ARRIVED but did not parse — the head arm of the same checker. Both shapes
+//! share the guarantee this module pins: the tool never runs, so no prompt is
+//! raised and no file is touched.
+//!
 //! The shape of the rejection is pinned here as `starts_with` / `contains`
 //! only — the byte-for-byte pin of the sentence deliberately lives elsewhere
 //! (the checker's own test), so this module does not duplicate a wording pin
@@ -19,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::support::*;
 use crate::events::RpcEvent;
 use crate::harness::dispatch::SubagentDispatcher;
-use crate::harness::provider::{FinishReason, ProviderEvent, ToolCall};
+use crate::harness::provider::{ArgumentDefect, FinishReason, ProviderEvent, ToolCall};
 use crate::harness::retry::RetryPolicy;
 
 /// A rejected `write` returns `is_error: true` as its WHOLE result and never
@@ -47,6 +52,7 @@ async fn a_rejected_call_returns_is_error_and_never_touches_the_filesystem() {
                     // so the suggestion fires.
                     "contentt": "typo",
                 }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -109,6 +115,114 @@ async fn a_rejected_call_returns_is_error_and_never_touches_the_filesystem() {
     .expect("the turn settled");
 }
 
+/// (issue #193) A call whose arguments ARRIVED but did not parse is rejected
+/// pre-dispatch with the HONEST sentence — and the tool's missing-parameter lie
+/// is never emitted.
+///
+/// The shape is the one the 566 database rows carry: `arguments` collapsed to
+/// `{}` by the parse failure, so the tool that would have run answers
+/// ``read: missing `path` parameter`` — a lie when the model had sent `path`
+/// and its JSON arrived truncated. The model reads that sentence as "I omitted
+/// a required parameter" and re-sends the identical call (303 times in 19
+/// minutes for one subagent). The head arm of `unknown_param_error` replaces it
+/// with a sentence naming the parse error and showing the raw text, and because
+/// it runs BEFORE the dispatch the read never runs at all.
+///
+/// Like the rest of this module the wording is pinned as `starts_with` /
+/// `contains` only — the byte-for-byte pin lives in `tool_specs`' own test
+/// module. What is pinned HERE that a wording pin cannot is the SHAPE: one
+/// content block (the refusal is the WHOLE result) and no filesystem effect.
+#[tokio::test]
+async fn a_malformed_payload_is_rejected_with_the_honest_sentence() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // The truncated payload: a `read` that DID send `path`, cut off mid-object.
+    let raw = r#"{"path": "defect-must-not-be-read.txt", "limit": 1"#;
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        Some(vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "read".to_string(),
+                // `{}` — the collapse is unchanged; the defect is what the
+                // refusal is built from.
+                arguments: json!({}),
+                defect: Some(ArgumentDefect {
+                    error: "EOF while parsing an object at line 1 column 41".to_string(),
+                    raw: raw.to_string(),
+                }),
+            }),
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ]),
+        Some(vec![
+            ProviderEvent::TextDelta("done".to_string()),
+            ProviderEvent::Done(FinishReason::Stop),
+        ]),
+    ]);
+    // The scratch guard is the FIRST tuple element (#96) — bind it, never
+    // `.0`-project it away: the no-dispatch proof below reads inside it.
+    let (space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let end = wait_for_event(
+        &mut events_rx,
+        SETTLE_MS,
+        |e| matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t1"),
+    )
+    .await
+    .expect("the defective call's tool_execution_end");
+    let RpcEvent::tool_execution_end {
+        result, is_error, ..
+    } = end
+    else {
+        unreachable!()
+    };
+    assert!(
+        is_error,
+        "an unparseable payload REJECTS the call: {result:?}"
+    );
+    assert_eq!(
+        result["content"].as_array().unwrap().len(),
+        1,
+        "the refusal is the WHOLE result — no tool output, no appended block"
+    );
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("invalid arguments for `read`"),
+        "the refusal names the tool and the real defect: {text}"
+    );
+    assert!(
+        text.contains("Received arguments:"),
+        "and shows what actually arrived: {text}"
+    );
+    assert!(
+        text.contains(raw),
+        "the raw text is VERBATIM in the refusal — that is the half that stops \
+         the identical re-send: {text}"
+    );
+    assert!(
+        !text.contains("missing `path`"),
+        "the lie is gone: the model is never told it omitted a parameter it \
+         actually sent: {text}"
+    );
+    // The no-dispatch proof: the read never ran, so nothing of the payload's
+    // `path` was touched. (A `read` would not create the file either — the
+    // assertion is that the name the truncated payload carried never reached an
+    // executor at all, which the scratch dir can witness.)
+    assert!(
+        !space.join("defect-must-not-be-read.txt").exists(),
+        "a rejected call must not touch the filesystem"
+    );
+    wait_for_event(&mut events_rx, SETTLE_MS, |e| {
+        matches!(e, RpcEvent::agent_settled)
+    })
+    .await
+    .expect("the turn settled");
+}
+
 /// A rejected `subagent` call never creates a child.
 ///
 /// This is the futures-`.filter` test: the `dispatch_subagent` futures are
@@ -127,6 +241,7 @@ async fn a_rejected_subagent_call_never_creates_a_child() {
                 name: "subagent".to_string(),
                 // `agent` is the trigger; `agentName` is the advertised twin.
                 arguments: json!({ "task": "the task", "agent": "reviewer" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -225,6 +340,15 @@ fn policy_settings(reads: &str, writes: &str, shell: &str) -> String {
 /// `space_cwd`, with `writes: "ask"` — so the old code really would have
 /// prompted (a typo'd `path` would make `policy_verdict` answer `Allow` for
 /// the missing-path reason and this test would pass vacuously).
+///
+/// (issue #193) The batch carries a SECOND call, DEFECT-shaped: `arguments`
+/// `{}` with the truncated text in `defect.raw`. It is the card's link 2 — a
+/// `Write` whose parsed arguments hold no `path` gets `Decision::Allow` from
+/// the policy gate, so nothing downstream would ever have raised a prompt or a
+/// refusal for it, and the pre-dispatch head arm is the ONLY thing that stops
+/// it. Both calls must be rejected and NEITHER may prompt: the guarantee the
+/// head arm inherits is exactly the one this test already pinned for the
+/// unknown-key shape.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_rejected_call_never_reaches_the_permission_gate() {
@@ -252,6 +376,25 @@ async fn a_rejected_call_never_reaches_the_permission_gate() {
                     // Legal-shaped `path` OUTSIDE the boundary + the unknown
                     // key that must reject BEFORE any gate decision.
                     "confidential_extra_key": 1,
+                }),
+                defect: None,
+            }),
+            // (issue #193) THE DEFECT-SHAPED CALL. Its `arguments` are `{}`
+            // because the payload never parsed — the truncated text lives in
+            // `defect.raw`. A `write` with NO `path` in its parsed arguments is
+            // what the policy gate answers `Decision::Allow` for, so this call
+            // would have RUN and answered the missing-`path` lie. Only the
+            // pre-dispatch head arm stops it.
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t2".to_string(),
+                name: "write".to_string(),
+                arguments: json!({}),
+                defect: Some(ArgumentDefect {
+                    error: "EOF while parsing an object at line 1 column 41".to_string(),
+                    raw: format!(
+                        "{{\"path\": \"{}\", \"content\": \"truncated he",
+                        outside_path.join("second.txt").display()
+                    ),
                 }),
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
@@ -347,6 +490,45 @@ async fn a_rejected_call_never_reaches_the_permission_gate() {
         "and the file was not written: {}",
         outside_path.display()
     );
+
+    // (issue #193) The DEFECT-SHAPED call: rejected by the same pre-dispatch
+    // pass, and covered by the same `prompts.is_empty()` assertion above — it
+    // raised no prompt either, which is the card's link 2 closed. Its wording is
+    // the OTHER sentence, and asserting the pair here is what proves the two
+    // arms did not converge.
+    let defect_end = wait_for_event(
+        &mut events_rx,
+        SETTLE_MS,
+        |e| matches!(e, RpcEvent::tool_execution_end { tool_call_id, .. } if tool_call_id == "t2"),
+    )
+    .await
+    .expect("the defective call's tool_execution_end");
+    let RpcEvent::tool_execution_end {
+        result: defect_result,
+        is_error: defect_is_error,
+        ..
+    } = defect_end
+    else {
+        unreachable!()
+    };
+    assert!(
+        defect_is_error,
+        "a defective call is rejected too: {defect_result:?}"
+    );
+    let defect_text = defect_result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        defect_text.starts_with("invalid arguments for `write`"),
+        "the defect names itself, not a missing parameter: {defect_text}"
+    );
+    assert!(
+        !defect_text.contains("unknown param"),
+        "and it is NOT the schema sentence: {defect_text}"
+    );
+    assert!(
+        !outside_path.join("second.txt").exists(),
+        "the defective call never reached the executor either: {}",
+        outside_path.join("second.txt").display()
+    );
 }
 
 /// A cancelled turn reports `cancelled`, not a rejection — the ordering rule
@@ -384,6 +566,7 @@ async fn a_cancelled_turn_reports_cancelled_and_not_a_rejection() {
                 arguments: json!({
                     "questions": [{ "id": "q1", "question": "Which?", "options": [{ "label": "A" }] }]
                 }),
+                defect: None,
             }),
             ProviderEvent::ToolCall(ToolCall {
                 id: "t2".to_string(),
@@ -391,6 +574,7 @@ async fn a_cancelled_turn_reports_cancelled_and_not_a_rejection() {
                 // An unknown key, so this call WOULD be rejected on a live
                 // turn — the cancelled turn must answer `cancelled` instead.
                 arguments: json!({ "path": "missing.txt", "pathe": 1 }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -501,11 +685,13 @@ async fn a_cancelled_subagent_call_reports_cancelled_and_not_a_rejection() {
             name: "subagent".to_string(),
             // The unknown `agent` key beside the legal pair.
             arguments: json!({ "task": "the task", "agentName": "reviewer", "agent": "reviewer" }),
+            defect: None,
         },
         ToolCall {
             id: "t2".to_string(),
             name: "read".to_string(),
             arguments: json!({ "path": "missing.txt", "pathe": 1 }),
+            defect: None,
         },
     ];
     let cancel = CancellationToken::new();

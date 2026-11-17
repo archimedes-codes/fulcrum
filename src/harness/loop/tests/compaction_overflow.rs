@@ -548,6 +548,7 @@ async fn a_retried_reply_closes_the_tool_calls_it_abandoned() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             }),
             ProviderEvent::Error(ProviderError::Retryable("transient".to_string())),
         ]),
@@ -639,6 +640,7 @@ async fn an_abandoned_tool_call_appends_no_tool_message() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             }),
             ProviderEvent::Error(ProviderError::Retryable("transient".to_string())),
         ]),
@@ -706,6 +708,7 @@ async fn a_mid_stream_overflow_closes_the_abandoned_tool_call() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             }),
             ProviderEvent::Error(ProviderError::ContextOverflow(
                 "invalid_request_error: prompt is too long: 213462 tokens > 200000 maximum"
@@ -849,6 +852,7 @@ async fn a_later_overflow_in_the_same_turn_gets_its_own_compact_and_retry() {
                     id: "t1".to_string(),
                     name: "manage_todo_list".to_string(),
                     arguments: json!({ "operation": "read" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ],

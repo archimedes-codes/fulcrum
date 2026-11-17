@@ -569,6 +569,11 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 /// the prompt and there is no second table to drift.
 ///
 /// The rule, in order:
+/// 0. (issue #193) The call CARRIED a defect → the honest sentence, and NO spec
+///    lookup. This arm runs FIRST precisely because there is nothing to look
+///    up: the arguments never became a value, so the key-by-key check below has
+///    no input, and a lookup by name would answer "no spec" for a tool that
+///    does have one and let the call through to dispatch.
 /// 1. No spec for the (alias-normalized) name → NO check. An unknown tool is
 ///    already a hard error in `dispatch_tool`'s `unknown tool:` arm
 ///    (`loop/tools.rs`), and a tool the session disabled is not in
@@ -585,12 +590,35 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 ///    case-insensitive containment in either direction — so `agent` →
 ///    `agentName`. Never suggested from anything but the advertised shape.
 ///
+/// Rules 1 and 2 are FALSE for a defective call, and that is the point of
+/// rule 0: a malformed payload has no keys to check and — because it is `{}` —
+/// walks past every key test into the tool, where `read` refuses with
+/// ``missing `path` parameter``. That sentence was a lie whenever the model HAD
+/// sent `path` and its JSON arrived broken, and because it reads as "you
+/// omitted a required parameter" the model re-sent the identical call. Rule 0
+/// says what actually happened and shows the raw text.
+///
 /// TOP-LEVEL ONLY, and it never mutates: a pure function of `(specs, tc)`
 /// returning display text, so it is safe to call before a dispatch has
-/// decided anything. Malformed JSON needs no branch — `parse_arguments`
-/// (`provider/openai.rs`) already collapses unparseable arguments to `{}`, and
-/// a non-object payload simply has no keys.
+/// decided anything. Malformed JSON is no longer invisible to this check —
+/// `parse_arguments` (`provider/openai.rs`) hands the parse error and the raw
+/// text up as `ToolCall::defect`, which rule 0 reports. A non-object payload
+/// (a top-level JSON string) still simply has no keys and stays uncheckable.
 pub(crate) fn unknown_param_error(specs: &[ToolSpec], tc: &ToolCall) -> Option<String> {
+    // (issue #193) THE HEAD ARM. Before any spec lookup, and deliberately so:
+    // the arguments never parsed, so there is nothing to check keys against and
+    // no spec is needed to say what went wrong. `tc.name` is used VERBATIM —
+    // resolving the `dispatch_subagent` alias would require the very lookup
+    // this arm exists to skip, and the alias matters only for that one tool.
+    // Textually distinct from the schema sentence below on purpose: that one
+    // says "fix the key and retry", and retrying an identical payload is the
+    // 303-calls-in-19-minutes loop this arm closes.
+    if let Some(defect) = &tc.defect {
+        return Some(format!(
+            "invalid arguments for `{}`: {} — the call was rejected. Received arguments:\n{}",
+            tc.name, defect.error, defect.raw
+        ));
+    }
     // The `dispatch_subagent` alias resolves to the `subagent` spec — the same
     // `effective_tool_name` `is_tool_enabled` gates on, so the alias is checked
     // against the shape the model was actually shown and the message names the
@@ -652,6 +680,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    // Test-only: importing it at the module head would be an unused import in
+    // the non-test build (only the defect-shaped fixtures below name it).
+    use crate::harness::provider::ArgumentDefect;
 
     /// A tool call with the given name + arguments (the checker input).
     fn call(name: &str, args: Value) -> ToolCall {
@@ -659,7 +690,106 @@ mod tests {
             id: "t1".into(),
             name: name.into(),
             arguments: args,
+            defect: None,
         }
+    }
+
+    /// (issue #193) A call whose arguments ARRIVED but did not parse: `{}` in
+    /// `arguments`, the defect carrying the error and the raw text. The head
+    /// arm's input — and the shape the 566 database rows arrived in.
+    fn defective_call(name: &str, raw: &str) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            name: name.into(),
+            arguments: Value::Object(Default::default()),
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 41".into(),
+                raw: raw.into(),
+            }),
+        }
+    }
+
+    /// (issue #193) THE head arm, pinned BYTE-FOR-BYTE — this file is the
+    /// single home of the literal (`param_rejection.rs` keeps its
+    /// `starts_with`/`contains` discipline, per its own module doc).
+    ///
+    /// Three things this pin holds:
+    /// - the sentence names the tool VERBATIM (`read`, no spec lookup, no alias
+    ///   resolution) and the parse error;
+    /// - `Received arguments:` shows the raw text the provider sent — the half
+    ///   that lets the model see what actually arrived instead of re-sending it;
+    /// - it is TEXTUALLY DISTINCT from the schema sentence. The schema one ends
+    ///   `fix the key and retry.`; there is no key to fix here and retrying the
+    ///   identical payload is the loop this closes, so any drift that makes the
+    ///   two converge reddens this test.
+    #[test]
+    fn a_malformed_payload_is_reported_with_the_error_and_the_raw_text() {
+        let raw = r#"{"path": "/tmp/x", "content": "truncated he"#;
+        let rejection = unknown_param_error(&tool_specs(), &defective_call("read", raw))
+            .expect("a defective call is always rejected");
+        assert_eq!(
+            rejection,
+            "invalid arguments for `read`: EOF while parsing an object at line 1 \
+             column 41 — the call was rejected. Received arguments:\n\
+             {\"path\": \"/tmp/x\", \"content\": \"truncated he",
+            "the whole sentence is the wire text the model reads"
+        );
+        // The distinctness pin, stated separately so a convergence names itself.
+        assert!(
+            !rejection.contains("fix the key and retry"),
+            "there is no key to fix and retry — that is the schema sentence: \
+             {rejection}"
+        );
+        assert!(
+            !rejection.contains("unknown param"),
+            "no key was unknown; the payload never parsed: {rejection}"
+        );
+    }
+
+    /// (issue #193) The head arm runs BEFORE the spec lookup, so it fires for a
+    /// name with NO spec at all and for a tool whose spec has no `properties` —
+    /// the two shapes rules 1 and 2 excuse. A malformed payload on a bare spec
+    /// (`list_agents`, a bare `{"type":"object"}`) would otherwise walk past
+    /// both rules untouched.
+    #[test]
+    fn the_defect_arm_fires_without_a_spec_lookup() {
+        // No spec named `read` in the list at all.
+        let without_spec = unknown_param_error(&[], &defective_call("read", "{oops"));
+        assert!(
+            without_spec
+                .as_deref()
+                .is_some_and(|t| t.starts_with("invalid arguments for `read`")),
+            "a defective call is rejected even where no spec exists to check: \
+             {without_spec:?}"
+        );
+        // A bare spec (rule 2's exemption: no `properties` → no check).
+        let bare = unknown_param_error(&tool_specs(), &defective_call("list_agents", "{oops"))
+            .expect("the bare spec's exemption does not excuse a malformed payload");
+        assert!(
+            bare.starts_with("invalid arguments for `list_agents`"),
+            "{bare}"
+        );
+        // The alias name is reported VERBATIM (no `effective_tool_name` — the
+        // arm deliberately does no lookup).
+        let aliased =
+            unknown_param_error(&tool_specs(), &defective_call("dispatch_subagent", "{o"))
+                .expect("a defective `dispatch_subagent` call is rejected too");
+        assert!(
+            aliased.starts_with("invalid arguments for `dispatch_subagent`:"),
+            "the name rides verbatim, unresolved: {aliased}"
+        );
+    }
+
+    /// (issue #193) A well-formed call carries NO defect and the head arm is
+    /// simply not taken — rules 1–4 behave exactly as before. The guard against
+    /// an arm that fires on `None`.
+    #[test]
+    fn a_call_without_a_defect_takes_the_schema_rules() {
+        assert_eq!(
+            unknown_param_error(&tool_specs(), &call("read", json!({ "path": "/x" }))),
+            None,
+            "a well-formed, fully advertised call is still clean"
+        );
     }
 
     fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 20] {

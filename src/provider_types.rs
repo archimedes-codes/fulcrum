@@ -164,6 +164,38 @@ pub struct ToolCall {
     pub name: String,
     /// The parsed arguments (an empty object when the model sent none).
     pub arguments: Value,
+    /// (issue #193) The arguments arrived but did not parse: the parse error and
+    /// the raw text the provider sent. `None` for a well-formed call AND for a
+    /// legitimately empty payload — the two are distinguished precisely BY this
+    /// field being absent. `{}` stays `{}` either way; nothing about `arguments`
+    /// changes. `skip_serializing_if` (not `skip_serializing`) is load-bearing:
+    /// without it every transcript row gains `"defect":null` and the display-wire
+    /// pin `tool_call_display_wire_stays_flat` reddens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defect: Option<ArgumentDefect>,
+}
+
+/// (issue #193) What was wrong with a tool call's arguments, and what actually
+/// arrived.
+///
+/// This exists because collapsing an unparseable payload into `{}` made every
+/// downstream refusal a lie: `read` answered ``missing `path` parameter`` for a
+/// call whose `path` had arrived truncated, the model read that as "I omitted a
+/// required parameter", and re-sent the identical call (one subagent made 303
+/// such calls in 19 minutes; 566 rows in this machine's database carry the
+/// sentence). Preserving the defect lets the refusal name the real problem and
+/// show the raw text, and it repairs NOTHING — the coercion victims are `write`
+/// (440 rows) and `edit` (125), and completing truncated JSON into a written
+/// file is worse than refusing.
+///
+/// `raw` is verbatim, not trimmed and not re-serialized: the only thing the
+/// model can act on is the text it sent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArgumentDefect {
+    /// The `serde_json` parse error, stringified.
+    pub error: String,
+    /// The argument text the provider sent, byte-for-byte.
+    pub raw: String,
 }
 
 /// The REQUEST-wire shape of a tool call (the OpenAI contract: a nested
@@ -466,8 +498,79 @@ pub fn parse_error_chunk(v: &Value) -> Option<ProviderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cost_usd_from_usage, parse_error_chunk, ProviderError};
+    use super::{
+        cost_usd_from_usage, parse_error_chunk, ChatMessage, ChatRole, ProviderError, ToolCall,
+    };
     use serde_json::json;
+
+    /// (issue #193) A HISTORICAL `content_json` row — hand-written in the
+    /// PRE-CHANGE shape, with no `defect` key anywhere — still deserializes.
+    ///
+    /// This is the desktop-compatibility acceptance criterion: the desktop reads
+    /// these rows out of the same SQLite file, and every one of them predates
+    /// the field. The mechanism is serde's own, and deliberately NOT a
+    /// `#[serde(default)]`: `serde_derive` emits a `missing_field` path for an
+    /// absent field and serde's `MissingFieldDeserializer` answers
+    /// `deserialize_option` with `visit_none()`, so a missing `Option` is `None`
+    /// for free. The in-crate precedent is `ChatMessage::tool_call_id`,
+    /// `tool_calls` and `ModelOptions` — `skip_serializing_if` alone, no
+    /// `default`. Adding `#[serde(default)]` here would be a second, redundant
+    /// mechanism, and this test is what makes its absence a CHOICE rather than
+    /// an oversight.
+    ///
+    /// The string is a literal on purpose: building it with `json!` from a
+    /// current `ToolCall` would let a future change to the struct silently
+    /// rewrite the fixture, and the whole point is a document that CANNOT change.
+    #[test]
+    fn a_pre_change_row_with_no_defect_key_still_deserializes() {
+        // Exactly what `emit.rs`'s `serde_json::to_string(&m)` wrote before this
+        // field existed: the flat `{id, name, arguments}` tool call, no `defect`.
+        const PRE_CHANGE_ROW: &str = concat!(
+            r#"{"role":"assistant","content":"let me read that","#,
+            r#""tool_calls":[{"id":"call_1","name":"read","#,
+            r#""arguments":{"path":"/x"}}]}"#,
+        );
+        let message: ChatMessage = serde_json::from_str(PRE_CHANGE_ROW)
+            .expect("a historical content_json row must still deserialize");
+        let calls = message.tool_calls.expect("the row's tool_calls survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, json!({ "path": "/x" }));
+        assert_eq!(
+            calls[0].defect, None,
+            "a row written before the field existed carries NO defect"
+        );
+
+        // The bare `ToolCall` row on its own (the `tool-call` display row and
+        // the `native_messages` shape ride this serialization too).
+        const PRE_CHANGE_TOOL_CALL: &str =
+            r#"{"id":"call_2","name":"bash","arguments":{"command":"ls"}}"#;
+        let call: ToolCall = serde_json::from_str(PRE_CHANGE_TOOL_CALL)
+            .expect("a pre-change tool-call object must still deserialize");
+        assert_eq!(call.defect, None);
+        assert_eq!(call.name, "bash");
+
+        // And the round-trip back out is BYTE-IDENTICAL to what went in: the
+        // field is `skip_serializing_if`-guarded, so re-serialifying a row that
+        // had no `defect` must not ADD one. This is the leak guard at the
+        // transcript layer (its display-wire twin is
+        // `tool_call_display_wire_stays_flat`).
+        let round_tripped = serde_json::to_string(&call).expect("serialization cannot fail");
+        assert_eq!(
+            round_tripped, PRE_CHANGE_TOOL_CALL,
+            "a defect-free call re-serializes to the pre-change bytes — no \
+             `\"defect\":null` is added to any row"
+        );
+        assert!(
+            !round_tripped.contains("defect"),
+            "the key is absent, not null: {round_tripped}"
+        );
+
+        // `ChatRole::Assistant` was actually parsed (the literal above must not
+        // be silently answering a default).
+        assert_eq!(message.role, ChatRole::Assistant);
+    }
 
     #[test]
     fn cost_usd_from_usage_reads_the_primary_cost_field() {

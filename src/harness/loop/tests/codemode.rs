@@ -93,6 +93,7 @@ fn codemode_scripts(code: &str) -> Vec<Option<Vec<ProviderEvent>>> {
                 id: "t1".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": code }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -146,6 +147,7 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
                 id: "t1".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": "1 + 1" }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -172,6 +174,7 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
                 id: "t2".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": 42 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -194,6 +197,7 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
                 id: "t3".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": "1 + 1", "extra": 1 }),
+                defect: None,
             }],
             &CancellationToken::new(),
         )
@@ -381,6 +385,7 @@ async fn promise_all_batches_nested_calls_in_completion_order() {
                 id: "p1".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": script }),
+                defect: None,
             },
             &turn,
         )
@@ -547,6 +552,7 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
         id: "d1/0".to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": &outside }),
+        defect: None,
     };
     // The fixture is not vacuous: this really is a `Deny`, and the direct route
     // renders it through `deny_tool_result`.
@@ -569,6 +575,7 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
                 arguments: json!({
                     "code": format!("const r = await tools.read({{ path: {outside:?} }});\n r.isError;")
                 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -649,6 +656,7 @@ async fn a_nested_ask_prompts_on_the_nested_request_id_and_a_reject_denies_it() 
         id: "a1/0".to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": &outside }),
+        defect: None,
     };
     assert_eq!(
         loop_.policy_verdict(&nested),
@@ -670,6 +678,7 @@ async fn a_nested_ask_prompts_on_the_nested_request_id_and_a_reject_denies_it() 
                 arguments: json!({
                     "code": format!("await tools.read({{ path: {outside:?} }});")
                 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -754,6 +763,7 @@ async fn a_nested_ask_raced_by_a_stop_ends_the_script_and_keeps_the_row_running(
                         id: "c1".to_string(),
                         name: "codemode".to_string(),
                         arguments: json!({ "code": code }),
+                        defect: None,
                     },
                     &turn,
                 )
@@ -864,6 +874,7 @@ async fn an_excluded_tool_is_not_installed_as_a_script_global() {
                     id: format!("x-{name}"),
                     name: "codemode".to_string(),
                     arguments: json!({ "code": format!("typeof tools.{name};") }),
+                    defect: None,
                 },
                 &turn,
             )
@@ -891,6 +902,7 @@ async fn an_excluded_tool_is_not_installed_as_a_script_global() {
                               ['ask','sudo_exec','manage_todo_list','subagent','list_agents','codemode']\
                               .includes(n)).join(',');"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -938,6 +950,7 @@ async fn the_interactive_mcp_auth_action_is_refused_from_a_script() {
                     "code": "const r = await tools.mcp({ action: 'auth', server: 'no-such-server' });\n\
                              r.isError + '|' + r.text;"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -989,6 +1002,7 @@ async fn the_interactive_mcp_auth_action_is_refused_from_a_script() {
                 arguments: json!({
                     "code": "const r = await tools.mcp({});\n!r.isError;"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1029,6 +1043,7 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                     "code": "const d = await describeTool('bash');\n\
                              JSON.stringify(Object.keys(d.parameters.properties).sort());"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1055,6 +1070,7 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                     "code": "const r = await searchTools('SHELL');\n\
                              r.tools.length >= 1 && r.tools[0].name === 'bash';"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1075,6 +1091,7 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                     "code": "const r = await searchTools('', { limit: 2 });\n\
                              r.tools.length;"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1096,6 +1113,7 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                 arguments: json!({
                     "code": "ALL_TOOLS.length + ':' + ALL_TOOLS.some(t => t.name === 'bash');"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1136,6 +1154,7 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
                              [typeof r.text, typeof r.isError, typeof r.details, \
                               r.text.includes('to-stdout'), r.text.includes('to-stderr'), r.isError].join(',');"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1159,6 +1178,7 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
                     "code": "const r = await tools.read({ path: 'definitely-not-here-42.txt' });\n\
                              r.isError + ':' + (r.text.length > 0);"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1193,6 +1213,7 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
                              const r = await tools.bash(circular);\n\
                              r.isError + '|' + r.text;"
                 }),
+                defect: None,
             },
             &turn,
         )
@@ -1226,6 +1247,7 @@ async fn a_throwing_script_reports_its_message_and_keeps_its_rows() {
                     "code": "await tools.bash({ command: 'echo first' });\n\
                              throw new Error('the script gave up');"
                 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -1271,6 +1293,7 @@ async fn an_empty_script_fails_without_producing_rows() {
                     id: "e1".to_string(),
                     name: "codemode".to_string(),
                     arguments: json!({ "code": code }),
+                    defect: None,
                 },
                 &CancellationToken::new(),
             )
@@ -1318,6 +1341,7 @@ async fn a_stop_cancels_a_running_script() {
                         id: "s1".to_string(),
                         name: "codemode".to_string(),
                         arguments: json!({ "code": "while (true) {}" }),
+                        defect: None,
                     },
                     &turn,
                 )

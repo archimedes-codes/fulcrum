@@ -35,6 +35,7 @@ async fn a_disabled_tool_is_a_tool_result_error_not_execution() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -53,6 +54,7 @@ async fn a_disabled_tool_is_a_tool_result_error_not_execution() {
                 id: "t2".to_string(),
                 name: "read".to_string(),
                 arguments: json!({ "path": "/nonexistent-file" }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -71,6 +73,7 @@ async fn a_disabled_tool_is_a_tool_result_error_not_execution() {
                 id: "t3".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -95,6 +98,7 @@ async fn a_native_session_with_enabled_tools_cannot_dispatch_a_disabled_tool() {
                 id: "t1".to_string(),
                 name: "ls".to_string(),
                 arguments: json!({ "path": "/tmp" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -165,6 +169,7 @@ async fn the_dispatch_subagent_alias_is_gated_by_the_subagent_enabled_tool() {
                 id: "t1".to_string(),
                 name: "dispatch_subagent".to_string(),
                 arguments: json!({ "task": "do the thing" }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -183,6 +188,7 @@ async fn the_dispatch_subagent_alias_is_gated_by_the_subagent_enabled_tool() {
                 id: "t2".to_string(),
                 name: "dispatch_subagent".to_string(),
                 arguments: json!({ "task": "do the thing" }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
@@ -583,6 +589,7 @@ async fn every_advertised_tool_reaches_an_executor() {
                     // An unreachable name produces `unknown tool` instead, and THAT
                     // is the string under test.
                     arguments: json!({}),
+                    defect: None,
                 },
                 &CancellationToken::new(),
             )
@@ -631,6 +638,7 @@ async fn the_seven_task_tools_are_dispatchable() {
                     id: "t1".to_string(),
                     name: name.to_string(),
                     arguments: json!({}),
+                    defect: None,
                 },
                 &CancellationToken::new(),
             )

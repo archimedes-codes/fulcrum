@@ -154,6 +154,7 @@ fn read_call(id: &str, path: &str) -> ToolCall {
         id: id.to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": path }),
+        defect: None,
     }
 }
 
@@ -227,6 +228,7 @@ fn write_scripts(path: &str, content: &str) -> Vec<Option<Vec<ProviderEvent>>> {
                 id: "t1".to_string(),
                 name: "write".to_string(),
                 arguments: json!({ "path": path, "content": content }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -455,6 +457,7 @@ async fn the_default_policy_reads_and_writes_beyond_the_boundary_in_silence() {
                         "path": write_path.display().to_string(),
                         "content": "WROTE-IT",
                     }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ]),
@@ -615,6 +618,7 @@ async fn a_sandboxed_shell_dispatches_confined_with_no_prompt() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "touch confined_ran.txt" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -988,6 +992,7 @@ async fn the_skill_tools_stay_outside_the_policy_gate() {
                 id: "t1".to_string(),
                 name: "read_skill".to_string(),
                 arguments: json!({ "name": "nope" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1121,6 +1126,7 @@ async fn default_posture_agent_dir_write_is_an_ask_not_a_silent_deny() {
         id: "t1".to_string(),
         name: "write".to_string(),
         arguments: json!({ "path": target.display().to_string(), "content": "PWNED" }),
+        defect: None,
     };
     assert_eq!(
         loop_.policy_verdict(&tc),
@@ -1188,6 +1194,7 @@ async fn a_guard_allow_directory_runs_the_tool() {
         id: "t1".to_string(),
         name: "write".to_string(),
         arguments: json!({ "path": target.display().to_string(), "content": "PWNED" }),
+        defect: None,
     };
     assert_eq!(
         loop_.policy_verdict(&tc),
@@ -1344,6 +1351,7 @@ async fn the_guard_ask_does_not_fire_on_a_trusted_space() {
         id: "t1".to_string(),
         name: "write".to_string(),
         arguments: json!({ "path": target.display().to_string(), "content": "PWNED" }),
+        defect: None,
     };
     // UNTRUSTED FIRST: the ask WOULD fire (this is what makes the trusted half
     // below load-bearing rather than vacuous).
@@ -1406,6 +1414,7 @@ async fn a_rule_deny_refuses_on_a_trusted_space() {
         id: "t1".to_string(),
         name: "write".to_string(),
         arguments: json!({ "path": target.display().to_string(), "content": "PWNED" }),
+        defect: None,
     };
     bounded_prompt(&mut loop_, "go").await;
     assert_eq!(
@@ -1536,6 +1545,7 @@ async fn a_rule_naming_a_not_yet_existing_dir_matches_at_the_gate() {
         id: "t1".to_string(),
         name: "write".to_string(),
         arguments: json!({ "path": target.display().to_string(), "content": "PWNED" }),
+        defect: None,
     };
     bounded_prompt(&mut loop_, "go").await;
     assert_eq!(
@@ -1590,6 +1600,7 @@ async fn a_read_of_an_agent_definition_file_is_not_an_ask() {
             id: "t1".to_string(),
             name: "write".to_string(),
             arguments: json!({ "path": path.clone(), "content": "X" }),
+            defect: None,
         }),
         Some(Decision::Ask),
         "the write direction of the same path IS the row-3 ask"
@@ -1745,6 +1756,7 @@ async fn a_settings_rule_edit_between_prompts_changes_the_next_turns_gating() {
             id: id.to_string(),
             name: "write".to_string(),
             arguments: json!({ "path": target.clone(), "content": "PWNED" }),
+            defect: None,
         })
     };
     let done = |text: &str| {
@@ -1919,6 +1931,7 @@ async fn a_rule_deny_on_an_ordinary_dir_uses_the_rule_wording_not_an_escape_clai
                         "path": format!("{}/secrets/hidden.txt", home.path().display()),
                         "content": "PWNED",
                     }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ]),
@@ -2003,6 +2016,7 @@ fn bash_call(id: &str, command: &str) -> ToolCall {
         id: id.to_string(),
         name: "bash".to_string(),
         arguments: json!({ "command": command }),
+        defect: None,
     }
 }
 
@@ -2012,6 +2026,7 @@ fn write_call(id: &str, path: &str) -> ToolCall {
         id: id.to_string(),
         name: "write".to_string(),
         arguments: json!({ "path": path, "content": "PWNED" }),
+        defect: None,
     }
 }
 
@@ -2513,6 +2528,7 @@ async fn a_definition_ask_on_an_unpoliced_tool_stays_as_self() {
             id: "t1".to_string(),
             name: name.to_string(),
             arguments: json!({}),
+            defect: None,
         };
         assert_eq!(
             loop_.policy_verdict(&tc),
@@ -2697,6 +2713,7 @@ async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones(
             id: "t1".to_string(),
             name: name.to_string(),
             arguments: args,
+            defect: None,
         };
         assert_eq!(
             loop_.policy_verdict(&tc),
@@ -2712,6 +2729,7 @@ async fn the_real_researcher_block_is_read_and_its_verdicts_are_the_scoped_ones(
             id: "t2".to_string(),
             name: "task".to_string(),
             arguments: json!({ "task": "x" }),
+            defect: None,
         }),
         None,
         "`task: deny` has no policed twin, so the gate answers `None` (the named \

@@ -20,8 +20,9 @@ use serde_json::Value;
 
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
-    cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
-    Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage, WireToolCall,
+    cost_usd_from_usage, parse_error_chunk, ArgumentDefect, ChatRole, FinishReason, MessageContent,
+    ModelRequest, Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
+    WireToolCall,
 };
 use crate::tools::ContentBlock;
 
@@ -614,10 +615,13 @@ impl SseStream {
             let Some(name) = acc.name else {
                 continue;
             };
+            // (issue #193) The defect rides the call — see `parse_arguments`.
+            let (arguments, defect) = parse_arguments(&acc.arguments);
             self.pending.push_back(ProviderEvent::ToolCall(ToolCall {
                 id: acc.id.unwrap_or_default(),
                 name,
-                arguments: parse_arguments(&acc.arguments),
+                arguments,
+                defect,
             }));
         }
     }
@@ -640,19 +644,48 @@ fn map_finish_reason(reason: &str) -> FinishReason {
     }
 }
 
-/// Parse accumulated argument text as JSON (an empty payload becomes
-/// `{}` — a tool with no arguments; a MALFORMED payload also becomes
-/// `{}`, but is logged — a silent `{}` would make the tool run with
-/// no arguments and hide the provider-side corruption).
-pub(super) fn parse_arguments(args: &str) -> Value {
+/// Parse accumulated argument text as JSON, PRESERVING the malformed-ness
+/// (issue #193).
+///
+/// The tuple is `(arguments, defect)`:
+/// - an EMPTY / whitespace-only payload is legitimate (a tool with no
+///   arguments) → `({}, None)`;
+/// - a payload that parses → `(value, None)`;
+/// - a payload that does NOT parse → `({}, Some(defect))` carrying the parse
+///   error and the raw text verbatim. `{}` — nothing is repaired, and that is
+///   deliberate: the coercion victims are `write` and `edit`, and completing
+///   truncated JSON into a written file is worse than refusing.
+///
+/// The `{}` is unchanged from before this fix; what changes is that the
+/// collapse is no longer the ONLY record of the failure. Before, an unparseable
+/// payload and an empty one were indistinguishable, so the tool's refusal said
+/// ``missing `path` parameter`` — a lie when the model had sent `path` and its
+/// JSON arrived broken — and the model re-sent the identical call. The defect is
+/// what lets `unknown_param_error` say what actually happened.
+///
+/// A top-level JSON STRING (`"abc"`) is a SEPARATE failure class this plan
+/// deliberately does not touch: it parses `Ok`, so it carries no defect, and it
+/// simply has no object keys, which makes it silently uncheckable by
+/// `unknown_param_error`'s `as_object()?`. It stays out of scope; if a real
+/// payload ever shows it, it needs its own defect arm.
+///
+/// The `eprintln!` stays: the log is the operator's witness, the defect is the
+/// model's.
+pub(super) fn parse_arguments(args: &str) -> (Value, Option<ArgumentDefect>) {
     if args.trim().is_empty() {
-        return Value::Object(Default::default());
+        return (Value::Object(Default::default()), None);
     }
     match serde_json::from_str(args) {
-        Ok(v) => v,
+        Ok(v) => (v, None),
         Err(e) => {
             eprintln!("harness: malformed tool-call arguments — using {{}}: {e}");
-            Value::Object(Default::default())
+            (
+                Value::Object(Default::default()),
+                Some(ArgumentDefect {
+                    error: e.to_string(),
+                    raw: args.to_string(),
+                }),
+            )
         }
     }
 }
@@ -1420,6 +1453,7 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ]
@@ -1643,13 +1677,72 @@ mod tests {
 
     #[test]
     fn parse_arguments_handles_empty_and_malformed() {
-        assert_eq!(parse_arguments(""), Value::Object(Default::default()));
-        assert_eq!(parse_arguments("  "), Value::Object(Default::default()));
         assert_eq!(
-            parse_arguments("{not json"),
-            Value::Object(Default::default())
+            parse_arguments(""),
+            (Value::Object(Default::default()), None)
         );
-        assert_eq!(parse_arguments(r#"{"a":1}"#), json!({ "a": 1 }));
+        assert_eq!(
+            parse_arguments("  "),
+            (Value::Object(Default::default()), None)
+        );
+        // (issue #193) An unparseable payload still becomes `{}` — nothing is
+        // repaired — but it now ALSO carries the defect, so the tuple's first
+        // element alone is no longer the whole answer.
+        let (args, defect) = parse_arguments("{not json");
+        assert_eq!(args, Value::Object(Default::default()));
+        let defect = defect.expect("an unparseable payload carries a defect");
+        assert_eq!(defect.raw, "{not json");
+        assert_eq!(parse_arguments(r#"{"a":1}"#), (json!({ "a": 1 }), None));
+    }
+
+    /// (issue #193) The defect names itself: a non-empty parse error and the
+    /// raw text the provider sent, BYTE-IDENTICAL. The verbatim `raw` is the
+    /// half the model needs — the sentence that used to be a lie
+    /// ("missing `path` parameter") is replaced by one that shows what
+    /// actually arrived, which is what stops the identical re-send.
+    #[test]
+    fn a_malformed_payload_carries_the_error_and_the_raw_text() {
+        // Truncated mid-object: the shape the real 566 rows carry.
+        let raw = r#"{"path": "/tmp/x", "content": "truncated he"#;
+        let (args, defect) = parse_arguments(raw);
+        assert_eq!(
+            args,
+            Value::Object(Default::default()),
+            "the defect is PRESERVED, never repaired — `arguments` stays `{{}}`"
+        );
+        let defect = defect.expect("a payload that failed to parse carries its defect");
+        assert!(
+            !defect.error.is_empty(),
+            "the parse error is named, not swallowed"
+        );
+        assert_eq!(
+            defect.raw.as_bytes(),
+            raw.as_bytes(),
+            "`raw` is byte-identical to what the provider sent"
+        );
+    }
+
+    /// (issue #193) THE distinction this whole track exists to draw: an empty
+    /// payload is LEGITIMATE (a tool with no arguments) and carries NO defect,
+    /// while a malformed one carries one — even though both end up as `{}` in
+    /// `arguments`. A tool's "missing `path`" refusal is honest for the first
+    /// and a lie for the second, and `defect` is precisely the field that
+    /// tells them apart.
+    #[test]
+    fn an_empty_payload_carries_no_defect() {
+        for empty in ["", "   ", "\n", "\t\n "] {
+            let (args, defect) = parse_arguments(empty);
+            assert_eq!(
+                args,
+                Value::Object(Default::default()),
+                "an empty payload is `{{}}` — unchanged by this fix"
+            );
+            assert!(
+                defect.is_none(),
+                "an empty payload ({empty:?}) is legitimate: no defect, and the \
+                 absence of the field IS the distinction"
+            );
+        }
     }
 
     /// A wire `usage` token count that exceeds `u32::MAX` SATURATES
@@ -1830,6 +1923,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "/x" }),
+                        defect: None,
                     }]),
                 },
                 ChatMessage {
@@ -2088,11 +2182,23 @@ mod tests {
                             id: "call_1".to_string(),
                             name: "read".to_string(),
                             arguments: json!({ "path": "/x", "limit": 10 }),
+                            defect: None,
                         },
                         ToolCall {
                             id: "call_2".to_string(),
                             name: "bash".to_string(),
                             arguments: Value::Object(Default::default()),
+                            // (issue #193) A DEFECT-CARRYING call, deliberately
+                            // in this fixture: `WireToolCall`'s own `Serialize`
+                            // writes `id` / `type` / `function` and nothing
+                            // else, so the defect cannot reach the request body
+                            // even when it is PRESENT. The `keys_of_names` pin
+                            // below is what proves it — the whole point is that
+                            // a provider must never see this field.
+                            defect: Some(crate::harness::provider::ArgumentDefect {
+                                error: "EOF while parsing an object".to_string(),
+                                raw: r#"{"command": "ls"#.to_string(),
+                            }),
                         },
                     ]),
                 },
@@ -2164,6 +2270,23 @@ mod tests {
             "a `tool` message is exactly `role` + `content` + `tool_call_id` \
              — a transcript-only field must not appear here"
         );
+        // (issue #193) THE DEFECT LEAK PIN. `call_2` above carries a defect and
+        // this is the object it became on the wire: exactly the three
+        // OpenAI-contract keys. `ToolCall`'s own `Serialize` would emit
+        // `defect` when present — `WireToolCall`'s hand-written one is what
+        // keeps it off, and this is the pin that says so. A provider that saw
+        // an unknown field here answers 400 on every tool-using turn.
+        assert_eq!(
+            keys_of_names(&calls[1]),
+            vec!["function", "id", "type"],
+            "a DEFECT-CARRYING tool call is exactly `id` + `type` + `function` \
+             on the request wire — `defect` must never reach a provider"
+        );
+        assert!(
+            calls[1].get("defect").is_none(),
+            "`defect` is absent, not null: {}",
+            calls[1]
+        );
     }
 
     // ── (issue #122) the outbound empty-content guard ──────────────────
@@ -2196,6 +2319,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "/x" }),
+                        defect: None,
                     }]),
                 }],
                 tools: vec![],
@@ -2277,6 +2401,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
                         arguments: Value::Object(Default::default()),
+                        defect: None,
                     }]),
                 },
                 ChatMessage {
@@ -2293,6 +2418,7 @@ mod tests {
                         id: "call_2".to_string(),
                         name: "bash".to_string(),
                         arguments: Value::Object(Default::default()),
+                        defect: None,
                     }]),
                 },
             ],
@@ -2338,6 +2464,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "/test" }),
+                        defect: None,
                     }]),
                 },
                 ChatMessage {
@@ -2553,6 +2680,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "read".to_string(),
             arguments: json!({ "path": "/x" }),
+            defect: None,
         };
         let v = serde_json::to_value(&tc).expect("serialization cannot fail");
         assert_eq!(

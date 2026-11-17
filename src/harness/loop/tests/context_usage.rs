@@ -241,6 +241,7 @@ async fn a_tool_batch_is_measured_before_the_next_compaction_check() {
                 id: "t1".to_string(),
                 name: "read".to_string(),
                 arguments: json!({ "path": "big.txt" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),

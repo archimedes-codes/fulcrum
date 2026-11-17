@@ -263,10 +263,14 @@ impl ResponsesStream {
                         .or_else(|| acc.name.clone());
                     if let Some(name) = name {
                         acc.done = true;
+                        // (issue #193) The defect rides the call — see
+                        // `parse_arguments`.
+                        let (arguments, defect) = parse_arguments(&acc.arguments);
                         self.pending.push_back(ProviderEvent::ToolCall(ToolCall {
                             id: id.unwrap_or_default(),
                             name,
-                            arguments: parse_arguments(&acc.arguments),
+                            arguments,
+                            defect,
                         }));
                     }
                 }
@@ -496,10 +500,13 @@ impl ResponsesStream {
             let Some(name) = acc.name else {
                 continue;
             };
+            // (issue #193) The defect rides the call — see `parse_arguments`.
+            let (arguments, defect) = parse_arguments(&acc.arguments);
             self.pending.push_back(ProviderEvent::ToolCall(ToolCall {
                 id: acc.id.unwrap_or_default(),
                 name,
-                arguments: parse_arguments(&acc.arguments),
+                arguments,
+                defect,
             }));
         }
     }
@@ -1013,6 +1020,7 @@ mod tests {
                     id: "fc_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
             ]
         );
@@ -1045,6 +1053,7 @@ mod tests {
                     id: "fc_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/y" }),
+                    defect: None,
                 }),
             ]
         );
@@ -1128,6 +1137,7 @@ mod tests {
                     id: "fc_9".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::Length),
             ],
@@ -1177,6 +1187,7 @@ mod tests {
                     id: "fc_9".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::Error),
             ],
@@ -1224,6 +1235,7 @@ mod tests {
                     id: "fc_9".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::Error),
             ],
@@ -1283,6 +1295,7 @@ mod tests {
                     id: "fc_9".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
                 // A `terminated` stream always carries a finish reason —
                 // a `completed` whose status is not `"completed"` is an
@@ -1335,6 +1348,7 @@ mod tests {
                     id: "fc_9".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::Stop),
             ],
@@ -1877,11 +1891,19 @@ mod tests {
                             id: "fc_1".to_string(),
                             name: "read".to_string(),
                             arguments: json!({ "path": "/x" }),
+                            defect: None,
                         },
                         ToolCall {
                             id: "fc_2".to_string(),
                             name: "bash".to_string(),
                             arguments: Value::Object(Default::default()),
+                            // (issue #193) DEFECT-CARRYING, so the exact-key-set
+                            // pin on `input[1]` below is the leak guard for a
+                            // call that actually HAS a defect (see the pin).
+                            defect: Some(crate::harness::provider::ArgumentDefect {
+                                error: "expected value at line 1 column 1".to_string(),
+                                raw: "{not json".to_string(),
+                            }),
                         },
                     ]),
                 ),
@@ -1961,7 +1983,9 @@ mod tests {
         assert_eq!(
             keys_of_names(&input[1]),
             vec!["arguments", "call_id", "name", "type"],
-            "the second `function_call` item carries the same exact set"
+            "the second `function_call` item carries the same exact set — and \
+             it is the DEFECT-CARRYING call, so `defect` demonstrably has no \
+             path to this wire either"
         );
         assert_eq!(
             keys_of_names(&input[2]),

@@ -38,8 +38,8 @@ pub use anthropic::{normalize_anthropic_base_url, normalize_wire_base_url, Anthr
 pub use openai::OpenAiCompatibleProvider;
 pub use responses::OpenAiResponsesProvider;
 pub use types::{
-    ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions, ModelRequest, Provider,
-    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, ToolSpec, Usage,
+    ArgumentDefect, ChatMessage, ChatRole, FinishReason, MessageContent, ModelOptions,
+    ModelRequest, Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, ToolSpec, Usage,
 };
 // (T5/S4, Step A.3) The two `pub(crate)` free functions and the two `pub(super)`
 // wire shapes in the moved file are now `pub`, because a package boundary erases

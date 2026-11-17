@@ -1440,6 +1440,7 @@ mod tests {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: serde_json::json!({ "command": "ls" }),
+                defect: None,
             }]),
         };
         let tool = ChatMessage {
@@ -1500,6 +1501,7 @@ mod tests {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: serde_json::json!({ "command": "ls" }),
+                defect: None,
             }]),
         };
         let tool = ChatMessage {
@@ -1541,6 +1543,7 @@ mod tests {
                 id: "t1".to_string(),
                 name: "write".to_string(),
                 arguments: serde_json::json!({ "path": "a.rs", "content": big }),
+                defect: None,
             }]),
         };
         // The shared estimate sees ONE tool call here: 21 tokens, which fits

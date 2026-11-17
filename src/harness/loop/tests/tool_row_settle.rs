@@ -355,6 +355,7 @@ async fn a_mid_stream_fatal_error_closes_the_announced_tool_calls() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             }),
             ProviderEvent::Error(ProviderError::Fatal("400 bad request".to_string())),
         ]),
@@ -488,11 +489,13 @@ async fn both_paths_of_retry_abandoned_attempt_close_the_announced_tool_calls_id
                     id: "t1".to_string(),
                     name: "bash".to_string(),
                     arguments: json!({ "command": "echo hi" }),
+                    defect: None,
                 }),
                 ProviderEvent::ToolCall(ToolCall {
                     id: "t2".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "a.txt" }),
+                    defect: None,
                 }),
                 ProviderEvent::Error(ProviderError::Retryable("transient".to_string())),
             ]),
@@ -605,6 +608,7 @@ async fn an_exhausted_retry_budget_closes_the_announced_tool_calls() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             }),
             ProviderEvent::Error(ProviderError::Retryable("still down".to_string())),
         ]),
@@ -716,6 +720,7 @@ async fn a_stop_while_the_model_streams_tool_calls_closes_the_announced_rows() {
             id: "t1".to_string(),
             name: "bash".to_string(),
             arguments: json!({ "command": "echo hi" }),
+            defect: None,
         }],
     );
     let (_space, mut loop_) = build_loop(
@@ -841,6 +846,7 @@ async fn the_closes_arrive_in_accumulator_order_and_every_one_precedes_the_settl
                 id: (*id).to_string(),
                 name: ["bash", "read", "grep"][i].to_string(),
                 arguments: json!({}),
+                defect: None,
             })
             .collect(),
     );
@@ -964,6 +970,7 @@ async fn a_settle_after_a_completed_batch_does_not_re_close_its_rows() {
                 id: "t1".to_string(),
                 name: "read".to_string(),
                 arguments: json!({ "path": "a.txt" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ],
@@ -1202,6 +1209,7 @@ async fn a_settle_with_nothing_announced_emits_no_tool_execution_end() {
                 id: "t1".to_string(),
                 name: "bash".to_string(),
                 arguments: json!({ "command": "echo hi" }),
+                defect: None,
             }),
             ProviderEvent::Error(ProviderError::Retryable("transient".to_string())),
         ]),
@@ -1316,6 +1324,7 @@ async fn a_capped_turn_closes_nothing_and_carries_the_prior_results() {
                 "content": "legal",
                 "contentt": "typo",
             }),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
