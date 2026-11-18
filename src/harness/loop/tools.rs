@@ -58,11 +58,24 @@ impl AgentLoop {
     /// interactive channel, called in-process — NOT over a socket) +
     /// `subagent` (a native parent spawns an IN-PROCESS native child via
     /// `dispatch_native`).
+    /// Dispatch a single call. Returns the [`ToolResult`] and whether a PERSON
+    /// refused it — the same `(ToolResult, bool)` shape
+    /// `codemode::run_nested` returns, for the same reason.
+    ///
+    /// `true` reaches here from exactly ONE arm: `sudo_exec`, whose confirm and
+    /// password sub-prompts are answered by a person and are refused INSIDE
+    /// `sudo_run_flow`, so the permission gate never sees the decision and
+    /// cannot supply the flag. Every other arm answers `false`, including the
+    /// `unknown tool` / `tool not enabled` results and a `codemode` bridge
+    /// refusal — those are the engine refusing, which IS a re-send instruction.
+    ///
+    /// The flag exists for `run_tool_batch`'s refusal predicate and nothing
+    /// else; `run_tool_batch` is this function's only production caller.
     pub(super) async fn dispatch_tool(
         &mut self,
         tc: &ToolCall,
         turn: &CancellationToken,
-    ) -> ToolResult {
+    ) -> (ToolResult, bool) {
         // The `enabled_tools` filter (`None` = ALL — finding 13b): a
         // disabled tool is a tool-result error, NOT executed.
         // `dispatch_subagent` is an ALIAS of `subagent` (the `match`
@@ -70,13 +83,18 @@ impl AgentLoop {
         // parent with `enabled_tools: Some(["subagent"])` must not get
         // `tool not enabled: dispatch_subagent` when the model emits it.
         if !self.is_tool_enabled(&tc.name) {
-            return ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("tool not enabled: {}", tc.name),
-                }],
-                details: None,
-                is_error: true,
-            };
+            // The ENGINE refusing (the tool is not enabled), not a person — so
+            // the flag is `false` and the refusal guard still counts it.
+            return (
+                ToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("tool not enabled: {}", tc.name),
+                    }],
+                    details: None,
+                    is_error: true,
+                },
+                false,
+            );
         }
         // The `subagent` / `dispatch_subagent` alias (the single source of
         // truth is `is_subagent_call` — the parallel batch + this dispatch
@@ -90,7 +108,9 @@ impl AgentLoop {
             // `&self` because the concurrent path calls it through a shared
             // borrow inside the batch's futures.
             self.fold_child_cost(child_cost);
-            return result;
+            // A child's own result is never a PERSON's refusal of THIS call; the
+            // child's gate ran inside the child, with its own refusal guard.
+            return (result, false);
         }
         match tc.name.as_str() {
             "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
@@ -112,31 +132,43 @@ impl AgentLoop {
                 // executor cannot re-decide differently from its gate. `cwd` is
                 // the loop's own `space_cwd` (not permission state) and `cancel`
                 // is the TURN token.
-                execute_tool(
-                    &self
-                        .permissions
-                        .to_tool_ctx(self.space_cwd.clone(), turn.clone()),
-                    &tc.name,
-                    &tc.arguments,
+                // An executor's own verdict (a missing or malformed parameter, a
+                // failed command) is the ENGINE refusing — counted. No person is
+                // involved here: the permission gate decided that BEFORE this
+                // arm, and its denial is marked in `run_tool_batch`.
+                (
+                    execute_tool(
+                        &self
+                            .permissions
+                            .to_tool_ctx(self.space_cwd.clone(), turn.clone()),
+                        &tc.name,
+                        &tc.arguments,
+                    )
+                    .await,
+                    false,
                 )
-                .await
             }
             "manage_todo_list" => {
                 // RACED against the TURN token (finding 8b, round 2 —
                 // a cancel stops the turn, it is never waited out; the
                 // flow's own `cancel` is the SESSION teardown token,
                 // which a Stop does NOT set).
-                tokio::select! {
-                    r = todo_apply(
-                        &self.todo_store,
-                        &self.session_id,
-                        "native",
-                        &tc.arguments,
-                        &self.sink,
-                        &self.cancel,
-                    ) => r,
-                    _ = turn.cancelled() => Self::cancelled_tool_result(),
-                }
+                (
+                    tokio::select! {
+                        r = todo_apply(
+                            &self.todo_store,
+                            &self.session_id,
+                            "native",
+                            &tc.arguments,
+                            &self.sink,
+                            &self.cancel,
+                        ) => r,
+                        _ = turn.cancelled() => Self::cancelled_tool_result(),
+                    },
+                    // The cancel arm is excluded by the predicate's own
+                    // `turn.is_cancelled()` half, not by this flag.
+                    false,
+                )
             }
             "sudo_exec" => {
                 // RACED against the TURN token (finding 8b, round 2 — the
@@ -146,6 +178,14 @@ impl AgentLoop {
                 // Stop still EXECUTED the elevated command). The prompts
                 // now carry no deadline at all, so this turn-token race is
                 // the ONLY thing that settles a Stop promptly.
+                // THE ONE arm in this `match` that can answer `true`, and the
+                // reason the tuple exists at all: a declined confirm or a
+                // cancelled password entry is a PERSON'S "no", decided inside
+                // `sudo_run_flow` where the permission gate cannot see it. The
+                // flag rides out of the flow rather than being read off the
+                // flow's sentence. The cancel arm answers `false` because a Stop
+                // is excluded one layer up, by the predicate's
+                // `turn.is_cancelled()` half.
                 tokio::select! {
                     r = sudo_run_flow(
                         &self.session_id,
@@ -158,11 +198,16 @@ impl AgentLoop {
                         &self.sudo.sudo_password,
                         &self.cancel,
                     ) => r,
-                    _ = turn.cancelled() => Self::sudo_cancelled_result(),
+                    _ = turn.cancelled() => (Self::sudo_cancelled_result(), false),
                 }
             }
             "ask" => {
-                crate::harness::ask::ask_flow(
+                // An `ask` ANSWER is not a refusal, and `ask_flow`'s only
+                // `is_error` arm is an UNUSABLE payload — the engine refusing a
+                // malformed call, which IS a re-send instruction. So `false`.
+                // (An unanswered/cancelled `ask` is excluded by the predicate's
+                // `turn.is_cancelled()` half, one layer up.)
+                let result = crate::harness::ask::ask_flow(
                     &self.pending_bridge,
                     &self.sink,
                     &self.session_id,
@@ -170,17 +215,21 @@ impl AgentLoop {
                     &tc.id,
                     turn,
                 )
-                .await
+                .await;
+                (result, false)
             }
-            "list_agents" => self.list_agents_tool().await,
+            "list_agents" => (self.list_agents_tool().await, false),
             "mcp" => {
                 // RACED against the TURN token (finding 8b, round 2 — a Stop
                 // mid-mcp-call cancels the in-flight request + kills the stdio
                 // child; the flow's internal `cancel` is the TURN token too).
-                tokio::select! {
-                    r = mcp_tool(&self.mcp, &tc.arguments, turn) => r,
-                    _ = turn.cancelled() => Self::cancelled_tool_result(),
-                }
+                (
+                    tokio::select! {
+                        r = mcp_tool(&self.mcp, &tc.arguments, turn) => r,
+                        _ = turn.cancelled() => Self::cancelled_tool_result(),
+                    },
+                    false,
+                )
             }
             "codemode" => {
                 // The `&mut self` here is exactly WHY the bridge takes `&AgentLoop`
@@ -190,16 +239,32 @@ impl AgentLoop {
                 // `loop/codemode.rs` against `&self` instead of reused from here.
                 // The engine is per-call (no field on the loop) and the turn token
                 // is the one cancellation authority.
-                crate::harness::r#loop::codemode::exec_codemode(self, &tc.id, &tc.arguments, turn)
-                    .await
+                // The bridge's own refusals (a disabled tool, an unknown param,
+                // the interactive `mcp auth` action) are the ENGINE refusing.
+                // A nested call's gate denial lands in the script's row, not in
+                // this batch's refusal vector, and `run_nested` marks it there.
+                (
+                    crate::harness::r#loop::codemode::exec_codemode(
+                        self,
+                        &tc.id,
+                        &tc.arguments,
+                        turn,
+                    )
+                    .await,
+                    false,
+                )
             }
-            other => ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("unknown tool: {other}"),
-                }],
-                details: None,
-                is_error: true,
-            },
+            // The ENGINE refusing an unreachable name — a re-send instruction.
+            other => (
+                ToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("unknown tool: {other}"),
+                    }],
+                    details: None,
+                    is_error: true,
+                },
+                false,
+            ),
         }
     }
 

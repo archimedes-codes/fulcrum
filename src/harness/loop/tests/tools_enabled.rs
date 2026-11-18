@@ -39,7 +39,8 @@ async fn a_disabled_tool_is_a_tool_result_error_not_execution() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert!(r.is_error, "the disabled tool is an error result");
     assert_eq!(
         result_text(&r),
@@ -58,7 +59,8 @@ async fn a_disabled_tool_is_a_tool_result_error_not_execution() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert_ne!(
         result_text(&r),
         "tool not enabled: read",
@@ -77,7 +79,8 @@ async fn a_disabled_tool_is_a_tool_result_error_not_execution() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert_ne!(
         result_text(&r),
         "tool not enabled: bash",
@@ -173,7 +176,8 @@ async fn the_dispatch_subagent_alias_is_gated_by_the_subagent_enabled_tool() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         result_text(&r),
         "subagent dispatch is not available in this session",
@@ -192,7 +196,8 @@ async fn the_dispatch_subagent_alias_is_gated_by_the_subagent_enabled_tool() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         result_text(&r),
         "tool not enabled: dispatch_subagent",
@@ -593,7 +598,8 @@ async fn every_advertised_tool_reaches_an_executor() {
                 },
                 &CancellationToken::new(),
             )
-            .await;
+            .await
+            .0;
         let text = result_text(&r);
         assert!(
             !text.contains("unknown tool"),
@@ -642,7 +648,8 @@ async fn the_seven_task_tools_are_dispatchable() {
                 },
                 &CancellationToken::new(),
             )
-            .await;
+            .await
+            .0;
         let text = result_text(&r);
         assert!(
             text.contains("no task store"),

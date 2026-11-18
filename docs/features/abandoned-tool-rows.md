@@ -37,29 +37,54 @@ way of §1's and §3's: the commit that bounded the malformed-arguments defect a
 touching this file. Re-measured against that tree before the numbers were deleted, **all ten of §2's rows were wrong**,
 not the four a reviewer's spot-check named — and every `loop.rs` figure had moved too, so the reviewer's guess that the
 `loop.rs` rows had survived was also wrong. The reviewer's own corrected numbers were worse than the ones they replaced:
-measured in this tree, `settle_truncated` sits at 1382 and not the "~1216" offered, `close_announced_tool_calls`'s
-docblock runs 1202–1248 and not "~1036–1082", and `run_tool_batch`'s dispatch loop is 1043–1187 and not "~906–1021" — a
-consistent off-by-~150, because those figures were taken before the two guard commits that landed after the review.
-That is the argument demonstrated twice over: a re-derivation is good for exactly one commit, so the numbers are
-DELETED rather than updated. §2's table, §2's prose, §11's table, and the surviving `turn.rs` / `loop.rs` /
+offered for `settle_truncated`, `close_announced_tool_calls`'s docblock and `run_tool_batch`'s dispatch loop, they were
+all **~150 lines low**, because they were taken before the two guard commits that landed after the review. What this
+paragraph used to do next is the trap it exists to argue against: it cited the three corrected numbers as evidence, and
+two of the three were already stale in the commit that wrote them. They are DELETED here, not renumbered — a
+re-derivation is good for exactly one commit, and this document has now demonstrated that four times.
+
+§2's table, §2's prose, §11's table, and the surviving `turn.rs` / `loop.rs` /
 `normalize.rs` / `compact.rs` / `retry.rs` citations in §3, §4, §7, §8 and §10 are therefore now **number-free**,
 resolved by `fn` name, `match`-arm name or test name — the treatment §1 already had. §11's first column is now §2's site
 NUMBER, because that is the stable identifier and it is what the source comments say out loud ("Site 7 of the ten").
-Counted mechanically off the diff: **72 distinct `turn.rs` / `loop.rs` citations removed**, 36 of them provably not the
-construct they named (the line was a comment, was blank, or was past EOF), and every one of the other 36 checked by hand
-and also not naming it.
+
+**How many were removed, stated as a rule rather than a number.** This sentence used to assert **72** distinct
+`turn.rs` / `loop.rs` citations removed, plus a 36/36 split between "provably not the construct they named" and "checked
+by hand". Neither figure is reproducible from `git show c34254e -- docs/features/abandoned-tool-rows.md`, and the
+reviewer's own recount (67 occurrences / 49 distinct) disagrees with it too — which is the expected outcome, because
+"how many citations were removed" has no answer until someone fixes what counts as a citation. The number a reader CAN
+reproduce is this one:
+
+    git show c34254e -- docs/features/abandoned-tool-rows.md \
+      | grep '^-' | grep -oE '[A-Za-z_/.-]+\.(rs|ts)(:|[[:space:]]+)(line[[:space:]]+)?[0-9]+' | wc -l
+
+**59 occurrences / 45 distinct** on that rule (any `.rs` or `.ts` token immediately followed by a number, counting
+ranges once at their head). Change the rule and the number changes — restricting it to the five engine files named above
+gives 56 / 42 — so the rule is the claim and the number is only its consequence. The 36/36 sub-claim is dropped rather
+than restated: nothing in the diff witnesses it.
 
 This is not a cosmetic preference: production comments cite §2 by number ("site N of the ten in
 `docs/features/abandoned-tool-rows.md` §2"), so the table's accuracy is a code-comment property, and a table whose rows
 point at prose teaches the next reader to distrust the citation that is supposed to justify a `&[]`. Hence the rule for
 anyone editing this file: **add no line number, and none needs re-checking** — name the function.
 
-**§5 and §9 are the exception and remain NOT re-read.** Their citations name `pump.rs`, `worker/client.rs`,
-`subagent_flow.rs`, `worker/manager/mod.rs`, `config_types.rs`, `worker/store.rs` and the daemon's `persist.rs` /
-`db/` paths — files outside the two this branch kept editing, but whose numbers were copied from the plan and never
-verified in this tree. Two are already known false: the pump lives at `worker/manager/pump.rs` (not `worker/pump.rs`),
-and the ring `client.rs` builds is at its `broadcast::channel(256)` line, which is not the number §5 gives. Treat every
-number in those two sections as a hint to grep for, never as a location.
+**§5, §6 and §9 are the exception and remain NOT re-read.** §5's and §9's citations name `pump.rs`,
+`worker/client.rs`, `subagent_flow.rs`, `worker/manager/mod.rs`, `config_types.rs`, `worker/store.rs` and the daemon's
+`persist.rs` / `db/` paths — files outside the two this branch kept editing, but whose numbers were copied from the plan
+and never verified in this tree. Two are already known false: the pump lives at `worker/manager/pump.rs` (not
+`worker/pump.rs`), and the ring `client.rs` builds is at its `broadcast::channel(256)` line, which is not the number §5
+gives. Treat every number in those two sections as a hint to grep for, never as a location.
+
+**§6 is on this list too, and it is named here explicitly because it was in neither list before.** It carries numbers
+that a reader applying the rule above would otherwise have no instruction about: `src/lib/subagentActivity.ts:302-309`
+and `:310-317`, `src-tauri/Cargo.toml:121`, and the two engine-side numbers at the end of §5 —
+`DEFAULT_SUBAGENT_DEAD_BOUND` at `worker/manager/mod.rs:70-71` and `default_subagent_dead_bound_secs` at
+`config_types.rs:258`. They were checked when this paragraph was written and all four are CORRECT — including the two
+engine-side ones, which is why they survived the sweep that deleted the rest. Correct-by-luck is not the same as
+exempt: §6's `.ts` figures are the least fragile things here because they are read out of a PINNED blob
+(`git show 744aac23:src/lib/subagentActivity.ts`, which the section says out loud), and `Cargo.toml:121` is pinned to
+`v0.13.0` the same way. The engine-side pair is the genuinely fragile kind — it moves with any commit that touches
+either file — so it is the one to grep for rather than to read.
 
 Statuses: **open work** = someone must do it · **recorded** = a known limit, deliberately not fixed ·
 **accepted** = decided, will not change here.

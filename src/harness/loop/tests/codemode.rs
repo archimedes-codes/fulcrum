@@ -13,6 +13,15 @@
 //! Every test here runs a REAL QuickJS engine — the bridge is not mocked. The
 //! scripted provider only stands in for the model.
 //!
+//! THE `.await.0` ON EVERY `dispatch_tool` CALL: the method returns
+//! `(ToolResult, bool)` — the result and whether a PERSON refused it — because
+//! `run_tool_batch`'s refusal guard needs the flag. These pins are about the
+//! RESULT, so they project `.0`; the flag itself is pinned by
+//! `a_sudo_exec_confirm_refusal_is_never_a_refusal_run` and the census
+//! `source_lints::every_denial_marking_site_in_the_batch_is_accounted`. Do not
+//! "tidy" the tuple away: a `ToolResult` return is what let the sudo confirm
+//! refusal reach the guard as a re-send instruction.
+//!
 //! THE FIXTURE RULE these tests all obey (`policy_gate.rs`'s own discovery, stated
 //! at its `policy_verdict` assertions): `PermissionContext::refresh` runs at the top
 //! of `handle_prompt`, so a loop that has never handled a prompt still carries the
@@ -151,7 +160,8 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert!(!r.is_error, "a well-formed script succeeds: {}", text(&r));
     assert_eq!(
         text(&r),
@@ -178,7 +188,8 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert!(r.is_error, "a non-string `code` is an error result");
     assert!(
         text(&r).contains("`code`") && text(&r).contains("string"),
@@ -389,7 +400,8 @@ async fn promise_all_batches_nested_calls_in_completion_order() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     let elapsed = started.elapsed();
 
     assert!(
@@ -579,7 +591,7 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await.0;
 
     let rows = result
         .details
@@ -682,7 +694,8 @@ async fn a_nested_ask_prompts_on_the_nested_request_id_and_a_reject_denies_it() 
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     answered.await.expect("the answer task ran");
 
     let prompts = emitted(&sink, "permission-request");
@@ -768,6 +781,7 @@ async fn a_nested_ask_raced_by_a_stop_ends_the_script_and_keeps_the_row_running(
                     &turn,
                 )
                 .await
+                .0
         })
     };
 
@@ -878,7 +892,8 @@ async fn an_excluded_tool_is_not_installed_as_a_script_global() {
                 },
                 &turn,
             )
-            .await;
+            .await
+            .0;
         assert!(
             !result.is_error,
             "`tools.{name}` is merely absent, so the script still runs: {}",
@@ -906,7 +921,7 @@ async fn an_excluded_tool_is_not_installed_as_a_script_global() {
             },
             &turn,
         )
-        .await;
+        .await.0;
     assert!(
         !result.is_error,
         "the discovery script ran: {}",
@@ -954,7 +969,7 @@ async fn the_interactive_mcp_auth_action_is_refused_from_a_script() {
             },
             &turn,
         )
-        .await;
+        .await.0;
     // The SCRIPT succeeds — a refused nested call is a result, not an exception, so
     // the parent's own outcome must not turn red over it.
     assert!(
@@ -1006,7 +1021,8 @@ async fn the_interactive_mcp_auth_action_is_refused_from_a_script() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert!(!result.is_error, "the script ran: {}", text(&result));
     assert_eq!(
         text(&result),
@@ -1047,7 +1063,8 @@ async fn the_discovery_globals_describe_the_advertised_set() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert!(
         !result.is_error,
         "the discovery script ran: {}",
@@ -1074,7 +1091,8 @@ async fn the_discovery_globals_describe_the_advertised_set() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         text(&result),
         "true",
@@ -1095,7 +1113,8 @@ async fn the_discovery_globals_describe_the_advertised_set() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         text(&result),
         "2",
@@ -1117,7 +1136,8 @@ async fn the_discovery_globals_describe_the_advertised_set() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     let expected = tool_specs().len() - 6;
     assert_eq!(
         text(&result),
@@ -1158,7 +1178,7 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
             },
             &turn,
         )
-        .await;
+        .await.0;
     assert!(!result.is_error, "the script ran: {}", text(&result));
     assert_eq!(
         text(&result),
@@ -1182,7 +1202,8 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         text(&result),
         "true:true",
@@ -1217,7 +1238,8 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert!(
         text(&result).starts_with("true|"),
         "a non-serializable argument is a failed result, not a script crash: {}",
@@ -1251,7 +1273,8 @@ async fn a_throwing_script_reports_its_message_and_keeps_its_rows() {
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert!(result.is_error, "a throwing script is a failed result");
     assert!(
         text(&result).contains("the script gave up"),
@@ -1297,7 +1320,8 @@ async fn an_empty_script_fails_without_producing_rows() {
                 },
                 &CancellationToken::new(),
             )
-            .await;
+            .await
+            .0;
         assert!(result.is_error, "{code:?} must fail");
         assert_eq!(
             text(&result),
@@ -1346,6 +1370,7 @@ async fn a_stop_cancels_a_running_script() {
                     &turn,
                 )
                 .await
+                .0
         })
     };
     tokio::time::sleep(Duration::from_millis(150)).await;

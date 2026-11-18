@@ -668,8 +668,13 @@ fn quoted_defect_raw(raw: &str) -> String {
 /// omitted a required parameter" the model re-sent the identical call. Rule 0
 /// says what actually happened and shows the raw text — bounded to
 /// [`MAX_DEFECT_RAW_BYTES`] with a trailing note naming the true length, because
-/// this sentence IS the tool result and rides the next request body (the stored
-/// `defect.raw` itself is never truncated).
+/// this sentence IS the tool result and rides the next request body. The bound
+/// is applied ONCE, at the parse site, by
+/// [`cap_defect_raw`](crate::provider_types::cap_defect_raw), so the stored
+/// `defect.raw` this rule reads is ALREADY capped — it is not an unbounded
+/// field, and it never was after `c34254e`; what survives here is the
+/// sentence's OWN second bound (see [`quoted_defect_raw`]), which composes with
+/// the stored one rather than re-cutting it.
 ///
 /// TOP-LEVEL ONLY, and it never mutates: a pure function of `(specs, tc)`
 /// returning display text, so it is safe to call before a dispatch has

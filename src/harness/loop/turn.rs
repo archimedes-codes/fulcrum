@@ -238,10 +238,13 @@ fn required_key_satisfied(
 ///
 /// THE COUPLING THIS CUTS BOTH WAYS: rewording one of those descriptions breaks
 /// the recognition and the alias stops being excluded — the over-count direction,
-/// i.e. the bug coming back. That is why
-/// `the_alias_rule_reads_the_wording_tool_specs_actually_uses` pins the wording
-/// of every `Alias for` declaration in `tool_specs()` rather than only the one
-/// this guard needs.
+/// i.e. the bug coming back.
+/// `the_alias_rule_reads_the_wording_tool_specs_actually_uses` walks the wording of
+/// every `Alias for` declaration in `tool_specs()` rather than only the one this
+/// guard needs, but READ ITS DOCBLOCK: it iterates only descriptions that STILL
+/// start `Alias for `, so a single reword makes it see one fewer alias and it
+/// passes. The pin that catches a reword is the behavioural
+/// `a_call_using_an_advertised_alias_is_never_a_refusal_run`.
 pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
     let description = schema.get("description").and_then(Value::as_str)?;
     let named = description.strip_prefix("Alias for ")?;
@@ -286,12 +289,12 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// the sentence "the engine told the model to re-send this" a fact rather than a
 /// guess.
 ///
-/// # The two exclusions class 2 needs beside `is_error`, and what is left
+/// # The exclusions class 2 needs beside `is_error`, and what is left
 ///
-/// Both halves are necessary and, on their own, NOT sufficient. Two real shapes
-/// satisfy `is_error` + a missing advertised `required` key without being "the
-/// engine told the model to re-send this with correct arguments", and both are
-/// excluded here rather than being argued about in prose:
+/// Both halves are necessary and, on their own, NOT sufficient. Three real
+/// shapes satisfy `is_error` + a missing advertised `required` key without being
+/// "the engine told the model to re-send this with correct arguments", and all
+/// three are excluded here rather than being argued about in prose:
 ///
 /// * **A permission DENIAL** (`denied`). The gate's refusal arms build their
 ///   result IN THIS FILE (`run_tool_batch`), with `is_error: true`, so a denied
@@ -303,9 +306,31 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 ///   `run_nested` threads its own `denied` bool for the same reason. It is
 ///   structural — no result text is consulted. Pinned by
 ///   `a_permission_denial_is_never_a_refusal_run`.
+/// * **A `sudo_exec` sub-prompt refusal** — the declined confirm, or a cancelled
+///   password entry. This is the THIRD corridor, and unlike the gate's two arms
+///   it is built outside this file, inside `sudo_run_flow`
+///   (`src/interactive/mod.rs`), so it does not arrive through `gate_tool` and
+///   the gate's flag cannot cover it. `sudo_run_flow` now returns
+///   `(ToolResult, bool)` for exactly that reason and `dispatch_tool` propagates
+///   the second half — the same shape `run_nested` already used, so the crate has
+///   ONE way to say "a person refused this call". Before it did, this was an
+///   **OVER**-count, and the over-count direction is the one that ends a prompt:
+///   `sudo_exec {"command": "x"}` — `command` present, `reason` OMITTED, which is
+///   what satisfies class 2's `required` half — plus a declined confirm plus
+///   three identical re-sends was measured at **4 provider calls and one
+///   `turn_capped`**. Pinned by
+///   `a_sudo_exec_confirm_refusal_is_never_a_refusal_run`; the shape that stays
+///   counted is the pre-prompt empty-`command` refusal, which nobody was asked
+///   about and which genuinely is a re-send instruction.
 /// * **A call that satisfies a required key through an advertised alias**
 ///   (`required_key_satisfied`). Pinned by
-///   `a_call_using_an_advertised_alias_is_never_a_refusal_run`.
+///   `a_call_using_an_advertised_alias_is_never_a_refusal_run`. Note the direction
+///   this exclusion's OWN fragility runs in: the alias is only ever DESCRIBED
+///   (`"Alias for <key>"`), never marked, so rewording one description stops the
+///   rule seeing it and the call is counted again — an OVER-count, and therefore
+///   not a member of the under-count list below. The pin that catches it is the
+///   behavioural one just named (measured: rewording one of the six leaves the
+///   declaration census green).
 ///
 /// What is DELIBERATELY NOT covered, all in the under-count direction (a stuck
 /// run reaches the 64-round ceiling instead of 3 — the accepted cost, because the
@@ -314,20 +339,28 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// * `ls {}` — `path` is advertised `required` and IS absent, but `exec_ls`
 ///   defaults it and the call SUCCEEDS, so `is_error` excludes it. The case that
 ///   proves `required` alone is not enough.
-/// * An advertised alias whose `description` has been reworded away from the
-///   `Alias for <key>` form — the rule above stops seeing it. Pinned so it
-///   reddens rather than silently regressing.
 /// * A `required` key present with the WRONG TYPE or an empty value.
-/// * **A `sudo_exec` confirm refusal.** The user's "no" there is built inside
-///   `sudo_run_flow` (`src/interactive/mod.rs`), which returns a plain
-///   `ToolResult` and is outside the files this change may touch, so the flag
-///   cannot be threaded from the arm that knows. The exposure is much narrower
-///   than the gate's was: it needs `command` present (an empty one is refused
-///   BEFORE the prompt, and that refusal IS a re-send instruction and is counted
-///   correctly) with `reason` omitted, then a declined confirm, then three
-///   identical re-sends. Closing it needs `sudo_run_flow` to report its own
-///   refusal the way `run_nested` does — a change to a file this branch does not
-///   own.
+/// * **The `sudo_exec` shape itself, now that its refusal is excluded.** The
+///   exclusion is per CALL, not per reason, so a model that omits `reason`, gets
+///   a confirm it ACCEPTS, and then re-sends identically is no longer counted
+///   either. That is the residual for this tool and it is 64 rounds of a doomed
+///   call — measured, and the accepted direction.
+///
+/// # Why the flag is a `bool`, and what actually guards a FOURTH corridor
+///
+/// The flag says "a person refused this call" and nothing else, so it cannot
+/// distinguish a declined confirm from a declined password entry from a prompt
+/// nobody has written yet — and it does not need to. What it genuinely cannot do
+/// is notice a corridor nobody thought of: a new refusal site that forgets to
+/// mark itself is invisible to every behavioural pin here, because each pin
+/// scripts only the shape it knows about. A non-exhaustive enum would not close
+/// that either — an unhandled variant still compiles at every `matches!` site.
+///
+/// The guard that does survive a fourth corridor is the census
+/// [`crate::source_lints::every_denial_marking_site_in_the_batch_is_accounted`]:
+/// it counts the denial-marking sites in `run_tool_batch`'s region and fails on a
+/// count nobody chose, so an added corridor reddens instead of silently
+/// over-counting.
 ///
 /// The `turn.is_cancelled()` half of class 2 keeps the standing
 /// **cancellation beats rejection** rule true of the new class too: every
@@ -1085,7 +1118,7 @@ impl AgentLoop {
                         unknown_param_result(param_errors[idx].as_deref().unwrap_or_default()),
                         false,
                     ),
-                    None => (self.dispatch_tool(tc, turn).await, false),
+                    None => self.dispatch_tool(tc, turn).await,
                 }
             } else if turn.is_cancelled() {
                 // Cancellation beats rejection (same rule, the sequential tools).
@@ -1107,7 +1140,12 @@ impl AgentLoop {
                         // `allow-directory` would allow.
                         let guard = self.guard_target(tc);
                         if self.gate_tool(tc, turn, guard.as_deref()).await {
-                            (self.dispatch_tool(tc, turn).await, false)
+                            // The flag PROPAGATES rather than being pinned to
+                            // `false`: a `sudo_exec` that passes this gate and is
+                            // then refused at its OWN confirm prompt is still a
+                            // person's "no", and this arm is the one that
+                            // dispatches it.
+                            self.dispatch_tool(tc, turn).await
                         } else {
                             // THE DENIAL ARM. `gate_tool` answers `false` for a
                             // `reject` click, a `Cancelled` (a Stop, or a closed
@@ -1153,7 +1191,14 @@ impl AgentLoop {
                     // could produce for a path tool — an unsandboxed `read`
                     // under a tier that meant refusal; that combination is now
                     // unrepresentable at the SOURCE rather than explained here.
-                    _ => (self.dispatch_tool(tc, turn).await, false),
+                    //
+                    // The flag PROPAGATES. This is the arm a `sudo_exec` takes
+                    // (`sudo_exec` is not a `POLICIED_TOOLS` name, so
+                    // `policy_verdict` answers `None` and its confirm prompt is
+                    // the only human decision in its path), so pinning `false`
+                    // here would drop the refusal on the floor and re-arm the
+                    // over-count this excludes.
+                    _ => self.dispatch_tool(tc, turn).await,
                 }
             };
             let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);

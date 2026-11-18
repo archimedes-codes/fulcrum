@@ -3106,7 +3106,224 @@ async fn a_call_using_an_advertised_alias_is_never_a_refusal_run() {
     );
 }
 
-/// The alias rule reads the wording `tool_specs()` ACTUALLY uses.
+/// The `sudo_exec` the confirm-refusal pin sends: `command` IS present (an empty
+/// one is refused BEFORE the confirm prompt ever fires, and that refusal IS a
+/// re-send instruction), and `reason` — which the spec advertises as `required` —
+/// is OMITTED. That omission is what makes the result satisfy class 2's
+/// `required` half; the declined confirm is what makes it a USER decision.
+fn sudo_exec_omitting_reason(command: &str) -> ToolCall {
+    ToolCall {
+        id: "t1".to_string(),
+        name: "sudo_exec".to_string(),
+        arguments: json!({ "command": command }),
+        defect: None,
+    }
+}
+
+/// Answer `count` `sudo_exec` SUB-prompts in the shape's own vocabulary, each
+/// with the supplied `confirmed` flag.
+///
+/// `answer_permission_prompts` (in `policy_gate.rs`) answers the PERMISSION
+/// gate's map; this answers the OTHER one — `sudo_run_flow`'s `pending_sudo`,
+/// keyed `"{session}/{tool_call_id}:confirm"`. A responder that answered the
+/// wrong map would leave the flow blocked on a prompt nobody resolves and the
+/// test would hang rather than fail.
+async fn answer_sudo_confirms(pending: crate::interactive::PendingSudo, count: usize, yes: bool) {
+    for _ in 0..count {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut map = pending.lock().await;
+            if let Some(key) = map.keys().find(|k| k.starts_with("s1/")).cloned() {
+                let sender = map.remove(&key).expect("the entry is in the map");
+                let _ = sender.send(json!({ "confirmed": yes }));
+                break;
+            }
+            drop(map);
+            if tokio::time::Instant::now() >= deadline {
+                return; // the test asserts the prompts it expected arrived
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// **A declined `sudo_exec` CONFIRM is never a refusal run.**
+///
+/// The third denial corridor. `c9feb4d` excluded the permission gate's denials
+/// from the identical-refusal guard, and the exclusion is structural (`denied`
+/// is threaded from the two arms that CONSTRUCT a gate denial). But
+/// `sudo_exec`'s confirm refusal is not built by either of those arms: it is
+/// built INSIDE `sudo_run_flow`, which returns a plain `ToolResult`, so the
+/// flag never reached it and the shape was an OVER-count — the direction that
+/// ends a user's prompt, not the direction that costs 64 rounds.
+///
+/// The exact shape, and why it is the narrow one:
+/// * `command` present — an empty `command` is refused BEFORE the confirm
+///   prompt fires, and that refusal genuinely is a re-send instruction;
+/// * `reason` OMITTED — the spec advertises `required: ["command", "reason"]`,
+///   so the omission is what satisfies class 2's `required` half;
+/// * the confirm DECLINED — the user said no;
+/// * three identical re-sends — the model only learns the missing-`reason`
+///   sentence AFTER the confirm has already fired, so the user really is asked
+///   and really does decline, three times.
+///
+/// Measured before the fix: **4 provider calls and one `turn_capped`** for
+/// `{"command": "x"}` + a declined confirm — a prompt ended as `turn_capped` on
+/// a user's own three "no"s, which is the false positive this branch exists to
+/// eliminate. Measured after: the SAME shape runs to the
+/// `MAX_MODEL_ROUNDS_PER_PROMPT` ceiling at **64 calls** — it moved from the
+/// over-count direction (ends the user's prompt) to the documented under-count
+/// direction (costs rounds), which is the trade every other pin in this file
+/// already makes. The `{"command":"x","reason":"r"}` shape is unaffected: both
+/// required keys are there, nothing refused it, so it was at 64 before and is at
+/// 64 after.
+///
+/// Scripted as `MAX_IDENTICAL_REFUSAL_RUNS + 2` identical declined rounds and
+/// THEN a terminal `Done(Stop)`, so the arithmetic is one-sided exactly as
+/// `a_permission_denial_is_never_a_refusal_run` explains it.
+///
+/// The elevated command is NEVER run: the runner is `RecordingSudoRunner`, whose
+/// `run` future is `unreachable!()` — reaching it at all fails the test loudly.
+#[tokio::test]
+async fn a_sudo_exec_confirm_refusal_is_never_a_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let round = vec![
+        ProviderEvent::ToolCall(sudo_exec_omitting_reason("echo declined-by-the-user")),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ];
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 2;
+    let mut scripts = vec![round; rounds as usize];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
+    let (ran_flag, mut loop_) = build_sudo_loop(Box::new(provider), events_tx);
+    let pending = loop_.sudo.pending_sudo.clone();
+    let answer = tokio::spawn(answer_sudo_confirms(pending, rounds as usize, false));
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let mut loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn TERMINATED (on its terminal script entry)")
+        .expect("the turn task did not panic");
+    answer.await.unwrap();
+
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert!(
+        !ran_flag.load(Ordering::SeqCst),
+        "the user declined every confirm, so the elevated command was NEVER executed"
+    );
+
+    // THE WITNESS that the turn was answering the shape this test claims: the
+    // flow's OWN declined-confirm sentence. Without this the turn could be
+    // settling on some other `sudo_exec` error and the pin would prove nothing.
+    let confirmed_texts: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            RpcEvent::tool_execution_end {
+                tool_name, result, ..
+            } if tool_name == "sudo_exec" => Some(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !confirmed_texts.is_empty(),
+        "the turn really did run `sudo_exec` rounds, got {kinds:?}"
+    );
+    assert!(
+        confirmed_texts
+            .iter()
+            .all(|t| t.starts_with("Command not confirmed")),
+        "every round answered the DECLINED CONFIRM (`Command not confirmed — not \
+         executed, and no password was requested.`). Anything else means this test \
+         is pinning a different shape, got {confirmed_texts:?}"
+    );
+
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "a user's DECLINED SUDO CONFIRM must not arm the refusal guard: three \
+         identical re-sends after three \"no\" clicks ending the prompt is the false \
+         positive this pin refuses, got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        rounds + 1,
+        "the run counter never grew, so the turn reached its terminal script entry \
+         ({rounds} declined rounds + the Stop). A turn that stopped at {} was capped \
+         by the refusal guard on a user decision, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+
+    // ── the structural half: the guard's OWN input, one call at a time ──
+    let pending = loop_.sudo.pending_sudo.clone();
+    let answer = tokio::spawn(answer_sudo_confirms(pending, 1, false));
+    let (_, refused) = loop_
+        .run_tool_batch(
+            &[sudo_exec_omitting_reason("echo declined-by-the-user")],
+            &CancellationToken::new(),
+        )
+        .await;
+    answer.await.unwrap();
+    assert_eq!(
+        refused,
+        vec![false],
+        "the predicate's answer for a DECLINED sudo confirm that omits a required \
+         key is `false` — the user said no, and no sentence told the model to \
+         re-send the call with a different argument"
+    );
+
+    // And the shape that IS still a refusal stays one: an EMPTY `command` is
+    // refused before any prompt fires, so nothing was asked and nothing was
+    // declined.
+    let (_, refused_empty) = loop_
+        .run_tool_batch(
+            &[ToolCall {
+                id: "t2".to_string(),
+                name: "sudo_exec".to_string(),
+                arguments: json!({}),
+                defect: None,
+            }],
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        refused_empty,
+        vec![true],
+        "the pre-prompt empty-`command` refusal is a re-send instruction and stays \
+         counted — this exclusion is about the DECLINED CONFIRM, not about \
+         `sudo_exec`"
+    );
+}
+
+/// `build_loop` with a `RecordingSudoRunner` installed, returning the `ran` flag.
+fn build_sudo_loop(
+    provider: Box<dyn Provider>,
+    events: mpsc::UnboundedSender<RpcEvent>,
+) -> (Arc<std::sync::atomic::AtomicBool>, AgentLoop) {
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_space, mut loop_) = build_loop(
+        provider,
+        events,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    loop_.sudo.runner = Arc::new(RecordingSudoRunner { ran: ran.clone() });
+    (ran, loop_)
+}
+
+/// The alias rule reads the wording `tool_specs()` ACTUALLY uses — a CENSUS of
+/// the declarations, not a guard against rewording one of them.
 ///
 /// `declared_alias_of` recognises an advertised alias by its declaration — the
 /// description spelled `"Alias for <key>"`. That is the narrowest rule available
@@ -3118,12 +3335,27 @@ async fn a_call_using_an_advertised_alias_is_never_a_refusal_run() {
 ///
 /// So this walks every advertised tool and asserts that every description
 /// starting `Alias for ` names a key that (a) is in the same `properties` and
-/// (b) is recognised by the guard's own rule. A rewording reddens HERE, naming
-/// the tool and the key, instead of quietly re-arming the guard.
+/// (b) is recognised by the guard's own rule.
 ///
-/// It also asserts the census is non-vacuous: at least one advertised alias exists
-/// in the tree. Were all of them removed, this test would pass on an empty
-/// iteration and the guard's alias half would be dead code with a green pin.
+/// **READ THIS BEFORE TRUSTING IT AS A REWORDING ALARM — it is not one.** This
+/// test only iterates descriptions that STILL start `Alias for `. Reword one of
+/// the six and the loop simply sees five: no assert is violated,
+/// `aliases_seen > 0` is still satisfied by the other five, and the test PASSES.
+/// Measured: changing `"Alias for response_id"` to `"Same as response_id"` leaves
+/// this census green and reddens
+/// `a_call_using_an_advertised_alias_is_never_a_refusal_run`, which is the pin
+/// that actually catches a single reword — it drives the alias-satisfied call and
+/// watches the provider-call count go from 5 to 4 with a `turn_capped`, i.e. it
+/// observes the false positive rather than the declaration that caused it. That
+/// test is the guard; this one is the shape check.
+///
+/// What THIS census does catch is the opposite end: every alias declaration
+/// disappearing. `aliases_seen` would then be 0, the floor below reddens, and the
+/// guard's alias half is exposed as dead code — the vacuous-green case this file
+/// refuses elsewhere. It also catches a declaration that survives rewording but
+/// rots in place: one that names a key outside its own `properties`, or one that
+/// declares itself an alias of itself, both of which make a `required` key
+/// satisfiable by something the executor would never read.
 #[test]
 fn the_alias_rule_reads_the_wording_tool_specs_actually_uses() {
     let mut aliases_seen = 0usize;

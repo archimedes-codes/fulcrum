@@ -562,13 +562,13 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 /// and hence the pins on both sides of the line
 /// (`a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run`).
 ///
-/// # Class 3's two exclusions, both load-bearing
+/// # Class 3's three exclusions, all load-bearing
 ///
 /// `is_error` + a missing advertised `required` key is NECESSARY but not
-/// SUFFICIENT, and two real shapes satisfy both halves without being "the engine
-/// told the model to re-send this with correct arguments". Both were live false
-/// positives until this commit, and both are excluded STRUCTURALLY — no result
-/// text is matched, so rewording a sentence cannot silently disarm the guard or
+/// SUFFICIENT, and three real shapes satisfy both halves without being "the
+/// engine told the model to re-send this with correct arguments". All three were
+/// live false positives, and all three are excluded STRUCTURALLY — no result text
+/// is matched, so rewording a sentence cannot silently disarm the guard or
 /// silently re-arm it:
 ///
 /// * **A permission DENIAL** — the gate's refusal arms in `run_tool_batch` build
@@ -581,6 +581,18 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 ///   `Ask`-answered-no arm and `Decision::Deny`), the same shape `codemode`'s
 ///   `run_nested` uses for its row status. Pinned by
 ///   `a_permission_denial_is_never_a_refusal_run`.
+/// * **A `sudo_exec` sub-prompt refusal — an OVER-count, and the one that ended
+///   prompts.** `sudo_exec {"command": "x"}` with `reason` OMITTED (so the
+///   advertised `required: ["command", "reason"]` half holds), a DECLINED
+///   confirm, and three identical re-sends: measured at **4 provider calls and
+///   one `turn_capped`** before this exclusion, i.e. a user who clicked "no"
+///   three times had their prompt ended as `turn_capped`. The refusal is built
+///   inside `sudo_run_flow`, which the gate's two arms never reach, so the flag
+///   now rides out of the flow itself: `sudo_run_flow` returns
+///   `(ToolResult, bool)` and `dispatch_tool` propagates it, the same pair
+///   `run_nested` already returned. Measured after: the same shape reaches the
+///   64-round ceiling, because nothing refused it any more. Pinned by
+///   `a_sudo_exec_confirm_refusal_is_never_a_refusal_run`.
 /// * **A call that satisfies a `required` key through an advertised ALIAS the
 ///   executor accepts** — `get_search_content` advertises
 ///   `required: ["response_id"]` while `properties` also carries `responseId`,
@@ -601,17 +613,37 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 ///   excludes it. The case that proves `required` alone is not enough, pinned by
 ///   the `ls` row of
 ///   `the_refusal_predicate_is_the_required_key_and_the_error_together`.
-/// * **The alias case, once its declaration is reworded.** The advertised alias
-///   is only DESCRIBED (`"Alias for response_id"`), never marked, so the rule
-///   reads that wording; `the_alias_rule_reads_the_wording_tool_specs_actually_uses`
-///   reddens if it changes, rather than letting the false positive return green.
 /// * **A `required` key present with the wrong TYPE or an empty value**
 ///   (`bash {"command": 42}`) — membership is what is tested, not validity.
-/// * **A `sudo_exec` confirm refusal.** That denial is built inside
-///   `sudo_run_flow`, which returns a plain `ToolResult` from outside this
-///   module's reach, so no `denied` flag can be threaded from the arm that knows.
-///   See the predicate's docblock for the exact (narrow) exposure and what
-///   closing it needs.
+/// * **The `sudo_exec` shape, now that its refusal is excluded.** The exclusion
+///   marks the CALL as refused, so a `sudo_exec` that omits `reason` and gets a
+///   confirm it ACCEPTS is no longer counted either, even though the executor
+///   did refuse it. The residual for that shape is the 64-round ceiling.
+///
+/// NOT an under-count, and listed here only so the heading is not misread: a
+/// reworded ALIAS declaration runs the OTHER way. The alias is only DESCRIBED
+/// (`"Alias for response_id"`), never marked, so the rule reads that wording and
+/// rewording one description makes the rule stop seeing it — the call is counted
+/// again and the guard fires at 4 calls with a `turn_capped`, which is an
+/// OVER-count. The pin that catches it is the BEHAVIOURAL
+/// `a_call_using_an_advertised_alias_is_never_a_refusal_run`; the declaration
+/// census `the_alias_rule_reads_the_wording_tool_specs_actually_uses` walks only
+/// the declarations that still start `Alias for `, so rewording one of the six
+/// leaves it green (measured). Its floor catches the opposite case: every
+/// declaration gone, which is what would make the alias half dead code.
+///
+/// # What a FOURTH corridor needs, and why the `bool` is not the guard for it
+///
+/// The flag says only "a person refused this call". It cannot enumerate the
+/// prompts that exist, and a new refusal site that forgets to mark itself is
+/// invisible to every behavioural pin above — each one scripts the shape it
+/// already knows about. A non-exhaustive enum would not help either: an
+/// unhandled variant still compiles at a `matches!`.
+///
+/// What does survive a fourth corridor is
+/// [`crate::source_lints::every_denial_marking_site_in_the_batch_is_accounted`],
+/// which counts the denial-marking sites in `run_tool_batch`'s region and reddens
+/// on a count nobody chose.
 ///
 /// Like the round ceiling, 3 is a STARTING value and is NOT a measurement of our
 /// traffic. The upstream band ("stop after 2–3 identical consecutive failures")

@@ -117,15 +117,36 @@ fn log_wire(wire: crate::harness::WireApi, m: &crate::harness::catalog::Model) {
     ));
 }
 
-/// Replace any newline / carriage return with a space, so a field that came from
-/// outside this crate cannot forge a line in the newline-delimited diagnostics
-/// file. Both are replaced (not stripped) so the field stays delimited from the
-/// one that follows it.
+/// Replace every control character and every Unicode line separator with a space,
+/// so a field that came from outside this crate cannot forge a line in the
+/// newline-delimited diagnostics file. Both are replaced (not stripped) so the
+/// field stays delimited from the one that follows it.
+///
+/// # Why `is_control()` and not just `\n` / `\r`
+///
+/// The two were enough while this sanitizer guarded only `m.id`, whose third-party
+/// `/models` text reaches the line through one path. It is NOT enough now:
+/// [`reduced_base_url`] runs this on the value [`extract_host`] produced, and
+/// `extract_host` emits a **path verbatim** — the anchored arm keeps it on purpose
+/// (§ "The path is kept"). A pasted `base_url` whose path carries `\u{2028}`,
+/// `\u{2029}` or any other control byte therefore reaches the line with it intact.
+///
+/// The severity is genuinely low and this does not claim otherwise: `\u{2028}` and
+/// friends are NOT `\n` or `\r`, so they cannot forge a line in a file delimited by
+/// `\n`, and `is_control()`'s own additions (`\t`, NUL, `\x0b`, the C1 range)
+/// likewise contain no line terminator. What they CAN do is break the reader —
+/// `diagnostics` renders into a log a supporter reads, where NUL truncates the line
+/// in most viewers and a line separator re-wraps it in anything Unicode-aware. This
+/// closes that corridor because the corridor is new, not because it was ever a
+/// forgery.
 fn one_field_per_line(s: &str) -> String {
     s.chars()
-        .map(|c| match c {
-            '\n' | '\r' => ' ',
-            other => other,
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
         })
         .collect()
 }
@@ -1596,6 +1617,68 @@ mod tests {
             "the id is still legible, with both newline forms replaced by spaces, \
              and the fields after it stayed on the SAME line:\n{}",
             ours[0]
+        );
+    }
+
+    /// The sanitizer covers every control character and both Unicode line
+    /// separators, not just `\n` / `\r` — because the value it now sanitises is
+    /// not the one it was written for.
+    ///
+    /// `reduced_base_url` runs this on whatever [`extract_host`] produced, and the
+    /// anchored arm keeps the PATH VERBATIM (deliberately — it is the fact the log
+    /// line exists to record). So a path carrying `\u{2028}`, `\u{2029}`, NUL,
+    /// `\x0b` or a C1 byte reaches the diagnostics line, which is a corridor the
+    /// original `\n | \r` match could not reach because the fallback was inert
+    /// then.
+    ///
+    /// What is asserted is the honest claim: none of these bytes survives. What is
+    /// NOT claimed is that any of them could FORGE a line — none of them is `\n`
+    /// or `\r`, so none is a line terminator here. The bug this closes is a log a
+    /// supporter cannot read (NUL truncates in most viewers, U+2028 re-wraps in
+    /// anything Unicode-aware), not an injection.
+    #[test]
+    fn control_characters_in_a_reduced_base_url_never_reach_the_line() {
+        // `grpc:` is not on `LOGGABLE_SCHEMES`, so this reaches `extract_host`
+        // rather than the `Url` reduction arm — the only route that emits a path
+        // verbatim. The host is a domain and the `//` anchor is present, which is
+        // the shape `extract_host` renders.
+        for (name, byte) in [
+            ("U+2028 LINE SEPARATOR", '\u{2028}'),
+            ("U+2029 PARAGRAPH SEPARATOR", '\u{2029}'),
+            ("NUL", '\0'),
+            ("VT", '\u{000b}'),
+            ("FF", '\u{000c}'),
+            ("ESC", '\u{001b}'),
+            ("C1", '\u{0085}'),
+            ("TAB", '\t'),
+        ] {
+            let raw = format!("grpc://gw.example/v1{name}/tail", name = byte);
+            let reduced = reduced_base_url(&raw);
+            assert!(
+                reduced
+                    .chars()
+                    .all(|c| !c.is_control() && c != '\u{2028}' && c != '\u{2029}'),
+                "{name} survived the sanitizer: {reduced:?}"
+            );
+            // The reduction still happened (the test is not passing because the
+            // whole value was refused): the host and both path halves are there.
+            assert!(
+                reduced.starts_with("gw.example/v1"),
+                "{name}: the anchored reduction stopped being rendered, so this \
+                 assertion is passing on `<unparseable>`: {reduced:?}"
+            );
+            assert!(
+                reduced.contains("/tail"),
+                "{name}: the path is still emitted verbatim apart from the byte \
+                 under test: {reduced:?}"
+            );
+        }
+        // And `\n` / `\r` — the ORIGINAL pair — still work, so the extension did
+        // not replace them.
+        assert_eq!(
+            reduced_base_url("grpc://gw.example/a\nb\rc"),
+            "gw.example/a b c",
+            "the two forms the sanitizer was written for still become spaces"
         );
     }
 

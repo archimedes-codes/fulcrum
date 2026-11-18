@@ -30,6 +30,7 @@
 //! | [`every_crate_mcp_manager_carries_the_open_requester`] | `harness/loop.rs` | none (moved whole) |
 //! | [`the_crate_threads_the_opener_into_its_production_loop`] | `worker/core.rs` | `open.rs` (the desktop needle) |
 //! | [`the_harness_takes_the_opener_instead_of_constructing_it`] | `harness/loop.rs` | none (moved whole) |
+//! | [`every_denial_marking_site_in_the_batch_is_accounted`] | `harness/loop/turn.rs`, `harness/loop/tools.rs`, `interactive/mod.rs` | none (this crate's own refusal guard) |
 //!
 //! The ones with a desktop half were **SPLIT, not moved**: moving a two-sided lint
 //! whole silently drops the half that polices the other tree, which is the
@@ -497,6 +498,251 @@ fn every_crate_mcp_manager_carries_the_open_requester() {
             n + 1
         );
     }
+}
+
+/// One function's body: the lines from the signature that starts with `signature`
+/// to the line its opening brace closes, comment lines already dropped.
+///
+/// Panics if the signature is absent or unmatched — a census over a region it
+/// could not find is a census that passes for the wrong reason.
+fn function_body(path: &std::path::Path, signature: &str) -> Vec<(usize, String)> {
+    let code = code_lines(path);
+    let start = code
+        .iter()
+        .find(|(_, l)| l.trim_start().starts_with(signature))
+        .unwrap_or_else(|| {
+            panic!(
+                "no line starting `{signature}` in {} — the census's subject moved, so \
+                 it would silently read the wrong region",
+                path.display()
+            )
+        })
+        .0;
+    let mut depth = 0usize;
+    let mut opened = false;
+    let mut end = None;
+    for (n, l) in code.iter().filter(|(n, _)| *n >= start) {
+        depth += l.matches('{').count();
+        depth = depth.saturating_sub(l.matches('}').count());
+        if l.contains('{') {
+            opened = true;
+        }
+        if opened && depth == 0 {
+            end = Some(*n);
+            break;
+        }
+    }
+    let end = end.unwrap_or_else(|| panic!("`{signature}` in {} never closes", path.display()));
+    code.into_iter()
+        .filter(|(n, _)| *n >= start && *n <= end)
+        .collect()
+}
+
+/// The refusal guard's denial-marking sites, COUNTED. The census that survives a
+/// corridor nobody has thought of yet.
+///
+/// # Why this exists when three behavioural pins already do
+///
+/// The identical-refusal guard ends a user's prompt when it is wrong, so every
+/// shape that is NOT "the engine told the model to re-send this" has to be
+/// excluded from it. Three are excluded today — the `Ask`-answered-no denial,
+/// `Decision::Deny`, and a `sudo_exec` sub-prompt refusal — each by a `bool`
+/// threaded from the arm that KNOWS, and each by its own behavioural pin.
+///
+/// None of those pins can see a FOURTH corridor. A refusal site that forgets to
+/// mark itself is invisible to a test that scripts only the shapes its author
+/// already knew about, and a non-exhaustive enum would not help either: an
+/// unhandled variant still compiles at every `matches!`. The `sudo_exec` confirm
+/// refusal is the proof — it was a live false positive for a whole commit, at
+/// **4 provider calls and one `turn_capped`** on a user's own three "no" clicks,
+/// with a green pin on either side of it.
+///
+/// What does survive is a COUNT. This lint asserts the number of denial-marking
+/// sites in `run_tool_batch`'s body, so a fourth corridor that has not been
+/// reasoned about reddens HERE and forces its author to name it.
+///
+/// # The second half is the half that actually caught the sudo case
+///
+/// Counting `true` in `run_tool_batch` alone would have MISSED the sudo corridor:
+/// that refusal arrives through `dispatch_tool`, and the bug was that the three
+/// `dispatch_tool` call sites hardcoded `false` instead of forwarding the flag.
+/// So the census also pins (a) how many `dispatch_tool` forwards there are, (b)
+/// that NONE of them pins the flag at the call site, and (c) that `dispatch_tool`
+/// forwards rather than decides. A corridor whose flag is dropped on the floor is
+/// the failure mode, and (b) is what forbids it.
+///
+/// Region: each named function's BODY, brace-matched from its signature, comment
+/// lines dropped — built on [`code_lines`], so it keeps the whole-file region rule
+/// the other `harness/loop*` lints use and for the reason they state. The body is
+/// brace-matched rather than the file scanned because a needle that fired file-wide
+/// would credit a test module's `true` to production; `turn.rs` has no test module
+/// today and `interactive/mod.rs` has a large one.
+#[test]
+fn every_denial_marking_site_in_the_batch_is_accounted() {
+    let body = function_body(
+        &crate_src("harness/loop/turn.rs"),
+        "pub(super) async fn run_tool_batch(",
+    );
+
+    // ── the denial-marking sites: a `true` that means "a person refused this" ──
+    // Two needles because the two arms differ in shape: the `Ask`-answered-no arm
+    // builds a literal `ToolResult` whose flag is a line of its own, and the
+    // `Decision::Deny` arm is a single expression. A THIRD needle form would be an
+    // unmarked corridor — which is what the exact-count assert is for, not an
+    // inconvenience.
+    let constructed: Vec<usize> = body
+        .iter()
+        .filter(|(_, l)| l.trim() == "true,")
+        .map(|(n, _)| *n)
+        .collect();
+    let inline: Vec<usize> = body
+        .iter()
+        .filter(|(_, l)| l.contains("deny_tool_result(tc), true"))
+        .map(|(n, _)| *n)
+        .collect();
+    let total = constructed.len() + inline.len();
+    assert_eq!(
+        total, 2,
+        "expected exactly 2 denial-marking sites inside `run_tool_batch` (the \
+         `Ask`-answered-no arm and `Decision::Deny`), found {total} (constructed \
+         {constructed:?}, inline {inline:?}). A different count means a corridor was \
+         added or removed: name it in `refused_before_the_model_could_act`'s docblock \
+         and in `MAX_IDENTICAL_REFUSAL_RUNS`'s, and add its behavioural pin — THEN \
+         update this number. Updating the number without the sentence is how the \
+         unmarked over-count comes back.",
+    );
+    // Each half non-zero: an aggregate that is right while one root is empty is
+    // the vacuity class `childproc`'s per-root floors exist for.
+    assert_eq!(
+        constructed.len(),
+        1,
+        "expected exactly 1 constructed denial (`true,` on its own line — the \
+         `Ask`-answered-no arm), found {constructed:?}",
+    );
+    assert_eq!(
+        inline.len(),
+        1,
+        "expected exactly 1 inline denial (`Decision::Deny`), found {inline:?}",
+    );
+
+    // ── the forwarding sites: corridors that arrive THROUGH `dispatch_tool` ──
+    let forwards: Vec<usize> = body
+        .iter()
+        .filter(|(_, l)| l.contains("self.dispatch_tool(tc, turn).await"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        forwards.len(),
+        3,
+        "expected exactly 3 `dispatch_tool` call sites inside `run_tool_batch`, found \
+         {forwards:?} — this census reads the flag every one of them forwards, so a \
+         4th dispatch is a corridor this lint has not been told about",
+    );
+    // THE HALF THAT MATTERS: no forward may pin the flag at the call site. A
+    // `(…, false)` here silently drops every refusal `dispatch_tool` knows about —
+    // exactly how the `sudo_exec` confirm refusal stayed a false positive while both
+    // behavioural pins stayed green.
+    let pinned_false: Vec<usize> = body
+        .iter()
+        .filter(|(_, l)| l.contains("self.dispatch_tool(tc, turn).await") && l.contains("false"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(
+        pinned_false.is_empty(),
+        "the `dispatch_tool` forwards at {pinned_false:?} pin the refusal flag at the \
+         call site instead of forwarding it — that drops the `sudo_exec` sub-prompt \
+         refusal (and any refusal `dispatch_tool` learns about later) on the floor, \
+         and the resulting over-count ends a user's prompt over their own \"no\"",
+    );
+    // The per-line needle above is DEFEATED by hoisting (`let (r, _) =
+    // dispatch_tool(…); (r, false)` puts the call and the `false` on different
+    // lines and compiles) — the exact mutation class `AGENTS.md`'s "prove it with a
+    // mutation that still compiles — hoist a value into a local, don't delete it"
+    // rule names, and it defeated the first version of this assert. So the
+    // aggregate closes the hole: the body answers "not a person's refusal" in
+    // EXACTLY five places, each one an arm that genuinely cannot be a refusal (a
+    // child's result, two cancellation arms, two unknown-param rejections). A
+    // hoisted `false` is a SIXTH and reddens here.
+    let not_refused: Vec<usize> = body
+        .iter()
+        .filter(|(_, l)| l.contains("false"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        not_refused.len(),
+        5,
+        "expected exactly 5 `false` answers in `run_tool_batch` (a child's result, the \
+         two cancellation arms, the two unknown-param rejections), found {} at {not_refused:?} \
+         — a 6th is a place that stops forwarding a refusal, most likely by hoisting the \
+         dispatch result into a local and pinning its flag, which the per-line assert \
+         above cannot see",
+        not_refused.len(),
+    );
+
+    // `dispatch_tool` FORWARDS, it does not decide: its own body marks no denial.
+    // The one refusal it can pass on comes from `sudo_run_flow`.
+    let dispatch = function_body(
+        &crate_src("harness/loop/tools.rs"),
+        "pub(super) async fn dispatch_tool(",
+    );
+    let dispatch_decides: Vec<usize> = dispatch
+        .iter()
+        .filter(|(_, l)| l.trim() == "true," || l.contains("), true"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(
+        dispatch_decides.is_empty(),
+        "`dispatch_tool` must not DECIDE a refusal, it forwards one; found `true` \
+         markings at {dispatch_decides:?} — a refusal built there belongs in the \
+         `run_tool_batch` census above, not in the dispatcher",
+    );
+    // And it really does read the flow's flag. Without this the empty `true` count
+    // above would be satisfiable by deleting the capability — the absence pin the
+    // `childproc` daemon census documents.
+    let sudo_sites: Vec<usize> = dispatch
+        .iter()
+        .filter(|(_, l)| l.contains("sudo_run_flow("))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        sudo_sites.len(),
+        1,
+        "expected exactly 1 `sudo_run_flow(` call inside `dispatch_tool`, found \
+         {sudo_sites:?} — the sudo sub-prompt refusal is the corridor this half of the \
+         census reads; without it the empty `true` count above proves nothing",
+    );
+
+    // `sudo_run_flow` marks exactly the two arms a PERSON decided, and marks the
+    // engine's own refusals `false`.
+    let flow = function_body(
+        &crate_src("interactive/mod.rs"),
+        "pub async fn sudo_run_flow(",
+    );
+    let flow_refused: Vec<usize> = flow
+        .iter()
+        .filter(|(_, l)| l.trim() == "true,")
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        flow_refused.len(),
+        2,
+        "expected exactly 2 refusals marked in `sudo_run_flow` (the declined confirm + \
+         the cancelled password entry), found {flow_refused:?} — a third `true` there is \
+         a new sub-prompt that needs naming here and in the predicate's docblock, and a \
+         missing one re-arms the over-count",
+    );
+    let flow_not_refused: Vec<usize> = flow
+        .iter()
+        .filter(|(_, l)| l.trim() == "false," || l.contains("(result, false)"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert!(
+        !flow_not_refused.is_empty(),
+        "`sudo_run_flow` must also mark what is NOT a person's refusal (the \
+         empty-`command` arm and the four post-run arms) — without those, the two `true` \
+         markings above are an unexplained pair and nothing says the executor's own \
+         failures are still counted"
+    );
 }
 
 /// The crate's half of the opener seam: this crate's production loop is built
