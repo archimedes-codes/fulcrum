@@ -142,14 +142,67 @@ fn one_field_per_line(s: &str) -> String {
 /// request bytes — the provider still gets `m.base_url` verbatim; only the log
 /// line is reduced.
 ///
-/// A parse failure yields something INERT, never the raw string: the bare host
-/// if one can be cut out, else a fixed placeholder. A string that will not parse
-/// has no scheme to anchor a userinfo strip to, so echoing it is what would put
-/// the credential in the file.
+/// # The fallback REFUSES. That is the whole design.
+///
+/// A value is rendered only when one of two things is true of it:
+///
+/// 1. it parses as a URL whose scheme is on [`LOGGABLE_SCHEMES`] **and** which
+///    has a real host — the reduction above is then applied by `Url` itself; or
+/// 2. [`extract_host`] recognises one of its two anchored shapes, whose host is
+///    a form that cannot BE a secret ([`host_cannot_be_a_secret`]) or which the
+///    author explicitly anchored with `//`.
+///
+/// Everything else is `<unparseable>`. The previous shape of this function cut a
+/// "host" out of the string by `split`/`rsplit` surgery and gated the result on
+/// host-*likeness*:
+///
+/// ```text
+/// host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.'|'-'|'_'|':'|'['|']'))
+/// ```
+///
+/// That charset is the alphabet of a modern API key, so the gate passed on the
+/// credential instead of on a host. Measured against that version, all four of
+/// `sk-proj-abc123XYZdef456ghi789`, `AKIAIOSFODNN7EXAMPLE`, a `ghp_…` PAT and a
+/// JWT came back **byte-identical** to the input — and a real key is NOT
+/// URL-shaped, so the fallback is the LIKELY path for the credential case, not
+/// the rare one. A charset gate cannot be repaired by adding another character
+/// class (that is how it broke), and blacklisting `sk-` / `AKIA` prefixes is a
+/// losing game against the next vendor's key format. Hence refuse-by-default:
+/// `base=<unparseable>` costs a supporter one ambiguous line, a key in the
+/// always-on, world-readable, no-opt-in `diagnostics.log` costs a rotation.
+///
+/// # The two claims this function used to make that it did not keep
+///
+/// Both are now **true because the behaviour was changed to match them**, not
+/// because the wording was softened:
+///
+/// * It said `host:port/path` and `//host/path` were extractable "through the
+///   fallback". They were not reachable there: `localhost:8080/v1` and
+///   `gw.example:443/v1` **parse successfully** as scheme `localhost` /
+///   `gw.example` with NO host, so they took the success arm, where `has_host()`
+///   is false and both userinfo strips are no-ops, and they were emitted whole.
+///   Inert content, but an arm the comment described that no input could reach.
+///   Such a value now reaches [`extract_host`] through the new
+///   "parsed, but not loggable" route, so the shapes the comment named are
+///   genuinely handled there — by an explicit, separately-tested extractor. What
+///   it then does with them is the second claim's business: `localhost:8080/v1`
+///   comes out byte-identical to what the old success arm emitted (so the
+///   comment's promise holds), and `gw.example:443/v1` is now REFUSED, because a
+///   scheme-less dotted host is the shape a JWT has.
+/// * It said a non-special scheme (`unknown://u:p@host`) renders `://@host` for
+///   an empty username, justifying a hand-anchored removal of the leftover `@`.
+///   True of `unknown:`, which the allowlist now REFUSES; for every scheme that
+///   survives, `Url` drops the empty userinfo itself (measured:
+///   `http://@h/v1`, `http://:@h/v1` and `ws://:@h/v1` all render without the
+///   `@`). The removal was therefore dead code for the reachable set and is gone.
 fn reduced_base_url(base_url: &str) -> String {
-    let reduced = url::Url::parse(base_url.trim())
-        .ok()
-        .map(|mut url| {
+    let reduced = match url::Url::parse(base_url.trim()) {
+        // The reduction arm — `Url` does the userinfo/query/fragment surgery.
+        // Gated on the scheme AND on a real host, because a parse SUCCEEDING is
+        // not evidence of anything: `Url::parse` accepts any
+        // `[a-zA-Z][a-zA-Z0-9+.-]*` prefix as a scheme, so `sk-proj-abc123:1234`
+        // parses "successfully" with the key as its scheme and no host at all.
+        Ok(mut url) if LOGGABLE_SCHEMES.contains(&url.scheme()) && url.has_host() => {
             // `unset` rather than `""`: an empty username is still a username,
             // and `Url` renders `https://:8080/v1` for it — a placeholder that
             // is not the credential, but it is a lie about the shape.
@@ -161,60 +214,237 @@ fn reduced_base_url(base_url: &str) -> String {
             }
             url.set_query(None);
             url.set_fragment(None);
-            // A non-special scheme (`unknown://u:p@host`) renders `://@host` for
-            // an EMPTY username where a special scheme renders `://host`, so the
-            // leftover `@` is removed by hand rather than left in the line. The
-            // removal is anchored at the authority, NOT a whole-string `replace`
-            // — a path may legitimately contain `://@` and must survive.
-            let rendered = url.as_str();
-            let prefix = format!("{}://@", url.scheme());
-            match rendered.strip_prefix(prefix.as_str()) {
-                Some(rest) => format!("{}://{}", url.scheme(), rest),
-                None => rendered.to_string(),
-            }
-        })
-        .or_else(|| {
-            // Unparseable: a bare host is still extractable for the common
-            // `host:port/path` and `//host/path` shapes, and a host carries no
-            // credential. Anything that does not LOOK like a host is replaced by
-            // the placeholder rather than echoed — for a string with no scheme
-            // there is no way to tell "the host" from "the secret", and the whole
-            // point of the fallback is to never echo the raw value.
-            let trimmed = base_url.trim();
-            // Drop a leading scheme first: `https://[bad` must yield something
-            // from the AUTHORITY, not the word `https`.
-            let after_scheme = match trimmed.split_once("://") {
-                Some((_, rest)) => rest,
-                None => trimmed,
-            };
-            let host = after_scheme
-                .strip_prefix("//")
-                .unwrap_or(after_scheme)
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or("");
-            // A `@` in what is left means the piece before the first `/` was
-            // `user:pass@host` — take only the host half of it.
-            let host = host.rsplit('@').next().unwrap_or("");
-            // A port is kept only when the host half is a bare hostname / IPv4,
-            // so an IPv6 literal (`[::1]`) cannot be mangled into a fake
-            // `host:port` by the split.
-            let host = if host.starts_with('[') {
-                host
-            } else {
-                host.split(':').next().unwrap_or("")
-            };
-            // The host-likeness gate. Space, `@`, `%`, a quote — any of these and
-            // what we cut out is not a hostname, it is free text that may itself
-            // be the credential.
-            let host_like = !host.is_empty()
-                && host.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')
-                });
-            host_like.then(|| host.to_string())
-        })
-        .unwrap_or_else(|| "<unparseable>".to_string());
+            Some(url.as_str().to_string())
+        }
+        // Either no parse at all, or a parse whose scheme is not one we will name
+        // in a log (which includes the key-as-scheme case above).
+        _ => extract_host(base_url),
+    }
+    .unwrap_or_else(|| "<unparseable>".to_string());
     one_field_per_line(&reduced)
+}
+
+/// The schemes this reducer will render WITH their scheme.
+///
+/// An allowlist, and it is load-bearing rather than tidy: `Url::parse` accepts
+/// any `[a-zA-Z][a-zA-Z0-9+.-]*` prefix as a scheme, so a denylist would have to
+/// name every scheme that can carry a secret — starting with the secret itself.
+/// These four are the host-bearing web schemes a `base_url` is ever configured
+/// with. `file:`, `data:` and `unix:` are deliberately out: their "authority" is
+/// a PATH, and a path is somebody's secret at least as often as a host is (the
+/// version this replaces emitted `file:///etc/passwd` and
+/// `unix:///tmp/gw.sock` whole).
+const LOGGABLE_SCHEMES: [&str; 4] = ["http", "https", "ws", "wss"];
+
+/// The ONLY two shapes the fallback will extract a host from, and the only
+/// thing standing between a pasted credential and the log line.
+///
+/// * **Anchored** — `scheme://authority…` or `//authority…`. The `//` is the
+///   author's own declaration that an authority follows, which is exactly how
+///   `Url` would read it, and a pasted key does not begin with it. The userinfo
+///   is dropped whole (at the LAST `@`, so a percent-encoded one inside the
+///   password cannot strand half of it) and the path is kept, query and fragment
+///   dropped — the same reduction the `Url` arm applies. The port is optional
+///   here, and a validated domain ([`is_domain`]) is accepted, because the `//`
+///   already says "what follows is an authority".
+/// * **Unanchored** — `host:port[/path]`, port PRESENT and valid, and host a
+///   **literal** ([`host_cannot_be_a_secret`]) — an IPv4, a bracketed IPv6, or
+///   `localhost`. No dotted domain is accepted here, and that is the load-bearing
+///   decision, not an oversight:
+///
+/// A JWT is `base64.base64.base64` — two or more dot-separated labels of
+/// alphanumerics, i.e. a syntactically valid domain with no marker to key on.
+/// `gw.example:443/v1` and
+/// `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU:443` are
+/// the SAME SHAPE, and no character rule separates them; prefix blacklists
+/// (`sk-`, `AKIA`, `ghp_`, `eyJ…`) are a losing game against the next vendor's
+/// key format, which is why the reviewer's suggested blacklist is worse than
+/// refusing. So the unanchored shape keeps only the hosts a credential
+/// structurally cannot be.
+///
+/// What that gives up: a scheme-less dotted host (`gw.example:443/v1`) now reads
+/// `base=<unparseable>`. That costs nothing real — a base URL with no scheme is
+/// BROKEN provider config (the HTTP client rejects a relative URL), so no working
+/// deployment is made less legible, while every scheme-bearing config
+/// (`https://gw.example/v1`) still renders in full through the `Url` arm, where
+/// `Url` has parsed a real host and there is nothing left to guess.
+///
+/// THE ONE RESIDUAL, stated rather than glossed: an ANCHORED authority whose host
+/// validates as a domain is emitted, so `//sk-proj-abc123.example/v1` yields
+/// `sk-proj-abc123.example/v1`. Getting there takes a paste that begins with `//`
+/// AND is dot-separated AND ends in a purely alphabetic label — a JWT fails the
+/// last two today on its base64URL `_`, and would fail the first anyway. Closing
+/// it completely means refusing domains everywhere, which is the `//host/path`
+/// shape the reducer is specified to keep; narrowing it further means matching
+/// secret prefixes, the game this function exists to stop playing.
+fn extract_host(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim();
+    let after = if let Some((_, rest)) = trimmed.split_once("://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("//") {
+        rest
+    } else {
+        return extract_unanchored_host(trimmed);
+    };
+    // The authority is everything up to the first path/query/fragment delimiter.
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    // The LAST `@`, so a percent-encoded `@` inside a password cannot strand the
+    // front half of the userinfo.
+    let host_and_port = authority.rsplit('@').next().unwrap_or("");
+    // The third element says the host is a LITERAL; when it is false the host is
+    // only good enough for an anchored authority, and only if it validates as a
+    // domain.
+    let (host, port, is_literal) = loggable_host_and_port(host_and_port)?;
+    if !is_literal && !is_domain(&host) {
+        return None;
+    }
+    Some(format!(
+        "{host}{}{}",
+        port.map(|p| format!(":{p}")).unwrap_or_default(),
+        path_of(after)
+    ))
+}
+
+/// The unanchored shape: `host:port[/path]`, port REQUIRED, host a literal.
+///
+/// Requiring the port is the second half of the anchor. Without it `sk-abc` and
+/// `localhost` on their own would be emitted; with it, a value has to look like
+/// something a person typed a listening socket for.
+fn extract_unanchored_host(trimmed: &str) -> Option<String> {
+    let head = trimmed.split(['/', '?', '#']).next().unwrap_or("");
+    // A port must be PRESENT — that is what distinguishes the shape from a bare
+    // pasted secret. Checked on the PARSED port rather than on "the string
+    // contains a `:`", because a bracketed IPv6 literal is full of colons and
+    // carries no port at all (`[::1]`), and that one is refused.
+    let (host, port, is_literal) = loggable_host_and_port(head)?;
+    port?;
+    // Literal-only, unlike the anchored arm: a dotted label sequence is not
+    // enough here (see [`extract_host`] — that is the shape a JWT has).
+    is_literal.then_some(host).map(|host| {
+        format!(
+            "{host}{}{}",
+            port.map(|p| format!(":{p}")).unwrap_or_default(),
+            path_of(trimmed)
+        )
+    })
+}
+
+/// The path of an authority-then-path string: from the first `/`, stopping at
+/// `?` / `#`. Empty when there is no path (the line then reads `host:port`,
+/// which is the whole of what such a config says).
+fn path_of(after_authority: &str) -> &str {
+    let until_query = after_authority.split(['?', '#']).next().unwrap_or("");
+    match until_query.find('/') {
+        Some(i) => &until_query[i..],
+        None => "",
+    }
+}
+
+/// Split `host[:port]` (or `[ipv6]:port`) and accept it only when BOTH halves are
+/// well-formed, lowercasing the host the way `Url` would.
+///
+/// The returned triple is `(host, port, is_literal)`. `is_literal` is the answer
+/// to [`host_cannot_be_a_secret`] and it travels with the host rather than being
+/// folded into `None`, because a non-literal host is NOT a failure: an anchored
+/// authority may legitimately name a domain. The caller decides.
+///
+/// The IPv6 case is matched on brackets FIRST so a bare `::1` can never be
+/// split into the fake `host:port` that the deleted `split(':').next()` produced
+/// — that is the other way the old code mangled a real value.
+fn loggable_host_and_port(authority: &str) -> Option<(String, Option<u16>, bool)> {
+    let (host, port_text) = if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        // +2: `end` indexes the `]` inside `rest`, which is one behind `authority`.
+        let host = &authority[..end + 2];
+        let after = &rest[end + 1..];
+        match after {
+            "" => (host, None),
+            other => (host, Some(other.strip_prefix(':')?)),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let port = match port_text {
+        None => None,
+        Some(p) => {
+            if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let value: u32 = p.parse().ok()?;
+            if value == 0 || value > 65535 {
+                return None;
+            }
+            Some(value as u16)
+        }
+    };
+    let host = host.to_ascii_lowercase();
+    Some((host.clone(), port, host_cannot_be_a_secret(&host)))
+}
+
+/// A host that is STRUCTURALLY incapable of being a credential: an IPv4 literal,
+/// a bracketed IPv6 literal, or `localhost`.
+///
+/// These are the only three host forms accepted outside a parsed URL. A key is
+/// alphanumeric entropy; none of these can be, and none of them has a dot
+/// followed by another label, which is the shape a JWT shares with a domain.
+fn host_cannot_be_a_secret(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        // An IPv6 literal: hex and `:` only, so a zone id (`%eth0`) and anything
+        // that is not an address are both refused.
+        return !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_hexdigit() || b == b':');
+    }
+    host.eq_ignore_ascii_case("localhost") || is_ipv4(host)
+}
+
+/// Four dot-separated decimal octets, each 1-3 digits and <= 255.
+fn is_ipv4(host: &str) -> bool {
+    let mut labels = host.split('.');
+    let (a, b, c, d) = (labels.next(), labels.next(), labels.next(), labels.next());
+    // Exactly four: a fifth label makes `labels.next()` `Some` and fails here.
+    if labels.next().is_some() {
+        return false;
+    }
+    [a, b, c, d].into_iter().all(|label| {
+        label.is_some_and(|l| {
+            !l.is_empty()
+                && l.len() <= 3
+                && l.bytes().all(|b| b.is_ascii_digit())
+                && l.parse::<u16>().is_ok_and(|v| v <= 255)
+        })
+    })
+}
+
+/// A multi-label domain: at least two labels (a bare `sk-proj-abc` is ONE and is
+/// therefore refused), each 1-63 chars of alphanumerics with INNER hyphens only,
+/// and a final label of pure letters (a trailing digit means a malformed IP).
+///
+/// Only ever consulted on an ANCHORED authority — see [`extract_host`], whose
+/// asymmetry explains why this is not trusted on the unanchored one.
+fn is_domain(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || !host.contains('.') {
+        return false;
+    }
+    let mut labels = host.split('.').peekable();
+    while let Some(label) = labels.next() {
+        let last = labels.peek().is_none();
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            || label.starts_with('-')
+            || label.ends_with('-')
+        {
+            return false;
+        }
+        if last && !label.bytes().all(|c| c.is_ascii_alphabetic()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Build the `Provider` for a `Model` (the `api` discriminator — ADR
@@ -899,6 +1129,15 @@ mod tests {
     /// a bare string can itself be the credential (there is no scheme to parse a
     /// userinfo out of, and no parse means no reduction), and a `base_url` with
     /// an embedded newline forges a second line in the file.
+    ///
+    /// This test used to pass FOR THE WRONG REASON: its only two inputs were
+    /// `not a url:sekrit` (rejected because of the SPACE) and `https://[bad`
+    /// (a malformed authority), and neither is remotely credential-shaped. The
+    /// four real key formats — which are exactly what a user pastes into the wrong
+    /// Settings row — all sailed through the old host-likeness gate and were
+    /// echoed byte-identical. They are in here now, so the test fails on the bug
+    /// it claims to catch. `a_pasted_api_key_never_survives_the_reducer` is the
+    /// per-shape unit form of the same property.
     #[test]
     fn an_unparseable_base_url_falls_back_to_something_inert() {
         let _guard = crate::test_support::env_lock();
@@ -910,6 +1149,15 @@ mod tests {
         // malformed authority.
         build_provider(&model("not a url:sekrit", Some("openai-completions")));
         build_provider(&model("https://[bad", Some("openai-completions")));
+        // The four credential shapes, at the same sink.
+        for secret in [
+            "sk-proj-abc123XYZdef456ghi789",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_16C7e42KpqpX6q9F1kQ3vZ8rLmYbNc0pQrSt",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU",
+        ] {
+            build_provider(&model(secret, Some("openai-completions")));
+        }
 
         let content = std::fs::read_to_string(dir.join(crate::diagnostics::FILE_NAME))
             .expect("the line lands");
@@ -917,6 +1165,19 @@ mod tests {
             !content.contains("sekrit"),
             "an unparseable base is not echoed verbatim:\n{content}"
         );
+        // No credential-shaped run survives ANYWHERE in the file — the assertion
+        // the four shapes above need, and one that echoing cannot satisfy.
+        for secret in [
+            "sk-proj-abc123XYZdef456ghi789",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_16C7e42KpqpX6q9F1kQ3vZ8rLmYbNc0pQrSt",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU",
+        ] {
+            assert!(
+                !content.contains(&secret[..16]),
+                "`{secret}` was echoed into the always-on file:\n{content}"
+            );
+        }
         // NOT a line count: a sibling test that reaches `build_provider` without
         // `env_lock()` (and ~17 of them do — see
         // `diagnostics::tests::a_line_is_timestamped_and_terminated` for why that
@@ -935,6 +1196,344 @@ mod tests {
             content.contains("provider wire=openai-completions"),
             "both constructions still record:\n{content}"
         );
+    }
+
+    /// Does a run of 12+ alphanumeric characters appear anywhere in `s`?
+    ///
+    /// The shape of an assertion the REDUCTION has to satisfy rather than the
+    /// ECHO: a real host (`gateway.example`, `127.0.0.1`, `[::1]`) and the
+    /// `<unparseable>` placeholder both have no such run, while every one of the
+    /// credential shapes below carries one or more runs far longer than 12. A test
+    /// that only asserted `!= input` would be satisfied by a reducer that appended
+    /// a marker to the raw value; this one is not.
+    fn has_long_alnum_run(s: &str) -> bool {
+        s.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|run| run.len() >= 12)
+    }
+
+    /// The four credential shapes a user actually pastes into the wrong Settings
+    /// row, each REDUCED TO NOTHING.
+    ///
+    /// These are the shapes `reduced_base_url`'s fallback used to ECHO VERBATIM.
+    /// Its host-likeness gate allowed `[A-Za-z0-9._-:[]]`, which is precisely the
+    /// alphabet of a modern API key, so the gate passed on the credential rather
+    /// than on a host — and a real key is NOT URL-shaped, so the fallback is the
+    /// LIKELY path for exactly the credential case, not the rare one.
+    ///
+    /// The charset gate could not be repaired by adding a character class (that is
+    /// how it broke), and blacklisting `sk-` / `AKIA` prefixes is a losing game
+    /// against the next vendor's format. The reducer now REFUSES BY DEFAULT: a
+    /// value is emitted only when it parses as a URL with an explicitly allowed
+    /// host-bearing scheme and a real host, or when the ONE extractor recognises
+    /// an anchored `host[:port][/path]` / `//host/path` shape. `base=<unparseable>`
+    /// costs a supporter one line of ambiguity; a key in the always-on,
+    /// world-readable `diagnostics.log` costs a credential rotation.
+    #[test]
+    fn a_pasted_api_key_never_survives_the_reducer() {
+        // The four shapes the reviewer reproduced, plus the two variants that
+        // reach the OTHER arm (see the `scheme` cases below): a key carrying a
+        // `:` parses as a URL whose SCHEME is the key.
+        let secrets = [
+            // OpenAI's project-scoped key: `[A-Za-z0-9-]` only, no delimiter.
+            "sk-proj-abc123XYZdef456ghi789",
+            // An AWS access key id: alphanumeric only.
+            "AKIAIOSFODNN7EXAMPLE",
+            // A GitHub PAT: the `_` is the only character outside a hostname's
+            // alphabet, so a charset gate alone would be doing all the work.
+            "ghp_16C7e42KpqpX6q9F1kQ3vZ8rLmYbNc0pQrSt",
+            // A JWT: base64URL segments joined by `.` — DOTS, i.e. the shape a
+            // "does it look like a domain" heuristic mistakes for a host.
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU",
+            // The same key with a port glued on: `Url::parse` reads the key as
+            // the SCHEME and the whole thing still parses successfully, so this
+            // one reached the SUCCESS arm and was echoed there too (lowercased).
+            "sk-proj-abc123:1234",
+            // The same JWT with a port: same scheme-masquerade, success arm.
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU:443",
+            // A bare key with a path glued on (a paste that caught the row's
+            // trailing `/v1`).
+            "sk-proj-abc123XYZdef456ghi789/v1",
+        ];
+        for secret in secrets {
+            let reduced = reduced_base_url(secret);
+            assert_eq!(
+                reduced, "<unparseable>",
+                "`{secret}` is not a URL the log may render — it must be refused, \
+                 not reduced"
+            );
+            assert!(
+                !has_long_alnum_run(&reduced),
+                "`{secret}` left a credential-shaped run in `{reduced}`"
+            );
+            assert!(
+                !reduced.contains(&secret[..12]),
+                "the head of `{secret}` survives in `{reduced}`"
+            );
+        }
+    }
+
+    /// The same property at the REAL SINK, not on the helper: the always-on
+    /// `diagnostics.log`, with no env var and no opt-in.
+    ///
+    /// Each iteration gives the `Model` a UNIQUE id, so the asserted line is
+    /// unambiguously this test's — a sibling `build_provider` call that takes no
+    /// `env_lock()` cannot satisfy it (the ~17 unlocked call sites the module doc
+    /// names) and cannot forge it either.
+    #[test]
+    fn a_pasted_api_key_never_reaches_the_always_on_log() {
+        let _guard = crate::test_support::env_lock();
+        let dir = crate::test_support::ScratchDir::in_env_temp("provider-keyleak-test-", "dir");
+        let _disable = DisableDiagnosticsOnExit;
+        crate::diagnostics::init(Some(dir.to_path_buf()));
+
+        for (n, secret) in [
+            "sk-proj-abc123XYZdef456ghi789",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_16C7e42KpqpX6q9F1kQ3vZ8rLmYbNc0pQrSt",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            reset_diagnostics_file(dir.path());
+            let tag = format!("keyleak-{n}");
+            let mut m = model(secret, Some("openai-completions"));
+            m.id = tag.clone();
+            build_provider(&m);
+
+            let content = std::fs::read_to_string(dir.join(crate::diagnostics::FILE_NAME))
+                .expect("the construction line lands with no env var");
+            let ours: Vec<&str> = content
+                .lines()
+                .filter(|line| line.contains(&format!("model={tag}")))
+                .collect();
+            assert_eq!(
+                ours.len(),
+                1,
+                "this iteration's own line is in the file exactly once:\n{content}"
+            );
+            assert!(
+                ours[0].ends_with("base=<unparseable>"),
+                "the line records `base=<unparseable>`, not a reduction of the \
+                 pasted key: {}\n{content}",
+                ours[0]
+            );
+            assert!(
+                !ours[0].contains(&secret[..12]),
+                "the pasted key `{secret}` leaked into the always-on file: {}",
+                ours[0]
+            );
+        }
+    }
+
+    /// The extractor is not merely a refusal: the shapes it exists for still
+    /// come through, WITH their port and their path.
+    ///
+    /// This is the refusal's counterpart — the positive half. Without it the
+    /// whole fix could be satisfied by deleting the fallback and returning
+    /// `<unparseable>` unconditionally, which would be safe and would silently
+    /// take away the line's only value for the configs people actually run
+    /// (`localhost:8080/v1`, `127.0.0.1:11434`).
+    ///
+    /// Note WHICH arm each of these used to reach. `localhost:8080/v1` PARSES
+    /// SUCCESSFULLY — as scheme `localhost` with NO host — so it never went
+    /// through the fallback the comment claimed handled it; it was emitted whole
+    /// by the success arm's `.map`, where `has_host()` is false and both userinfo
+    /// strips are no-ops. It now reaches the extractor on purpose, so the comment
+    /// is true because the BEHAVIOUR was changed to match it, not because the
+    /// claim was reworded.
+    #[test]
+    fn the_extractor_emits_the_anchored_host_shapes_with_port_and_path() {
+        for (base_url, want) in [
+            // `host:port/path` — parses as a bogus scheme today (success arm).
+            ("localhost:8080/v1", "localhost:8080/v1"),
+            ("Localhost:8080/v1", "localhost:8080/v1"),
+            ("localhost:8080", "localhost:8080"),
+            // The query and the fragment go, exactly as in the success arm.
+            ("localhost:8080/v1?a=b#c", "localhost:8080/v1"),
+            // `//host/path` — a parse failure today.
+            ("//gw.example/v1", "gw.example/v1"),
+            ("//gw.example:8443/v1", "gw.example:8443/v1"),
+            ("//gw.example", "gw.example"),
+            // A scheme-relative URL with userinfo: the userinfo is the credential
+            // and it is dropped, never reduced.
+            ("//user:sekrit@gw.example/v1", "gw.example/v1"),
+            // An IPv4 literal, with its port. The port was DROPPED before (the
+            // string surgery split on `:` and kept the left half); keeping it is
+            // what makes `127.0.0.1:11434` and `127.0.0.1:8080` distinguishable
+            // in the file.
+            ("127.0.0.1:11434", "127.0.0.1:11434"),
+            ("127.0.0.1:11434/v1", "127.0.0.1:11434/v1"),
+            ("10.0.0.5:11434/v1", "10.0.0.5:11434/v1"),
+            // An IPv6 literal — brackets and all, never mangled into a fake
+            // `host:port` by a `:` split (`loggable_host_and_port` matches the
+            // brackets before it looks for a port, which is the thing the deleted
+            // `split(':').next()` could not do).
+            ("[::1]:8080/v1", "[::1]:8080/v1"),
+            ("[::1]:8080", "[::1]:8080"),
+        ] {
+            assert_eq!(
+                reduced_base_url(base_url),
+                want,
+                "`{base_url}` is a host the log may name"
+            );
+        }
+    }
+
+    /// A dotted host with NO scheme and NO `//` anchor is refused, even though it
+    /// looks like a hostname.
+    ///
+    /// This is the deliberate cost of the design, stated where someone will
+    /// argue with it. `gw.example:443/v1` and
+    /// `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU:443`
+    /// are the SAME SHAPE — a JWT is dot-separated alphanumerics, which is a
+    /// valid DNS label sequence — so accepting the first on shape alone means
+    /// accepting the second. The anchor (`//`, or a real scheme that `Url`
+    /// parsed) is the only thing that tells them apart, and a pasted key has
+    /// neither. The loss is nil: a scheme-less base URL is BROKEN provider
+    /// config, and the working form (`https://gw.example/v1`) renders in full.
+    #[test]
+    fn an_unanchored_dotted_host_is_refused_because_a_jwt_has_that_shape() {
+        for base_url in [
+            "gw.example:443/v1",
+            "api.openai.com:443/v1",
+            // The JWT with a port glued on, i.e. the same shape as the line
+            // above, asserted side by side so the equivalence is on the record.
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU:443",
+        ] {
+            assert_eq!(
+                reduced_base_url(base_url),
+                "<unparseable>",
+                "`{base_url}` is indistinguishable from a JWT carrying a port"
+            );
+        }
+    }
+
+    /// The refusal is structural, so the shapes that are NOT hosts are refused —
+    /// including the ones that used to be emitted whole because they parsed.
+    ///
+    /// The scheme set is an ALLOWLIST, and that is load-bearing rather than
+    /// tidiness: `Url::parse` accepts any `[a-zA-Z][a-zA-Z0-9+.-]*` prefix as a
+    /// scheme, so a secret with a `:` in it parses as a URL whose scheme is the
+    /// secret. `file:` / `data:` / `unix:` are out for the same reason in reverse:
+    /// their authority is a PATH, and a path is somebody's secret at least as
+    /// often as a host is.
+    #[test]
+    fn only_an_allowed_scheme_with_a_real_host_is_rendered() {
+        for (base_url, want) in [
+            // The allowed schemes, reduced as before: userinfo (both halves),
+            // query and fragment gone, path kept.
+            (
+                "https://user:sekrit-token@gateway.example/v1/v1",
+                "https://gateway.example/v1/v1",
+            ),
+            (
+                "https://acct.example/v1?sig=sekrit",
+                "https://acct.example/v1",
+            ),
+            (
+                "https://user:pass@host.example/v1?sig=x#frag",
+                "https://host.example/v1",
+            ),
+            // A PERCENT-ENCODED userinfo is still a userinfo: `Url` decodes
+            // `%40` when it exposes the username, so the strip removes it whole
+            // rather than leaving `%40h@` behind.
+            (
+                "https://u:p%40h@host.example/v1#frag",
+                "https://host.example/v1",
+            ),
+            // A username with no password, and the reverse, both clear to nothing.
+            ("http://user@host.example/v1", "http://host.example/v1"),
+            ("http://:pw@host.example/v1", "http://host.example/v1"),
+            // A scheme-relative parse of an allowed scheme keeps working.
+            ("http://127.0.0.1:9/v1", "http://127.0.0.1:9/v1"),
+            // The two other host-bearing web schemes.
+            ("ws://user:pw@gw.example/v1", "ws://gw.example/v1"),
+            ("wss://gw.example/v1", "wss://gw.example/v1"),
+            // REFUSED: a non-allowed scheme. `file:`/`unix:`/`data:` were echoed
+            // whole before, which is a filesystem path in the log — `unix://`
+            // carried a socket path and `data:` carried whatever followed it.
+            ("file:///etc/passwd", "<unparseable>"),
+            ("unix:///var/run/secrets/gw.sock", "<unparseable>"),
+            ("data:text/plain,hello", "<unparseable>"),
+            // A non-allowed scheme whose authority IS a host: the host survives
+            // (via the extractor) and the userinfo does not.
+            ("unknown://u:sekrit@host.example/v1", "host.example/v1"),
+            // REFUSED: the empty host and the empty value. `https://:8080/v1` has
+            // no host at all — `:8080` is not a host that got a port.
+            ("http://", "<unparseable>"),
+            ("https://:8080/v1", "<unparseable>"),
+            ("", "<unparseable>"),
+            ("   ", "<unparseable>"),
+            // REFUSED: a bare label with no anchor. This is the pasted-key shape
+            // (`sk-proj-abc`), and it is also `localhost` on its own — an
+            // acceptable price, because a base URL worth logging carries a port,
+            // a path or a scheme.
+            ("sk-abc", "<unparseable>"),
+            ("localhost", "<unparseable>"),
+            ("gw.example", "<unparseable>"),
+            // REFUSED: a single label is not a domain, so `key:port` does not
+            // become `host:port`. This is the `sk-proj-abc123:1234` case again,
+            // asserted through the extractor rather than the parse.
+            ("myserver:8080/v1", "<unparseable>"),
+            // REFUSED: a malformed port (not digits, out of range) and a
+            // malformed host (an empty label, a leading hyphen).
+            ("gw.example:http/v1", "<unparseable>"),
+            ("gw.example:99999/v1", "<unparseable>"),
+            ("gw.example.", "<unparseable>"),
+            ("-bad.example:80", "<unparseable>"),
+            // REFUSED: the free-text case the original test used, and the
+            // malformed authority.
+            ("not a url:sekrit", "<unparseable>"),
+            ("https://[bad", "<unparseable>"),
+        ] {
+            assert_eq!(
+                reduced_base_url(base_url),
+                want,
+                "`{base_url}` reduces to exactly the credential-free form, and \
+                 nothing else"
+            );
+            assert!(
+                !reduced_base_url(base_url).contains("sekrit")
+                    && !reduced_base_url(base_url).contains("pw@"),
+                "`{base_url}` left a credential in the line"
+            );
+        }
+    }
+
+    /// Pins the ONE residual the reducer's docblock states, so it stays a
+    /// documented limit and not a surprise.
+    ///
+    /// An anchored authority whose host validates as a domain is emitted — the
+    /// `//host/path` shape the reducer is specified to keep. That means a paste
+    /// that begins with `//` AND is dot-separated AND ends in an alphabetic label
+    /// comes through. The test asserts the boundary on BOTH sides: the JWT form
+    /// (the realistic credential) is refused even anchored, because base64URL
+    /// segments carry `_` and `-` and their final label is not purely alphabetic.
+    #[test]
+    fn the_anchored_domain_residual_is_the_documented_one() {
+        // The residual, pinned as-is: an anchored, well-formed DOMAIN name is
+        // treated as a host. Widening this set is the thing to argue with.
+        assert_eq!(reduced_base_url("//gw.example/v1"), "gw.example/v1");
+        assert_eq!(
+            reduced_base_url("//sk-proj-abc123.example/v1"),
+            "sk-proj-abc123.example/v1",
+            "the stated residual"
+        );
+        // And the credential shapes stay refused EVEN anchored — this is the half
+        // that makes the residual narrow rather than a hole.
+        for anchored in [
+            "//eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.dXNlcl9zZWNyZXRfdmFsdWU/v1",
+            "//AKIAIOSFODNN7EXAMPLE",
+            "//ghp_16C7e42KpqpX6q9F1kQ3vZ8rLmYbNc0pQrSt",
+            "//sk-proj-abc123XYZdef456ghi789",
+        ] {
+            assert_eq!(
+                reduced_base_url(anchored),
+                "<unparseable>",
+                "`{anchored}` is refused even with the `//` anchor"
+            );
+        }
     }
 
     /// A provider's `/models` JSON can carry a newline in a model id, and the id
