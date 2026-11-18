@@ -100,7 +100,26 @@ pub fn append_to(dir: &std::path::Path, line: &str) {
     else {
         return;
     };
-    let _ = writeln!(f, "{ts} {line}");
+    // ONE `write_all`, not a `writeln!` — the [`crate::diagnostics::append_to`]
+    // precedent, and the same bug.
+    //
+    // `writeln!(f, "{ts} {line}")` formats in PIECES — the timestamp, the space,
+    // the payload, the newline — and `write_fmt` can issue a separate `write`
+    // syscall for each. This file is opened `O_APPEND`, so every one of those
+    // writes seeks to the current end on its own and a second writer's pieces
+    // land BETWEEN this writer's, producing a file whose lines are not lines at
+    // all: two epoch-millis prefixes side by side and both payloads concatenated.
+    // That makes EVERY whole-line property of this log unsound for a reader — the
+    // `ts` prefix, "one line per record", "a payload cannot forge a line" — and
+    // this log is the artifact a supporter reads when a Worker dies. A single
+    // `write_all` is one syscall, and `O_APPEND` makes the seek-to-end plus write
+    // atomic per call, so a record is whole or absent, never half of two.
+    //
+    // Exposure is lower than `diagnostics`' (this whole module is gated behind
+    // `ARCHIMEDES_DEBUG`, and `log_truncated` already caps each frame at 2 KB),
+    // but the failure mode is identical and several Workers write this ONE file.
+    let record = format!("{ts} {line}\n");
+    let _ = f.write_all(record.as_bytes());
 }
 
 /// Log a raw IPC line (both directions — the `WorkerHandle`'s stdin
@@ -248,6 +267,125 @@ mod tests {
             body.len() <= MAX_LINE_BYTES,
             "the body is at most 2 KB (got {} bytes)",
             body.len()
+        );
+    }
+
+    /// The [`crate::diagnostics`] precedent, applied here: ONE `write_all` per
+    /// record, so a second writer cannot interleave WITHIN a line.
+    ///
+    /// `writeln!(f, "{ts} {line}")` formatted in pieces and `write_fmt` may issue
+    /// a `write` syscall per piece; on an `O_APPEND` file each piece takes its own
+    /// offset, so a concurrent writer's pieces land between this writer's and the
+    /// result is a file whose "lines" are two timestamps and two half payloads
+    /// welded together. The race needs scheduler luck to observe, so this does not
+    /// wait for it — it manufactures the condition, exactly as
+    /// `a_sibling_writer_does_not_break_the_timestamp_assertions` does in
+    /// `diagnostics`: a thread with NO lock (as a real Worker's `log` call has
+    /// none) hammers the same dir through `append_to`, the pure seam.
+    ///
+    /// The property asserted is the one the fix claims: every line is a WHOLE
+    /// record — one `ts` prefix, then the payload, and a payload can never be seen
+    /// sharing a line with a second timestamp.
+    #[test]
+    fn a_sibling_writer_cannot_interleave_within_a_line() {
+        // The dir is what the assertions read, so the global `DIR` must not be
+        // pointed at it by a concurrent global-state test — but `append_to` takes
+        // the dir explicitly and needs no lock for its OWN writes. The lock is
+        // taken because a sibling global-state test could otherwise rotate THIS
+        // file out from under the read below.
+        let _g = lock();
+        let dir = temp_dir();
+
+        append_to(&dir, "owned-first");
+        // The thread gets its OWN handle (a `PathBuf`, not the `ScratchDir` guard —
+        // the guard must stay here so the dir outlives the assertions below).
+        let sibling_dir = dir.to_path_buf();
+        let sibling = std::thread::spawn(move || {
+            for i in 0..200 {
+                append_to(&sibling_dir, &format!("sibling payload {i}"));
+            }
+        });
+        // THE OVERLAP. A sibling that is merely busy is not a concurrent writer:
+        // joining before writing again would leave this test with ONE writer at a
+        // time and a green result over the broken `writeln!` form (measured — it
+        // passed). So the owned records are written WHILE the sibling is mid-loop,
+        // which is the only condition under which a piece-wise `write_fmt` can be
+        // caught between another writer's pieces.
+        let mut owned = Vec::new();
+        for i in 0..50 {
+            append_to(&dir, &format!("owned payload {i}"));
+            owned.push(format!("owned payload {i}"));
+        }
+        sibling.join().expect("the sibling writer finishes");
+        append_to(&dir, "owned-last");
+        owned.push("owned-first".to_string());
+        owned.push("owned-last".to_string());
+
+        let content = std::fs::read_to_string(dir.join("supervisor.log")).expect("the log");
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Non-vacuity: the interference landed, or the assertions below are free.
+        assert!(
+            lines.len() > 2,
+            "the sibling writer reached this file (otherwise this test proves \
+             nothing): {content}"
+        );
+
+        for (index, line) in lines.iter().enumerate() {
+            let (ts, rest) = line
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("line {index} has no `ts ` prefix: {line}"));
+            assert!(
+                ts.bytes().all(|b| b.is_ascii_digit()) && !ts.is_empty(),
+                "the prefix of line {index} is ONE epoch-millis number, not two \
+                 welded together by an interleaved write: {line}"
+            );
+            assert!(
+                !rest.contains("supervisor payload sibling payload")
+                    && !rest.contains("owned-firstowned")
+                    && !rest.contains("owned-lastowned"),
+                "no line carries two payloads concatenated: {line}"
+            );
+        }
+
+        // Both owned records are present and WHOLE, in order.
+        let first = lines
+            .iter()
+            .position(|l| l.ends_with("owned-first"))
+            .expect("the first owned line is intact");
+        let last = lines
+            .iter()
+            .position(|l| l.ends_with("owned-last"))
+            .expect("the last owned line is intact");
+        assert!(first < last, "the owned lines stay in order");
+        // EVERY owned record — the 50 written WHILE the sibling was mid-loop
+        // included — reads back as exactly one whole line. This is the property
+        // the one-write form buys and the `writeln!` form cannot make true.
+        for payload in &owned {
+            let hits = lines
+                .iter()
+                .filter(|l| l.ends_with(payload.as_str()))
+                .count();
+            assert_eq!(
+                hits, 1,
+                "`{payload}` is the tail of exactly ONE line (found {hits}) — a \
+                 second copy means a payload was duplicated by a split write, and \
+                 zero means it was cut"
+            );
+        }
+        // Every sibling line is whole too — the count is the strongest witness,
+        // since a split line would merge two records into one.
+        let siblings = lines
+            .iter()
+            .filter(|l| {
+                l.split_once(' ')
+                    .is_some_and(|(_, rest)| rest.starts_with("sibling payload"))
+            })
+            .count();
+        assert_eq!(
+            siblings, 200,
+            "all 200 sibling records are WHOLE lines — a single intra-line \
+             interleave would merge two of them and read 199"
         );
     }
 }

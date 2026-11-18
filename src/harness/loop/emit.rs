@@ -373,8 +373,17 @@ impl AgentLoop {
     /// text), which is the only carrier that reaches a failure tooltip; widening
     /// the display wire to carry the defect is out of scope and not done here.
     /// (The non-`ask` path below is `tc.clone()`, so a defect DOES ride the
-    /// clone for non-`ask` tools — harmless, because only `.arguments` ever
-    /// reaches the wire.)
+    /// clone — but it reaches NO wire from there. `tool_execution_start` takes
+    /// `.arguments` out of the clone, and the `toolcall_end` frame builds its
+    /// `toolCall` value as an explicit `{id, name, arguments}` whitelist at the
+    /// `turn.rs` site rather than serializing this whole struct. Both are pinned
+    /// — the frame by
+    /// `the_toolcall_end_frame_carries_only_id_name_and_arguments`, the request
+    /// wire by `tool_call_display_wire_stays_flat` — so do NOT "simplify" that
+    /// frame back to `"toolCall": display_tc`: `ToolCall`'s derived `Serialize`
+    /// emits `defect` whenever it is `Some`, and every `RpcEvent` is re-broadcast
+    /// verbatim to every socket client by the daemon. That whitelist is the whole
+    /// reason this struct's extra field is inert rather than a leak.)
     pub(super) fn normalized_for_display(&self, tc: &ToolCall) -> ToolCall {
         if tc.name != "ask" {
             return tc.clone();

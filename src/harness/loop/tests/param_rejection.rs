@@ -223,6 +223,105 @@ async fn a_malformed_payload_is_rejected_with_the_honest_sentence() {
     .expect("the turn settled");
 }
 
+/// (issue #193, review FIX 1) The `toolcall_end` frame's `toolCall` value is a
+/// THREE-KEY WHITELIST (`{ id, name, arguments }`) even for a DEFECTIVE call, so
+/// the malformed payload's `raw` text never reaches a display wire.
+///
+/// WHY THIS IS A LOOP TEST AND NOT A SERIALIZATION TEST. The frame is built at
+/// `turn.rs`'s `ProviderEvent::ToolCall` arm from `normalized_for_display`, and
+/// for every non-`ask` tool that is `tc.clone()` — so the defect rides the clone
+/// and `ToolCall`'s DERIVED `Serialize` would emit it. The `skip_serializing_if`
+/// on the field governs the TRANSCRIPT wire (`ChatMessage`'s rows); what governs
+/// THIS wire is the shape the frame literal builds. A unit test on
+/// `serde_json::to_value(&tc)` therefore cannot see this edge at all — only a
+/// test that drives the real emission can. This is the frame-level half of the
+/// guard named in FIX 2.
+///
+/// Why it matters: `EmitPipeline::run` sends EVERY `RpcEvent` on the events
+/// channel and the daemon (`fulcrum/src/serve.rs`'s `Event` arm) re-broadcasts
+/// the whole event verbatim to every subscribed socket client. Without the
+/// whitelist, a malformed call's `raw` argument text — potentially megabytes,
+/// and model-supplied — is broadcast on EVERY malformed call.
+#[tokio::test]
+async fn the_toolcall_end_frame_carries_only_id_name_and_arguments() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // A defect whose `raw` is distinctive: if it reaches the frame at all, the
+    // needle below finds it.
+    let raw = r#"{"path": "/tmp/x", "content": "truncated he"#;
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "write".to_string(),
+            arguments: json!({}),
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 43".to_string(),
+                raw: raw.to_string(),
+            }),
+        }),
+        ProviderEvent::Done(FinishReason::Length),
+    ])]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let events = drain_events(&mut events_rx);
+
+    let frames: Vec<Value> = events
+        .iter()
+        .filter_map(|e| match e {
+            RpcEvent::message_update {
+                assistant_message_event,
+                ..
+            } if assistant_message_event["type"] == json!("toolcall_end") => {
+                Some(assistant_message_event.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        frames.len(),
+        1,
+        "exactly one `toolcall_end` frame for the one call"
+    );
+    let tc = &frames[0]["toolCall"];
+    let mut keys: Vec<String> = tc
+        .as_object()
+        .expect("`toolCall` is an object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "arguments".to_string(),
+            "id".to_string(),
+            "name".to_string()
+        ],
+        "the display frame is a THREE-KEY WHITELIST — the same discipline the \
+         request-side `WireToolCall` serializer uses — so a field added to \
+         `ToolCall` later cannot silently join this wire. A `defect` key here \
+         means the malformed payload is being broadcast to every socket client."
+    );
+    assert_eq!(tc["id"], json!("t1"));
+    assert_eq!(tc["name"], json!("write"));
+    assert_eq!(
+        tc["arguments"],
+        json!({}),
+        "`arguments` is the collapsed object, unchanged"
+    );
+    let frame_text = frames[0].to_string();
+    assert!(
+        !frame_text.contains("defect") && !frame_text.contains("truncated he"),
+        "neither the field name nor the raw text appears anywhere in the frame: \
+         {frame_text}"
+    );
+}
+
 /// A rejected `subagent` call never creates a child.
 ///
 /// This is the futures-`.filter` test: the `dispatch_subagent` futures are

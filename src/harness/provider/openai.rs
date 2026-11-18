@@ -2674,6 +2674,37 @@ mod tests {
     /// The display wire keeps the FLAT `ToolCall` shape (`{ id, name,
     /// arguments }` — the `toolcall_end` / `tool_execution_start` events):
     /// the OpenAI wire shape is request-side only.
+    ///
+    /// TWO cases, and the second makes the pin non-vacuous in the direction that
+    /// is actually load-bearing. `ToolCall`'s docblock in `provider_types.rs`
+    /// names THIS test as the guard that reddens if the `skip_serializing_if`
+    /// attribute is dropped, and a review claimed the `defect: None` fixture
+    /// could not do that. **Measured, that claim is false**: serde's derived
+    /// `Serialize` for an `Option` without the attribute writes the key with a
+    /// `null` value, so deleting the attribute puts `"defect": null` on every
+    /// transcript row and the `None` case's `assert_eq!` reddens (verified by
+    /// mutation — `left` gains `"defect": Null`). The `None` fixture is therefore
+    /// NOT vacuous for that mutation.
+    ///
+    /// It IS vacuous for the mutation next door, and that is the hole worth
+    /// closing: replacing `skip_serializing_if = "Option::is_none"` with a bare
+    /// `skip_serializing` — an unconditional skip — leaves the `None` case
+    /// passing byte-for-byte while silently dropping a REAL defect from every
+    /// transcript row. `run_compaction` and `persist_transcript_message` both
+    /// re-serialize the message whole into `native_messages.content_json`, so
+    /// that mutation loses the defect on disk and a resume can no longer rebuild
+    /// the honest sentence. Only a `Some` fixture can see it, so the second case
+    /// asserts the OPPOSITE key set of the first: `defect` is present exactly
+    /// when it is `Some`. Measured both ways — the bare `skip_serializing`
+    /// mutation reddens the second case and leaves the first green, which is the
+    /// asymmetry a single-fixture pin hides.
+    ///
+    /// What stays flat in BOTH cases is the shape: no nested `function`, no
+    /// `type` tag. The frame-level half of this guard — the `toolcall_end`
+    /// frame's `toolCall` value is a three-key whitelist, so a `Some` defect
+    /// never reaches a DISPLAY wire — lives at the loop level in
+    /// `the_toolcall_end_frame_carries_only_id_name_and_arguments`, because a
+    /// serialization test cannot see the frame the loop builds.
     #[test]
     fn tool_call_display_wire_stays_flat() {
         let tc = ToolCall {
@@ -2692,6 +2723,55 @@ mod tests {
             "no nested `function` on the display wire"
         );
         assert!(v.get("type").is_none(), "no `type` tag on the display wire");
+
+        // THE NON-VACUOUS HALF: a call that CARRIES a defect. The key MUST be
+        // here — this is the transcript shape, and a defect that does not survive
+        // into `content_json` is a defect a resume cannot name. Reddens on an
+        // unconditional `skip_serializing`, which the case above cannot see.
+        let defective = ToolCall {
+            id: "call_2".to_string(),
+            name: "write".to_string(),
+            arguments: json!({}),
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 43".to_string(),
+                raw: r#"{"path": "/tmp/x", "content": "truncated he"#.to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&defective).expect("serialization cannot fail");
+        assert_eq!(
+            v,
+            json!({
+                "id": "call_2",
+                "name": "write",
+                "arguments": {},
+                "defect": {
+                    "error": "EOF while parsing an object at line 1 column 43",
+                    "raw": r#"{"path": "/tmp/x", "content": "truncated he"#,
+                },
+            }),
+            "a `Some` defect IS serialized, byte-exact and FLAT (an object of \
+             `error` + `raw` — no `function`, no `type`), so the transcript row \
+             carries it to disk"
+        );
+        let mut keys: Vec<String> = v
+            .as_object()
+            .expect("a tool call is an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "arguments".to_string(),
+                "defect".to_string(),
+                "id".to_string(),
+                "name".to_string()
+            ],
+            "exactly the three wire keys plus `defect` — and `raw` is UNTRUNCATED, \
+             which is why FIX-bound truncation happens in the refusal SENTENCE \
+             (`tool_specs`' head arm) and never in this field"
+        );
     }
 
     #[test]

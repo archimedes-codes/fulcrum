@@ -416,11 +416,37 @@ impl AgentLoop {
                         ProviderEvent::ToolCall(tc) => {
                             let display_tc = self.normalized_for_display(&tc);
                             acc.tool_calls.push(tc.clone());
+                            // The frame's `toolCall` is an EXPLICIT three-key
+                            // whitelist, not `display_tc` serialized whole.
+                            //
+                            // (issue #193) `normalized_for_display` is
+                            // `tc.clone()` for every non-`ask` tool, so a
+                            // `defect` rides that clone, and `ToolCall`'s
+                            // DERIVED `Serialize` emits it — `skip_serializing_if`
+                            // suppresses it only when it is `None`. That put the
+                            // malformed payload's `raw` text (unbounded, and
+                            // model-supplied) on a wire this frame reaches:
+                            // `EmitPipeline::run` sends every `RpcEvent` on the
+                            // events channel and the daemon
+                            // (`fulcrum/src/serve.rs`'s `Event` arm) re-broadcasts
+                            // the event verbatim to every subscribed socket
+                            // client. Building the object from named fields makes
+                            // the display wire flat BY CONSTRUCTION — the same
+                            // discipline `WireToolCall`'s serializer uses on the
+                            // request side — so a field added to `ToolCall` later
+                            // cannot quietly join it. Pinned by
+                            // `the_toolcall_end_frame_carries_only_id_name_and_arguments`.
+                            // `normalize`'s `toolcall_end` arm reads exactly these
+                            // three keys and nothing else.
                             self.emit(RpcEvent::message_update {
                                 usage: acc.usage_value(),
                                 assistant_message_event: json!({
                                     "type": "toolcall_end",
-                                    "toolCall": display_tc,
+                                    "toolCall": {
+                                        "id": &display_tc.id,
+                                        "name": &display_tc.name,
+                                        "arguments": &display_tc.arguments,
+                                    },
                                 }),
                             });
                             self.emit(RpcEvent::tool_execution_start {
@@ -1153,10 +1179,24 @@ impl AgentLoop {
     ///
     /// What does NOT change is the other half of this function's reason to exist.
     /// It NEVER dispatches. A truncated call's `arguments` arrived cut off
-    /// mid-object, so `parse_arguments` hands back `{}`, `unknown_param_error`
-    /// passes (it checks only EXTRANEOUS keys), the permission gate has no
-    /// `path` to judge and returns `Allow`, and the executor then refuses with
-    /// ``write: missing `path` or `content` parameter`` — a red card blaming the
+    /// mid-object, so `parse_arguments` hands back `{}` — and since issue #193
+    /// that same `{}` arrives WITH a `defect`, which makes
+    /// `unknown_param_error`'s HEAD ARM fire first and refuse the call there.
+    ///
+    /// The route this paragraph used to describe is therefore closed TWICE over,
+    /// and both closures point the same way:
+    /// * the checker now refuses a defective call before the permission gate and
+    ///   the executor are ever consulted, naming the parse error instead of the
+    ///   missing parameter (that arm deliberately fires for EVERY defective call,
+    ///   disabled or unknown tool included — see rule 0 in `tool_specs`);
+    /// * and even setting the defect aside, the old chain — `unknown_param_error`
+    ///   PASSING (it checks only EXTRANEOUS keys, and `{}` has none), the
+    ///   permission gate returning `Allow` because there is no `path` to judge,
+    ///   and the executor then refusing with ``write: missing `path` or `content`
+    ///   parameter`` — was already refused at THIS layer, one station earlier, by
+    ///   the per-turn gate below.
+    ///
+    /// Either way the misleading card never renders: a red refusal blaming the
     /// model for a parameter the output cap never let it send (566 such rows are
     /// measured in this machine's DB). Industry is unanimous that a length stop
     /// never executes — `vercel/ai`'s `isToolExecutionAllowedFinishReason`, pi's
@@ -1167,7 +1207,12 @@ impl AgentLoop {
     /// the per-call refinement (cline's "a closed JSON object cannot be the
     /// prefix of a longer one") buys nothing, because
     /// [`Self::close_announced_tool_calls`] already gives each call its own
-    /// precise error either way. Decision 2 / ADR 0108.
+    /// precise error either way. Decision 2 / ADR 0108. The one thing the defect
+    /// does NOT change is that conclusion: a truncated call closes with
+    /// `abandoned_tool_result()`'s sentence, never with the head arm's, because
+    /// this gate reaches it before the batch that would have run the checker —
+    /// pinned by
+    /// `a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatched`.
     pub(super) fn settle_truncated(&mut self, tool_results: Vec<Value>, announced: &[ToolCall]) {
         // Identical to an errored exit — INCLUDING the `turn_abandoned` this used
         // to skip. See the docblock: skipping it was measured to inflate the

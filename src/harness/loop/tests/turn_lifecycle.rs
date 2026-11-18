@@ -12,8 +12,8 @@ use crate::events::{EventSink, RpcEvent};
 use crate::harness::catalog::Model;
 use crate::harness::dispatch::SubagentDispatcher;
 use crate::harness::provider::{
-    ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
-    Usage,
+    ArgumentDefect, ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError,
+    ProviderEvent, ToolCall, Usage,
 };
 use crate::harness::retry::RetryPolicy;
 use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
@@ -1944,13 +1944,24 @@ async fn a_turn_cut_off_by_the_output_cap_settles_as_truncated_and_persists_its_
 }
 
 /// (issue #190, Decision 2) A truncated turn's tool calls are NEVER executed.
-/// Truncated arguments go `parse_arguments` → `{}` → `unknown_param_error`
-/// passes (it checks only EXTRANEOUS keys) → the permission gate returns
-/// `Allow` (there is no `path` to judge) → the executor refuses with
+/// Truncated arguments go `parse_arguments` → `{}` in `arguments` PLUS a
+/// `defect` carrying the parse error and the raw text, and since issue #193 that
+/// defect makes `unknown_param_error`'s head arm refuse the call. Had this route
+/// reached the batch at all, the permission gate would return `Allow` (there is
+/// no `path` to judge) and the executor would refuse with
 /// ``write: missing `path` or `content` parameter``. That card is red for the
 /// wrong reason, and 566 of them are measured in this machine's DB. The close
 /// here is `abandoned_tool_result()`'s honest sentence, and the counting
 /// dispatcher proves nothing ran.
+///
+/// (issue #193, review FIX 8) This test is ALSO a second, independent witness
+/// that the head arm and `settle_truncated` do not fight. The fixtures below now
+/// carry `Some(defect)` — the shape a post-#193 provider actually hands this
+/// route — and the assertions still land on `abandoned_tool_result()`, NOT on the
+/// head arm's `invalid arguments for …` sentence. That is the point: the
+/// per-turn truncation gate reaches these calls BEFORE `run_tool_batch` runs the
+/// checker, so the two guards are stacked, never racing, and whichever fires the
+/// call is refused and never dispatched.
 #[tokio::test]
 async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatched() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -1958,12 +1969,17 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
         ProviderEvent::TextDelta("writing the file now".to_string()),
         ProviderEvent::ToolCall(ToolCall {
             id: "t1".to_string(),
-            // The truncated shape: `parse_arguments` hands `{}` for arguments
-            // the cap cut off mid-object, which is exactly what used to reach
-            // the executor and produce the misleading refusal.
+            // The truncated shape, POST-#193: `parse_arguments` hands `{}` for
+            // arguments the cap cut off mid-object AND reports the failure as a
+            // `defect`. Before this fixture carried the defect this test modelled
+            // the pre-#193 arrival, so it could not show the two guards coexisting.
             name: "write".to_string(),
             arguments: json!({}),
-            defect: None,
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 41".to_string(),
+                raw: r#"{"path": "truncation-must-not-be-written.txt", "content": "half a"#
+                    .to_string(),
+            }),
         }),
         ProviderEvent::ToolCall(ToolCall {
             id: "t2".to_string(),
@@ -1972,7 +1988,10 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
             // the concurrent `join_all` ahead of the sequential loop.
             name: "subagent".to_string(),
             arguments: json!({}),
-            defect: None,
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 30".to_string(),
+                raw: r#"{"task": "finish the refactor", "agent"#.to_string(),
+            }),
         }),
         ProviderEvent::Done(FinishReason::Length),
     ])]);
@@ -2043,7 +2062,32 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
             "the card must NOT blame the model for a `path`/`content` parameter \
              the output cap never let it send, got {id} → {text}"
         );
+        // (issue #193, review FIX 8) And NOT the head arm's sentence either: the
+        // per-turn truncation gate settles these calls before `run_tool_batch`
+        // ever runs `unknown_param_error`, so the defect rides the call unused
+        // here. If the two guards were ever re-ordered so the batch ran first,
+        // this is what would catch it.
+        assert!(
+            !text.contains("invalid arguments for"),
+            "the head arm of `unknown_param_error` never fires on this route — \
+             the truncation gate settles first, got {id} → {text}"
+        );
     }
+    // The two guards do not BOTH speak: no rejection result was produced by the
+    // batch, because the batch never ran. `turn_end.tool_results` is asserted
+    // empty below; this names the defect-shaped reason.
+    let refusals = events
+        .iter()
+        .filter(|e| {
+            matches!(e, RpcEvent::tool_execution_end { result, .. }
+            if result.to_string().contains("invalid arguments for"))
+        })
+        .count();
+    assert_eq!(
+        refusals, 0,
+        "no `invalid arguments for …` refusal was emitted — a defective call on a \
+         truncated turn is closed as ABANDONED, not rejected by the param check"
+    );
 
     // And no `tool` transcript row: nothing dispatched, so nothing to answer.
     assert!(

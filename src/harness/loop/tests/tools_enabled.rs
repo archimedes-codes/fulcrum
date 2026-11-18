@@ -651,3 +651,104 @@ async fn the_seven_task_tools_are_dispatchable() {
         );
     }
 }
+
+/// (issue #193, review FIX 5) The defect arm of `unknown_param_error` PRECEDES
+/// the "tool not enabled" / "unknown tool" verdicts, and this records that as a
+/// decision rather than an accident.
+///
+/// `run_tool_batch` calls the checker with `advertised_specs()` — the same
+/// `enabled_tools` + child filter this module exists to pin — and the checker's
+/// head arm runs BEFORE its own spec lookup, so a defective call to a tool the
+/// session DISABLED never reaches the enablement verdict. It answers
+/// ``invalid arguments for `bash`: …`` where the well-formed call next to it
+/// answers ``tool not enabled: bash``.
+///
+/// Harmless, and deliberately kept: the call is refused either way and NEVER
+/// dispatched, and "your arguments did not parse" is the more actionable of the
+/// two sentences (a disabled tool's list is not something the model can fix by
+/// re-sending, and it may have genuinely mangled the payload too). What this test
+/// pins is the PRECEDENCE — the contrast pair below is what makes it a pin and
+/// not a tautology, and it lives HERE rather than in `tool_specs`' own module
+/// because the faithful fixture is the real `advertised_tool_specs`, which is
+/// private to `loop`.
+#[test]
+fn a_defective_call_to_a_disabled_tool_reports_the_defect_not_the_disablement() {
+    // The real filter, exactly as `advertised_specs()` builds it: `read` only.
+    let advertised = AgentLoop::advertised_tool_specs(&Some(vec!["read".to_string()]), false);
+    assert!(
+        advertised.iter().any(|s| s.name == "read"),
+        "the fixture enables `read`"
+    );
+    assert!(
+        !advertised.iter().any(|s| s.name == "bash"),
+        "and `bash` is therefore NOT advertised — which is the whole trigger"
+    );
+
+    let defective = ToolCall {
+        id: "t1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({}),
+        defect: Some(crate::harness::provider::ArgumentDefect {
+            error: "EOF while parsing an object at line 1 column 6".to_string(),
+            raw: "{oops".to_string(),
+        }),
+    };
+    let well_formed = ToolCall {
+        id: "t2".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({ "command": "echo hi" }),
+        defect: None,
+    };
+
+    let defect_verdict = crate::harness::tool_specs::unknown_param_error(&advertised, &defective)
+        .expect("a defective call is rejected whatever the tool");
+    assert!(
+        defect_verdict.starts_with("invalid arguments for `bash`: EOF while parsing"),
+        "the DEFECT wins over the disablement verdict: {defect_verdict}"
+    );
+    assert!(
+        !defect_verdict.contains("tool not enabled") && !defect_verdict.contains("unknown tool"),
+        "and the two dispatch-stage sentences are exactly what it displaces: \
+         {defect_verdict}"
+    );
+    // THE CONTRAST: the same disabled name, well-formed, is NOT this checker's
+    // business at all — rule 1 excuses it and `dispatch_tool` answers
+    // `tool not enabled: bash` (pinned by
+    // `a_disabled_tool_is_a_tool_result_error_not_execution` above). So it is the
+    // defect that changed the answer, not the name.
+    assert_eq!(
+        crate::harness::tool_specs::unknown_param_error(&advertised, &well_formed),
+        None,
+        "a well-formed call to a disabled tool stays `dispatch_tool`'s problem"
+    );
+
+    // A name nobody ever heard of takes the same precedence for the same reason.
+    let invented = ToolCall {
+        id: "t3".to_string(),
+        name: "frobnicate".to_string(),
+        arguments: json!({}),
+        defect: Some(crate::harness::provider::ArgumentDefect {
+            error: "EOF while parsing an object at line 1 column 6".to_string(),
+            raw: "{oops".to_string(),
+        }),
+    };
+    let invented_verdict = crate::harness::tool_specs::unknown_param_error(&advertised, &invented)
+        .expect("a defective call to an unknown tool is rejected too");
+    assert!(
+        invented_verdict.starts_with("invalid arguments for `frobnicate`:"),
+        "{invented_verdict}"
+    );
+    assert_eq!(
+        crate::harness::tool_specs::unknown_param_error(
+            &advertised,
+            &ToolCall {
+                id: "t4".to_string(),
+                name: "frobnicate".to_string(),
+                arguments: json!({ "x": 1 }),
+                defect: None,
+            },
+        ),
+        None,
+        "and a well-formed unknown tool is `unknown tool:`'s, not this arm's"
+    );
+}

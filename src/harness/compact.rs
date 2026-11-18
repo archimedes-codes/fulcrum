@@ -245,6 +245,27 @@ fn estimate_message_tokens(m: &ChatMessage) -> u32 {
 /// the summarized messages verbatim, `arguments` included. A file-writing call
 /// costs the shared estimate ~20 tokens and the wire thousands, so measuring
 /// the budget with it green-lights the exact overflow ADR 0047 exists to end.
+///
+/// `ToolCall::defect` is DELIBERATELY NOT counted (issue #193, review FIX 7), and
+/// the reason is the sentence above: this function measures what the summary call
+/// SENDS, and a defect is never sent. [`summarize`] hands its messages to the
+/// provider's request builder, and all three builders serialize a tool call
+/// through an explicit whitelist that names `id` / `name` / `arguments` and
+/// nothing else — `WireToolCall`'s own `Serialize` impl on the OpenAI-compatible
+/// wire, and the inline `json!` object literals on the Anthropic and Responses
+/// wires. `defect` cannot join any of them by a `serde` derive change, because
+/// none of them derives.
+///
+/// So the field is DISK-ONLY, and it stays there on purpose: `persist_transcript_message`
+/// and `run_compaction` both re-serialize the whole `ChatMessage` into
+/// `native_messages.content_json`, which is what lets a RESUME rebuild the honest
+/// refusal sentence — a real and intended cost, but a cost of the store, not of
+/// the summary request. Counting `raw` here would charge the summary budget for
+/// bytes the summary call never sends, and `raw` is precisely the field a
+/// truncated 8 MB argument stream fills, so the count would then refuse to
+/// compact the very transcript that most needs it. The sentence the model DOES
+/// receive on a defective call is the bounded one — see
+/// `MAX_DEFECT_RAW_BYTES` in `tool_specs`.
 fn estimate_summary_payload(m: &ChatMessage) -> u32 {
     let arguments = m
         .tool_calls

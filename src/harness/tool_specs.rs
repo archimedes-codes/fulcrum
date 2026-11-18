@@ -556,6 +556,52 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// (issue #193, review FIX 3) The most raw argument text the head arm's refusal
+/// sentence quotes.
+///
+/// WHY A BOUND AT ALL: `raw` is the full accumulated argument stream and no
+/// parser caps it (`parse_arguments` in `provider/openai.rs`, and the two other
+/// wire parsers, keep the text byte-for-byte). The refusal is the WHOLE tool
+/// result, so an unbounded quote makes it an unbounded tool result — the card's
+/// `rawOutput`, a `native_messages` row, and part of the NEXT request body, where
+/// it can itself cause the context overflow the refusal exists to survive.
+///
+/// WHY 2 KB: it is the in-repo precedent for "how much of one oversized thing
+/// does one line carry" — [`crate::debuglog`]'s `MAX_LINE_BYTES` /
+/// `log_truncated` cut every IPC line at 2048 for exactly this reason. A real
+/// tool result is a few KB, and the head of a JSON argument object is where the
+/// keys that arrived live, which is the half the model needs in order to not
+/// re-send the identical call. The number is a shape, not a measurement.
+///
+/// THE FIELD IS NOT CAPPED. `ArgumentDefect::raw` stays byte-exact — that is the
+/// entire point of preserving it, and it is what a resume rebuilds the sentence
+/// from. Only the interpolation into this one sentence is bounded, and the note
+/// it appends names the true length so nothing is hidden by the cut.
+const MAX_DEFECT_RAW_BYTES: usize = 2048;
+
+/// The head arm's quoted raw text: the first [`MAX_DEFECT_RAW_BYTES`] bytes of
+/// `raw`, cut at the last character boundary at or below that index, plus a
+/// trailing note naming the true length when a cut happened.
+///
+/// The boundary walk is the stable stand-in for `str::floor_char_boundary`, which
+/// is still unstable on the pinned toolchain (`rust-toolchain.toml`) — and a
+/// byte-indexed slice would PANIC on a multi-byte character, which a model
+/// streaming CJK content into a `write` body will eventually hit. Cutting a
+/// refusal sentence must never be able to panic.
+fn quoted_defect_raw(raw: &str) -> String {
+    if raw.len() <= MAX_DEFECT_RAW_BYTES {
+        return raw.to_string();
+    }
+    // Walk back to a boundary at or below the cap. `is_char_boundary` is true at
+    // index 0 and at `len`, and the cap is past `len` only when no cut is needed,
+    // so this terminates and never underflows.
+    let mut end = MAX_DEFECT_RAW_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (truncated, {} bytes total)", &raw[..end], raw.len())
+}
+
 /// (issue #93) The rejection text for a tool call that passes a key the model
 /// was never told about, or `None` when there is nothing to say.
 /// `run_tool_batch` (`harness/loop/turn.rs`) consumes the text as a REJECTION:
@@ -574,6 +620,18 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 ///    up: the arguments never became a value, so the key-by-key check below has
 ///    no input, and a lookup by name would answer "no spec" for a tool that
 ///    does have one and let the call through to dispatch.
+///    THE PRECEDENCE THIS IMPLIES, stated because it is a choice and not an
+///    oversight: callers pass `advertised_specs()`, which `enabled_tools` and
+///    child status FILTER, so a name missing from `specs` is a DISABLED tool or
+///    an unknown one — and a defective call to either gets this sentence instead
+///    of `dispatch_tool`'s ``tool not enabled: …`` / ``unknown tool: …``. Kept
+///    that way: the call is refused and never dispatched on BOTH routes, and
+///    "your arguments did not parse" is the more actionable of the two, since
+///    the enablement list is not something a re-send can fix while a mangled
+///    payload may well be. Pinned by
+///    `a_defective_call_to_a_disabled_tool_reports_the_defect_not_the_disablement`,
+///    which contrasts the same disabled name called WELL-FORMED (that one IS
+///    `dispatch_tool`'s business — rule 1 excuses it here).
 /// 1. No spec for the (alias-normalized) name → NO check. An unknown tool is
 ///    already a hard error in `dispatch_tool`'s `unknown tool:` arm
 ///    (`loop/tools.rs`), and a tool the session disabled is not in
@@ -596,7 +654,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 /// ``missing `path` parameter``. That sentence was a lie whenever the model HAD
 /// sent `path` and its JSON arrived broken, and because it reads as "you
 /// omitted a required parameter" the model re-sent the identical call. Rule 0
-/// says what actually happened and shows the raw text.
+/// says what actually happened and shows the raw text — bounded to
+/// [`MAX_DEFECT_RAW_BYTES`] with a trailing note naming the true length, because
+/// this sentence IS the tool result and rides the next request body (the stored
+/// `defect.raw` itself is never truncated).
 ///
 /// TOP-LEVEL ONLY, and it never mutates: a pure function of `(specs, tc)`
 /// returning display text, so it is safe to call before a dispatch has
@@ -616,7 +677,9 @@ pub(crate) fn unknown_param_error(specs: &[ToolSpec], tc: &ToolCall) -> Option<S
     if let Some(defect) = &tc.defect {
         return Some(format!(
             "invalid arguments for `{}`: {} — the call was rejected. Received arguments:\n{}",
-            tc.name, defect.error, defect.raw
+            tc.name,
+            defect.error,
+            quoted_defect_raw(&defect.raw)
         ));
     }
     // The `dispatch_subagent` alias resolves to the `subagent` spec — the same
@@ -743,6 +806,115 @@ mod tests {
         assert!(
             !rejection.contains("unknown param"),
             "no key was unknown; the payload never parsed: {rejection}"
+        );
+    }
+
+    /// (issue #193, review FIX 3) The refusal SENTENCE bounds the raw text; the
+    /// stored `defect.raw` stays byte-exact.
+    ///
+    /// `raw` is the full accumulated argument stream and NO parser caps it, so a
+    /// `write` whose stream died after 8 MB of body produced an 8 MB refusal.
+    /// That sentence becomes the whole tool result, which makes it the card's
+    /// `rawOutput`, a `native_messages` row, AND part of the NEXT request body —
+    /// where it can itself trigger the context overflow the refusal exists to
+    /// avoid. The bound is therefore on the INTERPOLATION, never on the field:
+    /// the field is what makes the honest sentence possible at all, and it is
+    /// what a resume rebuilds from.
+    #[test]
+    fn a_huge_raw_is_bounded_in_the_sentence_and_the_note_names_the_true_length() {
+        // 8 MB of body, the shape the finding names. Multi-byte characters are
+        // in the payload so a byte-indexed cut would panic or split a char.
+        let body = "α".repeat(1_000_000); // 3 MB of UTF-8 in 1M chars
+        let raw = format!(r#"{{"path": "/tmp/x", "content": "{body}"#);
+        let total = raw.len();
+        let rejection = unknown_param_error(&tool_specs(), &defective_call("write", &raw))
+            .expect("a defective call is always rejected");
+
+        assert!(
+            rejection.len() < 4096,
+            "the refusal is bounded ({} bytes) — it is a tool result and it rides \
+             the next request body, so an unbounded one is a self-inflicted context \
+             overflow",
+            rejection.len()
+        );
+        assert!(
+            rejection.contains(&format!("(truncated, {total} bytes total)")),
+            "the note names the TRUE length of the raw text, so the model knows \
+             how much it lost and the human reading the card can tell a cut from \
+             a short payload: {rejection}"
+        );
+        assert!(
+            rejection.starts_with("invalid arguments for `write`: "),
+            "the head of the sentence is unchanged: {rejection}"
+        );
+        // The prefix is the HEAD of the raw text (the part that shows which keys
+        // arrived), and it is cut on a character boundary.
+        let shown = rejection
+            .split("Received arguments:\n")
+            .nth(1)
+            .expect("the raw section is still there")
+            .strip_suffix(&format!("… (truncated, {total} bytes total)"))
+            .unwrap_or_else(|| panic!("the note is the sentence's tail: {rejection}"));
+        assert!(
+            shown.len() <= MAX_DEFECT_RAW_BYTES,
+            "the quoted prefix is at most the cap (got {})",
+            shown.len()
+        );
+        assert!(
+            raw.starts_with(shown) && shown.len() < raw.len(),
+            "the prefix is a genuine PREFIX of the raw text, cut short"
+        );
+        // The real property: the cut did not split a character. `shown` is a
+        // `&str` slice of the raw `String` and the slicing itself would PANIC on
+        // a non-boundary index, so the assertion that matters is that the lines
+        // above ran at all; this states it as a fact about the prefix.
+        assert!(
+            shown.chars().count() * 3 >= shown.len(),
+            "the prefix is whole characters: {} bytes / {} chars",
+            shown.len(),
+            shown.chars().count()
+        );
+    }
+
+    /// (issue #193, review FIX 3) The bound does NOT touch a payload that fits,
+    /// and a raw whose byte length is exactly the cap is not marked truncated.
+    /// The guard against an off-by-one that cuts ordinary refusals — the ordinary
+    /// case is what the 566 database rows were, and they must stay byte-exact.
+    #[test]
+    fn a_raw_within_the_cap_is_quoted_verbatim_with_no_note() {
+        let raw = r#"{"path": "/tmp/x", "content": "truncated he"#;
+        let rejection = unknown_param_error(&tool_specs(), &defective_call("read", raw))
+            .expect("a defective call is always rejected");
+        assert!(
+            rejection.ends_with(raw),
+            "a short raw is quoted to the END of the sentence, verbatim: {rejection}"
+        );
+        assert!(
+            !rejection.contains("truncated,"),
+            "no truncation note on a payload that never needed one: {rejection}"
+        );
+
+        // Exactly at the cap: still verbatim, still no note.
+        let exact = "b".repeat(MAX_DEFECT_RAW_BYTES);
+        let at_cap =
+            unknown_param_error(&tool_specs(), &defective_call("read", &exact)).expect("rejected");
+        assert!(
+            at_cap.ends_with(&exact) && !at_cap.contains("bytes total"),
+            "a raw of exactly the cap is not truncated (len {})",
+            exact.len()
+        );
+
+        // One byte over: now it is, and the byte BEFORE the note is the marker.
+        let over = "b".repeat(MAX_DEFECT_RAW_BYTES + 1);
+        let past =
+            unknown_param_error(&tool_specs(), &defective_call("read", &over)).expect("rejected");
+        assert!(
+            past.ends_with(&format!("… (truncated, {} bytes total)", over.len())),
+            "one byte past the cap truncates: {past}"
+        );
+        assert!(
+            !past.ends_with(&over),
+            "and the tail byte is what was dropped"
         );
     }
 

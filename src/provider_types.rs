@@ -168,9 +168,20 @@ pub struct ToolCall {
     /// the raw text the provider sent. `None` for a well-formed call AND for a
     /// legitimately empty payload — the two are distinguished precisely BY this
     /// field being absent. `{}` stays `{}` either way; nothing about `arguments`
-    /// changes. `skip_serializing_if` (not `skip_serializing`) is load-bearing:
-    /// without it every transcript row gains `"defect":null` and the display-wire
-    /// pin `tool_call_display_wire_stays_flat` reddens.
+    /// changes. `skip_serializing_if` (not `skip_serializing`) is load-bearing,
+    /// and BOTH directions of that choice are pinned, one per fixture, by
+    /// `tool_call_display_wire_stays_flat`:
+    /// * dropping the attribute entirely puts `"defect": null` on EVERY
+    ///   transcript row (serde's derived `Serialize` writes an absent `Option` as
+    ///   `null`) — reddens the test's `None` case;
+    /// * an unconditional `skip_serializing` passes the `None` case byte-for-byte
+    ///   and silently drops a REAL defect, which is the half that matters more:
+    ///   `persist_transcript_message` and `run_compaction` both re-serialize the
+    ///   message whole into `native_messages.content_json`, so a defect lost there
+    ///   cannot be rebuilt on a resume — reddens the test's `Some` case.
+    ///
+    /// What neither case may gain is the OpenAI request shape (`function` /
+    /// `type`) — that is the flat-shape claim this pin is named for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defect: Option<ArgumentDefect>,
 }
