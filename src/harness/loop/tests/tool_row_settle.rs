@@ -318,6 +318,43 @@ impl Provider for CancelOnSecondCallProvider {
     }
 }
 
+/// `ScriptedProvider`'s script, but with one `yield_now` per call.
+///
+/// THE REASON THIS EXISTS IS THE `SETTLE` TIMEOUT IN
+/// `a_capped_turn_closes_nothing_and_carries_the_prior_results`, and it is not a
+/// cosmetic detail: a `tokio::time::timeout` around a `tokio::spawn` bounds
+/// nothing unless the task being awaited ever SUSPENDS. `ScriptedProvider` answers
+/// from a `Vec` and the turn loop's body is otherwise synchronous work, so a turn
+/// loop with BOTH its guards disabled is a non-yielding busy loop, and on a
+/// current-thread runtime the timer cannot fire — measured, the wrapped test with
+/// a 3-SECOND timeout still ran past 60 s and `timeout 90 cargo test` exited 124.
+/// That is a property of the loop's shape, and it is true of all five looping
+/// tests in this file and in `turn_lifecycle.rs`, not of the one this note is
+/// about.
+///
+/// One `yield_now` per `complete` gives the scheduler a per-ROUND suspension
+/// point — a real provider has one for free, since it awaits a socket — and it is
+/// what makes the timeout in that test the load-bearing bound it is written to
+/// be. With the guard disabled there the test now FAILS at `SETTLE` naming the
+/// invariant; without the yield it would hang, which is the failure mode the
+/// finding was about.
+struct YieldingScriptedProvider {
+    calls: Arc<AtomicU32>,
+    script: Vec<ProviderEvent>,
+}
+
+#[async_trait::async_trait]
+impl Provider for YieldingScriptedProvider {
+    async fn complete(
+        &self,
+        _req: &ModelRequest,
+    ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError> {
+        tokio::task::yield_now().await;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(futures_util::stream::iter(self.script.clone()).boxed())
+    }
+}
+
 /// SITE 2 — the non-retryable fall-through of `handle_mid_stream_error`: a
 /// mid-stream `ProviderError::Fatal` after the stream announced a call closes
 /// the row, then the turn settles.
@@ -1315,19 +1352,23 @@ async fn a_capped_turn_closes_nothing_and_carries_the_prior_results() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     // The identical-refusal run: ONE refused call per round, so every count below
     // is exactly the round count and nothing else.
-    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
-        ProviderEvent::ToolCall(ToolCall {
-            id: "t1".to_string(),
-            name: "write".to_string(),
-            arguments: json!({
-                "path": "never-written.txt",
-                "content": "legal",
-                "contentt": "typo",
+    let calls = Arc::new(AtomicU32::new(0));
+    let provider = YieldingScriptedProvider {
+        calls: calls.clone(),
+        script: vec![
+            ProviderEvent::ToolCall(ToolCall {
+                id: "t1".to_string(),
+                name: "write".to_string(),
+                arguments: json!({
+                    "path": "never-written.txt",
+                    "content": "legal",
+                    "contentt": "typo",
+                }),
+                defect: None,
             }),
-            defect: None,
-        }),
-        ProviderEvent::Done(FinishReason::ToolCalls),
-    ])]);
+            ProviderEvent::Done(FinishReason::ToolCalls),
+        ],
+    };
     let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
@@ -1335,7 +1376,31 @@ async fn a_capped_turn_closes_nothing_and_carries_the_prior_results() {
         watch::channel(0u64).0,
         RetryPolicy::new_with(5, Duration::from_millis(1)),
     );
-    loop_.handle_prompt(&text_prompt("go")).await;
+    // SPAWNED and bounded, exactly as the other four looping tests in this file
+    // are. This one used to `await` the prompt bare, and with the guard disabled it
+    // HUNG rather than failed — `timeout 90 cargo test` exited 124 after "running
+    // for over 60 seconds". The thing under test is a turn loop that does not stop,
+    // so a bare await reports a stalled suite instead of a red test naming the
+    // invariant, and a hung test takes the rest of its process down with it.
+    //
+    // THE TIMEOUT ALONE IS NOT THE FIX, and a reader who copies the two lines
+    // below onto another looping test must know why. `tokio::time::timeout` bounds
+    // a task that SUSPENDS. `ScriptedProvider` answers from a `Vec` and the turn
+    // body is otherwise synchronous, so with both guards disabled the loop never
+    // yields, and on a current-thread runtime the timer cannot fire — measured: the
+    // wrapped test with a 3-SECOND timeout still ran past 60 s and exited 124. The
+    // provider above therefore yields once per call, which is the per-round
+    // suspension point a real provider gets from its socket for free. The pair —
+    // the yield AND the timeout — is what makes the disabled-guard case FAIL at
+    // `SETTLE` naming the bound; either half alone leaves the hang.
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the bounded turn TERMINATED (an unbounded loop hangs here)")
+        .expect("the turn task did not panic");
     let events =
         collect_events_until(&mut events_rx, |e| matches!(e, RpcEvent::agent_settled)).await;
     let kinds = kinds(&events);

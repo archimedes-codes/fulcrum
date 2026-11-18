@@ -511,21 +511,74 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 /// one key per turn is never bounded, however many rejections it accumulates
 /// over a long prompt.
 ///
-/// The shape this exists for is measured, and it is exact: one subagent made
-/// **303** `{}`-argument `bash` calls in 19 minutes. Each was refused BEFORE
-/// dispatch, each refusal was delivered to the model as its tool result, and the
-/// model answered with the identical call every time. Nothing in either repo
-/// could see it — `grep` for a loop detector, a dedup, a consecutive-error or a
-/// repeated-call guard returns zero production hits — because each individual
-/// round is a well-formed turn: a call, a rejection, a new attempt. Only the RUN
-/// is pathological.
+/// **And it is a PER-PROMPT bound.** `TurnLoopState` — which owns this counter
+/// and `model_rounds` beside it — is built fresh at the top of `handle_turn`, so
+/// BOTH counters reset on the next prompt. A capped turn therefore ends ONE
+/// turn; it does not stop the session from doing it again. A model that repeats
+/// the pathological call across prompts gets `MAX_IDENTICAL_REFUSAL_RUNS + 1`
+/// rounds PER PROMPT, forever, one user message at a time. That is the whole
+/// difference between "the loop is bounded" (true) and "the user must intervene"
+/// (also true), and the distinction is worth stating because the frame the user
+/// sees says only the first. Nothing here escalates, disables the tool, or
+/// surfaces a persistent flag — the cap is a per-turn circuit breaker, and the
+/// only cross-prompt memory in this loop is the transcript itself.
+///
+/// # The trigger classes it catches, and the one it deliberately does not
+///
+/// A batch counts as a refusal run when `refused_before_the_model_could_act` (`turn.rs`)
+/// answers true for EVERY call in it, and that predicate recognizes exactly
+/// three shapes — all of them "the engine refused this call and told the model to
+/// re-send it with correct arguments":
+///
+/// 1. **An extraneous top-level key** — `unknown_param_error`'s schema rule,
+///    refused BEFORE dispatch. Pinned by
+///    `a_run_of_identical_refused_batches_stops_the_turn_as_capped`.
+/// 2. **A parse `defect`** — the payload never became a value (issue #193), so
+///    `unknown_param_error`'s head arm refuses it before any spec lookup.
+/// 3. **A dispatched call that omitted an advertised `required` parameter** and
+///    came back `is_error` — the executor's ``missing `command` parameter``
+///    family. Pinned by
+///    `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`.
+///
+/// Class 3 is the one the shape of the field report actually needs, and it is
+/// the reason the guard is not simply "the pre-dispatch checker said no". The
+/// report is one subagent making **303** `{}`-argument `bash` calls in 19
+/// minutes, and `{}` carries NO keys at all — so `unknown_param_error`, which
+/// reports only EXTRANEOUS keys, answers `None` (`items.is_empty()`), the call is
+/// DISPATCHED, and `exec_bash` refuses with a tool-RESULT error the checker knows
+/// nothing about. At classes 1–2 alone the run reset to 0 every round and the
+/// burst ran to the 64-round ceiling: 64 rounds of a doomed call instead of 3.
+/// (The research also says the burst's assistant rows averaged 118 bytes — too
+/// small to be a truncation — so class 2, which is Task 4's `defect` arm, is NOT
+/// what catches it. The old text here claimed each of the 303 was "refused BEFORE
+/// dispatch". That was false of the burst and it is why class 3 exists.)
+///
+/// **What it is NOT is "the tool returned `is_error`".** That reading was
+/// rejected when the guard was designed and it is still rejected: a `bash`
+/// command that fails twice is progress, not a stuck loop, and a false positive
+/// here ends the user's prompt. `ls` is the sharper case — it DECLARES `path` as
+/// `required` and `exec_ls` defaults it to the `cwd`, so `ls {}` SUCCEEDS; a
+/// permission DENIAL is an `is_error` result too, and it is a user decision, not
+/// a mistake to correct. Hence the `required` conjunct beside `is_error`, and
+/// hence the pins on both sides of the line
+/// (`a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run`).
+/// The known UNDER-count that buys: a call carrying a required key of the wrong
+/// TYPE (`bash {"command": 42}`) is not a refusal, so such a run is bounded by
+/// the round ceiling instead. Narrower than the truth is the accepted direction.
 ///
 /// Like the round ceiling, 3 is a STARTING value and is NOT a measurement of our
 /// traffic. The upstream band ("stop after 2–3 identical consecutive failures")
-/// is where it comes from, and whether that band transfers to this engine's
-/// model mix is unverified here — a model that legitimately re-sends one rejected
-/// call twice before it reads the sentence would be bounded at 3. The constant is
-/// the knob to turn if that shows up.
+/// is where it comes from, and whether that band transfers to this engine's model
+/// mix is unverified here. The arithmetic, exactly: the initial refusal plus
+/// THREE identical re-sends all run, which is `MAX_IDENTICAL_REFUSAL_RUNS + 1`
+/// = 4 provider calls and 4 refused batches; the guard is consulted at the top of
+/// the next iteration, so the FOURTH re-send — the fifth call — is never made. A
+/// model that legitimately re-sends one refused call twice before it reads the
+/// sentence is therefore well inside the bound, and one that re-sends it three
+/// times is at its last tolerated round. It is a bare `const`, not a setting: not
+/// on `ModelOptions`, not in `settings.json`, nothing reads it from disk. Changing
+/// it is a commit, and the value that needs changing is argued for by the two
+/// pins named above, not by taste.
 ///
 /// And note WHERE it can fire: at the TOP of a loop iteration, never mid-batch.
 /// `run_tool_batch`'s `join_all` is awaited without a bound of its own, so a
@@ -1624,7 +1677,7 @@ impl AgentLoop {
             }
 
             // (4) Tool execution
-            let (batch_results, rejected) = self.run_tool_batch(&tool_calls, turn).await;
+            let (batch_results, refused) = self.run_tool_batch(&tool_calls, turn).await;
             // (the turn-loop bound) Update the identical-refusal run from the
             // batch's signature. `batch_signature` answers `None` the moment ONE
             // call was accepted, so a mixed batch resets the run to 0 rather than
@@ -1633,7 +1686,7 @@ impl AgentLoop {
             // the PREVIOUS batch only (a run, not a total), so a model that
             // alternates between two bad calls is bounded by the ROUND ceiling
             // instead, and not by this one.
-            let signature = turn::batch_signature(&tool_calls, &rejected);
+            let signature = turn::batch_signature(&tool_calls, &refused);
             state.identical_refusal_runs = if signature.is_some() && signature == previous_signature
             {
                 state.identical_refusal_runs + 1

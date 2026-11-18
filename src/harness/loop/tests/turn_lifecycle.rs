@@ -2721,10 +2721,15 @@ fn capped_kinds(events: &[RpcEvent]) -> Vec<String> {
 }
 
 /// A `write` call carrying the unknown `contentt` key ALONGSIDE the legal pair
-/// — `unknown_param_error`'s trigger, and the shape the field report describes
-/// (a call the engine refuses BEFORE dispatch, whose refusal the model then
-/// re-sends verbatim). The legal twin stays present so the rejection is the only
-/// reason the file is never written.
+/// — `unknown_param_error`'s extraneous-key trigger, refused BEFORE dispatch and
+/// then re-sent verbatim. The legal twin stays present so the rejection is the
+/// only reason the file is never written.
+///
+/// This is NOT the field report's shape. The report is `bash` with `arguments:
+/// {}`, which has no keys for the checker to call extraneous and so is DISPATCHED
+/// — that one is `bash_empty_call()` /
+/// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped` below.
+/// Both trigger classes must stay covered: this test pins the pre-dispatch one.
 fn refused_write_call() -> ToolCall {
     ToolCall {
         id: "t1".to_string(),
@@ -2740,10 +2745,16 @@ fn refused_write_call() -> ToolCall {
 
 /// A run of IDENTICAL refused batches stops the turn as `turn_capped`.
 ///
-/// The field report this exists for: one subagent made **303** `{}`-argument
-/// `bash` calls in 19 minutes — each refused before dispatch, each refusal
-/// delivered to the model, each followed by the identical call. Every individual
-/// round was a well-formed turn, so nothing in either repo could see it.
+/// This pins the PRE-DISPATCH trigger class: a call the param checker refuses
+/// before it runs. It is NOT the burst the field report describes — the report is
+/// **303** `{}`-argument `bash` calls in 19 minutes, and `{}` has no keys to
+/// refuse, so that call is DISPATCHED and refused by the executor instead. That
+/// shape is
+/// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`, and it
+/// is the one the guard was originally written for and did not catch. What both
+/// shapes share is why nothing could see them: every individual round is a
+/// well-formed turn — a call, a refusal, a new attempt — and only the RUN is
+/// pathological.
 ///
 /// One script entry reproduces a stuck turn, because `ScriptedProvider` repeats
 /// the LAST script when the index runs out — which is exactly what a looping
@@ -2833,6 +2844,138 @@ async fn a_run_of_identical_refused_batches_stops_the_turn_as_capped() {
     assert!(
         !kinds.iter().any(|k| k == "turn_truncated"),
         "the agent's own bound is not the provider's output cap, got {kinds:?}",
+    );
+}
+
+/// THE BURST SHAPE — `bash` with `arguments: {}`, the same call every round.
+///
+/// This is the shape the card, the plan and `MAX_IDENTICAL_REFUSAL_RUNS`'
+/// docblock all cite by number (**303** `{}`-argument `bash` calls in 19
+/// minutes), and it is NOT the shape `refused_write_call()` reproduces. The
+/// difference decides whether the guard fires at all:
+///
+/// * `refused_write_call` carries an EXTRANEOUS key, so `unknown_param_error`
+///   refuses it BEFORE dispatch and `rejected[i]` is true.
+/// * `bash` with `{}` has NO keys at all, so `unknown_param_error` — which
+///   reports only extraneous keys — answers `None` (`items.is_empty()`), the
+///   call is DISPATCHED, and `exec_bash` answers
+///   ``bash: missing `command` parameter``. That is a tool-RESULT error, which
+///   the pre-dispatch checker knows nothing about.
+///
+/// So the burst shape reaches this guard only through the SECOND trigger
+/// class: "the engine refused this call and told the model to re-send it with
+/// correct arguments", read off the advertised `required` list plus the
+/// result's own `is_error`. Without that class the 303-call run is stopped by
+/// the 64-round ceiling — 64 rounds of a doomed call instead of 3.
+///
+/// The bound is asserted at the provider, exactly as the extraneous-key test
+/// asserts it, for the same reason: a call count can be right for no wrong
+/// reason where an event count can.
+#[tokio::test]
+async fn a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            // NO keys at all — the field report's shape, verbatim.
+            arguments: json!({}),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ])]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let _loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the bounded turn TERMINATED (an unbounded loop hangs here)")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+        "the empty-argument burst is bounded at {MAX_IDENTICAL_REFUSAL_RUNS} repeats \
+         and the model is called exactly {} times — the 303-call loop is the failure \
+         this pins, and at HEAD the guard never sees this shape, so the turn runs to \
+         the {MAX_MODEL_ROUNDS_PER_PROMPT}-round ceiling instead, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "turn_capped").count(),
+        1,
+        "exactly ONE `turn_capped`, got {kinds:?}",
+    );
+    // And it is the REFUSAL guard, not the round ceiling, that ended it: the
+    // round count is the discriminator, and it is the smaller number.
+    assert!(
+        calls.load(Ordering::SeqCst) < MAX_MODEL_ROUNDS_PER_PROMPT,
+        "the refusal guard fired BEFORE the round ceiling, got {}",
+        calls.load(Ordering::SeqCst),
+    );
+}
+
+/// The false-positive half, and the reason the broadened predicate is not
+/// `is_error`: a batch whose calls FAILED BUT WERE WELL-FORMED is progress,
+/// not a stuck loop, and bounding it would end the user's prompt over a
+/// command that simply did not work.
+///
+/// `bash { "command": "exit 1" }` is the sharpest case available: identical
+/// every round, `is_error: true` every round, and NOTHING but the round
+/// ceiling can stop it. Every required key is present, so the `required`
+/// conjunct answers `false` and the run never grows — which is exactly the
+/// assertion that reddens if someone widens the predicate to "any tool error".
+///
+/// Reads the same way `a_mixed_batch_resets_the_identical_refusal_run` does:
+/// the run counter is loop-internal, so the observable is the provider call
+/// count. A run that grew stops at `MAX_IDENTICAL_REFUSAL_RUNS + 1`; a run
+/// that stays at 0 reaches `MAX_MODEL_ROUNDS_PER_PROMPT`.
+#[tokio::test]
+async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            // `command` IS there. The command fails; the CALL is well-formed.
+            arguments: json!({ "command": "exit 1" }),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ])]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("go")).await });
+    tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn TERMINATED (on the round ceiling, not the refusal guard)")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_MODEL_ROUNDS_PER_PROMPT,
+        "a failing command is NOT a refusal: the run stays at 0 and the turn \
+         survives to the round ceiling ({MAX_MODEL_ROUNDS_PER_PROMPT} calls). A turn \
+         stopped at {} means the guard fired on `is_error` alone, which is the \
+         false positive the plan rejected and this pin refuses, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
     );
 }
 
@@ -3211,5 +3354,255 @@ fn batch_signature_ignores_the_defect_field() {
         turn::batch_signature(std::slice::from_ref(&clean), &[false]),
         None,
         "one accepted call and there is no signature at all"
+    );
+}
+
+/// `batch_signature`'s docblock claims the `sort()` makes the signature
+/// independent of the order the provider emitted the calls in — "the difference
+/// between catching a model that repeats itself and missing one that permutes" —
+/// and until now **no test exercised a permutation at all**. Every existing
+/// signature test is a one-call batch, where sorting is a no-op and the claim is
+/// untestable; a `parts.sort()` deleted from the function would have left the
+/// whole suite green while silently un-arming the guard on any multi-call batch
+/// whose provider reordered (which providers do — the `subagent` batch's
+/// concurrent route is one reason the loop does not control emission order).
+///
+/// Two DIFFERENT calls, both refused, asserted equal in both orders — and then
+/// the half that keeps the equality honest: a batch that is actually a different
+/// SET still signs differently, so this is not a constant function either.
+#[test]
+fn batch_signature_is_independent_of_the_call_order() {
+    let bash_empty = ToolCall {
+        id: "t1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({}),
+        defect: None,
+    };
+    let read_missing = ToolCall {
+        id: "t2".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "pathe": "typo" }),
+        defect: None,
+    };
+    let both = [true, true];
+
+    let forward = turn::batch_signature(&[bash_empty.clone(), read_missing.clone()], &both)
+        .expect("a fully refused batch signs");
+    let reversed = turn::batch_signature(&[read_missing.clone(), bash_empty.clone()], &both)
+        .expect("and so does the same batch permuted");
+    assert_eq!(
+        forward, reversed,
+        "the same two refused calls in the OTHER order are the SAME batch — this \
+         is the permutation the `sort()` exists for, and the only assertion that \
+         would redden if it were dropped"
+    );
+
+    // The honesty half: a batch with a DIFFERENT membership is a different
+    // signature, so the equality above is a fact about order-independence and
+    // not about a function that ignores its input.
+    let third = ToolCall {
+        name: "grep".to_string(),
+        ..read_missing.clone()
+    };
+    assert_ne!(
+        forward,
+        turn::batch_signature(&[bash_empty.clone(), third], &both)
+            .expect("a fully refused batch signs"),
+        "swapping one call for another call changes the signature"
+    );
+    // And a permutation with an ACCEPTED call anywhere in it still answers `None`
+    // — the batch-wide rule is order-independent too, so the reset on progress
+    // cannot be lost by reordering.
+    assert_eq!(
+        turn::batch_signature(&[bash_empty.clone(), read_missing.clone()], &[true, false]),
+        None,
+        "one accepted call at the END and there is no signature"
+    );
+    assert_eq!(
+        turn::batch_signature(&[bash_empty, read_missing], &[false, true]),
+        None,
+        "one accepted call at the START and there is no signature"
+    );
+}
+
+/// `batch_signature` answers `None` when the two slices DISAGREE ON LENGTH.
+///
+/// The function `zip`ped the two, so a SHORT `refused` slice stopped the
+/// all-refused scan early and the function returned `Some(sig)` for a batch whose
+/// LAST call had been accepted — a false positive on the one guard whose false
+/// positives end the user's prompt. Production is safe today (`run_tool_batch`
+/// builds the vector to the exact length of the batch), but this is a
+/// `pub(super)` function over two INDEPENDENT slices, and the mis-alignment it
+/// would take to trigger is silent: no panic, no `debug_assert`, just a run that
+/// counts a batch the engine mostly ACCEPTED.
+///
+/// Both directions are pinned, and the short-`refused` case is the one that was
+/// actually wrong: two calls, one refusal flag, that flag `true`, and the batch
+/// is NOT all-refused because the second call was accepted.
+#[test]
+fn batch_signature_refuses_to_sign_a_length_mismatch() {
+    let first = ToolCall {
+        id: "t1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({}),
+        defect: None,
+    };
+    let second = ToolCall {
+        id: "t2".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "/x" }),
+        defect: None,
+    };
+
+    // The one that was WRONG: `zip` saw the single `true` and stopped.
+    assert_eq!(
+        turn::batch_signature(&[first.clone(), second.clone()], &[true]),
+        None,
+        "a `refused` slice SHORTER than the batch must not sign — the call the \
+         missing flag stands for may well have been accepted, and signing here is \
+         the false positive"
+    );
+    // The symmetric case, for the same reason (a longer flag slice means the
+    // caller is describing a batch it did not hand over).
+    assert_eq!(
+        turn::batch_signature(&[first.clone(), second.clone()], &[true, true, true]),
+        None,
+        "a `refused` slice LONGER than the batch is just as uninterpretable"
+    );
+    // And the empty pair, which is a length match: an EMPTY batch has nothing
+    // accepted in it, so it signs the empty signature. Nothing in production
+    // reaches this (an empty batch never gets here — the clean-stop return is
+    // gated on `tool_calls.is_empty()`), so it is pinned as the boundary of the
+    // rule rather than as behaviour anyone depends on.
+    assert_eq!(
+        turn::batch_signature(&[], &[]),
+        Some(String::new()),
+        "an empty batch is vacuously all-refused, and that is the boundary case \
+         the length check must not swallow"
+    );
+    // The control: the same batch with a correctly-sized flag slice DOES sign,
+    // so the two `None`s above came from the length and not from the calls.
+    assert!(
+        turn::batch_signature(&[first, second], &[true, true]).is_some(),
+        "the well-formed pair still signs — the mismatch arm did not become a \
+         blanket `None`"
+    );
+}
+
+/// The discriminator itself, pinned DIRECTLY on `run_tool_batch`'s second return
+/// value rather than inferred from a turn's provider-call count. The two
+/// end-to-end tests above prove the guard fires and does not over-fire; this says
+/// WHY, one call at a time, including the one shape that is the entire
+/// justification for requiring `is_error` beside the `required` test.
+///
+/// | call | refused | why |
+/// | --- | --- | --- |
+/// | `bash {}` | **true** | the field report's burst: `command` is advertised `required`, absent, and `exec_bash` errors |
+/// | `bash {"command": "exit 1"}` | false | well-formed; the COMMAND failed — progress, not a stuck loop |
+/// | `ls {}` | false | `path` is advertised `required` and IS absent, but `exec_ls` defaults it to the `cwd` and the call SUCCEEDS. This is the shape that makes `required` alone insufficient, and `is_error` is what saves it |
+/// | `write {path, content, contentt}` | **true** | the pre-dispatch extraneous-key class |
+/// | `list_agents {}` | false | declares no `required` at all, and succeeds |
+///
+/// The `ls` row is the one to keep. A future edit that drops the `is_error`
+/// conjunct "because a missing required param is obviously a refusal" reddens
+/// here — and would bound every successful bare `ls` in a repeated batch.
+#[tokio::test]
+async fn the_refusal_predicate_is_the_required_key_and_the_error_together() {
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("unused".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let call = |name: &str, arguments: Value| ToolCall {
+        id: format!("c-{name}"),
+        name: name.to_string(),
+        arguments,
+        defect: None,
+    };
+    let clean = CancellationToken::new();
+
+    // Each probe is its OWN batch, so one call's verdict cannot colour another's.
+    let burst = loop_
+        .run_tool_batch(&[call("bash", json!({}))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        burst,
+        vec![true],
+        "`bash` with NO arguments is the burst shape and MUST count as a refusal — \
+         this is the 303-call case, and at the pre-dispatch checker alone it is `false`"
+    );
+
+    let failing = loop_
+        .run_tool_batch(&[call("bash", json!({ "command": "exit 1" }))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        failing,
+        vec![false],
+        "a failing command with every required key present is NOT a refusal"
+    );
+
+    let bare_ls = loop_
+        .run_tool_batch(&[call("ls", json!({}))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        bare_ls,
+        vec![false],
+        "`ls` DECLARES `path` as required and `ls {{}}` omits it, but `exec_ls` \
+         defaults it and the call SUCCEEDS — so `is_error` is what keeps a working \
+         tool out of the refusal run. Drop that conjunct and this assertion reddens"
+    );
+
+    let extraneous = loop_
+        .run_tool_batch(
+            &[call(
+                "write",
+                json!({ "path": "x.txt", "content": "c", "contentt": "typo" }),
+            )],
+            &clean,
+        )
+        .await
+        .1;
+    assert_eq!(
+        extraneous,
+        vec![true],
+        "the pre-dispatch extraneous-key class is still a refusal"
+    );
+
+    let no_required = loop_
+        .run_tool_batch(&[call("list_agents", json!({}))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        no_required,
+        vec![false],
+        "a tool advertising no `required` list can never be a missing-parameter refusal"
+    );
+
+    // And the standing rule: on a CANCELLED batch nothing is a refusal, even the
+    // burst shape — every synthetic cancel result carries `is_error: true`, so
+    // without the guard's cancel arm a Stop would grow a run.
+    let stopped = CancellationToken::new();
+    stopped.cancel();
+    let cancelled = loop_
+        .run_tool_batch(&[call("bash", json!({}))], &stopped)
+        .await;
+    assert_eq!(
+        cancelled.1,
+        vec![false],
+        "cancellation beats refusal: a Stop must not arm the guard"
+    );
+    assert_eq!(
+        cancelled.0[0]["content"][0]["text"], "cancelled",
+        "and the model still reads `cancelled`, not a missing-parameter sentence"
     );
 }

@@ -13,6 +13,7 @@ use crate::events::RpcEvent;
 use crate::harness::provider::openai::content_is_the_sanitise_placeholder;
 use crate::harness::provider::{
     ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
+    ToolSpec,
 };
 use crate::policy::Decision;
 use crate::tools::{ContentBlock, ImageRef, ToolResult};
@@ -59,13 +60,22 @@ pub(super) struct TurnLoopState {
     pub(super) model_rounds: u32,
     /// How many consecutive batches have been refused with the SAME signature
     /// (see `MAX_IDENTICAL_REFUSAL_RUNS` in `loop.rs` — 3 is the consecutive
-    /// run, not a total). Reset to 0 by any batch that is not an exact repeat of
-    /// the one before it, which includes any batch with an accepted call.
+    /// run, not a total, and the bound is PER PROMPT because this whole struct
+    /// is rebuilt at the top of `handle_turn`). Reset to 0 by any batch that is
+    /// not an exact repeat of the one before it, which includes any batch with an
+    /// accepted call, and by a `refused` slice whose length disagrees with the
+    /// batch (`batch_signature` answers `None` rather than guessing).
+    ///
+    /// "Refused" is the predicate in `refused_before_the_model_could_act` (this module):
+    /// the pre-dispatch param check, a parse `defect`, or a dispatched call the
+    /// executor refused for omitting an advertised `required` parameter. NOT
+    /// "the tool errored" — see `MAX_IDENTICAL_REFUSAL_RUNS` for why that line
+    /// is where it is.
     pub(super) identical_refusal_runs: u32,
 }
 
 /// The signature of a batch that was refused WHOLESALE — `Some` only when EVERY
-/// call in it was rejected, `None` the moment one call was accepted.
+/// call in it was refused, `None` the moment one call was accepted.
 ///
 /// The `None`-on-any-accepted rule is what makes a mixed batch RESET the run
 /// rather than extend it: an agent that fixes one key and re-sends the rest is
@@ -78,17 +88,27 @@ pub(super) struct TurnLoopState {
 /// `(name, arguments)` can be re-split into a different pair that hashes the
 /// same way. Sorting makes the signature independent of the order the provider
 /// happened to emit the calls in, which is the difference between catching a
-/// model that repeats itself and missing one that permutes.
+/// model that repeats itself and missing one that permutes — pinned by
+/// `batch_signature_is_independent_of_the_call_order`, because that last clause
+/// is a claim about the `sort()` and nothing else exercised it.
 ///
 /// Takes `&[bool]`, NOT `&[Option<String>]`: the caller must not have to keep
 /// the rejection SENTENCES alive merely to ask whether a call was refused. The
 /// vector is index-aligned with `tool_calls`, straight off `run_tool_batch`.
-pub(super) fn batch_signature(tool_calls: &[ToolCall], rejected: &[bool]) -> Option<String> {
-    if tool_calls
-        .iter()
-        .zip(rejected)
-        .any(|(_, was_rejected)| !*was_rejected)
-    {
+///
+/// A LENGTH MISMATCH between the two slices answers `None` — no signature, so
+/// the run resets. `zip` would instead stop at the shorter slice and could
+/// return `Some` for a batch whose LAST call was accepted, which is a false
+/// positive on the one guard whose false positives end the user's prompt. The
+/// production caller builds `refused` to the exact length of `tool_calls`, so
+/// this arm is unreachable from `handle_turn`; it is here because this is a
+/// `pub(super)` function over two INDEPENDENT slices, and the silent early stop
+/// is the failure mode that would cost the most and show up the least.
+pub(super) fn batch_signature(tool_calls: &[ToolCall], refused: &[bool]) -> Option<String> {
+    if tool_calls.len() != refused.len() {
+        return None;
+    }
+    if refused.iter().any(|was_refused| !*was_refused) {
         return None;
     }
     let mut parts: Vec<String> = tool_calls
@@ -97,6 +117,114 @@ pub(super) fn batch_signature(tool_calls: &[ToolCall], rejected: &[bool]) -> Opt
         .collect();
     parts.sort();
     Some(parts.join("\n"))
+}
+
+/// Whether the ADVERTISED schema for `tc` names a `required` parameter the call
+/// does not carry, as a plain yes/no.
+///
+/// This is the structural half of the guard's second trigger class — see
+/// `refused_before_the_model_could_act` for what it is for and why it needs
+/// the `is_error` half beside it. It reads the SAME `advertised_specs()` value
+/// `unknown_param_error` reads (the same `tools[]` the provider was sent and the
+/// same `<tools>` the prompt rendered, ADR 0017's byte-identity), so the guard
+/// cannot hold the model to a `required` list it was never shown.
+///
+/// Deliberately NOT a second reading of `unknown_param_error`. That checker
+/// reports EXTRANEOUS keys and answers `None` for a call with no keys at all —
+/// which is exactly the shape of the burst this exists for, so reusing it would
+/// reuse the wrong question. This asks the other one: is a key the schema says
+/// is mandatory absent from what arrived? It is a membership test against the
+/// advertised shape, and nothing else — no value-type check, no prose matching.
+///
+/// Three absences answer `false`, each because a `true` there would be a false
+/// positive on a shape that is NOT a stuck loop:
+/// * no spec for the (alias-resolved) name — an unknown tool is
+///   `dispatch_tool`'s `unknown tool:` arm, and a disabled tool was never
+///   advertised, so there is no `required` list to hold the call to;
+/// * no `required` array — `list_agents`, `list_skills`, `mcp`, `web_search`
+///   declare none, so NOTHING they receive is a missing parameter;
+/// * a `required` key that IS present, whatever its type — `bash` with
+///   `{"command": 42}` omits nothing, so the guard does not read the executor's
+///   type refusal as a re-send instruction. That is a KNOWN UNDER-COUNT: such a
+///   run is bounded by the round ceiling instead. Narrower than the truth is
+///   the accepted direction here, because the failure mode of the wider reading
+///   is ending a user's prompt over a tool call that was fine.
+fn missing_required_param(specs: &[ToolSpec], tc: &ToolCall) -> bool {
+    let Some(spec) = specs
+        .iter()
+        .find(|s| s.name == crate::harness::dispatch::effective_tool_name(&tc.name))
+    else {
+        return false;
+    };
+    let Some(required) = spec.parameters.get("required").and_then(Value::as_array) else {
+        return false;
+    };
+    // A non-object `arguments` (a top-level JSON string) carries no keys, so it
+    // omits every required one. `unknown_param_error` cannot see that shape at
+    // all — its `as_object()?` answers `None` — which is the same blind spot the
+    // extraneous-key rule has, and the reason this half exists beside it.
+    let keys = tc.arguments.as_object();
+    required
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|key| keys.is_none_or(|args| !args.contains_key(key)))
+}
+
+/// Whether the engine refused call `i` in a way whose WHOLE POINT is "re-send
+/// this with correct arguments" — the predicate the identical-refusal run counts.
+///
+/// Two trigger classes, joined by OR, and nothing else:
+///
+/// 1. **Refused BEFORE dispatch**: `unknown_param_error` named an extraneous key
+///    or the call carried a parse `defect` (rule 0). `param_errors[i]` is the
+///    one source of truth for this and it is read, never recomputed.
+/// 2. **Dispatched, and refused by the executor for omitting a required
+///    parameter**: the advertised `required` list names a key the call does not
+///    carry AND the result came back `is_error`.
+///
+/// Class 2 is what makes the guard fire on the shape that motivated the whole
+/// change. The field report is **303 `{}`-argument `bash` calls in 19 minutes**,
+/// and class 1 cannot see it: `{}` has no keys, so there is no extraneous key to
+/// name, `unknown_param_error` answers `None`, the call is dispatched, and
+/// `exec_bash` answers ``bash: missing `command` parameter``. A tool-RESULT
+/// error, invisible to the pre-dispatch checker — so at class 1 alone the run
+/// reset to 0 every round and the burst ran to the 64-round ceiling. Class 2 is
+/// bounded by two pins:
+/// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped` (it does
+/// fire) and `a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run`
+/// (a failing command does NOT fire it).
+///
+/// Both halves of class 2 are load-bearing, and neither is `is_error` alone —
+/// which the plan rejected and still rejects. A `bash` command that fails twice
+/// is progress, not a stuck loop, and a guard that ends the user's prompt over
+/// one is worse than the loop it prevents; so the `required` half is what makes
+/// the sentence "the engine told the model to re-send this" a fact rather than a
+/// guess. Symmetrically, `ls` DECLARES `path` as required but `exec_ls` defaults
+/// it to the `cwd`, so `ls {}` SUCCEEDS — and it is the `is_error` half that
+/// keeps a succeeding call out of the run. The pair is the narrowest honest
+/// discriminator in the tree: both halves are structural (the advertised shape,
+/// and the executor's own verdict), and NO user-visible sentence is matched, so
+/// rewording ``missing `path` parameter`` cannot silently disarm the guard.
+///
+/// The `turn.is_cancelled()` half of class 2 keeps the standing
+/// **cancellation beats rejection** rule true of the new class too: every
+/// synthetic cancel result (`cancelled_tool_result`, `sudo_cancelled_result`)
+/// carries `is_error: true`, so without it a Stop pressed during a batch of
+/// empty-argument calls would grow a run the user just asked to stop. It gates
+/// class 2 and NOT class 1, because class 1's behaviour on a cancelled batch is
+/// pre-existing and pinned elsewhere (`param_rejection.rs` deliberately declines
+/// to assert `rejected` on a cancelled batch, for exactly this reason).
+fn refused_before_the_model_could_act(
+    tc: &ToolCall,
+    param_error: Option<&String>,
+    result: &ToolResult,
+    specs: &[ToolSpec],
+    turn_cancelled: bool,
+) -> bool {
+    if param_error.is_some() {
+        return true;
+    }
+    !turn_cancelled && result.is_error && missing_required_param(specs, tc)
 }
 
 impl AgentLoop {
@@ -652,27 +780,45 @@ impl AgentLoop {
 
     /// Dispatch tool calls (concurrent subagents + sequential tools) and append tool messages.
     ///
-    /// Returns `(results, rejected)`, BOTH index-aligned with `tool_calls`:
-    /// `rejected[i]` is true exactly where `unknown_param_error` refused call
-    /// `i` (the same `param_errors` vector the dispatch arms below consult — it
-    /// is NOT recomputed here, and a caller must not recompute it either,
-    /// because two independent readings of the checker is the drift the plan's
-    /// Decision 2 rejects). `rejected` exists so the caller can build
-    /// [`batch_signature`]: `param_errors` is a local of this function and a
-    /// signature computed from a second pass would be a second source of truth.
+    /// Returns `(results, refused)`, BOTH index-aligned with `tool_calls`:
+    /// `refused[i]` is true exactly where `refused_before_the_model_could_act`
+    /// says the engine told the model to re-send call `i` with correct
+    /// arguments — the pre-dispatch `unknown_param_error` refusal (which also
+    /// carries a parse `defect`), or a dispatched call the executor refused for
+    /// omitting a `required` parameter. The first half reads the SAME
+    /// `param_errors` vector the dispatch arms below consult — it is NOT
+    /// recomputed here, and a caller must not recompute it either, because two
+    /// independent readings of the checker is the drift the plan's Decision 2
+    /// rejects. `refused` exists so the caller can build [`batch_signature`]:
+    /// `param_errors` is a local of this function and a signature computed from
+    /// a second pass would be a second source of truth.
     ///
-    /// Note what `rejected[i]` does NOT claim: it is "the checker refused this
-    /// call's params", not "this call produced an error result". A call that was
-    /// ACCEPTED and then DENIED by the permission gate, or one that ran and
-    /// failed, is `false` — the repeat guard is about the model re-sending a
-    /// call the engine told it to fix, and a denied or failing tool is a
-    /// different problem with a different remedy.
+    /// Note what `refused[i]` does NOT claim. It is not "this call produced an
+    /// error result": a call that was ACCEPTED and then DENIED by the permission
+    /// gate, or one that ran and FAILED, is `false` — a denied or failing tool is
+    /// a different problem with a different remedy, and bounding it would end the
+    /// user's prompt over a command that merely did not work. The one
+    /// dispatched-call shape that DOES count is a call whose advertised
+    /// `required` keys are missing, because that sentence's only possible use is
+    /// "send it again, correctly". Cancellation is never a refusal, on either
+    /// class (see the function above for the arm-by-arm reason).
+    ///
+    /// The vector is built to the exact length of `tool_calls` — one push per
+    /// dispatch arm, in the same loop — and [`batch_signature`] refuses to sign a
+    /// length mismatch, so the alignment is structural at both ends.
     pub(super) async fn run_tool_batch(
         &mut self,
         tool_calls: &[ToolCall],
         turn: &CancellationToken,
     ) -> (Vec<Value>, Vec<bool>) {
         let mut turn_tool_results = Vec::new();
+        // (the turn-loop bound) The refusal vector, index-aligned with
+        // `tool_calls`, pushed to once per iteration of the dispatch loop below
+        // for the same reason `turn_tool_results` is: both halves of the pair
+        // `batch_signature` consumes have to be exactly as long as the batch,
+        // and a `zip` that stops early on a short vector is the silent
+        // mis-alignment this shape forecloses.
+        let mut refused: Vec<bool> = Vec::with_capacity(tool_calls.len());
         // (issue #93) The unknown-param check runs HERE, before the `join_all`
         // below, and NOT inside `dispatch_tool`: a `subagent` call is dispatched
         // CONCURRENTLY ahead of the sequential loop, so a check that only ran
@@ -820,6 +966,19 @@ impl AgentLoop {
                 }
             };
             let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
+            // (the turn-loop bound) THE REFUSAL, decided from the SAME
+            // `param_errors` the arms above consulted (class 1 — never a second
+            // `unknown_param_error` pass) plus the executor's own verdict and the
+            // advertised `required` list (class 2). Computed HERE, per call,
+            // inside the loop that produced the result, so the vector cannot
+            // drift out of step with the batch.
+            refused.push(refused_before_the_model_could_act(
+                tc,
+                param_errors.get(idx).and_then(Option::as_ref),
+                &result,
+                &specs,
+                turn.is_cancelled(),
+            ));
             turn_tool_results.push(result_value.clone());
             self.emit(RpcEvent::tool_execution_end {
                 tool_call_id: tc.id.clone(),
@@ -836,16 +995,16 @@ impl AgentLoop {
             self.persist_transcript_message();
         }
         self.note_context();
-        // (the turn-loop bound) The rejection vector, index-aligned with
-        // `tool_calls`, read off the SAME `param_errors` the dispatch arms above
-        // consulted — NOT a second `unknown_param_error` pass (see this
-        // function's docblock for why a recompute is the drift). `.get(i)` so a
-        // short vector reads as "not rejected" rather than panicking, matching
-        // the arms above.
-        let rejected: Vec<bool> = (0..tool_calls.len())
-            .map(|i| param_errors.get(i).is_some_and(Option::is_some))
-            .collect();
-        (turn_tool_results, rejected)
+        // (the turn-loop bound) The refusal vector, index-aligned with
+        // `tool_calls` by construction — one `push` per dispatch above, in the
+        // same loop — NOT a second `unknown_param_error` pass (see this
+        // function's docblock for why a recompute is the drift).
+        debug_assert_eq!(
+            refused.len(),
+            tool_calls.len(),
+            "one refusal per call in the batch"
+        );
+        (turn_tool_results, refused)
     }
 
     /// Close every tool row an ABANDONED attempt announced — the ONE close
