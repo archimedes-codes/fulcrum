@@ -58,24 +58,40 @@ impl AgentLoop {
     /// interactive channel, called in-process — NOT over a socket) +
     /// `subagent` (a native parent spawns an IN-PROCESS native child via
     /// `dispatch_native`).
-    /// Dispatch a single call. Returns the [`ToolResult`] and whether a PERSON
-    /// refused it — the same `(ToolResult, bool)` shape
-    /// `codemode::run_nested` returns, for the same reason.
+    /// Dispatch a single call. Returns the [`ToolResult`], whether a PERSON
+    /// refused it, and whether the executor ACCEPTED the arguments and RAN —
+    /// the same `(ToolResult, bool)` shape `codemode::run_nested` returns, for
+    /// the same reason, plus a third half for the mirror-image false positive.
     ///
-    /// `true` reaches here from exactly ONE arm: `sudo_exec`, whose confirm and
-    /// password sub-prompts are answered by a person and are refused INSIDE
-    /// `sudo_run_flow`, so the permission gate never sees the decision and
-    /// cannot supply the flag. Every other arm answers `false`, including the
-    /// `unknown tool` / `tool not enabled` results and a `codemode` bridge
-    /// refusal — those are the engine refusing, which IS a re-send instruction.
+    /// The second half, `true`, reaches here from exactly ONE arm: `sudo_exec`,
+    /// whose confirm and password sub-prompts are answered by a person and are
+    /// refused INSIDE `sudo_run_flow`, so the permission gate never sees the
+    /// decision and cannot supply the flag. Every other arm answers `false`,
+    /// including the `unknown tool` / `tool not enabled` results and a
+    /// `codemode` bridge refusal — those are the engine refusing, which IS a
+    /// re-send instruction.
     ///
-    /// The flag exists for `run_tool_batch`'s refusal predicate and nothing
+    /// The third half, `ran`, is FORWARDED and never decided here — no arm of
+    /// this `match` can tell "the executor rejected these arguments" from "the
+    /// executor accepted them and the command failed", and only `sudo_run_flow`
+    /// knows which of those it just did. It matters because `sudo_exec`
+    /// advertises `required: ["command", "reason"]` while the flow DEFAULTS an
+    /// omitted `reason`: a granted-confirm call whose command then fails is
+    /// `is_error` with an advertised-required key absent, which the refusal
+    /// predicate's class 2 would read as an argument rejection. It was not one.
+    /// `false` for every arm that never got that far, which is every other arm
+    /// in this `match` (the built-in executors are reached through
+    /// `execute_tool`, whose argument rejections this does NOT claim to see —
+    /// see `refused_before_the_model_could_act`'s docblock for what that leaves
+    /// as the guard's known weakness).
+    ///
+    /// Both flags exist for `run_tool_batch`'s refusal predicate and nothing
     /// else; `run_tool_batch` is this function's only production caller.
     pub(super) async fn dispatch_tool(
         &mut self,
         tc: &ToolCall,
         turn: &CancellationToken,
-    ) -> (ToolResult, bool) {
+    ) -> (ToolResult, bool, bool) {
         // The `enabled_tools` filter (`None` = ALL — finding 13b): a
         // disabled tool is a tool-result error, NOT executed.
         // `dispatch_subagent` is an ALIAS of `subagent` (the `match`
@@ -84,7 +100,8 @@ impl AgentLoop {
         // `tool not enabled: dispatch_subagent` when the model emits it.
         if !self.is_tool_enabled(&tc.name) {
             // The ENGINE refusing (the tool is not enabled), not a person — so
-            // the flag is `false` and the refusal guard still counts it.
+            // the flag is `false` and the refusal guard still counts it. The
+            // third flag is `false` too: nothing ran.
             return (
                 ToolResult {
                     content: vec![ContentBlock::Text {
@@ -93,6 +110,7 @@ impl AgentLoop {
                     details: None,
                     is_error: true,
                 },
+                false,
                 false,
             );
         }
@@ -109,8 +127,10 @@ impl AgentLoop {
             // borrow inside the batch's futures.
             self.fold_child_cost(child_cost);
             // A child's own result is never a PERSON's refusal of THIS call; the
-            // child's gate ran inside the child, with its own refusal guard.
-            return (result, false);
+            // child's gate ran inside the child, with its own refusal guard. The
+            // third flag is `false` as well — the child ran, not THIS call, and a
+            // child's result carries no verdict about this call's arguments.
+            return (result, false, false);
         }
         match tc.name.as_str() {
             "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
@@ -136,6 +156,22 @@ impl AgentLoop {
                 // failed command) is the ENGINE refusing — counted. No person is
                 // involved here: the permission gate decided that BEFORE this
                 // arm, and its denial is marked in `run_tool_batch`.
+                //
+                // The third flag is `false` HERE, and that is a deliberate
+                // CONSERVATISM, not a claim. The flag means "the executor
+                // accepted these arguments and RAN them", and `execute_tool`
+                // returns a plain `ToolResult` that cannot say which of the two
+                // happened — so this arm cannot attest it, and an unattested call
+                // stays inside class 2. That is what keeps the card's headline
+                // pin: `bash {}` omits the advertised-required `command`,
+                // `exec_bash` answers ``bash: missing `command` parameter``, and
+                // the 303-call burst must still cap at 4. Marking this arm `true`
+                // would silence the guard on the exact shape it exists for.
+                // The residual is documented in
+                // `refused_before_the_model_could_act`'s docblock: a built-in that
+                // DEFAULTS an advertised-required key and then errors would be a
+                // false positive of the same class as `sudo_exec`'s `reason`, and
+                // this arm cannot see one.
                 (
                     execute_tool(
                         &self
@@ -145,6 +181,7 @@ impl AgentLoop {
                         &tc.arguments,
                     )
                     .await,
+                    false,
                     false,
                 )
             }
@@ -166,7 +203,9 @@ impl AgentLoop {
                         _ = turn.cancelled() => Self::cancelled_tool_result(),
                     },
                     // The cancel arm is excluded by the predicate's own
-                    // `turn.is_cancelled()` half, not by this flag.
+                    // `turn.is_cancelled()` half, not by this flag. Neither flag
+                    // is attested: `todo_apply` returns a plain `ToolResult`.
+                    false,
                     false,
                 )
             }
@@ -178,14 +217,15 @@ impl AgentLoop {
                 // Stop still EXECUTED the elevated command). The prompts
                 // now carry no deadline at all, so this turn-token race is
                 // the ONLY thing that settles a Stop promptly.
-                // THE ONE arm in this `match` that can answer `true`, and the
-                // reason the tuple exists at all: a declined confirm or a
-                // cancelled password entry is a PERSON'S "no", decided inside
-                // `sudo_run_flow` where the permission gate cannot see it. The
-                // flag rides out of the flow rather than being read off the
-                // flow's sentence. The cancel arm answers `false` because a Stop
-                // is excluded one layer up, by the predicate's
-                // `turn.is_cancelled()` half.
+                // THE ONE arm in this `match` that can answer `true` on EITHER
+                // flag, and the reason the tuple exists at all: a declined confirm
+                // or a cancelled password entry is a PERSON'S "no", decided inside
+                // `sudo_run_flow` where the permission gate cannot see it, and a
+                // command that was confirmed, credentialed and RUN is a verdict on
+                // the PROCESS and not on the arguments. Both flags ride out of the
+                // flow rather than being read off the flow's sentence. The cancel
+                // arm answers `false` on both because a Stop is excluded one layer
+                // up, by the predicate's `turn.is_cancelled()` half.
                 tokio::select! {
                     r = sudo_run_flow(
                         &self.session_id,
@@ -198,7 +238,7 @@ impl AgentLoop {
                         &self.sudo.sudo_password,
                         &self.cancel,
                     ) => r,
-                    _ = turn.cancelled() => (Self::sudo_cancelled_result(), false),
+                    _ = turn.cancelled() => (Self::sudo_cancelled_result(), false, false),
                 }
             }
             "ask" => {
@@ -216,9 +256,9 @@ impl AgentLoop {
                     turn,
                 )
                 .await;
-                (result, false)
+                (result, false, false)
             }
-            "list_agents" => (self.list_agents_tool().await, false),
+            "list_agents" => (self.list_agents_tool().await, false, false),
             "mcp" => {
                 // RACED against the TURN token (finding 8b, round 2 — a Stop
                 // mid-mcp-call cancels the in-flight request + kills the stdio
@@ -228,6 +268,7 @@ impl AgentLoop {
                         r = mcp_tool(&self.mcp, &tc.arguments, turn) => r,
                         _ = turn.cancelled() => Self::cancelled_tool_result(),
                     },
+                    false,
                     false,
                 )
             }
@@ -252,6 +293,7 @@ impl AgentLoop {
                     )
                     .await,
                     false,
+                    false,
                 )
             }
             // The ENGINE refusing an unreachable name — a re-send instruction.
@@ -263,6 +305,7 @@ impl AgentLoop {
                     details: None,
                     is_error: true,
                 },
+                false,
                 false,
             ),
         }

@@ -383,16 +383,43 @@ pub async fn todo_apply(
 /// token); the `SudoPromptCleanup` guard emits the terminal
 /// `interactive-request-close` on a DROPPED (unanswered) prompt.
 ///
-/// Returns the [`ToolResult`] and whether a PERSON refused the flow — the SAME
-/// `(ToolResult, bool)` shape `codemode::run_nested` returns for the same
-/// reason. The second half is `true` for the two arms a human decided
-/// (the declined confirm, the cancelled password entry) and `false` for every
-/// arm the ENGINE or the OS decided (empty command, a process failure, an auth
-/// failure, a non-zero exit, success). It is structural, never inferred from
-/// the result text: the loop's identical-refusal guard must not end a user's
-/// prompt over their own three "no" clicks, and a guard that read the sentence
-/// "Command not confirmed" would be re-armed by rewording it. See
-/// `refused_before_the_model_could_act`'s docblock.
+/// Returns the [`ToolResult`], whether a PERSON refused the flow, and whether the
+/// flow REACHED THE RUN — the same `(ToolResult, bool)` shape
+/// [`codemode::run_nested`](crate::harness::r#loop::codemode::run_nested) returns,
+/// with a third half for the mirror-image false positive.
+///
+/// The second half is `true` for the two arms a human decided (the declined
+/// confirm, the cancelled password entry) and `false` for every arm the ENGINE or
+/// the OS decided (empty command, a process failure, an auth failure, a non-zero
+/// exit, success). It is structural, never inferred from the result text: the
+/// loop's identical-refusal guard must not end a user's prompt over their own three
+/// "no" clicks, and a guard that read the sentence "Command not confirmed" would be
+/// re-armed by rewording it.
+///
+/// The THIRD half is the one the guard cannot infer either, and it exists for the
+/// opposite failure. `sudo_exec` advertises `required: ["command", "reason"]` while
+/// this flow reads `reason` with `.unwrap_or("")` — an omitted `reason` is
+/// DEFAULTED, not rejected. So a granted-confirm call that then fails on a wrong
+/// password arrives at the loop as `is_error: true` with an advertised-`required`
+/// key absent, which is exactly what class 2 of `refused_before_the_model_could_act`
+/// reads as "the executor rejected these arguments, re-send them". It did not: the
+/// call was structurally accepted, the person confirmed it, the credential was
+/// supplied and the command RAN. `reached_the_run` says so at the one place that
+/// can know, and the guard's class 2 stands down when it is `true`. Measured before
+/// this flag: **4 provider calls and one `turn_capped`** on
+/// `{"command":"x"}` + a granted confirm + a failing command — four rounds of the
+/// engine's OWN "the user will be re-prompted on the next attempt" sentence, ending
+/// the user's prompt mid-authentication. Pinned by
+/// `a_confirmed_sudo_exec_that_fails_is_never_a_refusal_run`.
+///
+/// It is `true` for all FOUR post-run arms including the process-level failure (a
+/// spawn error is even less of an argument rejection than a non-zero exit is), and
+/// `false` for the three arms that return BEFORE any run: the empty-command
+/// rejection — which genuinely IS a re-send instruction and must stay counted — the
+/// declined confirm and the cancelled password entry.
+///
+/// See `refused_before_the_model_could_act`'s docblock for what the guard does with
+/// these two flags and for the general weakness they cannot close.
 #[allow(clippy::too_many_arguments)]
 // (T5/S3 A.3) `pub(crate)` → `pub`: the caller `harness/loop/tools.rs` stays
 // desktop until S5, and a package boundary erases `pub(crate)`.
@@ -406,7 +433,7 @@ pub async fn sudo_run_flow(
     pending_sudo: &PendingSudo,
     sudo_password: &Arc<Mutex<HashMap<String, CachedPassword>>>,
     cancel: &CancellationToken,
-) -> (ToolResult, bool) {
+) -> (ToolResult, bool, bool) {
     let command = params
         .get("command")
         .and_then(Value::as_str)
@@ -425,6 +452,11 @@ pub async fn sudo_run_flow(
     // asked, and the sentence IS a re-send instruction ("provide the exact
     // command"), so the second half is `false` and the refusal guard still
     // counts it.
+    //
+    // The THIRD half is `false` as well, and for the same reason: nothing ran, so
+    // nothing could have failed for a cause unrelated to the arguments. This arm's
+    // failure has ONLY the missing `command` as its cause, which is exactly the
+    // inference class 2 is entitled to make. Contrast the four post-run arms below.
     if command.is_empty() {
         return (
             ToolResult {
@@ -436,6 +468,7 @@ pub async fn sudo_run_flow(
                 ),
                 is_error: true,
             },
+            false,
             false,
         );
     }
@@ -516,6 +549,10 @@ pub async fn sudo_run_flow(
                 is_error: true,
             },
             true,
+            // Nothing was run — the guard's `denied` half is what excludes this, so
+            // the third half is `false` (it would be redundant here, and a `true`
+            // would claim a run that never happened).
+            false,
         );
     }
 
@@ -598,6 +635,8 @@ pub async fn sudo_run_flow(
                 is_error: true,
             },
             true,
+            // Not executed — see the declined-confirm arm above.
+            false,
         );
     };
     if prompted {
@@ -647,6 +686,15 @@ pub async fn sudo_run_flow(
     // spawn). Every one of them answers `refused: false`, so the guard's
     // exclusion covers the two sub-prompt arms and NOT the executor's verdicts:
     // a `sudo` command that fails twice is still progress, not a stuck loop.
+    //
+    // All four DO answer `reached_the_run: true`, and that is the half the guard
+    // needs for the MIRROR case: the call was accepted on its arguments, a person
+    // approved it, and the failure arrived from the process, not from the schema.
+    // That includes the process-level (spawn) arm — a spawn error is even further
+    // from an argument rejection than a non-zero exit is. Without this flag the
+    // omitted-but-DEFAULTED `reason` plus these arms' `is_error` reads to class 2
+    // as "the executor rejected these arguments", and four identical re-sends end
+    // the user's prompt on the engine's own re-prompt invitation.
     let result = if let Some(error) = &run.error {
         // Process-level failure (spawn error, transport failure, stdin-write
         // timeout) — the suite's `tool.ts:483-490`: a clean tool failure with
@@ -740,7 +788,7 @@ pub async fn sudo_run_flow(
             is_error: false,
         }
     };
-    (result, false)
+    (result, false, true)
 }
 
 #[cfg(test)]
@@ -990,8 +1038,9 @@ mod tests {
                 // not put on the wire: the envelope this path writes is the
                 // desktop's render input, and the flag exists only for the
                 // native loop's refusal guard (the worker's own loop reads it
-                // from `dispatch_tool` directly, not from this frame).
-                (result, _refused) = core => {
+                // from `dispatch_tool` directly, not from this frame). The
+                // `ran` half is dropped for exactly the same reason.
+                (result, _refused, _ran) = core => {
                     json!({
                         "type": "response",
                         "id": id,

@@ -74,6 +74,54 @@ impl SudoRunner for RecordingSudoRunner {
     }
 }
 
+/// A `SudoRunner` that COMPLETES a run and reports it as a WRONG-PASSWORD
+/// authentication failure, recording that the elevated command was reached.
+///
+/// The shape `a_confirmed_sudo_exec_that_fails_is_never_a_refusal_run` needs, and
+/// the reason `RecordingSudoRunner` cannot serve it: that double's `run` future is
+/// `unreachable!()` because its tests pin that the command NEVER runs. This one
+/// pins the opposite — the confirm was GRANTED, the credential was supplied, and
+/// the process ran and failed — so it must return a real `SudoRun`.
+///
+/// `stderr` carries the two substrings `is_sudo_auth_failure` keys on
+/// (`"[sudo] password for"` + `"incorrect password"`), which routes the flow to its
+/// auth-failure arm: `error: None` (a process-level failure would take the FIRST
+/// arm and never reach the auth signature) and `exit_code: Some(1)`, because that
+/// arm `expect`s an observed code rather than inventing one. The arm's sentence is
+/// the one that INVITES a retry ("the user will be re-prompted on the next
+/// attempt"), which is what makes this the user-visible instance of the false
+/// positive: the model obeys a sentence the engine itself wrote.
+pub(super) struct FailingSudoRunner {
+    pub(super) ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl SudoRunner for FailingSudoRunner {
+    fn run(
+        &self,
+        _argv: Vec<String>,
+        _password: String,
+        _timeout: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::interactive::SudoRun> + Send + 'static>,
+    > {
+        self.ran.store(true, Ordering::SeqCst);
+        Box::pin(async {
+            crate::interactive::SudoRun {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "[sudo] password for daniel: Sorry, try again.\n\
+                         sudo: 1 incorrect password attempt"
+                    .to_string(),
+                timed_out: false,
+                is_error: true,
+                note: None,
+                error: None,
+            }
+        })
+    }
+}
+
 /// A scripted `Provider` (canned `ProviderEvent`s per `complete` call
 /// — out of range repeats the LAST script; `None` = a HANGING call
 /// (`complete` never resolves — the cancel tests). `calls` counts the

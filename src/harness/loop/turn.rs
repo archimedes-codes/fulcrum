@@ -268,7 +268,15 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// 2. **Dispatched, and refused by the executor for omitting a required
 ///    parameter**: the advertised `required` list names a key the call does not
 ///    carry (nor satisfy through an advertised alias) AND the result came back
-///    `is_error` AND the call was not DENIED by the permission gate.
+///    `is_error` AND the call was not DENIED by the permission gate AND no
+///    executor attested that it ACCEPTED the arguments and RAN them.
+///
+///    Read that last pair as one rule with a name: class 2 means **"the executor
+///    rejected the arguments"**, not "it errored and a key happened to be missing".
+///    `denied` and `ran` are the two structural halves of that meaning, both
+///    threaded rather than inferred, and both exist because the inference in the
+///    middle of the sentence is not sound on its own — see
+///    "THE GENERAL WEAKNESS" below, which is the honest statement of what is left.
 ///
 /// Class 2 is what makes the guard fire on the shape that motivated the whole
 /// change. The field report is **303 `{}`-argument `bash` calls in 19 minutes**,
@@ -285,16 +293,18 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// Both halves of class 2 are load-bearing, and neither is `is_error` alone —
 /// which the plan rejected and still rejects. A `bash` command that fails twice
 /// is progress, not a stuck loop, and a guard that ends the user's prompt over
-/// one is worse than the loop it prevents; so the `required` half is what makes
-/// the sentence "the engine told the model to re-send this" a fact rather than a
-/// guess.
+/// one is worse than the loop it prevents; so the `required` half is what keeps
+/// the sentence "the engine told the model to re-send this" from being a pure
+/// guess. It does NOT make it a fact, and
+/// "THE GENERAL WEAKNESS — read this before trusting class 2" below says exactly
+/// where the inference still breaks.
 ///
 /// # The exclusions class 2 needs beside `is_error`, and what is left
 ///
-/// Both halves are necessary and, on their own, NOT sufficient. Three real
-/// shapes satisfy `is_error` + a missing advertised `required` key without being
+/// Both halves are necessary and, on their own, NOT sufficient. Four real shapes
+/// satisfy `is_error` + a missing advertised `required` key without being
 /// "the engine told the model to re-send this with correct arguments", and all
-/// three are excluded here rather than being argued about in prose:
+/// four are excluded here rather than being argued about in prose:
 ///
 /// * **A permission DENIAL** (`denied`). The gate's refusal arms build their
 ///   result IN THIS FILE (`run_tool_batch`), with `is_error: true`, so a denied
@@ -311,10 +321,10 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 ///   it is built outside this file, inside `sudo_run_flow`
 ///   (`src/interactive/mod.rs`), so it does not arrive through `gate_tool` and
 ///   the gate's flag cannot cover it. `sudo_run_flow` now returns
-///   `(ToolResult, bool)` for exactly that reason and `dispatch_tool` propagates
-///   the second half — the same shape `run_nested` already used, so the crate has
-///   ONE way to say "a person refused this call". Before it did, this was an
-///   **OVER**-count, and the over-count direction is the one that ends a prompt:
+///   `(ToolResult, bool, bool)` for exactly that reason and `dispatch_tool`
+///   propagates the second half — the same shape `run_nested` already used, so the
+///   crate has ONE way to say "a person refused this call". Before it did, this was
+///   an **OVER**-count, and the over-count direction is the one that ends a prompt:
 ///   `sudo_exec {"command": "x"}` — `command` present, `reason` OMITTED, which is
 ///   what satisfies class 2's `required` half — plus a declined confirm plus
 ///   three identical re-sends was measured at **4 provider calls and one
@@ -332,35 +342,96 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 ///   behavioural one just named (measured: rewording one of the six leaves the
 ///   declaration census green).
 ///
+/// * **A call the executor ACCEPTED and RAN** (`ran`). This is the FOURTH
+///   corridor and the MIRROR of the first: the gate's denials and the `sudo_exec`
+///   sub-prompt refusals are a person saying no, this one is the machine saying
+///   "the command failed". `sudo_exec {"command": "x"}` — `reason` omitted — plus a
+///   confirm the user ACCEPTS plus a wrong password arrives as `is_error: true`
+///   with an advertised-`required` key absent, and class 2 counted it. Measured at
+///   **4 provider calls and one `turn_capped`**, and it is the WORST instance of
+///   this class the tree contains, because the auth-failure arm's own sentence is
+///   "the user will be re-prompted on the next attempt": the engine invites the
+///   retry, the model obeys, and four obeyed invitations end the user's prompt
+///   mid-authentication. Like `denied`, the flag is threaded from the one place
+///   that can know — `sudo_run_flow` returns `(ToolResult, bool, bool)` and
+///   `dispatch_tool` forwards the third half — and no result text is read.
+///   Pinned by `a_confirmed_sudo_exec_that_fails_is_never_a_refusal_run`.
+///
+///   THE ONE CONSERVATIVE CHOICE INSIDE THAT FLAG, and the reason the headline pin
+///   survives: `ran` means "an executor attested that it accepted these arguments
+///   and ran them", and only `sudo_run_flow` can attest it. The built-in executors
+///   are reached through `execute_tool`, which returns a plain `ToolResult` that
+///   cannot say which of the two happened, so `dispatch_tool`'s built-in arm answers
+///   `ran: false` — an UNATTESTED call stays inside class 2. That is what keeps
+///   `bash {}` capping at 4 (`exec_bash` answers ``bash: missing `command`
+///   parameter`` and nothing attests a run); marking that arm `true` would silence
+///   the guard on the 303-call shape the whole card is about.
+///
+/// # THE GENERAL WEAKNESS — read this before trusting class 2
+///
+/// Class 2 is an INFERENCE, not a fact. It reads *the advertised shape* (a
+/// `required` key the call does not carry) together with *the executor's verdict*
+/// (`is_error`) and concludes "the executor rejected these arguments and told the
+/// model to re-send them". **Nothing in that pair requires the omission to be the
+/// CAUSE of the error.** The inference is wrong whenever an executor DEFAULTS a key
+/// the schema advertises as `required` — the call is structurally accepted, runs,
+/// and fails for a reason that has nothing to do with the missing key. The schema
+/// and the executor disagree about what is mandatory, and class 2 reads the schema.
+///
+/// Two instances of that disagreement exist in this tree today:
+///
+/// * **`sudo_exec`'s `reason`** — `tool_specs.rs` advertises
+///   `required: ["command", "reason"]` while `sudo_run_flow` reads `reason` with
+///   `.unwrap_or("")`. This one was LIVE and user-visible, and the `ran` flag above
+///   is the fix for it: the flow attests the run, so the inference is overruled by
+///   the one party that knows.
+/// * **`ls`'s `path`** — advertised `required`, and `exec_ls` defaults it. Excluded
+///   today only because the defaulted call SUCCEEDS, so `is_error` answers `false`
+///   before the inference is ever drawn. It is not excluded by anything that
+///   understands the disagreement: give `exec_ls` one more `is_error` arm — a
+///   permission error on the defaulted directory, say — and `ls {}` becomes this
+///   same false positive with no flag to exclude it, because `dispatch_tool`'s
+///   built-in arm answers `ran: false`.
+///
+/// Closing it properly means threading a "the arguments were rejected" signal out
+/// of every executor — `execute_tool` and its ~18 arms, the three web executors,
+/// the seven board verbs — which is a materially larger change than this false
+/// positive warrants, and it would have to be built so that `bash {}` STILL counts
+/// (the executor's missing-`command` arm genuinely is a rejection). The `ran` flag
+/// is the narrow slice of that signal this tree can state honestly today: the
+/// converse of "rejected", available at one corridor, chosen so the residual stays
+/// in the under-count direction.
+///
 /// What is DELIBERATELY NOT covered, all in the under-count direction (a stuck
 /// run reaches the 64-round ceiling instead of 3 — the accepted cost, because the
 /// cost of the opposite error is ending a legitimate prompt):
 ///
 /// * `ls {}` — `path` is advertised `required` and IS absent, but `exec_ls`
 ///   defaults it and the call SUCCEEDS, so `is_error` excludes it. The case that
-///   proves `required` alone is not enough.
+///   proves `required` alone is not enough, and — see the weakness above — the one
+///   that would turn into a false positive if that executor ever errored.
 /// * A `required` key present with the WRONG TYPE or an empty value.
-/// * **The `sudo_exec` shape itself, now that its refusal is excluded.** The
-///   exclusion is per CALL, not per reason, so a model that omits `reason`, gets
-///   a confirm it ACCEPTS, and then re-sends identically is no longer counted
-///   either. That is the residual for this tool and it is 64 rounds of a doomed
-///   call — measured, and the accepted direction.
+/// * **The `sudo_exec` shape itself, on both refusals.** The exclusion is per
+///   CALL, not per reason, so a model that omits `reason` and re-sends identically
+///   is no longer counted whichever way its confirm went. That is the residual for
+///   this tool and it is 64 rounds of a doomed call — measured, and the accepted
+///   direction.
 ///
-/// # Why the flag is a `bool`, and what actually guards a FOURTH corridor
+/// # Why the flags are `bool`s, and what actually guards a fifth corridor
 ///
-/// The flag says "a person refused this call" and nothing else, so it cannot
-/// distinguish a declined confirm from a declined password entry from a prompt
-/// nobody has written yet — and it does not need to. What it genuinely cannot do
-/// is notice a corridor nobody thought of: a new refusal site that forgets to
-/// mark itself is invisible to every behavioural pin here, because each pin
-/// scripts only the shape it knows about. A non-exhaustive enum would not close
+/// The flags say "a person refused this call" and "the executor ran it" and nothing
+/// else, so neither can distinguish a declined confirm from a declined password
+/// entry from a prompt nobody has written yet — and neither needs to. What they
+/// genuinely cannot do is notice a corridor nobody thought of: a new site that
+/// forgets to mark itself is invisible to every behavioural pin here, because each
+/// pin scripts only the shape it knows about. A non-exhaustive enum would not close
 /// that either — an unhandled variant still compiles at every `matches!` site.
 ///
-/// The guard that does survive a fourth corridor is the census
+/// The guard that does survive a corridor nobody thought of is the census
 /// [`crate::source_lints::every_denial_marking_site_in_the_batch_is_accounted`]:
-/// it counts the denial-marking sites in `run_tool_batch`'s region and fails on a
-/// count nobody chose, so an added corridor reddens instead of silently
-/// over-counting.
+/// it counts the denial-marking sites and every flag answer in `run_tool_batch`'s
+/// region, and fails on a count nobody chose, so an added corridor reddens instead
+/// of silently over- or under-counting.
 ///
 /// The `turn.is_cancelled()` half of class 2 keeps the standing
 /// **cancellation beats rejection** rule true of the new class too: every
@@ -377,13 +448,16 @@ fn refused_before_the_model_could_act(
     specs: &[ToolSpec],
     turn_cancelled: bool,
     denied: bool,
+    ran: bool,
 ) -> bool {
     if param_error.is_some() {
         return true;
     }
     // A denial is the USER's decision — never a re-send instruction, whatever the
     // result's `is_error` says. See the docblock's first exclusion.
-    !turn_cancelled && !denied && result.is_error && missing_required_param(specs, tc)
+    // A call the executor ACCEPTED and RAN is no one's argument rejection — see
+    // the fourth exclusion.
+    !turn_cancelled && !denied && !ran && result.is_error && missing_required_param(specs, tc)
 }
 
 impl AgentLoop {
@@ -980,24 +1054,32 @@ impl AgentLoop {
     ///
     /// Note what `refused[i]` does NOT claim. It is not "this call produced an
     /// error result": a call that was ACCEPTED and then DENIED by the permission
-    /// gate, or one that ran and FAILED, is `false` — a denied or failing tool is
-    /// a different problem with a different remedy, and bounding it would end the
-    /// user's prompt over a command that merely did not work. The one
+    /// gate, one that a person refused at a `sudo_exec` sub-prompt, or one whose
+    /// command RAN and FAILED is `false` — each a different problem with a
+    /// different remedy, and bounding any of them would end the user's prompt over
+    /// a decision they made or a command that merely did not work. The one
     /// dispatched-call shape that DOES count is a call whose advertised
-    /// `required` keys are missing (with no advertised alias carrying them),
-    /// because that sentence's only possible use is "send it again, correctly".
-    /// Cancellation is never a refusal, on either class (see the function above
-    /// for the arm-by-arm reason).
+    /// `required` keys are missing (with no advertised alias carrying them) and
+    /// that no executor attests it accepted and ran, because that sentence's only
+    /// possible use is "send it again, correctly". Cancellation is never a
+    /// refusal, on either class (see the function above for the arm-by-arm reason).
     ///
-    /// THE DENIAL HALF IS STRUCTURAL, NOT INFERRED, and that is the whole of the
-    /// first exclusion: the dispatch expression yields `(result, denied)` and the
-    /// two arms that CONSTRUCT a gate denial (`gate_tool` answering `false`, and
-    /// `Decision::Deny`) are the only ones that set `denied: true`. Reading the
-    /// result's text instead would make the guard depend on a sentence someone may
-    /// reword, and a rewording would silently re-arm the false positive that ends
-    /// a user's prompt over their own "no". `codemode`'s `run_nested` returns the
-    /// same pair for the same reason (there it picks `denied` over `error` as the
-    /// row's status).
+    /// THE DENIAL HALF AND THE `ran` HALF ARE STRUCTURAL, NOT INFERRED, and that is
+    /// the whole of the first and fourth exclusions: the dispatch expression yields
+    /// `(result, denied, ran)`, the two arms that CONSTRUCT a gate denial
+    /// (`gate_tool` answering `false`, and `Decision::Deny`) are the only ones that
+    /// set `denied: true`, and the only arm that can set `ran: true` is the one that
+    /// forwards `sudo_run_flow`'s third flag. Reading the result's text instead
+    /// would make the guard depend on a sentence someone may reword, and a
+    /// rewording would silently re-arm the false positive that ends a user's prompt
+    /// over their own "no" — or over a password prompt the engine itself told them
+    /// to try again. `codemode`'s `run_nested` returns the same pair for the same
+    /// reason (there it picks `denied` over `error` as the row's status).
+    ///
+    /// `ran` is `false` for every arm whose executor cannot attest a run — which
+    /// is every arm but `sudo_exec` — so an unattested call stays inside class 2.
+    /// That conservatism is load-bearing: it is what keeps `bash {}`, the 303-call
+    /// burst shape, counting as a refusal.
     ///
     /// The vector is built to the exact length of `tool_calls` — one push per
     /// dispatch arm, in the same loop — and [`batch_signature`] refuses to sign a
@@ -1082,7 +1164,7 @@ impl AgentLoop {
             // denial rather than inferred from the result text, exactly as
             // `codemode`'s `run_nested` returns `(ToolResult, bool)` for the same
             // reason (its `denied` feeds the row's `denied` status, not `error`).
-            let (result, denied) = if crate::harness::dispatch::is_subagent_call(&tc.name) {
+            let (result, denied, ran) = if crate::harness::dispatch::is_subagent_call(&tc.name) {
                 match subagent_results.remove(&idx) {
                     // A child that ran (or that the `SubagentWait` select
                     // itself cancelled) keeps its own result — unchanged.
@@ -1103,12 +1185,12 @@ impl AgentLoop {
                     // a total that spans both.
                     Some((result, child_cost)) => {
                         self.fold_child_cost(child_cost);
-                        (result, false)
+                        (result, false, false)
                     }
                     // CANCELLATION BEATS REJECTION: a call that never ran
                     // because the user stopped the turn must not be told to
                     // "fix the key and retry".
-                    None if turn.is_cancelled() => (Self::cancelled_tool_result(), false),
+                    None if turn.is_cancelled() => (Self::cancelled_tool_result(), false, false),
                     // A rejected `subagent` was filtered out of the futures
                     // above, so it has NO entry here. This arm MUST precede the
                     // `dispatch_tool` fallback: that fallback routes a subagent
@@ -1117,17 +1199,18 @@ impl AgentLoop {
                     None if param_errors.get(idx).is_some_and(Option::is_some) => (
                         unknown_param_result(param_errors[idx].as_deref().unwrap_or_default()),
                         false,
+                        false,
                     ),
                     None => self.dispatch_tool(tc, turn).await,
                 }
             } else if turn.is_cancelled() {
                 // Cancellation beats rejection (same rule, the sequential tools).
-                (Self::cancelled_tool_result(), false)
+                (Self::cancelled_tool_result(), false, false)
             } else if let Some(Some(err)) = param_errors.get(idx) {
                 // REJECTED, not warned: no dispatch, and deliberately NOT
                 // `policy_verdict` / `gate_tool` — a call that will not run
                 // must never raise a permission prompt.
-                (unknown_param_result(err), false)
+                (unknown_param_result(err), false, false)
             } else {
                 match self.policy_verdict(tc) {
                     Some(Decision::Ask) => {
@@ -1166,6 +1249,8 @@ impl AgentLoop {
                                     is_error: true,
                                 },
                                 true,
+                                // Nothing ran — the gate refused before dispatch.
+                                false,
                             )
                         }
                     }
@@ -1175,7 +1260,7 @@ impl AgentLoop {
                     // `deny_tool_result`'s wording is deliberately the executor's,
                     // which is exactly why `is_error` alone cannot tell the two
                     // apart. `codemode`'s sibling marks this arm `denied` too.
-                    Some(Decision::Deny) => (self.deny_tool_result(tc), true),
+                    Some(Decision::Deny) => (self.deny_tool_result(tc), true, false),
                     // (finding 6) What reaches here: `Some(Decision::Allow)`,
                     // `None` (an ungated tool), and `Some(Decision::Confine)`
                     // — and `Confine` can ONLY be `bash`, because
@@ -1215,6 +1300,7 @@ impl AgentLoop {
                 &specs,
                 turn.is_cancelled(),
                 denied,
+                ran,
             ));
             turn_tool_results.push(result_value.clone());
             self.emit(RpcEvent::tool_execution_end {
