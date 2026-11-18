@@ -60,9 +60,9 @@ pub use prompt::{
     build_child_system_message, build_main_prompt, load_project_context, PromptContext,
 };
 pub use provider::{
-    build_provider, AnthropicProvider, ChatMessage, ChatRole, FinishReason, MessageContent,
-    ModelOptions, ModelRequest, OpenAiCompatibleProvider, OpenAiResponsesProvider, Provider,
-    ProviderError, ProviderEvent, ToolCall, ToolCallDelta, ToolSpec, Usage,
+    build_provider, AnthropicProvider, ArgumentDefect, ChatMessage, ChatRole, FinishReason,
+    MessageContent, ModelOptions, ModelRequest, OpenAiCompatibleProvider, OpenAiResponsesProvider,
+    Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, ToolSpec, Usage,
 };
 pub use r#loop::{AgentLoop, ControlCmd, Prompt, PromptTurn, SudoDeps};
 pub use retry::RetryPolicy;
@@ -82,3 +82,44 @@ pub use tool_specs::tool_specs;
 // crate-side `harness::trust` alias would name a module that does not exist
 // here (the trait lives at the crate root, the Sqlite source stays desktop).
 pub use wire::WireApi;
+
+#[cfg(test)]
+mod tests {
+    // Resolves the `pub use provider::{…}` block at the head of this file — the
+    // block this test is the pin for.
+    use super::*;
+
+    /// (issue #193, review FIX 6) `ArgumentDefect` is re-exported at the SAME
+    /// level as the `ToolCall` field it types.
+    ///
+    /// WHY A TEST FOR A ONE-WORD RE-EXPORT. `ToolCall::defect` is public API on
+    /// a crate about to publish as 0.4.0, and a consumer that matches on it
+    /// cannot name the field's type without reaching one level deeper
+    /// (`harness::provider::ArgumentDefect`) than the type it is a field OF.
+    /// `harness::provider` already re-exported the name; this root did not, so
+    /// `fulcrum_harness::harness::ToolCall` resolved and
+    /// `fulcrum_harness::harness::ArgumentDefect` was E0425 — an asymmetry with
+    /// no argument behind it. The import below IS the pin: deleting the
+    /// re-export is a compile error, and this is the cheapest form a public-path
+    /// pin takes in a crate that has no `public_api` snapshot test to hang it on.
+    ///
+    /// NOTE, for the desktop's owner: the desktop mirrors this list at
+    /// `src-tauri/src/agent/harness/mod.rs` and needs the same name added there.
+    /// That repo is not edited from here.
+    #[test]
+    fn the_defect_type_is_namable_where_the_call_type_is() {
+        fn takes_both(_call: &ToolCall, _defect: &ArgumentDefect) {}
+        let defect = ArgumentDefect {
+            error: "EOF while parsing an object at line 1 column 6".to_string(),
+            raw: "{oops".to_string(),
+        };
+        let call = ToolCall {
+            id: "t1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({}),
+            defect: Some(defect.clone()),
+        };
+        takes_both(&call, &defect);
+        assert_eq!(call.defect.as_ref(), Some(&defect));
+    }
+}

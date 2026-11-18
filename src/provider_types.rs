@@ -164,6 +164,174 @@ pub struct ToolCall {
     pub name: String,
     /// The parsed arguments (an empty object when the model sent none).
     pub arguments: Value,
+    /// (issue #193) The arguments arrived but did not parse: the parse error and
+    /// the raw text the provider sent. `None` for a well-formed call AND for a
+    /// legitimately empty payload — the two are distinguished precisely BY this
+    /// field being absent. `{}` stays `{}` either way; nothing about `arguments`
+    /// changes. `skip_serializing_if` (not `skip_serializing`) is load-bearing,
+    /// and BOTH directions of that choice are pinned, one per fixture, by
+    /// `tool_call_display_wire_stays_flat`:
+    /// * dropping the attribute entirely puts `"defect": null` on EVERY
+    ///   transcript row (serde's derived `Serialize` writes an absent `Option` as
+    ///   `null`) — reddens the test's `None` case;
+    /// * an unconditional `skip_serializing` passes the `None` case byte-for-byte
+    ///   and silently drops a REAL defect, which is the half that matters more:
+    ///   `persist_transcript_message` and `run_compaction` both re-serialize the
+    ///   message whole into `native_messages.content_json`, so a defect lost there
+    ///   cannot be rebuilt on a resume — reddens the test's `Some` case.
+    ///
+    /// What neither case may gain is the OpenAI request shape (`function` /
+    /// `type`) — that is the flat-shape claim this pin is named for. Read the
+    /// two fixtures as ONE key, not two shapes: both serialize to a superset of
+    /// `{id, name, arguments}`, and the pair's entire content is whether
+    /// `defect` is in that set. They are not opposite key sets, and the test's
+    /// own key-list assertion says so ("exactly the three wire keys plus
+    /// `defect`"). If you want the property rather than the proxy,
+    /// `a_transcript_round_trip_rebuilds_the_defect_a_resume_needs` in
+    /// `harness/provider/openai.rs` asserts the `content_json` round-trip a
+    /// resume actually depends on.
+    ///
+    /// # Where the defect travels, and where it never goes
+    ///
+    /// **Disk and daemon-socket clients; never any provider request.** The
+    /// provider half is TRUE and pinned: all three request builders are
+    /// hand-built whitelists that name `id` / `name` / `arguments` and nothing
+    /// else, and none of them derives `Serialize`, so `defect` cannot join a
+    /// request body by a derive change. That half is what
+    /// `estimate_summary_payload` (`harness/compact.rs`) declines to count.
+    ///
+    /// The disk half is NOT the only destination, and a previous round of this
+    /// docblock said it was. `persist_transcript_message`
+    /// (`harness/loop/emit.rs`) serialises the whole `ChatMessage` into
+    /// `content_json`, `IpcStore::insert_message` (`worker/store.rs`) forwards
+    /// that verbatim as `StoreFrame::Insert`, and the daemon's `store_frame`
+    /// (`fulcrum/src/serve.rs`) puts the same `content_json` on the socket as a
+    /// `{"type":"transcript-insert","contentJson":…}` frame — so every socket
+    /// client receives `defect.raw`. That is why the field is bounded at the
+    /// parse site by [`MAX_DEFECT_RAW_BYTES`] rather than left unbounded: the
+    /// data is legitimately disk-shaped (a resume rebuilds the refusal sentence
+    /// from it) and it is not user content going to a hostile party, so the
+    /// store path stays as it is and the value carries a cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defect: Option<ArgumentDefect>,
+}
+
+/// (issue #193) What was wrong with a tool call's arguments, and what actually
+/// arrived.
+///
+/// This exists because collapsing an unparseable payload into `{}` made every
+/// downstream refusal a lie: `read` answered ``missing `path` parameter`` for a
+/// call whose `path` had arrived truncated, the model read that as "I omitted a
+/// required parameter", and re-sent the identical call (one subagent made 303
+/// such calls in 19 minutes; 566 rows in this machine's database carry the
+/// sentence). Preserving the defect lets the refusal name the real problem and
+/// show the raw text, and it repairs NOTHING — the coercion victims are `write`
+/// (440 rows) and `edit` (125), and completing truncated JSON into a written
+/// file is worse than refusing.
+///
+/// `raw` is verbatim up to [`MAX_DEFECT_RAW_BYTES`] — not trimmed, not
+/// re-serialized, not re-parsed: the only thing the model can act on is the
+/// text it sent, and the head of a JSON argument object is where the keys that
+/// arrived live. Past the cap the stored value is that head plus a note naming
+/// the true length; see the constant for why a bound at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArgumentDefect {
+    /// The `serde_json` parse error, stringified.
+    pub error: String,
+    /// The argument text the provider sent, byte-for-byte up to
+    /// [`MAX_DEFECT_RAW_BYTES`], then the head plus a note naming the true
+    /// length. Written by [`cap_defect_raw`] — never assign to this field
+    /// directly from provider text, or the bound is silently gone again.
+    pub raw: String,
+}
+
+/// The most raw argument text an [`ArgumentDefect`] stores (issue #193, review
+/// FIX 4).
+///
+/// # Why a bound, when the field was called disk-only
+///
+/// The docblock on `ToolCall::defect` used to say the field never leaves the
+/// disk. The provider half of that is TRUE and pinned — all three request
+/// builders are hand-built whitelists that name `id` / `name` / `arguments` and
+/// nothing else, so `defect` cannot reach a provider request by a `serde` derive
+/// change because none of them derives. The disk half was never the whole
+/// story:
+///
+/// * `persist_transcript_message` (`harness/loop/emit.rs`) serialises the WHOLE
+///   `ChatMessage` — `defect` included — into `content_json`;
+/// * `IpcStore::insert_message` (`worker/store.rs`) forwards that string
+///   verbatim as `StoreFrame::Insert`;
+/// * the daemon's `store_frame` (`fulcrum/src/serve.rs`) puts the same
+///   `content_json` on the socket as `{"type":"transcript-insert",
+///   "contentJson": …}`.
+///
+/// So `defect.raw` — documented as unbounded — reaches every daemon socket
+/// client and a transcript row. This is legitimately disk-shaped data (a resume
+/// needs it to rebuild the sentence) and it is not user content travelling to a
+/// hostile party, so the store path is deliberately NOT redesigned; the field
+/// is bounded instead. An 8 MB truncated `write` body should not be broadcast
+/// to satisfy a resume that can only ever quote its head.
+///
+/// # Why 2 KB, and why the number lives HERE
+///
+/// 2048 is the in-repo precedent for how much of one oversized thing a single
+/// line carries: [`crate::debuglog`]`::MAX_LINE_BYTES` cuts every IPC line at
+/// exactly that. The on-disk need is bounded by what a resume can usefully
+/// re-read, and a resume re-reads a sentence, not a payload.
+///
+/// It lives next to the field it bounds rather than beside the sentence that
+/// quotes it, because the field is now the thing the cap protects.
+/// `harness/tool_specs.rs`'s `MAX_DEFECT_RAW_BYTES` — the bound on the
+/// interpolation into the refusal sentence, added by an earlier review round —
+/// is this same constant, re-exported, so the two bounds cannot drift apart.
+pub const MAX_DEFECT_RAW_BYTES: usize = 2048;
+
+/// Bound provider argument text for [`ArgumentDefect::raw`]: byte-exact up to
+/// [`MAX_DEFECT_RAW_BYTES`], then the head plus `… (truncated, N bytes total)`.
+///
+/// The note is part of the stored value on purpose. A silent cut would make a
+/// 2 KB head indistinguishable from a complete 2 KB payload, and the whole
+/// reason this field exists is that a refusal must not misdescribe what
+/// arrived. Naming the true length keeps the truncation honest in the data.
+///
+/// # The cap is on the STORED VALUE, note included
+///
+/// The head is shortened so that head + note fits inside
+/// [`MAX_DEFECT_RAW_BYTES`] — the cap is what a consumer stores and broadcasts,
+/// so that is what must be bounded. It also makes the two bounds on this field
+/// COMPOSE instead of fight: `tool_specs`'s `quoted_defect_raw` cuts at the
+/// same constant, and if this one produced a value of `cap + note` the sentence
+/// would cut the field's own note in half and append a second one naming the
+/// **capped** length (2081) where the payload was 8 MB — silently undoing the
+/// "the note names the true length" property the earlier round added. A stored
+/// value at or under the cap is left alone by the sentence, which then quotes
+/// the note this function wrote.
+///
+/// # Why the cut walks
+///
+/// To a character boundary at or below the head budget:
+/// `str::floor_char_boundary` is still unstable on the pinned toolchain, and a
+/// byte-indexed slice would PANIC on a multi-byte character — which a model
+/// streaming CJK content into a `write` body eventually hits. Bounding the
+/// field must never be able to panic.
+pub fn cap_defect_raw(raw: &str) -> String {
+    if raw.len() <= MAX_DEFECT_RAW_BYTES {
+        return raw.to_string();
+    }
+    // The note is written FIRST because its own length depends on the true
+    // length, and the head budget depends on the note.
+    let note = format!("… (truncated, {} bytes total)", raw.len());
+    // `MAX_DEFECT_RAW_BYTES` (2048) dwarfs any note this can produce (a
+    // `usize`'s 20 digits plus 28 fixed bytes), so the subtraction cannot
+    // underflow; `saturating_sub` keeps it safe if the constant ever shrinks.
+    let budget = MAX_DEFECT_RAW_BYTES.saturating_sub(note.len());
+    // `is_char_boundary` is true at index 0, so this terminates and never
+    // underflows.
+    let mut end = budget;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &raw[..end], note)
 }
 
 /// The REQUEST-wire shape of a tool call (the OpenAI contract: a nested
@@ -466,8 +634,79 @@ pub fn parse_error_chunk(v: &Value) -> Option<ProviderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cost_usd_from_usage, parse_error_chunk, ProviderError};
+    use super::{
+        cost_usd_from_usage, parse_error_chunk, ChatMessage, ChatRole, ProviderError, ToolCall,
+    };
     use serde_json::json;
+
+    /// (issue #193) A HISTORICAL `content_json` row — hand-written in the
+    /// PRE-CHANGE shape, with no `defect` key anywhere — still deserializes.
+    ///
+    /// This is the desktop-compatibility acceptance criterion: the desktop reads
+    /// these rows out of the same SQLite file, and every one of them predates
+    /// the field. The mechanism is serde's own, and deliberately NOT a
+    /// `#[serde(default)]`: `serde_derive` emits a `missing_field` path for an
+    /// absent field and serde's `MissingFieldDeserializer` answers
+    /// `deserialize_option` with `visit_none()`, so a missing `Option` is `None`
+    /// for free. The in-crate precedent is `ChatMessage::tool_call_id`,
+    /// `tool_calls` and `ModelOptions` — `skip_serializing_if` alone, no
+    /// `default`. Adding `#[serde(default)]` here would be a second, redundant
+    /// mechanism, and this test is what makes its absence a CHOICE rather than
+    /// an oversight.
+    ///
+    /// The string is a literal on purpose: building it with `json!` from a
+    /// current `ToolCall` would let a future change to the struct silently
+    /// rewrite the fixture, and the whole point is a document that CANNOT change.
+    #[test]
+    fn a_pre_change_row_with_no_defect_key_still_deserializes() {
+        // Exactly what `emit.rs`'s `serde_json::to_string(&m)` wrote before this
+        // field existed: the flat `{id, name, arguments}` tool call, no `defect`.
+        const PRE_CHANGE_ROW: &str = concat!(
+            r#"{"role":"assistant","content":"let me read that","#,
+            r#""tool_calls":[{"id":"call_1","name":"read","#,
+            r#""arguments":{"path":"/x"}}]}"#,
+        );
+        let message: ChatMessage = serde_json::from_str(PRE_CHANGE_ROW)
+            .expect("a historical content_json row must still deserialize");
+        let calls = message.tool_calls.expect("the row's tool_calls survive");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, json!({ "path": "/x" }));
+        assert_eq!(
+            calls[0].defect, None,
+            "a row written before the field existed carries NO defect"
+        );
+
+        // The bare `ToolCall` row on its own (the `tool-call` display row and
+        // the `native_messages` shape ride this serialization too).
+        const PRE_CHANGE_TOOL_CALL: &str =
+            r#"{"id":"call_2","name":"bash","arguments":{"command":"ls"}}"#;
+        let call: ToolCall = serde_json::from_str(PRE_CHANGE_TOOL_CALL)
+            .expect("a pre-change tool-call object must still deserialize");
+        assert_eq!(call.defect, None);
+        assert_eq!(call.name, "bash");
+
+        // And the round-trip back out is BYTE-IDENTICAL to what went in: the
+        // field is `skip_serializing_if`-guarded, so re-serialifying a row that
+        // had no `defect` must not ADD one. This is the leak guard at the
+        // transcript layer (its display-wire twin is
+        // `tool_call_display_wire_stays_flat`).
+        let round_tripped = serde_json::to_string(&call).expect("serialization cannot fail");
+        assert_eq!(
+            round_tripped, PRE_CHANGE_TOOL_CALL,
+            "a defect-free call re-serializes to the pre-change bytes — no \
+             `\"defect\":null` is added to any row"
+        );
+        assert!(
+            !round_tripped.contains("defect"),
+            "the key is absent, not null: {round_tripped}"
+        );
+
+        // `ChatRole::Assistant` was actually parsed (the literal above must not
+        // be silently answering a default).
+        assert_eq!(message.role, ChatRole::Assistant);
+    }
 
     #[test]
     fn cost_usd_from_usage_reads_the_primary_cost_field() {

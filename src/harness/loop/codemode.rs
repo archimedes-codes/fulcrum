@@ -995,6 +995,12 @@ impl Bridge<'_> {
             id: starting.tool_call_id.clone(),
             name: starting.tool_name.clone(),
             arguments: starting.args.clone(),
+            // A nested call's arguments come from a JS object, not from
+            // provider text — they are well-formed BY CONSTRUCTION, so there is
+            // no defect to carry. (`run_nested` runs the same
+            // `unknown_param_error` the direct route runs, and the head arm
+            // there is simply never taken for a call built here.)
+            defect: None,
         };
         // 0. CANCELLATION beats everything (`turn.rs`: a stopped turn never prompts,
         //    and the nested call dies with the script).

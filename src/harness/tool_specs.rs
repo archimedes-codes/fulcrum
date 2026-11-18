@@ -1,6 +1,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::harness::provider::{ToolCall, ToolSpec};
+use crate::provider_types::MAX_DEFECT_RAW_BYTES;
 
 /// What the `bash` tool tells the model about the shell it is about to get.
 ///
@@ -556,6 +557,63 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+// (issue #193, review FIX 3) The most raw argument text the head arm's refusal
+// sentence quotes.
+//
+// **This is [`crate::provider_types::MAX_DEFECT_RAW_BYTES`], re-exported, not
+// a second number.** Two bounds on the same field in two files is one too
+// many — a reader who raises one and not the other gets a sentence that
+// quotes more than the field can hold, or one that cuts bytes the field
+// stored. Fix 4 moved the canonical constant next to the field it bounds
+// (because the field is now bounded at the parse site too); this is the alias
+// that keeps the interpolation site reading the same value.
+//
+// WHY A BOUND AT ALL: `raw` is the accumulated argument stream. The refusal is
+// the WHOLE tool result, so an unbounded quote makes it an unbounded tool
+// result — the card's `rawOutput`, a `native_messages` row, and part of the
+// NEXT request body, where it can itself cause the context overflow the
+// refusal exists to survive.
+//
+// WHY 2 KB: it is the in-repo precedent for "how much of one oversized thing
+// does one line carry" — [`crate::debuglog`]'s `MAX_LINE_BYTES` /
+// `log_truncated` cut every IPC line at 2048 for exactly this reason. A real
+// tool result is a few KB, and the head of a JSON argument object is where the
+// keys that arrived live, which is the half the model needs in order to not
+// re-send the identical call. The number is a shape, not a measurement.
+//
+// WHAT THIS ONE BOUNDS is the interpolation into this single sentence. Since
+// review FIX 4 the FIELD is bounded too, at the parse site
+// (`cap_defect_raw`, `provider_types`), so on the wire this arm quotes a value
+// that is already capped and the cut below fires only on a `defect` built
+// directly by a test or a future producer. Both bounds stay, because the
+// arm's input is any `ArgumentDefect` and not only one this crate parsed.
+//
+// The constant itself is [`crate::provider_types::MAX_DEFECT_RAW_BYTES`],
+// imported at the top of this file — one value, two bound sites.
+
+/// The head arm's quoted raw text: the first [`MAX_DEFECT_RAW_BYTES`] bytes of
+/// `raw`, cut at the last character boundary at or below that index, plus a
+/// trailing note naming the true length when a cut happened.
+///
+/// The boundary walk is the stable stand-in for `str::floor_char_boundary`, which
+/// is still unstable on the pinned toolchain (`rust-toolchain.toml`) — and a
+/// byte-indexed slice would PANIC on a multi-byte character, which a model
+/// streaming CJK content into a `write` body will eventually hit. Cutting a
+/// refusal sentence must never be able to panic.
+fn quoted_defect_raw(raw: &str) -> String {
+    if raw.len() <= MAX_DEFECT_RAW_BYTES {
+        return raw.to_string();
+    }
+    // Walk back to a boundary at or below the cap. `is_char_boundary` is true at
+    // index 0 and at `len`, and the cap is past `len` only when no cut is needed,
+    // so this terminates and never underflows.
+    let mut end = MAX_DEFECT_RAW_BYTES;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (truncated, {} bytes total)", &raw[..end], raw.len())
+}
+
 /// (issue #93) The rejection text for a tool call that passes a key the model
 /// was never told about, or `None` when there is nothing to say.
 /// `run_tool_batch` (`harness/loop/turn.rs`) consumes the text as a REJECTION:
@@ -569,6 +627,23 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 /// the prompt and there is no second table to drift.
 ///
 /// The rule, in order:
+/// 0. (issue #193) The call CARRIED a defect → the honest sentence, and NO spec
+///    lookup. This arm runs FIRST precisely because there is nothing to look
+///    up: the arguments never became a value, so the key-by-key check below has
+///    no input, and a lookup by name would answer "no spec" for a tool that
+///    does have one and let the call through to dispatch.
+///    THE PRECEDENCE THIS IMPLIES, stated because it is a choice and not an
+///    oversight: callers pass `advertised_specs()`, which `enabled_tools` and
+///    child status FILTER, so a name missing from `specs` is a DISABLED tool or
+///    an unknown one — and a defective call to either gets this sentence instead
+///    of `dispatch_tool`'s ``tool not enabled: …`` / ``unknown tool: …``. Kept
+///    that way: the call is refused and never dispatched on BOTH routes, and
+///    "your arguments did not parse" is the more actionable of the two, since
+///    the enablement list is not something a re-send can fix while a mangled
+///    payload may well be. Pinned by
+///    `a_defective_call_to_a_disabled_tool_reports_the_defect_not_the_disablement`,
+///    which contrasts the same disabled name called WELL-FORMED (that one IS
+///    `dispatch_tool`'s business — rule 1 excuses it here).
 /// 1. No spec for the (alias-normalized) name → NO check. An unknown tool is
 ///    already a hard error in `dispatch_tool`'s `unknown tool:` arm
 ///    (`loop/tools.rs`), and a tool the session disabled is not in
@@ -585,12 +660,45 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 ///    case-insensitive containment in either direction — so `agent` →
 ///    `agentName`. Never suggested from anything but the advertised shape.
 ///
+/// Rules 1 and 2 are FALSE for a defective call, and that is the point of
+/// rule 0: a malformed payload has no keys to check and — because it is `{}` —
+/// walks past every key test into the tool, where `read` refuses with
+/// ``missing `path` parameter``. That sentence was a lie whenever the model HAD
+/// sent `path` and its JSON arrived broken, and because it reads as "you
+/// omitted a required parameter" the model re-sent the identical call. Rule 0
+/// says what actually happened and shows the raw text — bounded to
+/// [`MAX_DEFECT_RAW_BYTES`] with a trailing note naming the true length, because
+/// this sentence IS the tool result and rides the next request body. The bound
+/// is applied ONCE, at the parse site, by
+/// [`cap_defect_raw`](crate::provider_types::cap_defect_raw), so the stored
+/// `defect.raw` this rule reads is ALREADY capped — it is not an unbounded
+/// field, and it never was after `c34254e`; what survives here is the
+/// sentence's OWN second bound (see [`quoted_defect_raw`]), which composes with
+/// the stored one rather than re-cutting it.
+///
 /// TOP-LEVEL ONLY, and it never mutates: a pure function of `(specs, tc)`
 /// returning display text, so it is safe to call before a dispatch has
-/// decided anything. Malformed JSON needs no branch — `parse_arguments`
-/// (`provider/openai.rs`) already collapses unparseable arguments to `{}`, and
-/// a non-object payload simply has no keys.
+/// decided anything. Malformed JSON is no longer invisible to this check —
+/// `parse_arguments` (`provider/openai.rs`) hands the parse error and the raw
+/// text up as `ToolCall::defect`, which rule 0 reports. A non-object payload
+/// (a top-level JSON string) still simply has no keys and stays uncheckable.
 pub(crate) fn unknown_param_error(specs: &[ToolSpec], tc: &ToolCall) -> Option<String> {
+    // (issue #193) THE HEAD ARM. Before any spec lookup, and deliberately so:
+    // the arguments never parsed, so there is nothing to check keys against and
+    // no spec is needed to say what went wrong. `tc.name` is used VERBATIM —
+    // resolving the `dispatch_subagent` alias would require the very lookup
+    // this arm exists to skip, and the alias matters only for that one tool.
+    // Textually distinct from the schema sentence below on purpose: that one
+    // says "fix the key and retry", and retrying an identical payload is the
+    // 303-calls-in-19-minutes loop this arm closes.
+    if let Some(defect) = &tc.defect {
+        return Some(format!(
+            "invalid arguments for `{}`: {} — the call was rejected. Received arguments:\n{}",
+            tc.name,
+            defect.error,
+            quoted_defect_raw(&defect.raw)
+        ));
+    }
     // The `dispatch_subagent` alias resolves to the `subagent` spec — the same
     // `effective_tool_name` `is_tool_enabled` gates on, so the alias is checked
     // against the shape the model was actually shown and the message names the
@@ -652,6 +760,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    // Test-only: importing it at the module head would be an unused import in
+    // the non-test build (only the defect-shaped fixtures below name it).
+    use crate::harness::provider::ArgumentDefect;
 
     /// A tool call with the given name + arguments (the checker input).
     fn call(name: &str, args: Value) -> ToolCall {
@@ -659,7 +770,265 @@ mod tests {
             id: "t1".into(),
             name: name.into(),
             arguments: args,
+            defect: None,
         }
+    }
+
+    /// (issue #193) A call whose arguments ARRIVED but did not parse: `{}` in
+    /// `arguments`, the defect carrying the error and the raw text. The head
+    /// arm's input — and the shape the 566 database rows arrived in.
+    fn defective_call(name: &str, raw: &str) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            name: name.into(),
+            arguments: Value::Object(Default::default()),
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 41".into(),
+                raw: raw.into(),
+            }),
+        }
+    }
+
+    /// (issue #193) THE head arm, pinned BYTE-FOR-BYTE — this file is the
+    /// single home of the literal (`param_rejection.rs` keeps its
+    /// `starts_with`/`contains` discipline, per its own module doc).
+    ///
+    /// Three things this pin holds:
+    /// - the sentence names the tool VERBATIM (`read`, no spec lookup, no alias
+    ///   resolution) and the parse error;
+    /// - `Received arguments:` shows the raw text the provider sent — the half
+    ///   that lets the model see what actually arrived instead of re-sending it;
+    /// - it is TEXTUALLY DISTINCT from the schema sentence. The schema one ends
+    ///   `fix the key and retry.`; there is no key to fix here and retrying the
+    ///   identical payload is the loop this closes, so any drift that makes the
+    ///   two converge reddens this test.
+    #[test]
+    fn a_malformed_payload_is_reported_with_the_error_and_the_raw_text() {
+        let raw = r#"{"path": "/tmp/x", "content": "truncated he"#;
+        let rejection = unknown_param_error(&tool_specs(), &defective_call("read", raw))
+            .expect("a defective call is always rejected");
+        assert_eq!(
+            rejection,
+            "invalid arguments for `read`: EOF while parsing an object at line 1 \
+             column 41 — the call was rejected. Received arguments:\n\
+             {\"path\": \"/tmp/x\", \"content\": \"truncated he",
+            "the whole sentence is the wire text the model reads"
+        );
+        // The distinctness pin, stated separately so a convergence names itself.
+        assert!(
+            !rejection.contains("fix the key and retry"),
+            "there is no key to fix and retry — that is the schema sentence: \
+             {rejection}"
+        );
+        assert!(
+            !rejection.contains("unknown param"),
+            "no key was unknown; the payload never parsed: {rejection}"
+        );
+    }
+
+    /// (issue #193, review FIX 3) The refusal SENTENCE bounds the raw text.
+    ///
+    /// `raw` is the accumulated argument stream, so a `write` whose stream died
+    /// after 8 MB of body produced an 8 MB refusal. That sentence becomes the
+    /// whole tool result, which makes it the card's `rawOutput`, a
+    /// `native_messages` row, AND part of the NEXT request body — where it can
+    /// itself trigger the context overflow the refusal exists to avoid. The
+    /// bound is on the INTERPOLATION, and it is deliberately SEPARATE from the
+    /// one on the field.
+    ///
+    /// Review FIX 4 added a second bound, at the parse site (`cap_defect_raw`,
+    /// `provider_types`), because the field turned out not to be disk-only — it
+    /// rides `content_json` onto the daemon socket. Both bounds are the same
+    /// constant, and BOTH stay: `unknown_param_error` takes any
+    /// `ArgumentDefect`, including one a caller constructed with an uncapped
+    /// `raw`, so the sentence cannot assume the field arrived bounded. That is
+    /// why this test builds its `ToolCall` by hand rather than through
+    /// `parse_arguments` — it pins the interpolation bound against an
+    /// over-cap input, which is exactly the input the field bound cannot be
+    /// relied on to have removed.
+    #[test]
+    fn a_huge_raw_is_bounded_in_the_sentence_and_the_note_names_the_true_length() {
+        // 8 MB of body, the shape the finding names. Multi-byte characters are
+        // in the payload so a byte-indexed cut would panic or split a char.
+        let body = "α".repeat(1_000_000); // 3 MB of UTF-8 in 1M chars
+        let raw = format!(r#"{{"path": "/tmp/x", "content": "{body}"#);
+        let total = raw.len();
+        let rejection = unknown_param_error(&tool_specs(), &defective_call("write", &raw))
+            .expect("a defective call is always rejected");
+
+        assert!(
+            rejection.len() < 4096,
+            "the refusal is bounded ({} bytes) — it is a tool result and it rides \
+             the next request body, so an unbounded one is a self-inflicted context \
+             overflow",
+            rejection.len()
+        );
+        assert!(
+            rejection.contains(&format!("(truncated, {total} bytes total)")),
+            "the note names the TRUE length of the raw text, so the model knows \
+             how much it lost and the human reading the card can tell a cut from \
+             a short payload: {rejection}"
+        );
+        assert!(
+            rejection.starts_with("invalid arguments for `write`: "),
+            "the head of the sentence is unchanged: {rejection}"
+        );
+        // The prefix is the HEAD of the raw text (the part that shows which keys
+        // arrived), and it is cut on a character boundary.
+        let shown = rejection
+            .split("Received arguments:\n")
+            .nth(1)
+            .expect("the raw section is still there")
+            .strip_suffix(&format!("… (truncated, {total} bytes total)"))
+            .unwrap_or_else(|| panic!("the note is the sentence's tail: {rejection}"));
+        assert!(
+            shown.len() <= MAX_DEFECT_RAW_BYTES,
+            "the quoted prefix is at most the cap (got {})",
+            shown.len()
+        );
+        assert!(
+            raw.starts_with(shown) && shown.len() < raw.len(),
+            "the prefix is a genuine PREFIX of the raw text, cut short"
+        );
+        // The real property: the cut did not split a character. `shown` is a
+        // `&str` slice of the raw `String` and the slicing itself would PANIC on
+        // a non-boundary index, so the assertion that matters is that the lines
+        // above ran at all; this states it as a fact about the prefix.
+        assert!(
+            shown.chars().count() * 3 >= shown.len(),
+            "the prefix is whole characters: {} bytes / {} chars",
+            shown.len(),
+            shown.chars().count()
+        );
+    }
+
+    /// (issue #193, review FIX 3) The bound does NOT touch a payload that fits,
+    /// and a raw whose byte length is exactly the cap is not marked truncated.
+    /// The guard against an off-by-one that cuts ordinary refusals — the ordinary
+    /// case is what the 566 database rows were, and they must stay byte-exact.
+    #[test]
+    fn a_raw_within_the_cap_is_quoted_verbatim_with_no_note() {
+        let raw = r#"{"path": "/tmp/x", "content": "truncated he"#;
+        let rejection = unknown_param_error(&tool_specs(), &defective_call("read", raw))
+            .expect("a defective call is always rejected");
+        assert!(
+            rejection.ends_with(raw),
+            "a short raw is quoted to the END of the sentence, verbatim: {rejection}"
+        );
+        assert!(
+            !rejection.contains("truncated,"),
+            "no truncation note on a payload that never needed one: {rejection}"
+        );
+
+        // Exactly at the cap: still verbatim, still no note.
+        let exact = "b".repeat(MAX_DEFECT_RAW_BYTES);
+        let at_cap =
+            unknown_param_error(&tool_specs(), &defective_call("read", &exact)).expect("rejected");
+        assert!(
+            at_cap.ends_with(&exact) && !at_cap.contains("bytes total"),
+            "a raw of exactly the cap is not truncated (len {})",
+            exact.len()
+        );
+
+        // One byte over: now it is, and the byte BEFORE the note is the marker.
+        let over = "b".repeat(MAX_DEFECT_RAW_BYTES + 1);
+        let past =
+            unknown_param_error(&tool_specs(), &defective_call("read", &over)).expect("rejected");
+        assert!(
+            past.ends_with(&format!("… (truncated, {} bytes total)", over.len())),
+            "one byte past the cap truncates: {past}"
+        );
+        assert!(
+            !past.ends_with(&over),
+            "and the tail byte is what was dropped"
+        );
+    }
+
+    /// (review FIX 4) The two bounds on `defect.raw` COMPOSE instead of
+    /// fighting.
+    ///
+    /// The field is now capped at the parse site (`cap_defect_raw`,
+    /// `provider_types`) and quoted through this file's `quoted_defect_raw`, at
+    /// the SAME constant. That is only safe because the parse-site cap counts
+    /// the note inside itself. Were it `cap + note`, this cut would slice the
+    /// field's own note in half and append a fresh one naming the **capped**
+    /// length — an 8 MB payload reported as "2081 bytes total", silently
+    /// undoing the "the note names the true length" property the previous round
+    /// added, and doing it in a way that reads as a passing truncation.
+    ///
+    /// So: a value that came from `cap_defect_raw` must pass through
+    /// `quoted_defect_raw` byte-identical.
+    #[test]
+    fn a_parse_site_capped_raw_passes_through_the_sentence_unchanged() {
+        let huge = format!(
+            r#"{{"path": "/tmp/x", "content": "{}"#,
+            "α".repeat(3_000_000)
+        );
+        let total = huge.len();
+        let capped = crate::provider_types::cap_defect_raw(&huge);
+
+        assert!(
+            capped.len() <= MAX_DEFECT_RAW_BYTES,
+            "the stored field fits the constant ({capped} bytes stored)",
+            capped = capped.len()
+        );
+        assert_eq!(
+            quoted_defect_raw(&capped),
+            capped,
+            "the sentence must not re-cut a value the parse site already \
+             bounded — a re-cut would replace the true length with the cap"
+        );
+        assert!(
+            capped.contains(&format!("(truncated, {total} bytes total)")),
+            "and the note that survives into the sentence names the {total}-byte \
+             payload, not the cap it was cut to"
+        );
+    }
+
+    /// (issue #193) The head arm runs BEFORE the spec lookup, so it fires for a
+    /// name with NO spec at all and for a tool whose spec has no `properties` —
+    /// the two shapes rules 1 and 2 excuse. A malformed payload on a bare spec
+    /// (`list_agents`, a bare `{"type":"object"}`) would otherwise walk past
+    /// both rules untouched.
+    #[test]
+    fn the_defect_arm_fires_without_a_spec_lookup() {
+        // No spec named `read` in the list at all.
+        let without_spec = unknown_param_error(&[], &defective_call("read", "{oops"));
+        assert!(
+            without_spec
+                .as_deref()
+                .is_some_and(|t| t.starts_with("invalid arguments for `read`")),
+            "a defective call is rejected even where no spec exists to check: \
+             {without_spec:?}"
+        );
+        // A bare spec (rule 2's exemption: no `properties` → no check).
+        let bare = unknown_param_error(&tool_specs(), &defective_call("list_agents", "{oops"))
+            .expect("the bare spec's exemption does not excuse a malformed payload");
+        assert!(
+            bare.starts_with("invalid arguments for `list_agents`"),
+            "{bare}"
+        );
+        // The alias name is reported VERBATIM (no `effective_tool_name` — the
+        // arm deliberately does no lookup).
+        let aliased =
+            unknown_param_error(&tool_specs(), &defective_call("dispatch_subagent", "{o"))
+                .expect("a defective `dispatch_subagent` call is rejected too");
+        assert!(
+            aliased.starts_with("invalid arguments for `dispatch_subagent`:"),
+            "the name rides verbatim, unresolved: {aliased}"
+        );
+    }
+
+    /// (issue #193) A well-formed call carries NO defect and the head arm is
+    /// simply not taken — rules 1–4 behave exactly as before. The guard against
+    /// an arm that fires on `None`.
+    #[test]
+    fn a_call_without_a_defect_takes_the_schema_rules() {
+        assert_eq!(
+            unknown_param_error(&tool_specs(), &call("read", json!({ "path": "/x" }))),
+            None,
+            "a well-formed, fully advertised call is still clean"
+        );
     }
 
     fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 20] {

@@ -13,6 +13,15 @@
 //! Every test here runs a REAL QuickJS engine — the bridge is not mocked. The
 //! scripted provider only stands in for the model.
 //!
+//! THE `.await.0` ON EVERY `dispatch_tool` CALL: the method returns
+//! `(ToolResult, bool)` — the result and whether a PERSON refused it — because
+//! `run_tool_batch`'s refusal guard needs the flag. These pins are about the
+//! RESULT, so they project `.0`; the flag itself is pinned by
+//! `a_sudo_exec_confirm_refusal_is_never_a_refusal_run` and the census
+//! `source_lints::every_denial_marking_site_in_the_batch_is_accounted`. Do not
+//! "tidy" the tuple away: a `ToolResult` return is what let the sudo confirm
+//! refusal reach the guard as a re-send instruction.
+//!
 //! THE FIXTURE RULE these tests all obey (`policy_gate.rs`'s own discovery, stated
 //! at its `policy_verdict` assertions): `PermissionContext::refresh` runs at the top
 //! of `handle_prompt`, so a loop that has never handled a prompt still carries the
@@ -93,6 +102,7 @@ fn codemode_scripts(code: &str) -> Vec<Option<Vec<ProviderEvent>>> {
                 id: "t1".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": code }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -146,10 +156,12 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
                 id: "t1".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": "1 + 1" }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert!(!r.is_error, "a well-formed script succeeds: {}", text(&r));
     assert_eq!(
         text(&r),
@@ -172,10 +184,12 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
                 id: "t2".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": 42 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert!(r.is_error, "a non-string `code` is an error result");
     assert!(
         text(&r).contains("`code`") && text(&r).contains("string"),
@@ -185,13 +199,16 @@ async fn codemode_dispatch_runs_a_script_through_agent_loop() {
 
     // (b) The batch pre-pass REJECTS a non-advertised top-level key before dispatch
     //     (`param_rejection.rs`'s pattern: `run_tool_batch` returns the same
-    //     `serde_json::to_value(&result)` the `tool_execution_end` carries).
-    let results = loop_
+    //     `serde_json::to_value(&result)` the `tool_execution_end` carries, plus
+    //     the rejection vector the turn-bound guard reads — destructured here,
+    //     unused).
+    let (results, _rejected) = loop_
         .run_tool_batch(
             &[ToolCall {
                 id: "t3".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": "1 + 1", "extra": 1 }),
+                defect: None,
             }],
             &CancellationToken::new(),
         )
@@ -379,10 +396,12 @@ async fn promise_all_batches_nested_calls_in_completion_order() {
                 id: "p1".to_string(),
                 name: "codemode".to_string(),
                 arguments: json!({ "code": script }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     let elapsed = started.elapsed();
 
     assert!(
@@ -545,6 +564,7 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
         id: "d1/0".to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": &outside }),
+        defect: None,
     };
     // The fixture is not vacuous: this really is a `Deny`, and the direct route
     // renders it through `deny_tool_result`.
@@ -567,10 +587,11 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
                 arguments: json!({
                     "code": format!("const r = await tools.read({{ path: {outside:?} }});\n r.isError;")
                 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await.0;
 
     let rows = result
         .details
@@ -606,9 +627,13 @@ async fn nested_gate_denial_returns_the_identical_denial_wording() {
     );
 
     // The equality in the other direction, against the DIRECT wire result.
+    // (`run_tool_batch`'s second tuple element — the rejection vector the
+    // turn-bound guard reads — is not what this asserts, so it is dropped with
+    // the `into_iter()` that already projects the results.)
     let direct_batch = loop_
         .run_tool_batch(&[nested], &CancellationToken::new())
         .await
+        .0
         .into_iter()
         .next()
         .expect("one result");
@@ -643,6 +668,7 @@ async fn a_nested_ask_prompts_on_the_nested_request_id_and_a_reject_denies_it() 
         id: "a1/0".to_string(),
         name: "read".to_string(),
         arguments: json!({ "path": &outside }),
+        defect: None,
     };
     assert_eq!(
         loop_.policy_verdict(&nested),
@@ -664,10 +690,12 @@ async fn a_nested_ask_prompts_on_the_nested_request_id_and_a_reject_denies_it() 
                 arguments: json!({
                     "code": format!("await tools.read({{ path: {outside:?} }});")
                 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     answered.await.expect("the answer task ran");
 
     let prompts = emitted(&sink, "permission-request");
@@ -748,10 +776,12 @@ async fn a_nested_ask_raced_by_a_stop_ends_the_script_and_keeps_the_row_running(
                         id: "c1".to_string(),
                         name: "codemode".to_string(),
                         arguments: json!({ "code": code }),
+                        defect: None,
                     },
                     &turn,
                 )
                 .await
+                .0
         })
     };
 
@@ -858,10 +888,12 @@ async fn an_excluded_tool_is_not_installed_as_a_script_global() {
                     id: format!("x-{name}"),
                     name: "codemode".to_string(),
                     arguments: json!({ "code": format!("typeof tools.{name};") }),
+                    defect: None,
                 },
                 &turn,
             )
-            .await;
+            .await
+            .0;
         assert!(
             !result.is_error,
             "`tools.{name}` is merely absent, so the script still runs: {}",
@@ -885,10 +917,11 @@ async fn an_excluded_tool_is_not_installed_as_a_script_global() {
                               ['ask','sudo_exec','manage_todo_list','subagent','list_agents','codemode']\
                               .includes(n)).join(',');"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await.0;
     assert!(
         !result.is_error,
         "the discovery script ran: {}",
@@ -932,10 +965,11 @@ async fn the_interactive_mcp_auth_action_is_refused_from_a_script() {
                     "code": "const r = await tools.mcp({ action: 'auth', server: 'no-such-server' });\n\
                              r.isError + '|' + r.text;"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await.0;
     // The SCRIPT succeeds — a refused nested call is a result, not an exception, so
     // the parent's own outcome must not turn red over it.
     assert!(
@@ -983,10 +1017,12 @@ async fn the_interactive_mcp_auth_action_is_refused_from_a_script() {
                 arguments: json!({
                     "code": "const r = await tools.mcp({});\n!r.isError;"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert!(!result.is_error, "the script ran: {}", text(&result));
     assert_eq!(
         text(&result),
@@ -1023,10 +1059,12 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                     "code": "const d = await describeTool('bash');\n\
                              JSON.stringify(Object.keys(d.parameters.properties).sort());"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert!(
         !result.is_error,
         "the discovery script ran: {}",
@@ -1049,10 +1087,12 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                     "code": "const r = await searchTools('SHELL');\n\
                              r.tools.length >= 1 && r.tools[0].name === 'bash';"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         text(&result),
         "true",
@@ -1069,10 +1109,12 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                     "code": "const r = await searchTools('', { limit: 2 });\n\
                              r.tools.length;"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         text(&result),
         "2",
@@ -1090,10 +1132,12 @@ async fn the_discovery_globals_describe_the_advertised_set() {
                 arguments: json!({
                     "code": "ALL_TOOLS.length + ':' + ALL_TOOLS.some(t => t.name === 'bash');"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     let expected = tool_specs().len() - 6;
     assert_eq!(
         text(&result),
@@ -1130,10 +1174,11 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
                              [typeof r.text, typeof r.isError, typeof r.details, \
                               r.text.includes('to-stdout'), r.text.includes('to-stderr'), r.isError].join(',');"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await.0;
     assert!(!result.is_error, "the script ran: {}", text(&result));
     assert_eq!(
         text(&result),
@@ -1153,10 +1198,12 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
                     "code": "const r = await tools.read({ path: 'definitely-not-here-42.txt' });\n\
                              r.isError + ':' + (r.text.length > 0);"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert_eq!(
         text(&result),
         "true:true",
@@ -1187,10 +1234,12 @@ async fn a_nested_call_resolves_to_the_uniform_result_and_never_throws() {
                              const r = await tools.bash(circular);\n\
                              r.isError + '|' + r.text;"
                 }),
+                defect: None,
             },
             &turn,
         )
-        .await;
+        .await
+        .0;
     assert!(
         text(&result).starts_with("true|"),
         "a non-serializable argument is a failed result, not a script crash: {}",
@@ -1220,10 +1269,12 @@ async fn a_throwing_script_reports_its_message_and_keeps_its_rows() {
                     "code": "await tools.bash({ command: 'echo first' });\n\
                              throw new Error('the script gave up');"
                 }),
+                defect: None,
             },
             &CancellationToken::new(),
         )
-        .await;
+        .await
+        .0;
     assert!(result.is_error, "a throwing script is a failed result");
     assert!(
         text(&result).contains("the script gave up"),
@@ -1265,10 +1316,12 @@ async fn an_empty_script_fails_without_producing_rows() {
                     id: "e1".to_string(),
                     name: "codemode".to_string(),
                     arguments: json!({ "code": code }),
+                    defect: None,
                 },
                 &CancellationToken::new(),
             )
-            .await;
+            .await
+            .0;
         assert!(result.is_error, "{code:?} must fail");
         assert_eq!(
             text(&result),
@@ -1312,10 +1365,12 @@ async fn a_stop_cancels_a_running_script() {
                         id: "s1".to_string(),
                         name: "codemode".to_string(),
                         arguments: json!({ "code": "while (true) {}" }),
+                        defect: None,
                     },
                     &turn,
                 )
                 .await
+                .0
         })
     };
     tokio::time::sleep(Duration::from_millis(150)).await;

@@ -171,6 +171,32 @@ pub struct SubagentCapture {
     /// call drains that set, so the liveness half cannot tell a truncated child
     /// from one whose tool finished.
     saw_truncation: std::sync::atomic::AtomicBool,
+    /// (the turn-loop bound) Did the child's turn get stopped by the AGENT's own
+    /// turn limit (`RpcEvent::turn_capped`)?
+    ///
+    /// THE SIBLING OF [`Self::saw_truncation`], and it exists because the cap
+    /// walks through a NEW DOOR into the SAME shape. A capped child's loop is
+    /// bounded by the same guard's sibling, so it SETTLES — it is not reaped, not
+    /// crashed, not cancelled — with no closing message. Without this flag it
+    /// reaches the ordinary empty path, and if it had announced a tool call on the
+    /// way there the `saw_tool_activity` exemption hands its parent
+    /// `Completed { output: "" }`: precisely the empty-`Completed` issue #122
+    /// exists to prevent, arriving by a route `turn_truncated` does not cover.
+    ///
+    /// Why a separate flag and not a widening of `saw_truncation`: the two are
+    /// DIFFERENT FACTS with different remediations — one is the provider cutting
+    /// the reply off, the other is the agent looping against its own ceiling — and
+    /// the parent-facing error names whichever one happened. Reusing the
+    /// truncation flag would tell a parent "the provider's output cap did this"
+    /// about a turn the provider never cut off.
+    ///
+    /// The same invisibility argument as `saw_truncation`'s applies: the cap
+    /// notice is a bookkeeping line on `{stamp}:cap:N`, and
+    /// `is_bookkeeping_message_id` answers true for it precisely because a parent
+    /// must never read the harness's own notice as its child's answer — so the
+    /// disposition cannot be read out of `captured_text()` and has to be carried
+    /// beside it.
+    saw_cap: std::sync::atomic::AtomicBool,
 }
 
 impl Default for SubagentCapture {
@@ -188,6 +214,7 @@ impl SubagentCapture {
             cost: StdMutex::new(None),
             saw_tool_activity: std::sync::atomic::AtomicBool::new(false),
             saw_truncation: std::sync::atomic::AtomicBool::new(false),
+            saw_cap: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -314,6 +341,16 @@ impl SubagentCapture {
             self.saw_truncation
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // (the turn-loop bound) The cap marker (see `saw_cap`). Recorded HERE for
+        // the same reason and with the same guarantee as the truncation marker
+        // immediately above: `pump.rs` feeds every child `RpcEvent` through this
+        // method, and the child emits `turn_capped` BEFORE its settle — so the
+        // flag is set while the drive is still listening, which is the same
+        // contract the notice has on the wire.
+        if matches!(event, RpcEvent::turn_capped) {
+            self.saw_cap
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let RpcEvent::message_update { usage, .. } = event {
             let input = usage
                 .get("inputTokens")
@@ -376,6 +413,17 @@ impl SubagentCapture {
     pub fn saw_truncation(&self) -> bool {
         self.saw_truncation
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// (the turn-loop bound) Did the child's turn end on the AGENT's own turn
+    /// limit (`RpcEvent::turn_capped`)? The settle guard reads this to DEFEAT the
+    /// `saw_tool_activity()` exemption for the same reason `saw_truncation()`
+    /// does: a bounded child settles without a closing message, and an announce is
+    /// not evidence of work when the turn was cut off on the way to it. See the
+    /// field's doc for why this is a SIBLING flag and not a widening of the
+    /// truncation one.
+    pub fn saw_cap(&self) -> bool {
+        self.saw_cap.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn output_tokens(&self) -> u64 {
@@ -1234,55 +1282,7 @@ async fn drive_subagent(
             // empty-`Completed` #122 exists to prevent, on a route this branch
             // created. Pinned by
             // `manager::tests::a_truncated_child_that_streamed_nothing_is_not_completed_empty`.
-            if capture.saw_truncation() {
-                // The SALVAGE is the child's own streamed text, when it has any
-                // (the same partial-output hand-off `failed_with_salvage` gives a
-                // dead child); an empty or placeholder-only capture yields `""`,
-                // so the banner never reaches the parent — the #122 discipline,
-                // unchanged in kind.
-                let salvage = if content_is_effectively_empty(&output) {
-                    String::new()
-                } else {
-                    output.clone()
-                };
-                // The metrics ride the `Failed` path UNCHANGED, exactly as the
-                // guard below does: a truncated child spent real tokens and real
-                // money, and its failure is not a reason to report it as free.
-                let mut metrics = metrics;
-                metrics.output = salvage.clone();
-                SubagentOutcome::Failed {
-                    // `Other` for the same reason the #122 guard uses it: the
-                    // child was not reaped, did not crash, and was not cancelled.
-                    reason: SubagentFailureReason::Other,
-                    error: "the subagent's turn was truncated by the provider's \
-                            output cap"
-                        .to_string(),
-                    output: salvage,
-                    metrics,
-                }
-            } else if content_is_effectively_empty(&output) && !capture.saw_tool_activity() {
-                // The metrics ride the `Failed` path UNCHANGED (the child's real
-                // tokens and money are not forfeited by its empty answer); only
-                // the `output` mirror is emptied, so nothing placeholder-shaped
-                // survives into the parent.
-                let mut metrics = metrics;
-                metrics.output = String::new();
-                SubagentOutcome::Failed {
-                    // `Other`, NOT `Cancelled`: the child was not stopped — it
-                    // SETTLED. `Cancelled` is the parent/user-Stop meaning (ADR
-                    // 0055) and a `Failed` here must never read as one.
-                    reason: SubagentFailureReason::Other,
-                    error: "the subagent settled with no output".to_string(),
-                    // No partial to salvage: `captured_text()` IS the empty (or
-                    // placeholder-only) run this guard rejects, and forwarding
-                    // the placeholder into the parent's `output` / `error` fields
-                    // would re-leak the very banner this fix silences.
-                    output: String::new(),
-                    metrics,
-                }
-            } else {
-                SubagentOutcome::Completed { output, metrics }
-            }
+            settled_outcome(capture, output, metrics)
         }
         Race::Dead => failed_with_salvage(
             SubagentFailureReason::Unresponsive,
@@ -1309,6 +1309,132 @@ async fn drive_subagent(
         }
     };
     Some(outcome)
+}
+
+/// The `Race::Settled` disposition: what a child that SETTLED hands its parent.
+///
+/// Extracted from `drive_subagent` so the three-way decision has a test of its
+/// own that does not need a Worker process (`drive_subagent` needs a live
+/// `WorkerHandle`, a pump, four `watch`es and a preflight). The extraction moves
+/// the decision, not its reasoning — every claim below is the one the call site
+/// made before it.
+///
+/// **(issue #190 follow-up, F1) FIRST comes the truncation arm**, which outranks
+/// BOTH the #122 guard and the `Completed` fall-through. A child whose turn the
+/// provider's output cap cut off is not a success, with text or without (Decision
+/// 1: terminal), and since Decision 2 its announced tool call was CLOSED rather
+/// than dispatched — so `saw_tool_activity` no longer distinguishes "did real work
+/// and had nothing to say" (ADR 0055's legitimate `Completed`) from "announced a
+/// call that will never run and produced nothing". Reading the announce alone made
+/// a truncated, text-less child exempt from the #122 guard and hand the parent
+/// `Completed { output: "" }` — the exact empty-`Completed` #122 exists to prevent,
+/// on a route that branch created. Pinned end-to-end by
+/// `manager::tests::a_truncated_child_that_streamed_nothing_is_not_completed_empty`.
+///
+/// **(the turn-loop bound) THEN the cap arm**, the truncation arm's sibling, for
+/// the reason on `SubagentCapture::saw_cap`: a child whose turn hit the agent's own
+/// ceiling settles the same way and must not be a `Completed` either. It sits
+/// AFTER the truncation arm because a turn the provider cut off is the more
+/// specific fact and the better error to hand the parent. The two are near-
+/// but not quite mutually exclusive: `handle_truncated_turn` ends in
+/// `settle_truncated` + `TurnFlow::Return` today, so a truncated turn never reaches
+/// the bound — but its caller's `Continue` arm exists (dead, and covered by the
+/// close that already ran), and a route that became live would let one child set
+/// both flags. Truncation-first is therefore the arm order that stays right if
+/// that arm ever wakes, which is why
+/// `the_truncation_arm_outranks_the_cap_arm` pins the ORDER and not just the
+/// reachable state.
+///
+/// **(issue #122) THEN the empty-output guard.** A child that SETTLED with no
+/// output at all (nothing streamed, or only the upstream sanitisation placeholder)
+/// is NOT a `Completed { output: "" }`: dispatch.rs's `Completed` arm builds
+/// `ToolResult { content: [Text { text: output }] }` with no `salvage_text` shield
+/// (only the `Failed` arm has one), so an empty `Completed` lands in the parent's
+/// transcript as a `tool` row with empty text and puts `"content": ""` on the
+/// parent's NEXT request — the wire LiteLLM rewrites into the placeholder. It
+/// becomes the honest `Failed`, with the child's metrics preserved on that path and
+/// `subagent-closed` still firing `status: "failed"`. EXACT-MATCH ONLY
+/// (`content_is_effectively_empty` is empty-ish or the whole placeholder, never a
+/// substring): a child that ends a real answer with the banner sentence keeps it —
+/// don't-filter-too-much. Pinned end-to-end by
+/// `manager::tests::a_silent_child_that_settled_is_not_completed_empty`.
+fn settled_outcome(
+    capture: &SubagentCapture,
+    output: String,
+    metrics: SubagentMetrics,
+) -> SubagentOutcome {
+    if capture.saw_truncation() {
+        // The SALVAGE is the child's own streamed text, when it has any (the same
+        // partial-output hand-off `failed_with_salvage` gives a dead child); an
+        // empty or placeholder-only capture yields `""`, so the banner never
+        // reaches the parent — the #122 discipline, unchanged in kind.
+        let salvage = if content_is_effectively_empty(&output) {
+            String::new()
+        } else {
+            output.clone()
+        };
+        // The metrics ride the `Failed` path UNCHANGED, exactly as the
+        // guard below does: a truncated child spent real tokens and real
+        // money, and its failure is not a reason to report it as free.
+        let mut metrics = metrics;
+        metrics.output = salvage.clone();
+        SubagentOutcome::Failed {
+            // `Other` for the same reason the #122 guard uses it: the
+            // child was not reaped, did not crash, and was not cancelled.
+            reason: SubagentFailureReason::Other,
+            error: "the subagent's turn was truncated by the provider's \
+                    output cap"
+                .to_string(),
+            output: salvage,
+            metrics,
+        }
+    } else if capture.saw_cap() {
+        // (the turn-loop bound) The cap arm — the truncation arm's SIBLING, and
+        // byte-identical in shape on purpose: the same salvage discipline (the
+        // child's own streamed text, `""` when it has none), the same non-
+        // forfeiture of the child's tokens and money, the same `Other` reason (a
+        // bounded child was not reaped, did not crash, and was not cancelled).
+        // Only the ERROR differs, and it must: the parent is told which ceiling
+        // ended its child, and `attention.ts` must not be able to read this as a
+        // user-initiated stop.
+        let salvage = if content_is_effectively_empty(&output) {
+            String::new()
+        } else {
+            output.clone()
+        };
+        let mut metrics = metrics;
+        metrics.output = salvage.clone();
+        SubagentOutcome::Failed {
+            reason: SubagentFailureReason::Other,
+            error: "the subagent's turn was stopped by the agent's own turn \
+                    limit"
+                .to_string(),
+            output: salvage,
+            metrics,
+        }
+    } else if content_is_effectively_empty(&output) && !capture.saw_tool_activity() {
+        // The metrics ride the `Failed` path UNCHANGED (the child's real
+        // tokens and money are not forfeited by its empty answer); only the
+        // `output` mirror is emptied, so nothing placeholder-shaped survives
+        // into the parent.
+        let mut metrics = metrics;
+        metrics.output = String::new();
+        SubagentOutcome::Failed {
+            // `Other`, NOT `Cancelled`: the child was not stopped — it
+            // SETTLED. `Cancelled` is the parent/user-Stop meaning (ADR
+            // 0055) and a `Failed` here must never read as one.
+            reason: SubagentFailureReason::Other,
+            error: "the subagent settled with no output".to_string(),
+            // No partial to salvage: `captured_text()` IS the empty (or
+            // placeholder-only) run this guard rejects, and forwarding
+            // the placeholder into the parent's `output` / `error` fields
+            // would re-leak the very banner this fix silences.
+            output: String::new(),
+            metrics,
+        }
+    } else {
+        SubagentOutcome::Completed { output, metrics }
+    }
 }
 
 /// The SAFETY-NET exit future (ADR 0055 review, thread 3): the child's exit code
@@ -2513,5 +2639,224 @@ mod rollup_tests {
              `SessionInfo.costUsd` spelling), got {:?}",
             closed["metrics"]["cost"]
         );
+    }
+}
+
+/// (the turn-loop bound) `settled_outcome`'s cap arm — the fourth consumer of
+/// `RpcEvent::turn_capped`, and the easiest one to miss.
+///
+/// Why the pin lives HERE rather than end-to-end in `manager::tests`: the
+/// end-to-end shape (`a_truncated_child_that_streamed_nothing_is_not_completed_empty`)
+/// needs a fixture worker that emits the capped frame order, and `src/fixtures/
+/// worker.rs` / `src/worker/manager/tests/mod.rs` are outside this change's file
+/// set. `settled_outcome` is the decision itself, extracted from `drive_subagent`
+/// precisely so it can be driven without a Worker process, a pump and four
+/// `watch`es — so the arm gets a real assertion at the point it is made, and the
+/// end-to-end leg is named below as the follow-up rather than claimed here.
+#[cfg(test)]
+mod settled_outcome_tests {
+    use super::*;
+
+    fn metrics() -> SubagentMetrics {
+        SubagentMetrics {
+            output: String::new(),
+            input_tokens: 77,
+            output_tokens: 21,
+            cost: Some(0.0042),
+            duration_ms: 10,
+        }
+    }
+
+    /// A child whose turn hit the agent's own turn limit is `Failed`, NOT
+    /// `Completed { output: "" }` — even though it ANNOUNCED a tool call, which is
+    /// the exemption that made the truncation route a false success.
+    ///
+    /// The three flags are set the way production sets them, through
+    /// `observe_event`, so this exercises the recording path and the decision in
+    /// one pass: the announce (`tool_execution_start`) sets `saw_tool_activity`,
+    /// and `turn_capped` sets `saw_cap`. Without the cap flag the child below is
+    /// exempt from the #122 guard (it announced a tool) and hands its parent the
+    /// empty `Completed` that puts `"content": ""` on the parent's next request.
+    #[test]
+    fn a_capped_child_that_announced_a_tool_is_not_completed_empty() {
+        let capture = SubagentCapture::new();
+        capture.observe_event(&RpcEvent::tool_execution_start {
+            tool_call_id: "t1".to_string(),
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({ "command": "echo hi" }),
+        });
+        capture.observe_event(&RpcEvent::turn_capped);
+
+        // The witnesses that this is the both-armed shape: exempt by the announce,
+        // bounded by the cap.
+        assert!(
+            capture.saw_tool_activity(),
+            "the announce set the #122 exemption flag — this is the case that \
+             used to slip through"
+        );
+        assert!(capture.saw_cap(), "`turn_capped` set the cap flag");
+        assert!(
+            !capture.saw_truncation(),
+            "and NOT the truncation flag — the cap is a different fact with a \
+             different error, and reusing that flag would tell the parent the \
+             provider's output cap did this"
+        );
+
+        let outcome = settled_outcome(&capture, String::new(), metrics());
+        match outcome {
+            SubagentOutcome::Completed { output, metrics } => panic!(
+                "a capped child is never `Completed` — its loop was bounded and it \
+                 settled with no closing message, so an empty `Completed` is the \
+                 #122 shape arriving by a new door. Got output {output:?} with \
+                 metrics {metrics:?}",
+            ),
+            SubagentOutcome::Failed {
+                reason,
+                error,
+                output,
+                metrics,
+            } => {
+                assert_eq!(
+                    reason,
+                    SubagentFailureReason::Other,
+                    "`Other` — the child was not reaped, did not crash, and was \
+                     NOT cancelled (`Cancelled` is the parent/user-Stop meaning, \
+                     ADR 0055), got {reason:?}"
+                );
+                assert!(
+                    error.contains("turn limit"),
+                    "the error names the agent's OWN limit, not the provider's \
+                     output cap, got {error:?}"
+                );
+                assert!(
+                    !error.contains("output cap"),
+                    "and it must not read as the truncation, got {error:?}"
+                );
+                assert!(
+                    output.is_empty(),
+                    "nothing streamed, so nothing to salvage, got {output:?}"
+                );
+                assert_eq!(
+                    (metrics.input_tokens, metrics.output_tokens),
+                    (77, 21),
+                    "the child's real usage rides the `Failed` path — a bounded \
+                     child spent real tokens"
+                );
+                assert_eq!(
+                    metrics.cost,
+                    Some(0.0042),
+                    "and its real money rides it unchanged"
+                );
+            }
+        }
+    }
+
+    /// A capped child WITH a partial answer keeps the text on the `Failed` path
+    /// (the disposition changes, the salvage does not) — and the cap notice itself
+    /// never reaches the parent, because `is_bookkeeping_message_id` answers true
+    /// for the `cap` word.
+    #[test]
+    fn a_capped_child_keeps_its_partial_text_and_never_its_notice() {
+        let capture = SubagentCapture::new();
+        capture.observe_event(&RpcEvent::turn_capped);
+        // The child's real answer, on a model message id.
+        capture.observe_sink_frame(
+            "session-update",
+            &json!({
+                "sessionId": "child-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "t:m1",
+                    "content": { "type": "text", "text": "Half an answer, then the bound." }
+                }
+            }),
+        );
+        // The cap notice, on the id `normalize` mints for it.
+        capture.observe_sink_frame(
+            "session-update",
+            &json!({
+                "sessionId": "child-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "t:cap:0",
+                    "content": {
+                        "type": "text",
+                        "text": "The turn was stopped by the agent's own turn limit before it finished."
+                    },
+                    "disposition": "max_turn_requests"
+                }
+            }),
+        );
+
+        assert_eq!(
+            capture.captured_text(),
+            "Half an answer, then the bound.",
+            "the notice is bookkeeping and is never the child's answer"
+        );
+
+        let output = capture.captured_text();
+        match settled_outcome(&capture, output, metrics()) {
+            SubagentOutcome::Completed { .. } => {
+                panic!("a capped turn is NOT a success, with text or without")
+            }
+            SubagentOutcome::Failed { output, .. } => {
+                assert_eq!(
+                    output, "Half an answer, then the bound.",
+                    "the text the child DID stream is salvaged onto the `Failed` \
+                     path, got {output:?}"
+                );
+            }
+        }
+    }
+
+    /// The precedence rail: a capture that saw BOTH dispositions reports the
+    /// truncation. That state is unreachable today (`handle_truncated_turn` ends in
+    /// `settle_truncated` + `TurnFlow::Return`, so a truncated turn never lives long
+    /// enough to hit the bound), and this pins the arm ORDER anyway — an edit that
+    /// moved the cap arm above the truncation arm would otherwise be silent, and it
+    /// would start reporting the wrong ceiling the day `handle_truncated_turn`'s
+    /// dead-but-present `Continue` arm wakes.
+    #[test]
+    fn the_truncation_arm_outranks_the_cap_arm() {
+        let capture = SubagentCapture::new();
+        capture.observe_event(&RpcEvent::turn_truncated);
+        capture.observe_event(&RpcEvent::turn_capped);
+        match settled_outcome(&capture, String::new(), metrics()) {
+            SubagentOutcome::Failed { error, .. } => assert!(
+                error.contains("output cap") && !error.contains("turn limit"),
+                "the truncation arm wins, got {error:?}",
+            ),
+            other => panic!("a doubly-disposed child is `Failed`, got {other:?}"),
+        }
+    }
+
+    /// The rails the cap arm must NOT widen: a child that announced nothing and
+    /// streamed nothing is still the #122 `Failed`, and a child that did real
+    /// work and had something to say is still a `Completed`.
+    #[test]
+    fn the_cap_arm_leaves_the_other_two_dispositions_alone() {
+        // Silent, no announce, no cap → the #122 guard.
+        let silent = SubagentCapture::new();
+        match settled_outcome(&silent, String::new(), metrics()) {
+            SubagentOutcome::Failed { error, .. } => {
+                assert_eq!(error, "the subagent settled with no output")
+            }
+            other => panic!("the #122 guard still fires, got {other:?}"),
+        }
+        // Announced a tool, no cap → ADR 0055's legitimate empty `Completed`.
+        let worker = SubagentCapture::new();
+        worker.observe_event(&RpcEvent::tool_execution_start {
+            tool_call_id: "t1".to_string(),
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({ "command": "cargo test" }),
+        });
+        match settled_outcome(&worker, String::new(), metrics()) {
+            SubagentOutcome::Completed { .. } => {}
+            other => panic!(
+                "a child that ran a tool and had nothing to say is STILL a \
+                 `Completed` (ADR 0055) — the cap arm must not reach it, got \
+                 {other:?}",
+            ),
+        }
     }
 }

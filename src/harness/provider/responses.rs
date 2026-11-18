@@ -75,13 +75,41 @@ struct ResponsesStream {
     tool_acc: BTreeMap<u32, ResponsesToolAcc>,
     /// A terminal event was seen (`response.completed` /
     /// `response.incomplete` / `response.failed` / `error` — no synthetic
-    /// `Done` at stream end).
+    /// `Done` at stream end). Also the latch the three TOOL-CALL
+    /// ACCUMULATION arms test: a terminal event has already flushed this
+    /// response's calls and emptied the map, so an item event after it is
+    /// dropped rather than accumulated into a call nobody will flush (or
+    /// flushed a second time — a duplicate dispatch).
     terminated: bool,
     /// A combined `Usage` was emitted (exactly once — the first terminal
     /// event to carry a `response.usage` with at least one token count).
     usage_emitted: bool,
+    /// A terminal `Done` carrying a NON-`Stop` disposition (`Length` or
+    /// `Error`) was already delivered, so NO later terminal's `Done` may
+    /// follow it (see [`Self::push_terminal_done`] — a second `Done`
+    /// overwrites the first downstream, which makes a never-retried
+    /// truncation retryable and makes a FAILED response report success).
+    sticky_done_emitted: bool,
     /// The raw stream is exhausted (the stream ends after `pending`).
     exhausted: bool,
+}
+
+/// The `item.type` of an item event, for the post-terminal discard line.
+///
+/// A protocol discriminator (`"function_call"` / `"message"` /
+/// `"reasoning"`) that says which kind of call was lost; `"<none>"` when
+/// the event carries no readable `item.type` at all, which is itself the
+/// interesting answer. It is provider-supplied, so it is a string and not
+/// an enum — but the line it feeds goes to stderr and thence to
+/// `debuglog::log_truncated`, which caps every line at its own
+/// `MAX_LINE_BYTES`, so an absurd value is bounded by the sink rather than
+/// needing a second cap here.
+fn item_type_label(v: &Value) -> String {
+    v.get("item")
+        .and_then(|i| i.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("<none>")
+        .to_string()
 }
 
 impl ResponsesStream {
@@ -94,6 +122,7 @@ impl ResponsesStream {
             tool_acc: BTreeMap::new(),
             terminated: false,
             usage_emitted: false,
+            sticky_done_emitted: false,
             exhausted: false,
         }
     }
@@ -152,6 +181,52 @@ impl ResponsesStream {
                 }
             }
             Some("response.output_item.added") => {
+                // A terminal event has already flushed this response's
+                // tool calls and emptied the accumulator map, so an item
+                // event AFTER the terminal cannot contribute to a call
+                // anyone will ever see: it would build a FRESH acc on the
+                // emptied map and either be flushed a second time (a
+                // duplicate `ToolCall` → a duplicate dispatch — no `id`
+                // dedupe downstream) or never flushed at all. The
+                // terminal ENDS the response; nothing after it is
+                // accumulated. (UNVERIFIED upstream — per the Responses
+                // spec `response.completed` is final and every
+                // `output_item.done` precedes it; this gate is defensive
+                // hardening, not a fix for an observed wire.)
+                //
+                // The discard is LOUD, and that is load-bearing. What this
+                // gate prevents is a duplicate `ToolCall` for a call the
+                // terminal already delivered, and `run_tool_batch` has no `id`
+                // dedupe — the failure mode it guards is a SECOND side effect
+                // on a payment path. If the gate ever engages in the field we
+                // have to be able to tell, and a bare `return` leaves no trace
+                // anywhere: it returns BEFORE touching `tool_acc`, so there is
+                // no accumulator residue to find downstream either. Silent,
+                // this hardening can regress from "loud duplicate write" to
+                // "silently lost call" — the softer failure, not the safer one.
+                //
+                // `eprintln!`, deliberately, and not `debuglog::log` /
+                // `diagnostics::record` (the asymmetry `provider/mod.rs`'s
+                // "Why two sinks" documents in full): the Worker's stderr is
+                // drained by a task in `worker/client.rs` into
+                // `debuglog::log_truncated`, which makes this line the only
+                // Worker-side sink that survives at all — and that sink is
+                // itself gated behind `ARCHIMEDES_DEBUG`, so in a DEFAULT
+                // launch the Worker drops it. That is accepted. `diagnostics`
+                // is the always-on channel and is NOT used here: its rule is
+                // reviewed call sites at low volume, and one line per dropped
+                // item on a stream is not always-on-worthy volume for a shape
+                // that has never been observed on a real wire.
+                if self.terminated {
+                    eprintln!(
+                        "harness: responses post-terminal item dropped: \
+                         `response.output_item.added` after a terminal event, \
+                         item type {} — the terminal already flushed this \
+                         response's calls",
+                        item_type_label(v)
+                    );
+                    return;
+                }
                 let Some(item) = v.get("item") else {
                     return;
                 };
@@ -197,6 +272,33 @@ impl ResponsesStream {
                 // the `*_delta` events — nothing to record at `added`.
             }
             Some("response.function_call_arguments.delta") => {
+                // Gate as above: after a terminal the accumulator map is
+                // flushed and empty, so a late fragment would open a
+                // fresh acc whose `arguments` can never reach a `ToolCall`
+                // (and the `ToolCallDelta` would render a card for a call
+                // that was already delivered — or, with a name in the
+                // item, be flushed a second time).
+                //
+                // Loud for the same reason as the arm above, and this is the
+                // arm most likely to fire in the field — a proxy that
+                // re-orders the tail of the stream sends fragments after the
+                // terminal without ever re-sending the item. There is no item
+                // type on this event, so the line names the `output_index`
+                // instead: which call the provider was still streaming into is
+                // the one fact that identifies the loss.
+                if self.terminated {
+                    eprintln!(
+                        "harness: responses post-terminal item dropped: \
+                         `response.function_call_arguments.delta` after a \
+                         terminal event, output_index {} — the terminal \
+                         already flushed this response's calls",
+                        v.get("output_index")
+                            .and_then(|i| i.as_u64())
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "<none>".to_string())
+                    );
+                    return;
+                }
                 let Some(index) = v
                     .get("output_index")
                     .and_then(|i| i.as_u64())
@@ -221,6 +323,35 @@ impl ResponsesStream {
                     }));
             }
             Some("response.output_item.done") => {
+                // The third accumulation arm, gated for the same reason
+                // and the one that actually bit: post-terminal the acc map
+                // is EMPTY, so the done item no longer upgrades an
+                // in-flight acc — it CREATES one. With `id` + `name` on
+                // the item (or falling back to nothing) that emits a
+                // SECOND `ToolCall` for a call the terminal already
+                // delivered — same `id`, or an empty one — and
+                // `run_tool_batch` has no `id` dedupe, so a `write` runs
+                // twice. (UNVERIFIED upstream — the spec orders every
+                // `output_item.done` BEFORE `response.completed`; this is
+                // defensive.)
+                //
+                // Loud, and this is the gate the whole hardening was written
+                // for: the duplicate `write` on a payment path. A suppressed
+                // call that leaves no trace is the worse outcome, because the
+                // duplicate we would have caught becomes a call the user never
+                // sees and never learns was dropped. Same `eprintln!`-not-
+                // `diagnostics` reasoning as the two arms above.
+                if self.terminated {
+                    eprintln!(
+                        "harness: responses post-terminal item dropped: \
+                         `response.output_item.done` after a terminal event, \
+                         item type {} — this is the arm that duplicates a \
+                         dispatch; the call was already delivered by the \
+                         terminal",
+                        item_type_label(v)
+                    );
+                    return;
+                }
                 let Some(item) = v.get("item") else {
                     return;
                 };
@@ -263,10 +394,14 @@ impl ResponsesStream {
                         .or_else(|| acc.name.clone());
                     if let Some(name) = name {
                         acc.done = true;
+                        // (issue #193) The defect rides the call — see
+                        // `parse_arguments`.
+                        let (arguments, defect) = parse_arguments(&acc.arguments);
                         self.pending.push_back(ProviderEvent::ToolCall(ToolCall {
                             id: id.unwrap_or_default(),
                             name,
-                            arguments: parse_arguments(&acc.arguments),
+                            arguments,
+                            defect,
                         }));
                     }
                 }
@@ -277,18 +412,45 @@ impl ResponsesStream {
                 // The terminal event: the `usage` (when at least one side
                 // is present) PRECEDES the `Done`.
                 self.emit_terminal_usage(v);
+                // The tool calls flush BEFORE the `Done` — the ordering
+                // invariant the `openai` and `anthropic` wires already
+                // hold (`Usage` → tool calls → `Done`). Without this the
+                // stream-end flush is UNREACHABLE (it sits behind
+                // `!this.terminated`, set here), so a `function_call` in
+                // flight at the terminal was lost on every healthy
+                // `completed`. The order between this and the
+                // `terminated` write below is not load-bearing —
+                // `flush_tool_calls` does not consult the flag — it is
+                // readability only; what matters is that the flush
+                // precedes the `Done`.
+                self.flush_tool_calls();
                 self.terminated = true;
-                if v.get("response")
+                let status = v
+                    .get("response")
                     .and_then(|r| r.get("status"))
-                    .and_then(|s| s.as_str())
-                    == Some("completed")
-                {
-                    self.pending
-                        .push_back(ProviderEvent::Done(FinishReason::Stop));
+                    .and_then(|s| s.as_str());
+                if status == Some("completed") {
+                    self.push_terminal_done(FinishReason::Stop);
+                } else {
+                    // A `terminated` stream always carries a finish
+                    // reason. A `response.completed` whose `status` is
+                    // absent or anything else is NOT a success: pushing
+                    // nothing left `acc.finish` at `None`, bypassed the
+                    // `Length` gate and the fabrication guard, and let
+                    // the turn fall through into `note_success` and the
+                    // success triple — a SILENT SUCCESS with a vanished
+                    // tool call. (Defensive/proxy shape: no captured
+                    // payload shows a real backend sending a `completed`
+                    // without `status: "completed"`.)
+                    self.push_terminal_done(FinishReason::Error);
                 }
             }
             Some("response.incomplete") => {
                 self.emit_terminal_usage(v);
+                // Same in-arm flush: a truncated response still delivers
+                // the call it accumulated (the truncation notice must not
+                // arrive without the tool card).
+                self.flush_tool_calls();
                 self.terminated = true;
                 // `max_output_tokens` → `Length`; any other reason (or an
                 // absent one) → `Error`.
@@ -302,13 +464,15 @@ impl ResponsesStream {
                 } else {
                     FinishReason::Error
                 };
-                self.pending.push_back(ProviderEvent::Done(finish));
+                self.push_terminal_done(finish);
             }
             Some("response.failed") => {
                 self.emit_terminal_usage(v);
+                // … and a failed response is not a reason to swallow the
+                // call the model had already committed to.
+                self.flush_tool_calls();
                 self.terminated = true;
-                self.pending
-                    .push_back(ProviderEvent::Done(FinishReason::Error));
+                self.push_terminal_done(FinishReason::Error);
             }
             Some("error") => {
                 // An in-stream `error` event (the HTTP status was 200 —
@@ -336,13 +500,18 @@ impl ResponsesStream {
                 // either way — never both an `Error` and a `Done`.
                 self.exhausted = true;
                 self.terminated = true;
+                // The flush runs here too, BEFORE the match: this arm can
+                // push a `ProviderEvent::Error` instead of a `Done`, and
+                // its `terminated = true` (written above, so it covers
+                // BOTH branches of the match) makes the stream-end flush
+                // unreachable — without this line an in-flight call
+                // vanished on the error path as well.
+                self.flush_tool_calls();
                 match parse_error_chunk(v) {
                     Some(e @ (ProviderError::ContextOverflow(_) | ProviderError::Auth(_))) => {
                         self.pending.push_back(ProviderEvent::Error(e));
                     }
-                    _ => self
-                        .pending
-                        .push_back(ProviderEvent::Done(FinishReason::Error)),
+                    _ => self.push_terminal_done(FinishReason::Error),
                 }
             }
             _ => {
@@ -434,11 +603,81 @@ impl ResponsesStream {
             .and_then(cost_usd_from_usage)
     }
 
+    /// Push a terminal event's `Done`, ONCE per disposition: a NON-`Stop`
+    /// disposition is sticky, so a later terminal's `Done` is dropped rather
+    /// than overwriting it.
+    ///
+    /// Why the latch exists at all: the finish reason is not merged
+    /// downstream, it is REWRITTEN (`acc.finish = Some(f)` is unconditional),
+    /// so last-terminal-won. A `response.incomplete{max_output_tokens}`
+    /// followed by a statusless `response.completed` therefore turned
+    /// `Length` into `Error` — and `Error` routes through the fabrication
+    /// guard to a `Retryable` disposition, so `retry_abandoned_attempt`
+    /// RE-ISSUED a request whose response was already truncated. ADR 0108
+    /// Decision 1 forbids replaying a truncated response, and a truncation is
+    /// strictly more specific than a generic error: the first terminal knew
+    /// WHY the turn ended.
+    ///
+    /// Why the latch covers `Error` and not only `Length`: the same
+    /// rewrite, read the other way round, is worse.
+    /// `response.failed` followed by `response.completed{status:"completed"}`
+    /// yielded `Error → Stop`, and `Stop` is the SUCCESS disposition — the
+    /// turn takes the success triple and a response the provider called a
+    /// FAILURE reports as a completed turn. That is precisely the fabrication
+    /// the fabrication guard on `acc.finish == Some(Error)` exists to refuse,
+    /// reached by a doubled terminal rather than by a lying provider. The rule
+    /// is therefore about specificity, not about truncation: `Length` and
+    /// `Error` are assertions about WHY the turn ended, `Stop` is the absence
+    /// of one, and a later event cannot assert an absence over an earlier
+    /// event's finding.
+    ///
+    /// The latch stays deliberately narrow in the two directions that are not
+    /// lies. A doubled `Done(Stop)` (the residue `sse_single_usage_chunk`
+    /// documents) is a benign stop-reason duplication and stays as it was —
+    /// collapsing it would change a vector a test records on purpose. And
+    /// `Error → Error` still passes through: the second terminal repeats the
+    /// first's disposition, so nothing is overwritten and the event vector
+    /// keeps describing what the wire actually sent. Nor is the `error` arm's
+    /// `ProviderEvent::Error` push routed through here at all: an
+    /// `Auth` / `ContextOverflow` tier is not a finish reason and must reach
+    /// the loop even after a truncation was reported.
+    fn push_terminal_done(&mut self, finish: FinishReason) {
+        if self.sticky_done_emitted {
+            return;
+        }
+        if !matches!(finish, FinishReason::Stop) {
+            self.sticky_done_emitted = true;
+        }
+        self.pending.push_back(ProviderEvent::Done(finish));
+    }
+
     /// Emit the accumulated tool calls as complete `ToolCall` events
     /// (dropping any acc that never arrived with a `name` — a
     /// `function_call` item without a `name` cannot be dispatched — and
     /// any `done` acc: its `output_item.done` already emitted the
     /// `ToolCall`, flushing it again would duplicate it).
+    ///
+    /// Runs at EVERY terminal arm (`response.completed` /
+    /// `response.incomplete` / `response.failed` / `error`) as well as at
+    /// stream end — meaning every PARSED terminal event, not every way
+    /// this stream can end: a mid-stream TRANSPORT failure also ends it
+    /// and does NOT flush (`poll_next`'s `Err` arm sets `exhausted`, so
+    /// the `Ready(None)` arm — the only other caller — is never reached),
+    /// and the in-flight call is dropped with it. That is survivable
+    /// rather than a leak: the retry re-issues the whole request, and a
+    /// call dropped here was never ANNOUNCED, so nothing dangles waiting
+    /// for a `function_call_output`.
+    ///
+    /// The in-arm call is what the `openai` and `anthropic` parsers
+    /// already did and this one did not: `terminated` is consulted only
+    /// by the stream-end `if !this.terminated` block, every terminal arm
+    /// sets it, so the stream-end flush never ran on a terminal event and
+    /// a `function_call` in flight at one was LOST. The in-arm flush makes
+    /// each terminal event deliver `Usage` → tool calls → `Done` WITHIN
+    /// itself, the same order the other two wires hold. Per terminal
+    /// EVENT, not per stream: the `error` arm never calls
+    /// `emit_terminal_usage`, so an `error`-then-`completed` stream emits
+    /// its `Done` BEFORE its `Usage`.
     fn flush_tool_calls(&mut self) {
         for (_index, acc) in std::mem::take(&mut self.tool_acc).into_iter() {
             if acc.done {
@@ -447,10 +686,13 @@ impl ResponsesStream {
             let Some(name) = acc.name else {
                 continue;
             };
+            // (issue #193) The defect rides the call — see `parse_arguments`.
+            let (arguments, defect) = parse_arguments(&acc.arguments);
             self.pending.push_back(ProviderEvent::ToolCall(ToolCall {
                 id: acc.id.unwrap_or_default(),
                 name,
-                arguments: parse_arguments(&acc.arguments),
+                arguments,
+                defect,
             }));
         }
     }
@@ -494,6 +736,23 @@ impl Stream for ResponsesStream {
                     // a Responses `usage` arrives only on the terminal
                     // events; a missing terminal event means missing
                     // usage, and a zero-filled `Usage` would misreport).
+                    //
+                    // With the terminal arms flushing in-arm, this
+                    // block's flush is provably a NO-OP on every
+                    // terminated path, for two INDEPENDENT reasons:
+                    //   1. `flush_tool_calls` does
+                    //      `std::mem::take(&mut self.tool_acc)`, so the
+                    //      in-arm flush EMPTIES the map — there is nothing
+                    //      left to emit here; and
+                    //   2. the whole block sits inside `if
+                    //      !this.terminated` and all four terminal arms
+                    //      set `terminated = true` — including the `error`
+                    //      arm, whose write PRECEDES its `parse_error_chunk`
+                    //      match, so the `ProviderEvent::Error` branch
+                    //      (which pushes an `Error`, not a `Done`) is
+                    //      covered too.
+                    // The block still does real work on the stream-ended-
+                    // with-no-terminal-event path, which is what it is for.
                     if let Some(tail) = this.lines.finish() {
                         this.handle_line(&tail);
                     }
@@ -947,6 +1206,7 @@ mod tests {
                     id: "fc_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
             ]
         );
@@ -979,6 +1239,7 @@ mod tests {
                     id: "fc_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/y" }),
+                    defect: None,
                 }),
             ]
         );
@@ -1016,6 +1277,614 @@ mod tests {
         ]))
         .await;
         assert_eq!(events, vec![ProviderEvent::Done(FinishReason::Error)]);
+    }
+
+    /// A `function_call` IN FLIGHT at a `response.incomplete` is flushed
+    /// before the `Done` (the truncation notice must not arrive without the
+    /// tool card the stream already carried — the `openai` / `anthropic`
+    /// wires flush in the terminal arm; this one did not).
+    #[tokio::test]
+    async fn responses_sse_incomplete_flushes_a_partial_function_call() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"read\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.incomplete\n\
+             data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        ]))
+        .await;
+        // The flush precedes the `Done` (the ordering invariant:
+        // `Usage` → tool calls → `Done`).
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("read".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Length),
+            ],
+            "a truncated stream still delivers the tool call it accumulated \
+             (got {events:?})"
+        );
+    }
+
+    /// The flush is NOT tied to the truncation reason: a
+    /// `content_filter` incomplete (→ `Done(Error)`, not `Done(Length)`)
+    /// still yields the call in flight.
+    #[tokio::test]
+    async fn responses_sse_incomplete_non_token_reason_still_flushes() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"read\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.incomplete\n\
+             data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("read".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Error),
+            ],
+            "a non-token incomplete reason still flushes (got {events:?})"
+        );
+    }
+
+    /// … and so does a FAILED terminal (the call the model had already
+    /// committed to is not paid for and then swallowed).
+    #[tokio::test]
+    async fn responses_sse_failed_flushes_a_partial_function_call() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"read\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.failed\n\
+             data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("read".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Error),
+            ],
+            "a failed terminal still flushes the call in flight (got {events:?})"
+        );
+    }
+
+    /// The sharpest of the four: `response.completed` sets `terminated`
+    /// UNCONDITIONALLY but pushed `Done(Stop)` only for
+    /// `status == "completed"`, so an absent/other `status` emitted NO
+    /// finish reason at all — `acc.finish` stayed `None`, the `Length`
+    /// gate and the fabrication guard were bypassed, and the turn fell
+    /// through into `note_success` and the success triple: a SILENT
+    /// SUCCESS with a vanished call. (UNVERIFIED upstream: no captured
+    /// payload shows a real backend doing this — this arm is the
+    /// defensive/proxy shape.)
+    ///
+    /// The fixture carries NO `usage` key on purpose: `response_usage`
+    /// returns `None` for an absent `response.usage`, so
+    /// `emit_terminal_usage` pushes nothing and no `Usage` lands between
+    /// the deltas and the `ToolCall`.
+    #[tokio::test]
+    async fn responses_sse_completed_without_status_flushes_and_errors() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"read\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("read".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                // A `terminated` stream always carries a finish reason —
+                // a `completed` whose status is not `"completed"` is an
+                // ERROR, never a silent success.
+                ProviderEvent::Done(FinishReason::Error),
+            ],
+            "a `completed` without a `completed` status flushes AND reports \
+             a finish reason (got {events:?})"
+        );
+    }
+
+    /// Even a HEALTHY `completed` loses a call that never got its
+    /// `output_item.done` (the terminal is the last chance to flush —
+    /// the stream-end flush is unreachable once `terminated` is set).
+    ///
+    /// The fixture carries a `usage` on purpose: this is the wire's only
+    /// pin on the FULL `Usage` → tool calls → `Done` order the commit
+    /// exists to establish. Swapping the `flush_tool_calls()` and
+    /// `emit_terminal_usage(v)` calls in the arm reddens it. (The
+    /// Anthropic wire pins the same order in
+    /// `anthropic_sse_tool_use_block`; this wire had no equivalent, so
+    /// every other fixture here omits `usage` and `Usage` never enters
+    /// their expected vectors.)
+    #[tokio::test]
+    async fn responses_sse_completed_with_status_flushes_a_never_done_call() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"read\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("read".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                // `Usage` BETWEEN the deltas and the `ToolCall`: within a
+                // terminal event the order is `emit_terminal_usage` →
+                // `flush_tool_calls` → `Done`, the same order the `openai`
+                // and `anthropic` wires hold.
+                ProviderEvent::Usage(
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                    None
+                ),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Stop),
+            ],
+            "a `completed` with no `output_item.done` still flushes the \
+             call it accumulated, after its `Usage` and before the `Done` \
+             (got {events:?})"
+        );
+    }
+
+    /// The terminal event ENDS the response: an `output_item.done` that
+    /// arrives AFTER it must not resurrect the accumulator the terminal
+    /// already flushed and emptied. Without the `terminated` gate on the
+    /// accumulation arms the late done item builds a FRESH acc (the map
+    /// was `std::mem::take`n by the flush) and emits a SECOND `ToolCall`
+    /// with the SAME `id`.
+    ///
+    /// Why that is the expensive one: `consume_stream` pushes both into
+    /// `acc.tool_calls`, `run_tool_batch` has no `id` dedupe, and
+    /// `tool_execution_start` is emitted twice — TWO executions of the
+    /// same `write`. `normalize`'s `announced_tool_calls` set collapses
+    /// the duplicate `ToolCallStart` FRAME, not the dispatch.
+    ///
+    /// (UNVERIFIED upstream: per the Responses spec `response.completed`
+    /// is final and every `output_item.done` precedes it, so no real
+    /// backend is known to send this order. This is defensive hardening
+    /// against a duplicated side effect on a payment path, NOT a fix for
+    /// an observed wire.)
+    #[tokio::test]
+    async fn responses_sse_done_item_after_completed_does_not_duplicate_the_call() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"write\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+             event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"/x\\\"}\",\"status\":\"completed\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("write".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Stop),
+            ],
+            "a done item after the terminal must not emit a second ToolCall \
+             for the call the terminal already flushed (got {events:?})"
+        );
+    }
+
+    /// The same gate, the shape the arm explicitly supports — "a proxy
+    /// may omit them on the done item": `id` / `name` fall back to the
+    /// accumulator's, and after the flush emptied the map there is no
+    /// `id` to fall back to. Measured on the current tree this late item
+    /// emits a SECOND `ToolCall` with `id: ""` — not merely a duplicate,
+    /// a call whose `call_id` matches no `function_call` item, so the
+    /// `function_call_output` the loop sends back for it references
+    /// nothing (and on the `write`/`bash` tools it is still a second
+    /// dispatch).
+    ///
+    /// (UNVERIFIED upstream, as above.)
+    #[tokio::test]
+    async fn responses_sse_done_item_without_id_after_completed_does_not_duplicate_the_call() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"write\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+             event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"/x\\\"}\",\"status\":\"completed\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("write".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Stop),
+            ],
+            "a done item that omits `id` after the terminal must not emit a \
+             second, `id`-less ToolCall (got {events:?})"
+        );
+    }
+
+    /// The third shape, and the one that is ALREADY correct: the late
+    /// done item carries NEITHER `id` NOR `name`. It can emit nothing
+    /// here (a nameless call cannot be dispatched) and it can never be
+    /// flushed later (`flush_tool_calls` drops a nameless acc), so the
+    /// single `ToolCall` the caller sees is the one the terminal flushed —
+    /// with the authoritative arguments, because on a well-formed stream
+    /// the accumulated fragments ARE the complete `arguments`. GREEN
+    /// before the gate as well as after: this test is a PRESERVATION
+    /// guard, pinning that the gate keeps it that way and that the late
+    /// item adds no event of any kind.
+    ///
+    /// The residue this test does NOT claim to fix, measured: when the
+    /// `arguments.delta` fragments were themselves truncated AND the late
+    /// done item is the only carrier of the complete `arguments`, the
+    /// flushed call keeps the stale fragment and its `defect` (the "your
+    /// JSON arrived truncated" refusal). The gate cannot repair that —
+    /// resurrecting the flushed acc to adopt a post-terminal `arguments`
+    /// is what re-creates the duplicate dispatch the two tests above
+    /// exist to prevent. Logging that dropped late item is another card's
+    /// job (see the untouched `continue`s in `flush_tool_calls`).
+    #[tokio::test]
+    async fn responses_sse_done_item_without_id_or_name_after_completed_adds_no_call() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"write\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\"}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+             event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"arguments\":\"{\\\"path\\\":\\\"/x\\\"}\",\"status\":\"completed\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("write".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{".to_string()),
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Stop),
+            ],
+            "a nameless done item after the terminal adds no event at all \
+             (got {events:?})"
+        );
+    }
+
+    /// A doubled terminal must not downgrade a TRUNCATION to an `Error`.
+    ///
+    /// `flush_tool_calls` is idempotent, but the `Done`s were not:
+    /// `acc.finish = Some(f)` is written unconditionally downstream, so
+    /// last-terminal-won and `response.incomplete{max_output_tokens}`
+    /// followed by a statusless `response.completed` yielded
+    /// `[Done(Length), Done(Error)]` — `acc.finish` became `Error`, the
+    /// fabrication guard fired, the disposition was `Retryable`, and
+    /// `retry_abandoned_attempt` RE-ISSUED the request. ADR 0108 Decision
+    /// 1 forbids replaying a truncated response, and the neighbouring
+    /// code is emphatic about it. Nothing dispatches here (no tool call in
+    /// flight), so no side effect duplicates — but a never-retried
+    /// truncation became a retried attempt, which is the one thing that
+    /// must not happen.
+    ///
+    /// The first terminal's `Done(Length)` now stands; the second
+    /// terminal's `Done` is dropped. (A doubled `Done(Stop)` — the residue
+    /// `sse_single_usage_chunk` documents — is a separate, benign
+    /// stop-reason concern and deliberately NOT collapsed by this latch.)
+    #[tokio::test]
+    async fn responses_sse_incomplete_length_then_completed_keeps_the_length_disposition() {
+        let events = collect(responses_stream(&[
+            "event: response.incomplete\n\
+             data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done(FinishReason::Length)],
+            "a later terminal must not overwrite a `Done(Length)` with \
+             `Done(Error)` — a truncated response is never re-issued \
+             (got {events:?})"
+        );
+    }
+
+    /// A doubled terminal must not turn a FAILED response into a SUCCESS.
+    ///
+    /// The `Length` latch above is narrower than the defect it guards. The
+    /// finish reason is still REWRITTEN downstream (`acc.finish = Some(f)`
+    /// is unconditional in `consume_stream`), so with only `Length` sticky a
+    /// `response.failed` followed by `response.completed{status:"completed"}`
+    /// yielded `[Done(Error), Done(Stop)]` and `acc.finish` ended at `Stop` —
+    /// **a failed response reporting success**. That is the exact fabrication
+    /// the fabrication guard exists to refuse, reached by a doubled terminal
+    /// instead of by a lying provider: the turn takes the success triple, the
+    /// composer unlocks, and the user is told a response the provider called a
+    /// failure completed. Nothing dispatches here either, so this is a
+    /// disposition lie rather than a duplicated side effect — but it is the
+    /// lie on the path that decides whether a turn is a success.
+    ///
+    /// The general rule the latch now implements: a non-`Stop` disposition is
+    /// STICKY. `Length` and `Error` are what a terminal knew about WHY the
+    /// turn ended; `Stop` is the absence of a problem, and the absence cannot
+    /// be asserted by a later event over an earlier event that found one. A
+    /// doubled `Done(Stop)` is still deliberately NOT collapsed (see
+    /// [`Self::push_terminal_done`] and the residue `sse_single_usage_chunk`
+    /// records on purpose), and `Error → Error` still passes through.
+    #[tokio::test]
+    async fn responses_sse_failed_then_completed_keeps_the_error_disposition() {
+        let events = collect(responses_stream(&[
+            "event: response.failed\n\
+             data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done(FinishReason::Error)],
+            "a later `completed` must not overwrite a `Done(Error)` with \
+             `Done(Stop)` — a failed response cannot be reported as a \
+             success (got {events:?})"
+        );
+    }
+
+    /// The other two post-terminal gates: an `output_item.added` and a
+    /// `function_call_arguments.delta` that arrive AFTER `response.completed`
+    /// are dropped, and the event vector carries nothing for them.
+    ///
+    /// The three accumulation arms are gated together, but only the
+    /// `output_item.done` arm has a test of its own (the three
+    /// `*_after_completed_*` cases). This pins the other two, which are the
+    /// arms a proxy that re-orders the tail of the stream would actually
+    /// exercise — it re-sends fragments and items without re-sending the
+    /// terminal.
+    ///
+    /// The assertion is the observable consequence, and it is the honest shape
+    /// for this: an ungated `added` would push a `ToolCallDelta` carrying
+    /// `id` + `name`, and an ungated `delta` would push one per fragment, so
+    /// the ABSENCE of every `ToolCallDelta` after the `Done` is exactly what
+    /// "the gate engaged" looks like from inside the process. The accumulator
+    /// residue the gate also prevents is not observable here — the gate
+    /// returns before touching `tool_acc`, which is the point.
+    ///
+    /// **What this does NOT pin: the `eprintln!` itself.** A lib unit test
+    /// cannot capture the process's stderr — it runs inside cargo's test
+    /// harness, whose stderr goes to the harness, and the only production
+    /// reader of a Worker's stderr is the drain task in `worker/client.rs`,
+    /// which needs a real spawned Worker. So the log line is unpinned, the
+    /// same way `the_chosen_wire_is_logged_at_construction` records its own
+    /// inability to reach the `eprintln!` half. What is pinned is that the
+    /// DISCARD happens; the line is there so that when it does engage in the
+    /// field somebody can find out.
+    #[tokio::test]
+    async fn responses_sse_item_events_after_completed_are_dropped_not_accumulated() {
+        let events = collect(responses_stream(&[
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+             event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_late\",\"name\":\"write\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"/receipts/totals.csv\\\"}\"}\n\n\
+             event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_late\",\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"/receipts/totals.csv\\\"}\",\"status\":\"completed\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done(FinishReason::Stop)],
+            "a terminal ENDS the response: no `ToolCallDelta` and no second \
+             `ToolCall` may follow the `Done` — an ungated `added` or `delta` \
+             would push a `ToolCallDelta` right here (got {events:?})"
+        );
     }
 
     // ── the per-call cost off the BODY's usage object (D4, AMENDED) ─────
@@ -1261,6 +2130,97 @@ mod tests {
             }
             other => panic!("expected an Auth error, got {other:?}"),
         }
+    }
+
+    /// The `error` arm flushes too — the fourth of the four terminal arms
+    /// `flush_tool_calls` was added to, and the one with no red-test
+    /// evidence until now (every pre-existing `event: error` fixture
+    /// carries no `function_call`, so deleting the flush in this arm left
+    /// the suite green).
+    ///
+    /// The unclassifiable body: the in-flight call is flushed BEFORE the
+    /// terminal `Done(Error)`, so the loop sees the card it was shown and
+    /// the turn settles with a finish reason rather than a vanished call.
+    #[tokio::test]
+    async fn responses_sse_error_event_flushes_a_partial_function_call() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"write\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"/x\\\"}\"}\n\n\
+             event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("write".to_string()),
+                    arguments: None,
+                }),
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: None,
+                    arguments: Some("{\"path\":\"/x\"}".to_string()),
+                }),
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({ "path": "/x" }),
+                    defect: None,
+                }),
+                ProviderEvent::Done(FinishReason::Error),
+            ],
+            "an in-stream error still flushes the call in flight, before the \
+             terminal Done (got {events:?})"
+        );
+    }
+
+    /// … and on the branch that pushes a real `ProviderEvent::Error`
+    /// instead of a `Done` — the tier the arm's own docblock singles out.
+    /// This is the branch the flush most needed to cover: its
+    /// `terminated = true` is written BEFORE the `parse_error_chunk`
+    /// match, so it covers BOTH arms, and the whole point of the flush
+    /// line is that it runs BEFORE the match. The vector therefore pins
+    /// the `ToolCall` PRECEDING the `Error` (an `Error` first would put
+    /// the recovery tier ahead of the card the loop has to render).
+    #[tokio::test]
+    async fn responses_sse_auth_error_flushes_the_call_before_the_error() {
+        let events = collect(responses_stream(&[
+            "event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_9\",\"name\":\"write\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"Bad key\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolCallDelta(ToolCallDelta {
+                    index: 1,
+                    id: Some("fc_9".to_string()),
+                    name: Some("write".to_string()),
+                    arguments: None,
+                }),
+                // No `arguments.delta` arrived, so the flushed call
+                // carries the `added` item's empty `arguments` → `{}`
+                // with NO defect (an empty string is not malformed).
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "fc_9".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({}),
+                    defect: None,
+                }),
+                ProviderEvent::Error(ProviderError::Auth(
+                    "authentication_error: Bad key".to_string()
+                )),
+            ],
+            "the flush precedes the upgraded `Error` tier too (got {events:?})"
+        );
     }
 
     #[tokio::test]
@@ -1552,11 +2512,19 @@ mod tests {
                             id: "fc_1".to_string(),
                             name: "read".to_string(),
                             arguments: json!({ "path": "/x" }),
+                            defect: None,
                         },
                         ToolCall {
                             id: "fc_2".to_string(),
                             name: "bash".to_string(),
                             arguments: Value::Object(Default::default()),
+                            // (issue #193) DEFECT-CARRYING, so the exact-key-set
+                            // pin on `input[1]` below is the leak guard for a
+                            // call that actually HAS a defect (see the pin).
+                            defect: Some(crate::harness::provider::ArgumentDefect {
+                                error: "expected value at line 1 column 1".to_string(),
+                                raw: "{not json".to_string(),
+                            }),
                         },
                     ]),
                 ),
@@ -1636,7 +2604,9 @@ mod tests {
         assert_eq!(
             keys_of_names(&input[1]),
             vec!["arguments", "call_id", "name", "type"],
-            "the second `function_call` item carries the same exact set"
+            "the second `function_call` item carries the same exact set — and \
+             it is the DEFECT-CARRYING call, so `defect` demonstrably has no \
+             path to this wire either"
         );
         assert_eq!(
             keys_of_names(&input[2]),

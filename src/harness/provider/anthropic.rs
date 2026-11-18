@@ -536,10 +536,13 @@ impl AnthropicStream {
             let Some(name) = acc.name else {
                 continue;
             };
+            // (issue #193) The defect rides the call — see `parse_arguments`.
+            let (arguments, defect) = parse_arguments(&acc.arguments);
             self.pending.push_back(ProviderEvent::ToolCall(ToolCall {
                 id: acc.id.unwrap_or_default(),
                 name,
-                arguments: parse_arguments(&acc.arguments),
+                arguments,
+                defect,
             }));
         }
     }
@@ -1517,6 +1520,7 @@ mod tests {
                     id: "tu_1".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "path": "/x" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ]
@@ -1583,11 +1587,13 @@ mod tests {
                     id: "tu_0".to_string(),
                     name: "read".to_string(),
                     arguments: json!({ "p": "x" }),
+                    defect: None,
                 }),
                 ProviderEvent::ToolCall(ToolCall {
                     id: "tu_1".to_string(),
                     name: "bash".to_string(),
                     arguments: json!({ "c": "y" }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ]
@@ -2108,6 +2114,16 @@ mod tests {
                         id: "tu_1".to_string(),
                         name: "read".to_string(),
                         arguments: json!({ "path": "/x" }),
+                        // (issue #193) A DEFECT-CARRYING call sits in this
+                        // fixture on purpose: the `keys_of_names` pin on the
+                        // `tool_use` block below is the leak guard, and it only
+                        // proves anything if a call that HAS a defect is the one
+                        // being rendered. `anthropic_messages` builds the block
+                        // field by field, so `defect` has no path to the wire.
+                        defect: Some(crate::harness::provider::ArgumentDefect {
+                            error: "EOF while parsing an object".to_string(),
+                            raw: r#"{"path": "/x"#.to_string(),
+                        }),
                     }]),
                 ),
                 chat_message(
@@ -2221,7 +2237,9 @@ mod tests {
             keys_of_names(&content[0]),
             vec!["id", "input", "name", "type"],
             "a `tool_use` block is exactly `type` + `id` + `name` + `input` \
-             — a transcript-only field must not appear here"
+             — a transcript-only field must not appear here (and the call behind \
+             this block CARRIES a `defect`, so the field is proven absent rather \
+             than merely never set: issue #193)"
         );
         assert_eq!(
             keys_of_names(&messages[2]),
@@ -2478,6 +2496,7 @@ mod tests {
             id: "tu_1".to_string(),
             name: "read".to_string(),
             arguments: json!({}),
+            defect: None,
         }])
     }
 

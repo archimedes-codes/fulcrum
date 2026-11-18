@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -12,8 +12,8 @@ use crate::events::{EventSink, RpcEvent};
 use crate::harness::catalog::Model;
 use crate::harness::dispatch::SubagentDispatcher;
 use crate::harness::provider::{
-    ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError, ProviderEvent, ToolCall,
-    Usage,
+    ArgumentDefect, ChatMessage, ChatRole, FinishReason, MessageContent, ProviderError,
+    ProviderEvent, ToolCall, Usage,
 };
 use crate::harness::retry::RetryPolicy;
 use crate::subagent::{AgentNameResolution, LaunchConfig, SubagentOutcome};
@@ -92,6 +92,7 @@ async fn the_persisted_ask_row_and_the_emitted_request_carry_the_same_payload() 
             id: "t1".to_string(),
             name: "ask".to_string(),
             arguments: raw.clone(),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
@@ -215,11 +216,13 @@ async fn a_cancel_stops_the_remaining_tool_calls_in_a_batch() {
                 arguments: json!({
                     "questions": [{ "id": "q1", "question": "Which?", "options": [{ "label": "A" }] }]
                 }),
+                defect: None,
             }),
             ProviderEvent::ToolCall(ToolCall {
                 id: "t2".to_string(),
                 name: "read".to_string(),
                 arguments: json!({ "path": "/nonexistent-file" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -450,6 +453,7 @@ async fn a_cancel_stops_a_sudo_flow_blocking_on_its_confirm_prompt() {
             id: "t1".to_string(),
             name: "sudo_exec".to_string(),
             arguments: json!({ "command": "echo never-runs", "reason": "test" }),
+            defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
     ])]);
@@ -939,6 +943,7 @@ async fn an_empty_text_tool_calls_turn_is_not_treated_as_empty() {
                 id: "t1".to_string(),
                 name: "ls".to_string(),
                 arguments: json!({ "path": "." }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1248,6 +1253,7 @@ async fn a_tool_result_image_reaches_the_model_transcript() {
                 id: "t1".to_string(),
                 name: "read".to_string(),
                 arguments: json!({ "path": "img.png" }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1405,6 +1411,7 @@ async fn model_requests_carry_the_session_id_across_turns_and_tool_calls() {
                     id: "t1".to_string(),
                     name: "ls".to_string(),
                     arguments: json!({ "path": "." }),
+                    defect: None,
                 }),
                 ProviderEvent::Done(FinishReason::ToolCalls),
             ],
@@ -1503,6 +1510,7 @@ async fn an_mcp_tool_call_round_trips_into_the_transcript() {
                 id: "m1".to_string(),
                 name: "mcp".to_string(),
                 arguments: json!({ "tool": "echo", "args": { "text": "hi" } }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1592,6 +1600,7 @@ async fn a_stop_mid_mcp_call_cancels() {
                 id: "m1".to_string(),
                 name: "mcp".to_string(),
                 arguments: json!({ "tool": "hang", "args": {} }),
+                defect: None,
             }),
             ProviderEvent::Done(FinishReason::ToolCalls),
         ]),
@@ -1935,13 +1944,24 @@ async fn a_turn_cut_off_by_the_output_cap_settles_as_truncated_and_persists_its_
 }
 
 /// (issue #190, Decision 2) A truncated turn's tool calls are NEVER executed.
-/// Truncated arguments go `parse_arguments` → `{}` → `unknown_param_error`
-/// passes (it checks only EXTRANEOUS keys) → the permission gate returns
-/// `Allow` (there is no `path` to judge) → the executor refuses with
+/// Truncated arguments go `parse_arguments` → `{}` in `arguments` PLUS a
+/// `defect` carrying the parse error and the raw text, and since issue #193 that
+/// defect makes `unknown_param_error`'s head arm refuse the call. Had this route
+/// reached the batch at all, the permission gate would return `Allow` (there is
+/// no `path` to judge) and the executor would refuse with
 /// ``write: missing `path` or `content` parameter``. That card is red for the
 /// wrong reason, and 566 of them are measured in this machine's DB. The close
 /// here is `abandoned_tool_result()`'s honest sentence, and the counting
 /// dispatcher proves nothing ran.
+///
+/// (issue #193, review FIX 8) This test is ALSO a second, independent witness
+/// that the head arm and `settle_truncated` do not fight. The fixtures below now
+/// carry `Some(defect)` — the shape a post-#193 provider actually hands this
+/// route — and the assertions still land on `abandoned_tool_result()`, NOT on the
+/// head arm's `invalid arguments for …` sentence. That is the point: the
+/// per-turn truncation gate reaches these calls BEFORE `run_tool_batch` runs the
+/// checker, so the two guards are stacked, never racing, and whichever fires the
+/// call is refused and never dispatched.
 #[tokio::test]
 async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatched() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -1949,11 +1969,17 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
         ProviderEvent::TextDelta("writing the file now".to_string()),
         ProviderEvent::ToolCall(ToolCall {
             id: "t1".to_string(),
-            // The truncated shape: `parse_arguments` hands `{}` for arguments
-            // the cap cut off mid-object, which is exactly what used to reach
-            // the executor and produce the misleading refusal.
+            // The truncated shape, POST-#193: `parse_arguments` hands `{}` for
+            // arguments the cap cut off mid-object AND reports the failure as a
+            // `defect`. Before this fixture carried the defect this test modelled
+            // the pre-#193 arrival, so it could not show the two guards coexisting.
             name: "write".to_string(),
             arguments: json!({}),
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 41".to_string(),
+                raw: r#"{"path": "truncation-must-not-be-written.txt", "content": "half a"#
+                    .to_string(),
+            }),
         }),
         ProviderEvent::ToolCall(ToolCall {
             id: "t2".to_string(),
@@ -1962,6 +1988,10 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
             // the concurrent `join_all` ahead of the sequential loop.
             name: "subagent".to_string(),
             arguments: json!({}),
+            defect: Some(ArgumentDefect {
+                error: "EOF while parsing an object at line 1 column 30".to_string(),
+                raw: r#"{"task": "finish the refactor", "agent"#.to_string(),
+            }),
         }),
         ProviderEvent::Done(FinishReason::Length),
     ])]);
@@ -2032,7 +2062,32 @@ async fn a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatch
             "the card must NOT blame the model for a `path`/`content` parameter \
              the output cap never let it send, got {id} → {text}"
         );
+        // (issue #193, review FIX 8) And NOT the head arm's sentence either: the
+        // per-turn truncation gate settles these calls before `run_tool_batch`
+        // ever runs `unknown_param_error`, so the defect rides the call unused
+        // here. If the two guards were ever re-ordered so the batch ran first,
+        // this is what would catch it.
+        assert!(
+            !text.contains("invalid arguments for"),
+            "the head arm of `unknown_param_error` never fires on this route — \
+             the truncation gate settles first, got {id} → {text}"
+        );
     }
+    // The two guards do not BOTH speak: no rejection result was produced by the
+    // batch, because the batch never ran. `turn_end.tool_results` is asserted
+    // empty below; this names the defect-shaped reason.
+    let refusals = events
+        .iter()
+        .filter(|e| {
+            matches!(e, RpcEvent::tool_execution_end { result, .. }
+            if result.to_string().contains("invalid arguments for"))
+        })
+        .count();
+    assert_eq!(
+        refusals, 0,
+        "no `invalid arguments for …` refusal was emitted — a defective call on a \
+         truncated turn is closed as ABANDONED, not rejected by the param check"
+    );
 
     // And no `tool` transcript row: nothing dispatched, so nothing to answer.
     assert!(
@@ -2683,5 +2738,1359 @@ async fn a_truncated_turn_does_not_leave_a_retry_report_for_the_next_prompt_to_c
         3,
         "the empty attempt, the truncated one, and turn 2's — the truncation is \
          still terminal (Decision 1: no re-issue)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (the turn-loop bound) Two guards on the turn loop's inner `loop`, both
+// producing `RpcEvent::turn_capped`: a ceiling on rounds per prompt, and a
+// ceiling on CONSECUTIVE tool batches refused with an identical signature.
+//
+// Every test here is wrapped in `tokio::time::timeout`. That is not decoration:
+// the thing under test is a loop that does not stop, and an unbounded one hangs
+// to the 15 s settle timeout and then reports a confusing empty-event failure
+// instead of "the guard did not fire".
+//
+// The provider call counts are asserted through `ScriptedProvider`'s own
+// `Arc<AtomicU32>`, never inferred from an event count — an event count can be
+// right for the wrong reason (a turn that emitted the frame and then looped
+// again would still show one `turn_capped`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The turn bound's own event order, as `(kind)` names (this file's other tests
+/// each build what they need; the bound's tests all need the same three
+/// positions, so they share this one).
+fn capped_kinds(events: &[RpcEvent]) -> Vec<String> {
+    events.iter().map(|e| e.kind().to_string()).collect()
+}
+
+/// A `write` call carrying the unknown `contentt` key ALONGSIDE the legal pair
+/// — `unknown_param_error`'s extraneous-key trigger, refused BEFORE dispatch and
+/// then re-sent verbatim. The legal twin stays present so the rejection is the
+/// only reason the file is never written.
+///
+/// This is NOT the field report's shape. The report is `bash` with `arguments:
+/// {}`, which has no keys for the checker to call extraneous and so is DISPATCHED
+/// — that one is `bash_empty_call()` /
+/// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped` below.
+/// Both trigger classes must stay covered: this test pins the pre-dispatch one.
+fn refused_write_call() -> ToolCall {
+    ToolCall {
+        id: "t1".to_string(),
+        name: "write".to_string(),
+        arguments: json!({
+            "path": "never-written-by-the-bound.txt",
+            "content": "legal content",
+            "contentt": "typo",
+        }),
+        defect: None,
+    }
+}
+
+/// A run of IDENTICAL refused batches stops the turn as `turn_capped`.
+///
+/// This pins the PRE-DISPATCH trigger class: a call the param checker refuses
+/// before it runs. It is NOT the burst the field report describes — the report is
+/// **303** `{}`-argument `bash` calls in 19 minutes, and `{}` has no keys to
+/// refuse, so that call is DISPATCHED and refused by the executor instead. That
+/// shape is
+/// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`, and it
+/// is the one the guard was originally written for and did not catch. What both
+/// shapes share is why nothing could see them: every individual round is a
+/// well-formed turn — a call, a refusal, a new attempt — and only the RUN is
+/// pathological.
+///
+/// One script entry reproduces a stuck turn, because `ScriptedProvider` repeats
+/// the LAST script when the index runs out — which is exactly what a looping
+/// turn does.
+#[tokio::test]
+async fn a_run_of_identical_refused_batches_stops_the_turn_as_capped() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // THE YIELDING PROVIDER, not `ScriptedProvider` — and the yield is not
+    // decoration. `tokio::time::timeout` bounds a task that SUSPENDS, and with
+    // both loop guards disabled this turn is a non-yielding busy loop whose timer
+    // can never fire: measured by the reviewer with both guards at `u32::MAX`,
+    // this test exited **124 (hang)**. See `YieldingScriptedProvider`'s docblock.
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
+        ProviderEvent::ToolCall(refused_write_call()),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ]]);
+    // The scratch guard is the FIRST tuple element (#96) — bind it, never
+    // `.0`-project it away: the no-dispatch proof below reads inside it.
+    let (space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let _loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the bounded turn TERMINATED (an unbounded loop hangs here)")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    // The bound fired, and fired ONCE — a guard that emitted the frame on every
+    // remaining iteration would be as broken as no guard.
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "turn_capped").count(),
+        1,
+        "exactly ONE `turn_capped`, got {kinds:?}",
+    );
+
+    // The ordering contract: BEFORE `turn_end` and `agent_settled`, so a peer can
+    // stash the disposition while the turn is still unresolved.
+    let capped_at = kinds
+        .iter()
+        .position(|k| k == "turn_capped")
+        .unwrap_or_else(|| panic!("the capped turn emitted `turn_capped`, got {kinds:?}"));
+    let turn_end_at = kinds
+        .iter()
+        .position(|k| k == "turn_end")
+        .unwrap_or_else(|| panic!("the capped turn settled with `turn_end`, got {kinds:?}"));
+    let settled_at = kinds
+        .iter()
+        .position(|k| k == "agent_settled")
+        .unwrap_or_else(|| panic!("the capped turn settled with `agent_settled`, got {kinds:?}"));
+    assert!(
+        capped_at < turn_end_at && capped_at < settled_at,
+        "`turn_capped` at {capped_at} must PRECEDE `turn_end` ({turn_end_at}) and \
+         `agent_settled` ({settled_at}) — after the settle the driver has resolved \
+         the turn and stops listening, got {kinds:?}",
+    );
+
+    // THE BOUND, measured at the provider rather than inferred from the frame:
+    // 3 refused batches are tolerated, and the guard is consulted at the TOP of
+    // the iteration AFTER the run reaches the ceiling — so the model is called
+    // exactly `MAX_IDENTICAL_REFUSAL_RUNS + 1` times and never a 5th.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+        "the run is bounded at {MAX_IDENTICAL_REFUSAL_RUNS} repeats, so the model \
+         gets exactly {} calls — the 303-call loop is the failure this pins, got \
+         {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+
+    // The refused calls were NEVER DISPATCHED — three rounds of refusals and a
+    // fourth, and not one of them touched the filesystem. `param_rejection.rs`
+    // owns the one-batch version of this proof; this is the version that says
+    // "and it stayed true across the whole bounded run".
+    assert!(
+        !space.join("never-written-by-the-bound.txt").exists(),
+        "a refused call must not touch the filesystem, in any round of the run"
+    );
+
+    // And the settle is the FAILURE settle, not a cancel and not a truncation:
+    // no `turn_truncated` frame (that is the provider's output cap, a different
+    // fact), and the disposition the desktop's `attention.ts` reads is not the
+    // user-Stop one.
+    assert!(
+        !kinds.iter().any(|k| k == "turn_truncated"),
+        "the agent's own bound is not the provider's output cap, got {kinds:?}",
+    );
+}
+
+/// THE BURST SHAPE — `bash` with `arguments: {}`, the same call every round.
+///
+/// This is the shape the card, the plan and `MAX_IDENTICAL_REFUSAL_RUNS`'
+/// docblock all cite by number (**303** `{}`-argument `bash` calls in 19
+/// minutes), and it is NOT the shape `refused_write_call()` reproduces. The
+/// difference decides whether the guard fires at all:
+///
+/// * `refused_write_call` carries an EXTRANEOUS key, so `unknown_param_error`
+///   refuses it BEFORE dispatch and `rejected[i]` is true.
+/// * `bash` with `{}` has NO keys at all, so `unknown_param_error` — which
+///   reports only extraneous keys — answers `None` (`items.is_empty()`), the
+///   call is DISPATCHED, and `exec_bash` answers
+///   ``bash: missing `command` parameter``. That is a tool-RESULT error, which
+///   the pre-dispatch checker knows nothing about.
+///
+/// So the burst shape reaches this guard only through the SECOND trigger
+/// class: "the engine refused this call and told the model to re-send it with
+/// correct arguments", read off the advertised `required` list plus the
+/// result's own `is_error`. Without that class the 303-call run is stopped by
+/// the 64-round ceiling — 64 rounds of a doomed call instead of 3.
+///
+/// The bound is asserted at the provider, exactly as the extraneous-key test
+/// asserts it, for the same reason: a call count can be right for no wrong
+/// reason where an event count can.
+#[tokio::test]
+async fn a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            // NO keys at all — the field report's shape, verbatim.
+            arguments: json!({}),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ]]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let _loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the bounded turn TERMINATED (an unbounded loop hangs here)")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+        "the empty-argument burst is bounded at {MAX_IDENTICAL_REFUSAL_RUNS} repeats \
+         and the model is called exactly {} times — the 303-call loop is the failure \
+         this pins, and at HEAD the guard never sees this shape, so the turn runs to \
+         the {MAX_MODEL_ROUNDS_PER_PROMPT}-round ceiling instead, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "turn_capped").count(),
+        1,
+        "exactly ONE `turn_capped`, got {kinds:?}",
+    );
+    // And it is the REFUSAL guard, not the round ceiling, that ended it: the
+    // round count is the discriminator, and it is the smaller number.
+    assert!(
+        calls.load(Ordering::SeqCst) < MAX_MODEL_ROUNDS_PER_PROMPT,
+        "the refusal guard fired BEFORE the round ceiling, got {}",
+        calls.load(Ordering::SeqCst),
+    );
+}
+
+/// **A call that satisfies a required key through an ADVERTISED ALIAS is never a
+/// refusal run.**
+///
+/// `get_search_content` advertises `required: ["response_id"]` while its
+/// `properties` also carries `responseId` — described as `"Alias for
+/// response_id"` — and `exec_get_search_content` reads BOTH spellings
+/// (`params.get("response_id").or_else(|| params.get("responseId"))`). The alias
+/// is advertised deliberately (issue #82): `fetch_content`'s own truncation note
+/// provokes the camelCase spelling, so a call built from the tool's own sentence
+/// must not be flagged by issue #78's unknown-param checker.
+///
+/// That leaves a hole in class 2. A model that calls with `{"responseId": …}`
+/// omits the spelling `required` names, so `missing_required_param` answers
+/// `true`; when the cache has evicted the handle the tool answers
+/// `"Response not found"` with `is_error: true`; both halves of class 2 hold, and
+/// the guard counts the run — measured end to end by the reviewer at **4 provider
+/// calls and one `turn_capped`** for a normal, recoverable step. Reading a cache
+/// miss is a step, not a stuck loop.
+///
+/// This is the SAME shape as the `ls` row of
+/// `the_refusal_predicate_is_the_required_key_and_the_error_together` — a call the
+/// executor accepts even though it omits the advertised spelling — and that row
+/// is excluded only because `exec_ls` defaults `path` and SUCCEEDS. Nobody probed
+/// the variant where the alias is accepted and the call then errors. That is this
+/// test.
+///
+/// Scripted as `MAX_IDENTICAL_REFUSAL_RUNS + 2` identical rounds and then a
+/// terminal `Done(Stop)`, so the arithmetic is one-sided exactly as the denial pin
+/// below the burst test explains: if the guard counts these rounds it fires at
+/// call `MAX_IDENTICAL_REFUSAL_RUNS + 1` and never reaches the Stop.
+#[tokio::test]
+async fn a_call_using_an_advertised_alias_is_never_a_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // A handle nothing ever stores, so the answer is the cache-miss arm and not
+    // whatever a sibling test left in the process-wide cache.
+    let round = vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "get_search_content".to_string(),
+            // The ADVERTISED alias, and NOT the `required` spelling.
+            arguments: json!({ "responseId": "evicted-handle-never-stored-by-this-test" }),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ];
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 2;
+    let mut scripts = vec![round; rounds as usize];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let mut loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn TERMINATED (on its terminal script entry)")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        rounds + 1,
+        "an alias-satisfied call is not a refusal, so the run never grew and the \
+         turn reached its terminal script entry ({rounds} rounds + the Stop). A turn \
+         that stopped at {} was capped over a cache miss the model could walk away \
+         from, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "the guard must never fire on a call whose required key is satisfied by an \
+         advertised alias the executor accepts, got {kinds:?}",
+    );
+
+    // ── the structural half, and the witness that the shape is the one claimed ──
+    let (results, refused) = loop_
+        .run_tool_batch(
+            &[ToolCall {
+                id: "a1".to_string(),
+                name: "get_search_content".to_string(),
+                arguments: json!({ "responseId": "evicted-handle-never-stored-by-this-test" }),
+                defect: None,
+            }],
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        refused,
+        vec![false],
+        "the predicate's answer for an alias-satisfied call that then errors is \
+         `false` — the executor reads this spelling, so nothing told the model to \
+         re-send the call with a different key"
+    );
+    assert_eq!(
+        results[0]["content"][0]["text"], "Response not found",
+        "the witness: the executor ACCEPTED the alias and answered with its own \
+         cache-miss error. If this reads `missing \\`response_id\\` parameter` the \
+         alias stopped being honoured and this pin is testing the wrong shape"
+    );
+
+    // And the shape that IS a refusal stays one: with NEITHER spelling there is no
+    // alias satisfying `response_id`, and the executor says so.
+    let (_, refused_without_alias) = loop_
+        .run_tool_batch(
+            &[ToolCall {
+                id: "a2".to_string(),
+                name: "get_search_content".to_string(),
+                arguments: json!({}),
+                defect: None,
+            }],
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        refused_without_alias,
+        vec![true],
+        "the alias exclusion is about the ALONE-satisfied case: a call carrying \
+         neither spelling still omits the required key"
+    );
+}
+
+/// The `sudo_exec` the confirm-refusal pin sends: `command` IS present (an empty
+/// one is refused BEFORE the confirm prompt ever fires, and that refusal IS a
+/// re-send instruction), and `reason` — which the spec advertises as `required` —
+/// is OMITTED. That omission is what makes the result satisfy class 2's
+/// `required` half; the declined confirm is what makes it a USER decision.
+fn sudo_exec_omitting_reason(command: &str) -> ToolCall {
+    ToolCall {
+        id: "t1".to_string(),
+        name: "sudo_exec".to_string(),
+        arguments: json!({ "command": command }),
+        defect: None,
+    }
+}
+
+/// Answer `count` `sudo_exec` SUB-prompts in the shape's own vocabulary, each
+/// with the supplied `confirmed` flag.
+///
+/// `answer_permission_prompts` (in `policy_gate.rs`) answers the PERMISSION
+/// gate's map; this answers the OTHER one — `sudo_run_flow`'s `pending_sudo`,
+/// keyed `"{session}/{tool_call_id}:confirm"`. A responder that answered the
+/// wrong map would leave the flow blocked on a prompt nobody resolves and the
+/// test would hang rather than fail.
+async fn answer_sudo_confirms(pending: crate::interactive::PendingSudo, count: usize, yes: bool) {
+    for _ in 0..count {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut map = pending.lock().await;
+            if let Some(key) = map.keys().find(|k| k.starts_with("s1/")).cloned() {
+                let sender = map.remove(&key).expect("the entry is in the map");
+                let _ = sender.send(json!({ "confirmed": yes }));
+                break;
+            }
+            drop(map);
+            if tokio::time::Instant::now() >= deadline {
+                return; // the test asserts the prompts it expected arrived
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// **A declined `sudo_exec` CONFIRM is never a refusal run.**
+///
+/// The third denial corridor. `c9feb4d` excluded the permission gate's denials
+/// from the identical-refusal guard, and the exclusion is structural (`denied`
+/// is threaded from the two arms that CONSTRUCT a gate denial). But
+/// `sudo_exec`'s confirm refusal is not built by either of those arms: it is
+/// built INSIDE `sudo_run_flow`, which returns a plain `ToolResult`, so the
+/// flag never reached it and the shape was an OVER-count — the direction that
+/// ends a user's prompt, not the direction that costs 64 rounds.
+///
+/// The exact shape, and why it is the narrow one:
+/// * `command` present — an empty `command` is refused BEFORE the confirm
+///   prompt fires, and that refusal genuinely is a re-send instruction;
+/// * `reason` OMITTED — the spec advertises `required: ["command", "reason"]`,
+///   so the omission is what satisfies class 2's `required` half;
+/// * the confirm DECLINED — the user said no;
+/// * three identical re-sends — the model only learns the missing-`reason`
+///   sentence AFTER the confirm has already fired, so the user really is asked
+///   and really does decline, three times.
+///
+/// Measured before the fix: **4 provider calls and one `turn_capped`** for
+/// `{"command": "x"}` + a declined confirm — a prompt ended as `turn_capped` on
+/// a user's own three "no"s, which is the false positive this branch exists to
+/// eliminate. Measured after: the SAME shape runs to the
+/// `MAX_MODEL_ROUNDS_PER_PROMPT` ceiling at **64 calls** — it moved from the
+/// over-count direction (ends the user's prompt) to the documented under-count
+/// direction (costs rounds), which is the trade every other pin in this file
+/// already makes. The `{"command":"x","reason":"r"}` shape is unaffected: both
+/// required keys are there, nothing refused it, so it was at 64 before and is at
+/// 64 after.
+///
+/// Scripted as `MAX_IDENTICAL_REFUSAL_RUNS + 2` identical declined rounds and
+/// THEN a terminal `Done(Stop)`, so the arithmetic is one-sided exactly as
+/// `a_permission_denial_is_never_a_refusal_run` explains it.
+///
+/// The elevated command is NEVER run: the runner is `RecordingSudoRunner`, whose
+/// `run` future is `unreachable!()` — reaching it at all fails the test loudly.
+#[tokio::test]
+async fn a_sudo_exec_confirm_refusal_is_never_a_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let round = vec![
+        ProviderEvent::ToolCall(sudo_exec_omitting_reason("echo declined-by-the-user")),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ];
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 2;
+    let mut scripts = vec![round; rounds as usize];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
+    let (ran_flag, mut loop_) = build_sudo_loop(Box::new(provider), events_tx);
+    let pending = loop_.sudo.pending_sudo.clone();
+    let answer = tokio::spawn(answer_sudo_confirms(pending, rounds as usize, false));
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let mut loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn TERMINATED (on its terminal script entry)")
+        .expect("the turn task did not panic");
+    answer.await.unwrap();
+
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert!(
+        !ran_flag.load(Ordering::SeqCst),
+        "the user declined every confirm, so the elevated command was NEVER executed"
+    );
+
+    // THE WITNESS that the turn was answering the shape this test claims: the
+    // flow's OWN declined-confirm sentence. Without this the turn could be
+    // settling on some other `sudo_exec` error and the pin would prove nothing.
+    let confirmed_texts: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            RpcEvent::tool_execution_end {
+                tool_name, result, ..
+            } if tool_name == "sudo_exec" => Some(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !confirmed_texts.is_empty(),
+        "the turn really did run `sudo_exec` rounds, got {kinds:?}"
+    );
+    assert!(
+        confirmed_texts
+            .iter()
+            .all(|t| t.starts_with("Command not confirmed")),
+        "every round answered the DECLINED CONFIRM (`Command not confirmed — not \
+         executed, and no password was requested.`). Anything else means this test \
+         is pinning a different shape, got {confirmed_texts:?}"
+    );
+
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "a user's DECLINED SUDO CONFIRM must not arm the refusal guard: three \
+         identical re-sends after three \"no\" clicks ending the prompt is the false \
+         positive this pin refuses, got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        rounds + 1,
+        "the run counter never grew, so the turn reached its terminal script entry \
+         ({rounds} declined rounds + the Stop). A turn that stopped at {} was capped \
+         by the refusal guard on a user decision, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+
+    // ── the structural half: the guard's OWN input, one call at a time ──
+    let pending = loop_.sudo.pending_sudo.clone();
+    let answer = tokio::spawn(answer_sudo_confirms(pending, 1, false));
+    let (_, refused) = loop_
+        .run_tool_batch(
+            &[sudo_exec_omitting_reason("echo declined-by-the-user")],
+            &CancellationToken::new(),
+        )
+        .await;
+    answer.await.unwrap();
+    assert_eq!(
+        refused,
+        vec![false],
+        "the predicate's answer for a DECLINED sudo confirm that omits a required \
+         key is `false` — the user said no, and no sentence told the model to \
+         re-send the call with a different argument"
+    );
+
+    // And the shape that IS still a refusal stays one: an EMPTY `command` is
+    // refused before any prompt fires, so nothing was asked and nothing was
+    // declined.
+    let (_, refused_empty) = loop_
+        .run_tool_batch(
+            &[ToolCall {
+                id: "t2".to_string(),
+                name: "sudo_exec".to_string(),
+                arguments: json!({}),
+                defect: None,
+            }],
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        refused_empty,
+        vec![true],
+        "the pre-prompt empty-`command` refusal is a re-send instruction and stays \
+         counted — this exclusion is about the DECLINED CONFIRM, not about \
+         `sudo_exec`"
+    );
+}
+
+/// `build_loop` with a `RecordingSudoRunner` installed, returning the `ran` flag.
+fn build_sudo_loop(
+    provider: Box<dyn Provider>,
+    events: mpsc::UnboundedSender<RpcEvent>,
+) -> (Arc<std::sync::atomic::AtomicBool>, AgentLoop) {
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_space, mut loop_) = build_loop(
+        provider,
+        events,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    loop_.sudo.runner = Arc::new(RecordingSudoRunner { ran: ran.clone() });
+    (ran, loop_)
+}
+
+/// The alias rule reads the wording `tool_specs()` ACTUALLY uses — a CENSUS of
+/// the declarations, not a guard against rewording one of them.
+///
+/// `declared_alias_of` recognises an advertised alias by its declaration — the
+/// description spelled `"Alias for <key>"`. That is the narrowest rule available
+/// (nothing in the schema MARKS a property as an alias; the pairing with the
+/// executor lives in `src/web/tools.rs`, invisible to this check), and it cuts
+/// both ways: reword one of those descriptions and the alias stops being
+/// recognised, which is the OVER-count direction — the false positive this change
+/// exists to remove, coming back silently.
+///
+/// So this walks every advertised tool and asserts that every description
+/// starting `Alias for ` names a key that (a) is in the same `properties` and
+/// (b) is recognised by the guard's own rule.
+///
+/// **READ THIS BEFORE TRUSTING IT AS A REWORDING ALARM — it is not one.** This
+/// test only iterates descriptions that STILL start `Alias for `. Reword one of
+/// the six and the loop simply sees five: no assert is violated,
+/// `aliases_seen > 0` is still satisfied by the other five, and the test PASSES.
+/// Measured: changing `"Alias for response_id"` to `"Same as response_id"` leaves
+/// this census green and reddens
+/// `a_call_using_an_advertised_alias_is_never_a_refusal_run`, which is the pin
+/// that actually catches a single reword — it drives the alias-satisfied call and
+/// watches the provider-call count go from 5 to 4 with a `turn_capped`, i.e. it
+/// observes the false positive rather than the declaration that caused it. That
+/// test is the guard; this one is the shape check.
+///
+/// What THIS census does catch is the opposite end: every alias declaration
+/// disappearing. `aliases_seen` would then be 0, the floor below reddens, and the
+/// guard's alias half is exposed as dead code — the vacuous-green case this file
+/// refuses elsewhere. It also catches a declaration that survives rewording but
+/// rots in place: one that names a key outside its own `properties`, or one that
+/// declares itself an alias of itself, both of which make a `required` key
+/// satisfiable by something the executor would never read.
+#[test]
+fn the_alias_rule_reads_the_wording_tool_specs_actually_uses() {
+    let mut aliases_seen = 0usize;
+    for spec in crate::harness::tool_specs::tool_specs() {
+        let Some(properties) = spec.parameters.get("properties").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, schema) in properties {
+            let Some(description) = schema.get("description").and_then(Value::as_str) else {
+                continue;
+            };
+            if !description.starts_with("Alias for ") {
+                continue;
+            }
+            aliases_seen += 1;
+            let named = turn::declared_alias_of(schema).unwrap_or_else(|| {
+                panic!(
+                    "`{}`'s `{key}` declares `{description:?}` and the guard's rule does NOT \
+                     read it — the alias is advertised and the executor honours it, so a call \
+                     using it would be counted as a refusal. Fix the rule, do not reword the \
+                     description.",
+                    spec.name,
+                )
+            });
+            assert!(
+                properties.contains_key(named),
+                "`{}`'s `{key}` declares itself an alias of `{named}`, which is not an \
+                 advertised property of that tool — the rule requires the target to be \
+                 advertised, so this declaration satisfies nothing",
+                spec.name,
+            );
+            // The rule is one-directional (`alias -> target`), so a description
+            // must never declare an alias of ITSELF: that would make every
+            // required key trivially satisfied by its own name.
+            assert_ne!(
+                named, key,
+                "`{}`'s `{key}` declares itself an alias of itself",
+                spec.name,
+            );
+        }
+    }
+    assert!(
+        aliases_seen > 0,
+        "no advertised `Alias for` property exists in `tool_specs()` — either the \
+         aliases are gone (and the guard's alias half is dead code that should be \
+         deleted with this pin) or the wording changed and the rule no longer sees \
+         them. Either way this pin has stopped proving anything."
+    );
+}
+
+/// The false-positive half, and the reason the broadened predicate is not
+/// `is_error`: a batch whose calls FAILED BUT WERE WELL-FORMED is progress,
+/// not a stuck loop, and bounding it would end the user's prompt over a
+/// command that simply did not work.
+///
+/// `bash { "command": "exit 1" }` is the sharpest case available: identical
+/// every round, `is_error: true` every round, and NOTHING but the round
+/// ceiling can stop it. Every required key is present, so the `required`
+/// conjunct answers `false` and the run never grows — which is exactly the
+/// assertion that reddens if someone widens the predicate to "any tool error".
+///
+/// Reads the same way `a_mixed_batch_resets_the_identical_refusal_run` does:
+/// the run counter is loop-internal, so the observable is the provider call
+/// count. A run that grew stops at `MAX_IDENTICAL_REFUSAL_RUNS + 1`; a run
+/// that stays at 0 reaches `MAX_MODEL_ROUNDS_PER_PROMPT`.
+#[tokio::test]
+async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            // `command` IS there. The command fails; the CALL is well-formed.
+            arguments: json!({ "command": "exit 1" }),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ]]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("go")).await });
+    tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn TERMINATED (on the round ceiling, not the refusal guard)")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_MODEL_ROUNDS_PER_PROMPT,
+        "a failing command is NOT a refusal: the run stays at 0 and the turn \
+         survives to the round ceiling ({MAX_MODEL_ROUNDS_PER_PROMPT} calls). A turn \
+         stopped at {} means the guard fired on `is_error` alone, which is the \
+         false positive the plan rejected and this pin refuses, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+}
+
+/// A batch with ONE accepted call and one refused call never increments the
+/// identical-refusal run, however many times it repeats.
+///
+/// This is the reset rule, and it is the difference between bounding a runaway
+/// and punishing the behaviour the rejection sentence asks for: an agent that
+/// fixes one key and re-sends the rest IS making progress.
+///
+/// HOW the pin reads. `state.identical_refusal_runs` is loop-internal, so the
+/// observable that separates "the run never grew" from "the run grew" is the
+/// PROVIDER CALL COUNT: a run that grew would stop the turn at
+/// `MAX_IDENTICAL_REFUSAL_RUNS + 1` calls; a run that stays at 0 lets the turn
+/// run all the way to the ROUND ceiling. So this asserts the turn reached
+/// `MAX_MODEL_ROUNDS_PER_PROMPT` calls — strictly more than the refusal guard
+/// would ever allow — which is `turn_capped`-by-the-round-guard, and proves the
+/// refusal guard never fired. Asserting "no `turn_capped` at all" would be
+/// unsatisfiable: the round ceiling is the other guard in the same `if`, and a
+/// turn that repeats forever must end somehow.
+#[tokio::test]
+async fn a_mixed_batch_resets_the_identical_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
+        // ACCEPTED: `list_agents` advertises `{}` (no `properties`), so
+        // `unknown_param_error` has nothing to call extraneous and the call
+        // dispatches.
+        ProviderEvent::ToolCall(ToolCall {
+            id: "a1".to_string(),
+            name: "list_agents".to_string(),
+            arguments: json!({}),
+            defect: None,
+        }),
+        // REFUSED: the same trigger as the test above.
+        ProviderEvent::ToolCall(refused_write_call()),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ]]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let _loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the bounded turn TERMINATED")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_MODEL_ROUNDS_PER_PROMPT,
+        "a mixed batch RESETS the run, so the refusal guard never fires and the \
+         turn survives all the way to the round ceiling ({} calls). A run that \
+         counted mixed batches would have stopped at {}, got {kinds:?}",
+        MAX_MODEL_ROUNDS_PER_PROMPT,
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "turn_capped").count(),
+        1,
+        "the turn still ends as capped — by the ROUND guard, which is the only \
+         one a mixed batch can arm, got {kinds:?}",
+    );
+}
+
+/// A turn that hits the ROUND ceiling settles as `turn_capped`.
+///
+/// The script always returns a DISPATCHABLE tool call whose tool SUCCEEDS
+/// (`list_agents` advertises `{}`, takes no arguments, reads the Agent
+/// definitions from disk and answers — nothing about it can fail, be rejected or
+/// be denied), so NOTHING but the ceiling can stop this turn.
+///
+/// **This test passes only because `ScriptedProvider` never retries, and it pins
+/// the ROUND unit — it must not be described as a provider-call ceiling.**
+/// `MAX_MODEL_ROUNDS_PER_PROMPT` counts rounds through the turn loop (one model
+/// call plus its tool batch). Inside one round `RetryPolicy::call_with_retry` can
+/// issue up to `DEFAULT_MAX_ATTEMPTS` provider calls, and `compact_if_due` issues
+/// an uncounted summary call. A retrying or compacting provider would make the
+/// count exceed the ceiling while the ROUND count stayed exactly at it, and this
+/// assertion would then be false for a reason that has nothing to do with the
+/// guard.
+#[tokio::test]
+async fn a_turn_that_hits_the_round_ceiling_settles_as_capped() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "a1".to_string(),
+            name: "list_agents".to_string(),
+            arguments: json!({}),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ]]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let _loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the round ceiling TERMINATED the turn")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_MODEL_ROUNDS_PER_PROMPT,
+        "the ceiling is a ceiling on ROUNDS, and a `ScriptedProvider` issues \
+         exactly one call per round — so exactly {MAX_MODEL_ROUNDS_PER_PROMPT} \
+         calls, got {kinds:?}",
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "turn_capped").count(),
+        1,
+        "the round ceiling emitted `turn_capped` once, got {kinds:?}",
+    );
+    let capped_at = kinds
+        .iter()
+        .position(|k| k == "turn_capped")
+        .expect("the capped turn emitted `turn_capped`");
+    let settled_at = kinds
+        .iter()
+        .position(|k| k == "agent_settled")
+        .expect("the capped turn settled");
+    assert!(
+        capped_at < settled_at,
+        "`turn_capped` at {capped_at} precedes `agent_settled` ({settled_at}), got {kinds:?}",
+    );
+    // Every round dispatched its call, so every round closed its own row — and
+    // the ceiling settle added nothing (it passes `&[]`). The count is the
+    // discriminator: one close per round, no more.
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "tool_execution_end").count(),
+        MAX_MODEL_ROUNDS_PER_PROMPT as usize,
+        "one close per DISPATCHED call and no synthetic extra from the settle, \
+         got {kinds:?}",
+    );
+}
+
+/// Cancellation still wins over the bound, when BOTH are armed.
+///
+/// The two guards sit in one `if` at the top of the iteration, immediately AFTER
+/// the existing cancel guard, and this test arms both at once so the ORDER of
+/// those two checks is what decides the outcome — not which one happens to be
+/// true first in time.
+///
+/// The instrument is a `subagent` call whose dispatcher cancels the TURN token on
+/// the last round's dispatch. That lands the cancel after the model call and
+/// after the stream check (site 8 — the token is armed inside the batch, so
+/// `consume_stream` finished before it) and before the NEXT iteration's top,
+/// which is the only window where both guards are simultaneously true. The
+/// dispatcher's child never resolves, so the batch ends on `SubagentWait::Cancelled`
+/// and returns normally — the loop reaches the loop top with `model_rounds` at
+/// the ceiling AND the token cancelled.
+///
+/// What it asserts is `settle_cancelled`'s disposition, not `turn_capped`:
+/// telling the desktop the turn was capped when the user pressed Stop would let
+/// `attention.ts` mis-attribute a user-initiated stop to an agent failure — and
+/// the reverse (the bound winning) is the regression this pins.
+#[tokio::test]
+async fn a_cancel_beats_the_turn_bound() {
+    struct CancellingOnLastRoundDispatcher {
+        turn_cancel: Arc<StdMutex<CancellationToken>>,
+        dispatches: AtomicU32,
+        fire_on: u32,
+    }
+
+    impl SubagentDispatcher for CancellingOnLastRoundDispatcher {
+        fn dispatch(
+            &self,
+            _parent_session_id: &str,
+            _parent_cwd: &std::path::Path,
+            _parent_model: &Model,
+            _parent_enabled_tools: Vec<String>,
+            _agent_name: String,
+            _name_resolution: AgentNameResolution,
+            _launch: LaunchConfig,
+            _task: String,
+            _sink: &Arc<dyn crate::events::EventSink>,
+        ) -> (
+            tokio::sync::oneshot::Receiver<SubagentOutcome>,
+            crate::subagent::SubagentCancel,
+        ) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if self.dispatches.fetch_add(1, Ordering::SeqCst) + 1 >= self.fire_on {
+                // The token `handle_turn` cloned into this same slot.
+                self.turn_cancel
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .cancel();
+                // The LAST round's child NEVER resolves (the sender is forgotten,
+                // never sent and never dropped), so the wait runs to the
+                // `select!`'s `turn.cancelled()` arm — the batch ENDS, on cancel,
+                // and returns normally to the loop top.
+                std::mem::forget(tx);
+            } else {
+                // An EARLIER round's child answers immediately. It must, or the
+                // `select!` has nothing to wake on for 63 rounds and the test
+                // hangs for a reason that has nothing to do with the guard.
+                let _ = tx.send(SubagentOutcome::Completed {
+                    output: "done".to_string(),
+                    metrics: crate::subagent::SubagentMetrics {
+                        output: "done".to_string(),
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cost: None,
+                        duration_ms: 1,
+                    },
+                });
+            }
+            (rx, crate::subagent::SubagentCancel::none())
+        }
+    }
+
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
+    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "s1".to_string(),
+            name: "subagent".to_string(),
+            arguments: json!({ "task": "loop forever" }),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ])]);
+    let dispatcher = Arc::new(CancellingOnLastRoundDispatcher {
+        turn_cancel: turn_cancel.clone(),
+        dispatches: AtomicU32::new(0),
+        fire_on: MAX_MODEL_ROUNDS_PER_PROMPT,
+    });
+    let (_space, mut loop_) = build_loop_with_dispatcher(
+        Box::new(provider),
+        events_tx,
+        turn_cancel.clone(),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        Arc::new(TestSink {
+            updates: Arc::new(StdMutex::new(Vec::new())),
+        }),
+        Some(dispatcher as Arc<dyn SubagentDispatcher>),
+        vec![fake_model("m1")],
+        None,
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn terminated")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    // Both guards really were armed: the round counter reached the ceiling (the
+    // dispatcher fired on the last round's dispatch, and one dispatch = one
+    // round) and the token is cancelled.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_MODEL_ROUNDS_PER_PROMPT,
+        "the turn ran every round up to the ceiling (so `model_rounds` was AT \
+         the bound when the loop top was next reached), got {kinds:?}",
+    );
+    assert!(
+        turn_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_cancelled(),
+        "the turn token IS cancelled — this is the both-armed case, not a \
+         round-ceiling turn that never saw a Stop, got {kinds:?}",
+    );
+
+    // And the cancel won.
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "a Stop wins over the bound: `turn_capped` must NOT be emitted when the \
+         user stopped the turn (the desktop would report an agent failure for a \
+         user-initiated stop), got {kinds:?}",
+    );
+    assert!(
+        kinds.iter().any(|k| k == "turn_end") && kinds.iter().any(|k| k == "agent_settled"),
+        "the turn settled on the cancel path, got {kinds:?}",
+    );
+    // The cancelled batch's result is still carried (the turn did real rounds).
+    assert!(
+        !loop_.messages.is_empty(),
+        "the bounded-and-then-stopped turn's transcript is intact"
+    );
+}
+
+/// (issue #193) `batch_signature` compares `(name, arguments)` ONLY — a pair of
+/// batches whose calls differ **solely in `defect`** still sign as identical.
+///
+/// This is deliberate and it is the stuck case: the defect is preserved, the
+/// arguments are still `{}`, so the refusal the model reads back is still the
+/// same refusal, and re-sending the same truncated payload produces the same
+/// result. A signature that folded `defect` in would call that a NEW batch and
+/// reset the run — which would un-bound exactly the 303-calls-in-19-minutes loop
+/// this guard exists to stop, for the very defect this change introduces.
+///
+/// The behaviour was already true (the `format!` names `tc.name` and
+/// `tc.arguments` and nothing else); it had no pin, and the field this commit
+/// adds is the first thing that could plausibly be added to that `format!` for
+/// a good reason. This test is what makes that edit loud.
+#[test]
+fn batch_signature_ignores_the_defect_field() {
+    let clean = ToolCall {
+        id: "t1".to_string(),
+        name: "write".to_string(),
+        arguments: json!({}),
+        defect: None,
+    };
+    let mut defective = clean.clone();
+    defective.defect = Some(crate::harness::provider::ArgumentDefect {
+        error: "EOF while parsing an object at line 1 column 41".to_string(),
+        raw: r#"{"path": "/x", "content": "truncated he"#.to_string(),
+    });
+    let mut other_defect = defective.clone();
+    other_defect.defect = Some(crate::harness::provider::ArgumentDefect {
+        error: "expected value at line 1 column 1".to_string(),
+        raw: "{not json".to_string(),
+    });
+
+    let rejected = [true];
+    let clean_sig = turn::batch_signature(std::slice::from_ref(&clean), &rejected)
+        .expect("a fully refused batch signs");
+    let defect_sig =
+        turn::batch_signature(&[defective], &rejected).expect("a defective batch signs too");
+    let other_sig = turn::batch_signature(&[other_defect], &rejected).expect("and so does another");
+    assert_eq!(
+        clean_sig, defect_sig,
+        "the same (name, arguments) with and without a defect is the SAME batch"
+    );
+    assert_eq!(
+        defect_sig, other_sig,
+        "and two DIFFERENT defects on the same (name, arguments) are the same \
+         batch too — the refusal is identical either way, so the run counts"
+    );
+
+    // The half that keeps the pin honest: a differing name or argument set still
+    // signs DIFFERENTLY, so the equality above is not a constant function.
+    let renamed = ToolCall {
+        name: "read".to_string(),
+        ..clean.clone()
+    };
+    assert_ne!(
+        clean_sig,
+        turn::batch_signature(&[renamed], &rejected).expect("a refused batch signs"),
+        "a different NAME still changes the signature"
+    );
+    let reargued = ToolCall {
+        arguments: json!({ "path": "/x" }),
+        ..clean.clone()
+    };
+    assert_ne!(
+        clean_sig,
+        turn::batch_signature(&[reargued], &rejected).expect("a refused batch signs"),
+        "different ARGUMENTS still change the signature"
+    );
+    // And the `None`-on-any-accepted rule is untouched.
+    assert_eq!(
+        turn::batch_signature(std::slice::from_ref(&clean), &[false]),
+        None,
+        "one accepted call and there is no signature at all"
+    );
+}
+
+/// `batch_signature`'s docblock claims the `sort()` makes the signature
+/// independent of the order the provider emitted the calls in — "the difference
+/// between catching a model that repeats itself and missing one that permutes" —
+/// and until now **no test exercised a permutation at all**. Every existing
+/// signature test is a one-call batch, where sorting is a no-op and the claim is
+/// untestable; a `parts.sort()` deleted from the function would have left the
+/// whole suite green while silently un-arming the guard on any multi-call batch
+/// whose provider reordered (which providers do — the `subagent` batch's
+/// concurrent route is one reason the loop does not control emission order).
+///
+/// Two DIFFERENT calls, both refused, asserted equal in both orders — and then
+/// the half that keeps the equality honest: a batch that is actually a different
+/// SET still signs differently, so this is not a constant function either.
+#[test]
+fn batch_signature_is_independent_of_the_call_order() {
+    let bash_empty = ToolCall {
+        id: "t1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({}),
+        defect: None,
+    };
+    let read_missing = ToolCall {
+        id: "t2".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "pathe": "typo" }),
+        defect: None,
+    };
+    let both = [true, true];
+
+    let forward = turn::batch_signature(&[bash_empty.clone(), read_missing.clone()], &both)
+        .expect("a fully refused batch signs");
+    let reversed = turn::batch_signature(&[read_missing.clone(), bash_empty.clone()], &both)
+        .expect("and so does the same batch permuted");
+    assert_eq!(
+        forward, reversed,
+        "the same two refused calls in the OTHER order are the SAME batch — this \
+         is the permutation the `sort()` exists for, and the only assertion that \
+         would redden if it were dropped"
+    );
+
+    // The honesty half: a batch with a DIFFERENT membership is a different
+    // signature, so the equality above is a fact about order-independence and
+    // not about a function that ignores its input.
+    let third = ToolCall {
+        name: "grep".to_string(),
+        ..read_missing.clone()
+    };
+    assert_ne!(
+        forward,
+        turn::batch_signature(&[bash_empty.clone(), third], &both)
+            .expect("a fully refused batch signs"),
+        "swapping one call for another call changes the signature"
+    );
+    // And a permutation with an ACCEPTED call anywhere in it still answers `None`
+    // — the batch-wide rule is order-independent too, so the reset on progress
+    // cannot be lost by reordering.
+    assert_eq!(
+        turn::batch_signature(&[bash_empty.clone(), read_missing.clone()], &[true, false]),
+        None,
+        "one accepted call at the END and there is no signature"
+    );
+    assert_eq!(
+        turn::batch_signature(&[bash_empty, read_missing], &[false, true]),
+        None,
+        "one accepted call at the START and there is no signature"
+    );
+}
+
+/// `batch_signature` answers `None` when the two slices DISAGREE ON LENGTH.
+///
+/// The function `zip`ped the two, so a SHORT `refused` slice stopped the
+/// all-refused scan early and the function returned `Some(sig)` for a batch whose
+/// LAST call had been accepted — a false positive on the one guard whose false
+/// positives end the user's prompt. Production is safe today (`run_tool_batch`
+/// builds the vector to the exact length of the batch), but this is a
+/// `pub(super)` function over two INDEPENDENT slices, and the mis-alignment it
+/// would take to trigger is silent: no panic, no `debug_assert`, just a run that
+/// counts a batch the engine mostly ACCEPTED.
+///
+/// Both directions are pinned, and the short-`refused` case is the one that was
+/// actually wrong: two calls, one refusal flag, that flag `true`, and the batch
+/// is NOT all-refused because the second call was accepted.
+#[test]
+fn batch_signature_refuses_to_sign_a_length_mismatch() {
+    let first = ToolCall {
+        id: "t1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({}),
+        defect: None,
+    };
+    let second = ToolCall {
+        id: "t2".to_string(),
+        name: "read".to_string(),
+        arguments: json!({ "path": "/x" }),
+        defect: None,
+    };
+
+    // The one that was WRONG: `zip` saw the single `true` and stopped.
+    assert_eq!(
+        turn::batch_signature(&[first.clone(), second.clone()], &[true]),
+        None,
+        "a `refused` slice SHORTER than the batch must not sign — the call the \
+         missing flag stands for may well have been accepted, and signing here is \
+         the false positive"
+    );
+    // The symmetric case, for the same reason (a longer flag slice means the
+    // caller is describing a batch it did not hand over).
+    assert_eq!(
+        turn::batch_signature(&[first.clone(), second.clone()], &[true, true, true]),
+        None,
+        "a `refused` slice LONGER than the batch is just as uninterpretable"
+    );
+    // And the empty pair, which is a length match: an EMPTY batch has nothing
+    // accepted in it, so it signs the empty signature. Nothing in production
+    // reaches this (an empty batch never gets here — the clean-stop return is
+    // gated on `tool_calls.is_empty()`), so it is pinned as the boundary of the
+    // rule rather than as behaviour anyone depends on.
+    assert_eq!(
+        turn::batch_signature(&[], &[]),
+        Some(String::new()),
+        "an empty batch is vacuously all-refused, and that is the boundary case \
+         the length check must not swallow"
+    );
+    // The control: the same batch with a correctly-sized flag slice DOES sign,
+    // so the two `None`s above came from the length and not from the calls.
+    assert!(
+        turn::batch_signature(&[first, second], &[true, true]).is_some(),
+        "the well-formed pair still signs — the mismatch arm did not become a \
+         blanket `None`"
+    );
+}
+
+/// The discriminator itself, pinned DIRECTLY on `run_tool_batch`'s second return
+/// value rather than inferred from a turn's provider-call count. The end-to-end
+/// tests above prove the guard fires and does not over-fire; this says WHY, one
+/// call at a time, including the one shape that is the entire justification for
+/// requiring `is_error` beside the `required` test.
+///
+/// The two shapes class 3 must NOT match for a reason `is_error` cannot supply
+/// are pinned where their fixtures live, each with its own direct probe of this
+/// same return value: a permission DENIAL in
+/// `policy_gate::a_permission_denial_is_never_a_refusal_run` (the gate fixture is
+/// that file's) and an advertised-alias call in
+/// `a_call_using_an_advertised_alias_is_never_a_refusal_run`.
+///
+/// | call | refused | why |
+/// | --- | --- | --- |
+/// | `bash {}` | **true** | the field report's burst: `command` is advertised `required`, absent, and `exec_bash` errors |
+/// | `bash {"command": "exit 1"}` | false | well-formed; the COMMAND failed — progress, not a stuck loop |
+/// | `ls {}` | false | `path` is advertised `required` and IS absent, but `exec_ls` defaults it to the `cwd` and the call SUCCEEDS. This is the shape that makes `required` alone insufficient, and `is_error` is what saves it |
+/// | `write {path, content, contentt}` | **true** | the pre-dispatch extraneous-key class |
+/// | `list_agents {}` | false | declares no `required` at all, and succeeds |
+///
+/// The `ls` row is the one to keep. A future edit that drops the `is_error`
+/// conjunct "because a missing required param is obviously a refusal" reddens
+/// here — and would bound every successful bare `ls` in a repeated batch.
+#[tokio::test]
+async fn the_refusal_predicate_is_the_required_key_and_the_error_together() {
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(vec![
+        ProviderEvent::TextDelta("unused".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ])]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let call = |name: &str, arguments: Value| ToolCall {
+        id: format!("c-{name}"),
+        name: name.to_string(),
+        arguments,
+        defect: None,
+    };
+    let clean = CancellationToken::new();
+
+    // Each probe is its OWN batch, so one call's verdict cannot colour another's.
+    let burst = loop_
+        .run_tool_batch(&[call("bash", json!({}))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        burst,
+        vec![true],
+        "`bash` with NO arguments is the burst shape and MUST count as a refusal — \
+         this is the 303-call case, and at the pre-dispatch checker alone it is `false`"
+    );
+
+    let failing = loop_
+        .run_tool_batch(&[call("bash", json!({ "command": "exit 1" }))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        failing,
+        vec![false],
+        "a failing command with every required key present is NOT a refusal"
+    );
+
+    let bare_ls = loop_
+        .run_tool_batch(&[call("ls", json!({}))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        bare_ls,
+        vec![false],
+        "`ls` DECLARES `path` as required and `ls {{}}` omits it, but `exec_ls` \
+         defaults it and the call SUCCEEDS — so `is_error` is what keeps a working \
+         tool out of the refusal run. Drop that conjunct and this assertion reddens"
+    );
+
+    let extraneous = loop_
+        .run_tool_batch(
+            &[call(
+                "write",
+                json!({ "path": "x.txt", "content": "c", "contentt": "typo" }),
+            )],
+            &clean,
+        )
+        .await
+        .1;
+    assert_eq!(
+        extraneous,
+        vec![true],
+        "the pre-dispatch extraneous-key class is still a refusal"
+    );
+
+    let no_required = loop_
+        .run_tool_batch(&[call("list_agents", json!({}))], &clean)
+        .await
+        .1;
+    assert_eq!(
+        no_required,
+        vec![false],
+        "a tool advertising no `required` list can never be a missing-parameter refusal"
+    );
+
+    // And the standing rule: on a CANCELLED batch nothing is a refusal, even the
+    // burst shape — every synthetic cancel result carries `is_error: true`, so
+    // without the guard's cancel arm a Stop would grow a run.
+    let stopped = CancellationToken::new();
+    stopped.cancel();
+    let cancelled = loop_
+        .run_tool_batch(&[call("bash", json!({}))], &stopped)
+        .await;
+    assert_eq!(
+        cancelled.1,
+        vec![false],
+        "cancellation beats refusal: a Stop must not arm the guard"
+    );
+    assert_eq!(
+        cancelled.0[0]["content"][0]["text"], "cancelled",
+        "and the model still reads `cancelled`, not a missing-parameter sentence"
     );
 }

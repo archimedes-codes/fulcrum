@@ -173,7 +173,26 @@ pub fn append_to(dir: &std::path::Path, line: &str) {
     else {
         return;
     };
-    let _ = writeln!(f, "{ts} {line}");
+    // ONE `write_all`, not a `writeln!`.
+    //
+    // `writeln!(f, "{ts} {line}")` formats in PIECES — the timestamp, the space,
+    // the payload, the newline — and `write_fmt` can issue a separate `write`
+    // syscall for each. This file is opened `O_APPEND`, so every one of those
+    // writes seeks to the current end on its own, and a second writer's pieces
+    // land BETWEEN this writer's. Measured, that produces a file whose lines are
+    // not lines at all:
+    //
+    //   17949907409011794990740901  provider wire=litellm …/9/v1provider wire=openai-completions …/33825/v1
+    //
+    // — two records' timestamps side by side and both payloads concatenated. That
+    // is not a hypothetical: it is what a sibling test's `record` does to this
+    // module's own test, and it makes EVERY whole-line property (the epoch-millis
+    // prefix, "one line per record", "a payload cannot forge a line") unsound for
+    // any reader, including a supporter. A single `write_all` is one syscall, and
+    // `O_APPEND` makes the seek-to-end plus write atomic per call, so a record is
+    // whole or absent — never half of two.
+    let record = format!("{ts} {line}\n");
+    let _ = f.write_all(record.as_bytes());
 }
 
 #[cfg(test)]
@@ -274,6 +293,38 @@ mod tests {
 
     /// A line is timestamped and newline-terminated, so lines stay orderable —
     /// the property that makes the file worth asking a user for.
+    ///
+    /// **Do not "restore" an exact line count here.** This test used to open with
+    /// `assert_eq!(lines.len(), 2, "one line per record")`, and that assertion was
+    /// a flake — reported in review as 29 failures per 400 runs at
+    /// `--test-threads=3`, reading `left: 4, right: 2`.
+    ///
+    /// The mechanism was reproduced here deterministically (a sibling thread
+    /// calling `record` while this test held the lock and had its scratch dir armed
+    /// fails the assertion with exactly that `left: 4, right: 2`), even though the
+    /// statistical rate did not reproduce on this machine at this load — the window
+    /// is two file appends wide, so it turns on scheduler luck. A flake that needs
+    /// luck to show is still a flake: the count was never this test's to own.
+    ///
+    /// The cause is the channel, not this test. `env_lock()` serialises only the
+    /// tests that TAKE it, and roughly seventeen tests in this binary call
+    /// `build_provider` without it (`build_provider_dispatches_on_the_api`,
+    /// `build_provider_keeps_the_configured_base_for_completions_and_responses`,
+    /// `build_provider_base_pass_is_idempotent_on_v1_bases`,
+    /// `build_provider_posts_messages_at_root_normalized_v1`, the
+    /// `harness::loop::tests` provider-switch sites, …). Every one of them now
+    /// reaches `record`, and `record` writes to the ONE process-global target — so
+    /// while this test holds the lock and has armed its scratch dir, an unlocked
+    /// sibling's construction line lands in THIS file. The count is therefore not
+    /// this test's to own.
+    ///
+    /// The alternative — threading `env_lock()` into all seventeen — would
+    /// serialise the provider suite to protect a number that is incidental to the
+    /// property this test is named for, so it was rejected. What the name promises
+    /// is that a line is TIMESTAMPED and TERMINATED, and that is what is asserted:
+    /// the two lines this test wrote are found, in order, and each carries an
+    /// epoch-millis prefix and a non-empty payload. A third line from a sibling
+    /// is not a defect and must not read as one.
     #[test]
     fn a_line_is_timestamped_and_terminated() {
         let _g = lock();
@@ -283,8 +334,27 @@ mod tests {
         record("second");
         let content = std::fs::read_to_string(dir.join(FILE_NAME)).expect("the file");
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "one line per record:\n{content}");
-        for line in &lines {
+
+        // PRESENT and ORDERED, not counted: `O_APPEND` gives each `record` its own
+        // offset atomically, so the relative order of these two is guaranteed even
+        // when a sibling's line lands between them.
+        let first = lines
+            .iter()
+            .position(|line| line.ends_with("first"))
+            .unwrap_or_else(|| panic!("the `first` line is in the file:\n{content}"));
+        let second = lines
+            .iter()
+            .position(|line| line.ends_with("second"))
+            .unwrap_or_else(|| panic!("the `second` line is in the file:\n{content}"));
+        assert!(
+            first < second,
+            "one line per `record`, in the order they were written:\n{content}"
+        );
+
+        // The two properties the test is NAMED for, asserted on the lines it owns
+        // (a sibling's line is not this module's to vouch for).
+        for &index in &[first, second] {
+            let line = lines[index];
             let (ts, rest) = line
                 .split_once(' ')
                 .unwrap_or_else(|| panic!("every line carries an epoch-millis prefix: {line}"));
@@ -294,8 +364,88 @@ mod tests {
             );
             assert!(!rest.is_empty(), "the payload survives the prefix: {line}");
         }
-        assert!(lines[0].ends_with("first"), "the payload is verbatim");
+        assert!(lines[first].ends_with("first"), "the payload is verbatim");
         init(None);
+    }
+
+    /// The regression test for the flake above, made DETERMINISTIC.
+    ///
+    /// The race itself needs scheduler luck, so this does not wait for it: it
+    /// manufactures the condition instead. A helper thread — standing in for one of
+    /// the ~17 unlocked `build_provider` tests, which take no lock and reach
+    /// `record` through the same process-global target — writes 200 lines into the
+    /// dir this test has armed, BETWEEN this test's two `record`s. The sibling's
+    /// lines are therefore certainly interleaved with the two owned lines, which is
+    /// the shape the race produces.
+    ///
+    /// Against the previous exact-count assertion this fails with the reported
+    /// signature (`left: 4, right: 2`). Against the present-in, ordered form it
+    /// passes, which is the property the fix claims: a sibling's line in this file
+    /// is legitimate and must not read as a defect.
+    #[test]
+    fn a_sibling_writer_does_not_break_the_timestamp_assertions() {
+        let _g = lock();
+        let dir = temp_dir();
+        init(Some(dir.to_path_buf()));
+
+        record("first");
+        // The sibling runs BETWEEN the two `record`s, so its lines are certainly
+        // interleaved — the exact shape the race produces, without depending on
+        // scheduler luck. `first < second` must still hold, because `O_APPEND`
+        // gives each write its own offset atomically.
+        let sibling = std::thread::spawn(|| {
+            // `record` reads the same global target; this thread deliberately takes
+            // NO lock, exactly as the unlocked `build_provider` tests do.
+            for _ in 0..200 {
+                record("provider wire=openai-completions model=m/1 base=http://sibling/v1");
+            }
+        });
+        sibling.join().expect("the sibling writer finishes");
+        record("second");
+        let content = std::fs::read_to_string(dir.join(FILE_NAME)).expect("the file");
+        init(None);
+
+        let lines: Vec<&str> = content.lines().collect();
+        // The manufactured interference actually landed, or this test proves
+        // nothing: without this, the assertions below would pass for the trivial
+        // reason that no sibling ever wrote.
+        assert!(
+            lines.len() > 2,
+            "the sibling writer reached this file (otherwise this test is vacuous):\n{content}"
+        );
+
+        let first = lines
+            .iter()
+            .position(|line| line.ends_with("first"))
+            .expect("the `first` line is present among the sibling's");
+        let second = lines
+            .iter()
+            .position(|line| line.ends_with("second"))
+            .expect("the `second` line is present among the sibling's");
+        assert!(
+            first < second,
+            "the two owned lines stay in order however many siblings interleave:\n{content}"
+        );
+        for &index in &[first, second] {
+            let (ts, rest) = lines[index].split_once(' ').unwrap_or_else(|| {
+                panic!(
+                    "every line carries an epoch-millis prefix: {}",
+                    lines[index]
+                )
+            });
+            assert!(
+                ts.parse::<u128>().is_ok() && ts.len() >= 10,
+                "the prefix is epoch millis, not prose: {}",
+                lines[index]
+            );
+            assert!(!rest.is_empty(), "the payload survives the prefix");
+        }
+        // And the dir is not left behind: `init(None)` cleared the global before
+        // `ScratchDir::Drop` removed it, so nothing can resurrect it afterwards.
+        assert!(
+            effective_dir().is_none(),
+            "the channel is unarmed again, so no later test writes into the removed dir"
+        );
     }
 
     /// THE test-safety property: unarmed, the channel writes NOWHERE — in

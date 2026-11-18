@@ -382,6 +382,17 @@ pub async fn todo_apply(
 /// core (the `cancel` token — the native `AgentLoop`'s session teardown
 /// token); the `SudoPromptCleanup` guard emits the terminal
 /// `interactive-request-close` on a DROPPED (unanswered) prompt.
+///
+/// Returns the [`ToolResult`] and whether a PERSON refused the flow — the SAME
+/// `(ToolResult, bool)` shape `codemode::run_nested` returns for the same
+/// reason. The second half is `true` for the two arms a human decided
+/// (the declined confirm, the cancelled password entry) and `false` for every
+/// arm the ENGINE or the OS decided (empty command, a process failure, an auth
+/// failure, a non-zero exit, success). It is structural, never inferred from
+/// the result text: the loop's identical-refusal guard must not end a user's
+/// prompt over their own three "no" clicks, and a guard that read the sentence
+/// "Command not confirmed" would be re-armed by rewording it. See
+/// `refused_before_the_model_could_act`'s docblock.
 #[allow(clippy::too_many_arguments)]
 // (T5/S3 A.3) `pub(crate)` → `pub`: the caller `harness/loop/tools.rs` stays
 // desktop until S5, and a package boundary erases `pub(crate)`.
@@ -395,7 +406,7 @@ pub async fn sudo_run_flow(
     pending_sudo: &PendingSudo,
     sudo_password: &Arc<Mutex<HashMap<String, CachedPassword>>>,
     cancel: &CancellationToken,
-) -> ToolResult {
+) -> (ToolResult, bool) {
     let command = params
         .get("command")
         .and_then(Value::as_str)
@@ -410,17 +421,23 @@ pub async fn sudo_run_flow(
         .to_string();
 
     // The suite's empty-command rejection (`tool.ts:404-411`) — BEFORE any
-    // sub-prompt (no runner call, no modal).
+    // sub-prompt (no runner call, no modal). NOT a person's refusal: nobody was
+    // asked, and the sentence IS a re-send instruction ("provide the exact
+    // command"), so the second half is `false` and the refusal guard still
+    // counts it.
     if command.is_empty() {
-        return ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "The command is empty — provide the exact command to run with elevated privileges.".to_string(),
-            }],
-            details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "empty command" }),
-            ),
-            is_error: true,
-        };
+        return (
+            ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "The command is empty — provide the exact command to run with elevated privileges.".to_string(),
+                }],
+                details: Some(
+                    json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "empty command" }),
+                ),
+                is_error: true,
+            },
+            false,
+        );
     }
 
     // The DROPPED-flow cleanup guard (finding 3): a `tokio::select!` dropping
@@ -477,16 +494,29 @@ pub async fn sudo_run_flow(
     if !confirmed {
         // The suite's result (`tool.ts:429-434`) — on a user cancel, a
         // timeout, OR a session close: no password prompt, no execution.
-        return ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "Command not confirmed — not executed, and no password was requested."
-                    .to_string(),
-            }],
-            details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "command not confirmed" }),
-            ),
-            is_error: true,
-        };
+        //
+        // `refused: true` — this arm is a PERSON'S "no" (or a Stop/close that
+        // resolves the confirm as not-confirmed, which is equally not a re-send
+        // instruction). It is the third denial corridor: the shape `command`
+        // present + `reason` omitted + a declined confirm satisfied BOTH halves
+        // of the refusal predicate's class 2 (`is_error`, and an advertised
+        // `required` key the call omits) and three identical re-sends after
+        // three "no" clicks settled the turn as `turn_capped` — measured at 4
+        // provider calls. The flag is threaded rather than read off this
+        // sentence, exactly as `run_nested` threads its own.
+        return (
+            ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "Command not confirmed — not executed, and no password was requested."
+                        .to_string(),
+                }],
+                details: Some(
+                    json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "command not confirmed" }),
+                ),
+                is_error: true,
+            },
+            true,
+        );
     }
 
     // ── the password (CACHE-HIT FIRST — the suite's `credentialCache.get()`,
@@ -550,16 +580,25 @@ pub async fn sudo_run_flow(
         // Cancelled (an empty password, a session close, or a Stop) — the
         // suite's result (`tool.ts:437-447`): nothing was cached, nothing
         // was run.
-        return ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "Password entry cancelled — not executed, and nothing was cached."
-                    .to_string(),
-            }],
-            details: Some(
-                json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "password entry cancelled" }),
-            ),
-            is_error: true,
-        };
+        //
+        // `refused: true` for the same reason as the confirm arm: the person
+        // in front of the prompt declined to supply the credential. A Stop is
+        // ALSO excluded, but by the predicate's own `turn.is_cancelled()` half
+        // rather than by this flag, so the two exclusions do not overlap by
+        // accident — they cover the two different ways this arm is reached.
+        return (
+            ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "Password entry cancelled — not executed, and nothing was cached."
+                        .to_string(),
+                }],
+                details: Some(
+                    json!({ "command": command, "reason": reason, "exitCode": null, "stdout": "", "stderr": "", "error": "password entry cancelled" }),
+                ),
+                is_error: true,
+            },
+            true,
+        );
     };
     if prompted {
         // Cache the password with the suite's TTL (15 min — `config.ts`;
@@ -603,7 +642,12 @@ pub async fn sudo_run_flow(
     // it renders from — so it must be checked before any verdict-derived arm,
     // or the success branch would report a spawn failure as a completed run:
     // the exact class of misreport this seam exists to kill.
-    if let Some(error) = &run.error {
+    // NONE of the four arms below is a person's refusal — the command was
+    // confirmed, the credential was supplied, and the process ran (or failed to
+    // spawn). Every one of them answers `refused: false`, so the guard's
+    // exclusion covers the two sub-prompt arms and NOT the executor's verdicts:
+    // a `sudo` command that fails twice is still progress, not a stuck loop.
+    let result = if let Some(error) = &run.error {
         // Process-level failure (spawn error, transport failure, stdin-write
         // timeout) — the suite's `tool.ts:483-490`: a clean tool failure with
         // the `error` + `isError`, NEVER an auth failure — the cached
@@ -695,7 +739,8 @@ pub async fn sudo_run_flow(
             ),
             is_error: false,
         }
-    }
+    };
+    (result, false)
 }
 
 #[cfg(test)]
@@ -941,7 +986,12 @@ mod tests {
             );
             let mut close_rx = close_tx.subscribe();
             tokio::select! {
-                result = core => {
+                // The refusal flag is DESTRUCTURED AWAY here and deliberately
+                // not put on the wire: the envelope this path writes is the
+                // desktop's render input, and the flag exists only for the
+                // native loop's refusal guard (the worker's own loop reads it
+                // from `dispatch_tool` directly, not from this frame).
+                (result, _refused) = core => {
                     json!({
                         "type": "response",
                         "id": id,
