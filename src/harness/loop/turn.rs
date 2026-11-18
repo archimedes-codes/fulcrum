@@ -23,6 +23,71 @@ pub(super) enum TurnFlow {
     Return,
 }
 
+/// The settle-site line for the silent-settle shape: the stream carried
+/// tool-call deltas and the turn dispatches NONE.
+///
+/// This is the sibling of [`AgentLoop::handle_truncated_turn`]'s message — same
+/// `finish_reason` + `N chars of streamed text and N …` skeleton, so the two
+/// read alike side by side in a log — and it answers the one question the settle
+/// site cannot answer on its own. The settle site sees `acc.tool_calls`, which
+/// holds the calls the parser ASSEMBLED; `tool_call_deltas` holds what the
+/// stream CARRIED. The two disagree exactly here, and only here, so the
+/// disagreement is the whole content of the line: "the model called nothing"
+/// and "a call was streamed and never became a dispatched call" look identical
+/// from where the settle is written, and only one of them is a bug.
+///
+/// # Why a pure function returning `Option<String>`
+///
+/// Every other `harness: ` site in the engine is an `eprintln!` inline in a
+/// `&mut self` method, and not one of them has a test: `[dev-dependencies]` is
+/// `tempfile`, `wiremock` and `tokio` — there is no stderr-capture crate, so a
+/// line written straight to stderr is unobservable from inside a `cargo test`.
+/// Building the sentence from three scalars makes the message — the part that
+/// can be WRONG — testable, and leaves the call site as two calls.
+///
+/// # What may appear in it
+///
+/// Counts and a closed enum, which is what keeps the `diagnostics::record` half
+/// legal: its module rule is "a `record` call site may not contain user
+/// content… not a model answer", and `text_chars` is the LENGTH of the answer,
+/// never the answer. The finish reason is one of four `FinishReason` variants.
+/// Deliberately absent: `self.model.id`. `catalog.rs`'s `expand_v1_models` takes
+/// the id straight from the provider's `/models` JSON, so it is third-party text
+/// that needs the `one_field_per_line` sanitizer `provider/mod.rs` keeps to
+/// itself, and the existing `harness: provider wire=… model=…` line already
+/// records the id where it is sanitized.
+pub(super) fn settled_with_nothing_dispatched(
+    finish: Option<FinishReason>,
+    text_chars: usize,
+    tool_call_deltas: usize,
+) -> Option<String> {
+    // The guard, kept INSIDE the helper so the tested function and the emitted
+    // line cannot disagree about when the line exists.
+    if tool_call_deltas == 0 {
+        return None;
+    }
+    // The WIRE spelling of the reason (`serde`'s `rename_all = "snake_case"` on
+    // `FinishReason`) rather than `{:?}`: the line is read against a provider
+    // response, and a diagnostic that spells the reason differently from the
+    // wire is a second spelling to keep in sync for no benefit. `None` — a
+    // stream that ended with no `finish_reason` at all, one of the shapes
+    // issue #64's comment records as used to settle clean — reports `none`
+    // rather than inventing a reason.
+    let reason = match finish {
+        Some(FinishReason::Stop) => "stop",
+        Some(FinishReason::ToolCalls) => "tool_calls",
+        Some(FinishReason::Length) => "length",
+        Some(FinishReason::Error) => "error",
+        None => "none",
+    };
+    Some(format!(
+        "settled with no tool call dispatched: finish_reason `{reason}` with {text_chars} \
+         chars of streamed text and {tool_call_deltas} streamed tool-call delta(s) — a call \
+         was streamed and never dispatched, so the turn settled as a success with nothing \
+         run (where the call went is the provider parser's account)"
+    ))
+}
+
 /// A rejected call's result (issue #93). Mirrors `cancelled_tool_result` /
 /// `deny_tool_result`: one text block, no details, `is_error: true`. The text
 /// is `unknown_param_error`'s sentence — the model gets the offending key AND
@@ -637,6 +702,20 @@ impl AgentLoop {
                             });
                         }
                         ProviderEvent::ToolCallDelta(d) => {
+                            // Counted FIRST, BEFORE the `emit` — and the
+                            // position is forced, not stylistic: `d.arguments`
+                            // is `Option<String>` and the `json!` below consumes
+                            // it through `unwrap_or_default()`, so anything that
+                            // reads `d` must come before that move.
+                            //
+                            // It counts ARRIVALS, not outcomes: nothing in this
+                            // arm can decide whether the call ever lands in
+                            // `acc.tool_calls` (the assembled `ToolCall` arrives
+                            // later, from the parser), and the whole point of
+                            // the counter is to be able to say "the stream
+                            // carried a tool call" at a settle where
+                            // `acc.tool_calls` says it did not.
+                            acc.tool_call_deltas += 1;
                             self.emit(RpcEvent::message_update {
                                 usage: acc.usage_value(),
                                 assistant_message_event: json!({

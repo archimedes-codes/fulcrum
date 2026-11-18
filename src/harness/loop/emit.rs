@@ -451,6 +451,23 @@ pub(super) struct TurnAccumulator {
     pub(super) tool_calls: Vec<ToolCall>,
     pub(super) usage: Option<Usage>,
     pub(super) finish: Option<FinishReason>,
+    /// How many `ProviderEvent::ToolCallDelta`s this attempt streamed, whatever
+    /// became of them.
+    ///
+    /// The settle site (`loop.rs`, the `tool_calls.is_empty()` arm) can see the
+    /// RESULT of the stream — `acc.tool_calls`, the completed calls — and that
+    /// is not the same fact as what ARRIVED: a `ToolCall` is produced by the
+    /// wire's parser once it has assembled the fragments, so a parser that
+    /// drops an assembled call leaves `acc.tool_calls` empty while the stream
+    /// carried the call all along. Without this counter the two shapes — "the
+    /// model never called a tool" and "a tool call was streamed and something
+    /// between the delta and the accumulator lost it" — are indistinguishable
+    /// from where the diagnostic has to be written, and that distinction is the
+    /// only question the line answers.
+    ///
+    /// Incremented once per delta at the top of `consume_stream`'s
+    /// `ToolCallDelta` arm, so it counts arrivals, not outcomes.
+    pub(super) tool_call_deltas: usize,
 }
 
 impl TurnAccumulator {

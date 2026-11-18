@@ -1798,6 +1798,61 @@ impl AgentLoop {
             state.overflow_recovered = false;
 
             if tool_calls.is_empty() {
+                // (supervisor-log diagnostics) The turn settled as a SUCCESS
+                // having dispatched nothing. That is the ordinary shape of a
+                // final answer — but it is ALSO the shape of a tool call that
+                // streamed and never became a dispatched call, and from here the
+                // two are indistinguishable UNLESS the delta counter is read:
+                // `tool_calls` is what the parser ASSEMBLED, `acc.tool_call_deltas`
+                // is what the stream CARRIED. When they disagree, something
+                // between the delta and this block lost a call the model really
+                // made, and the user watched a clean, silent stop.
+                //
+                // TWO sinks, on purpose — the same split `log_wire`
+                // (`provider/mod.rs`) documents, and for the same reasons. The
+                // `eprintln!` half is the WORKER's only reader with
+                // `ARCHIMEDES_DEBUG=1` set: the Worker's stderr is drained by a
+                // task in `worker/client.rs` into `debuglog`, which returns at
+                // its first statement without the var. The `record` half is what
+                // a DEFAULT launch leaves the supporter — `diagnostics` is always
+                // on, and it is the half that survives the desktop's Supervisor,
+                // whose stderr is inherited and never persisted (and on a Windows
+                // release build the GUI subsystem discards it outright). Neither
+                // half is redundant with the other: DO NOT delete one because the
+                // other exists. `record` takes the line WITHOUT the `harness: `
+                // prefix, exactly as `log_wire`'s does.
+                //
+                // The payload is three counts and a closed enum — which is what
+                // makes the always-on half legal at all. `diagnostics`' rule is
+                // "not a transcript, not a prompt, not a model answer", and
+                // `acc.text.chars().count()` is the LENGTH of the answer, never
+                // the answer. `self.model.id` is absent for the reason
+                // `turn.rs::settled_with_nothing_dispatched` states (third-party
+                // `/models` text, and its sanitizer is private to
+                // `provider/mod.rs`).
+                //
+                // WHY THIS CANNOT DOUBLE-FIRE WITH `handle_empty_turn`: the gate
+                // above (`acc.text.is_empty() && acc.tool_calls.is_empty()`)
+                // `continue`s or `returns` on EVERY path it takes —
+                // `handle_empty_turn` answers `TurnFlow::Continue` (a retry) or
+                // `TurnFlow::Return` (the budget spent, an error settle) and both
+                // are matched into `continue` / `return` here — so an attempt with
+                // no text never reaches this block at all. This site is therefore
+                // reachable only with text present, and `handle_empty_turn`'s line
+                // is only ever written on an attempt with none. The two lines are
+                // disjoint by control flow, not by a condition written here.
+                //
+                // `Length` is likewise already gone (handled above, and it
+                // returns), and a `Retryable` mid-stream error never arrives here
+                // either — `handle_mid_stream_error` settles and returns.
+                if let Some(msg) = turn::settled_with_nothing_dispatched(
+                    acc.finish,
+                    acc.text.chars().count(),
+                    acc.tool_call_deltas,
+                ) {
+                    eprintln!("harness: {msg}");
+                    crate::diagnostics::record(&msg);
+                }
                 self.emit(RpcEvent::agent_end {
                     messages: vec![self.assistant_message_value(&acc)],
                     will_retry: false,
