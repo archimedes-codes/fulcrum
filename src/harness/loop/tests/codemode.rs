@@ -14,13 +14,16 @@
 //! scripted provider only stands in for the model.
 //!
 //! THE `.await.0` ON EVERY `dispatch_tool` CALL: the method returns
-//! `(ToolResult, bool)` — the result and whether a PERSON refused it — because
-//! `run_tool_batch`'s refusal guard needs the flag. These pins are about the
-//! RESULT, so they project `.0`; the flag itself is pinned by
-//! `a_sudo_exec_confirm_refusal_is_never_a_refusal_run` and the census
+//! `(ToolResult, bool, bool)` — the result, whether a PERSON refused it, and
+//! whether an executor attested it ACCEPTED the arguments and RAN them — because
+//! `run_tool_batch`'s refusal guard needs both flags. These pins are about the
+//! RESULT, so they project `.0`; the flags themselves are pinned by
+//! `a_sudo_exec_confirm_refusal_is_never_a_refusal_run`,
+//! `a_confirmed_sudo_exec_that_fails_is_never_a_refusal_run` and the census
 //! `source_lints::every_denial_marking_site_in_the_batch_is_accounted`. Do not
 //! "tidy" the tuple away: a `ToolResult` return is what let the sudo confirm
-//! refusal reach the guard as a re-send instruction.
+//! refusal reach the guard as a re-send instruction, and what would let a sudo
+//! command that RAN and FAILED reach it the same way from the other direction.
 //!
 //! THE FIXTURE RULE these tests all obey (`policy_gate.rs`'s own discovery, stated
 //! at its `policy_verdict` assertions): `PermissionContext::refresh` runs at the top

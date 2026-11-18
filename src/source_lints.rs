@@ -541,21 +541,34 @@ fn function_body(path: &std::path::Path, signature: &str) -> Vec<(usize, String)
 /// The refusal guard's denial-marking sites, COUNTED. The census that survives a
 /// corridor nobody has thought of yet.
 ///
-/// # Why this exists when three behavioural pins already do
+/// # Why this exists when several behavioural pins already do
 ///
 /// The identical-refusal guard ends a user's prompt when it is wrong, so every
 /// shape that is NOT "the engine told the model to re-send this" has to be
-/// excluded from it. Three are excluded today — the `Ask`-answered-no denial,
-/// `Decision::Deny`, and a `sudo_exec` sub-prompt refusal — each by a `bool`
-/// threaded from the arm that KNOWS, and each by its own behavioural pin.
+/// excluded from it. Three CORRIDORS are excluded today — the `Ask`-answered-no
+/// denial, `Decision::Deny`, and a `sudo_exec` sub-prompt refusal — each by a
+/// `bool` threaded from the arm that KNOWS, and each by its own behavioural pin.
 ///
-/// None of those pins can see a FOURTH corridor. A refusal site that forgets to
-/// mark itself is invisible to a test that scripts only the shapes its author
-/// already knew about, and a non-exhaustive enum would not help either: an
+/// A FOURTH exclusion arrived by a different route, and the census had to grow to
+/// see it: `sudo_exec`'s command can be CONFIRMED, RUN and FAIL, which is nobody's
+/// argument refusal either. That exclusion is not a third `true` in
+/// `run_tool_batch` — it is a THIRD ELEMENT of the tuple, a `ran` flag forwarded
+/// from `sudo_run_flow`'s post-run arms. So the counts below are now over TWO
+/// flags, and they are counted PER OCCURRENCE rather than per line: two flags
+/// riding one line would otherwise let a dropped flag leave the count untouched,
+/// which is precisely the drift this lint exists to catch.
+///
+/// None of the pins can see a corridor nobody thought of. A refusal site that
+/// forgets to mark itself is invisible to a test that scripts only the shapes its
+/// author already knew about, and a non-exhaustive enum would not help either: an
 /// unhandled variant still compiles at every `matches!`. The `sudo_exec` confirm
 /// refusal is the proof — it was a live false positive for a whole commit, at
 /// **4 provider calls and one `turn_capped`** on a user's own three "no" clicks,
-/// with a green pin on either side of it.
+/// with a green pin on either side of it. The granted-confirm-then-failed-command
+/// shape is the SECOND proof: same tool, same omitted `reason`, the opposite
+/// verdict, and it too measured **4 provider calls and one `turn_capped`** — with
+/// the declined-confirm pin green the whole time, because that pin scripts a
+/// DECLINED confirm and this shape is not one.
 ///
 /// What does survive is a COUNT. This lint asserts the number of denial-marking
 /// sites in `run_tool_batch`'s body, so a fourth corridor that has not been
@@ -659,24 +672,53 @@ fn every_denial_marking_site_in_the_batch_is_accounted() {
     // lines and compiles) — the exact mutation class `AGENTS.md`'s "prove it with a
     // mutation that still compiles — hoist a value into a local, don't delete it"
     // rule names, and it defeated the first version of this assert. So the
-    // aggregate closes the hole: the body answers "not a person's refusal" in
-    // EXACTLY five places, each one an arm that genuinely cannot be a refusal (a
-    // child's result, two cancellation arms, two unknown-param rejections). A
-    // hoisted `false` is a SIXTH and reddens here.
+    // aggregate closes the hole: the body answers "not a person's refusal" and
+    // "the executor did not run it" in EXACTLY twelve places, each one an arm that
+    // genuinely cannot be either (a child's result, two cancellation arms, two
+    // unknown-param rejections — TWO flags each — plus the two denial arms, which
+    // mark `denied: true` and so write only the `ran` half). A hoisted `false` is a
+    // THIRTEENTH and reddens here.
+    //
+    // THE COUNT WENT 5 → 12 because the tuple widened from `(result, denied)` to
+    // `(result, denied, ran)`, NOT because a corridor was added or removed: the
+    // five ARMS are unchanged, each now answers two flags. It is therefore counted
+    // PER OCCURRENCE rather than per line — with two flags riding the same line a
+    // per-line count would credit one arm with one answer and would not move when a
+    // flag was dropped from it, which is the very thing this assert watches for.
+    // The per-line count is asserted alongside it (8 lines) so a change in EITHER
+    // direction — a flag dropped, an arm added — moves a number someone has to
+    // explain, the same pair-of-floors shape the `total` / `constructed` / `inline`
+    // trio above uses.
     let not_refused: Vec<usize> = body
+        .iter()
+        .flat_map(|(n, l)| std::iter::repeat_n(*n, l.matches("false").count()))
+        .collect();
+    assert_eq!(
+        not_refused.len(),
+        12,
+        "expected exactly 12 `false` answers in `run_tool_batch` (the five arms that \
+         neither a person refused nor ran — a child's result, the two cancellation \
+         arms, the two unknown-param rejections — at TWO flags each, plus the two \
+         denial arms marking only `ran`), found {} at {not_refused:?} — a 13th is a \
+         place that stops forwarding one of the flags, most likely by hoisting the \
+         dispatch result into a local and pinning it, which the per-line assert \
+         above cannot see",
+        not_refused.len(),
+    );
+    let not_refused_lines: Vec<usize> = body
         .iter()
         .filter(|(_, l)| l.contains("false"))
         .map(|(n, _)| *n)
         .collect();
     assert_eq!(
-        not_refused.len(),
-        5,
-        "expected exactly 5 `false` answers in `run_tool_batch` (a child's result, the \
-         two cancellation arms, the two unknown-param rejections), found {} at {not_refused:?} \
-         — a 6th is a place that stops forwarding a refusal, most likely by hoisting the \
-         dispatch result into a local and pinning its flag, which the per-line assert \
-         above cannot see",
-        not_refused.len(),
+        not_refused_lines.len(),
+        8,
+        "expected exactly 8 LINES answering a `false` flag in `run_tool_batch` (the \
+         five never-refused-never-run arms, the constructed denial's `ran`, and the \
+         `Decision::Deny` arm's `ran`), found {} at {not_refused_lines:?} — 12 flag \
+         answers spread over fewer lines means two flags were collapsed onto an arm \
+         that should not carry them",
+        not_refused_lines.len(),
     );
 
     // `dispatch_tool` FORWARDS, it does not decide: its own body marks no denial.
@@ -739,9 +781,56 @@ fn every_denial_marking_site_in_the_batch_is_accounted() {
     assert!(
         !flow_not_refused.is_empty(),
         "`sudo_run_flow` must also mark what is NOT a person's refusal (the \
-         empty-`command` arm and the four post-run arms) — without those, the two `true` \
-         markings above are an unexplained pair and nothing says the executor's own \
-         failures are still counted"
+         empty-`command` arm and the two sub-prompt arms' `ran` half) — without those, \
+         the two `true` markings above are an unexplained pair and nothing says the \
+         executor's own failures are still counted"
+    );
+
+    // ── the SECOND flag: `ran`, the executor attested it accepted and ran ──
+    // The census above reads the `denied` half, which excludes a PERSON's "no".
+    // This reads the half that excludes a COMMAND that ran and failed, and it is
+    // the mirror false positive: `sudo_exec {"command":"x"}` (the advertised
+    // `required` `reason` DEFAULTED by this very flow) + a GRANTED confirm + a
+    // wrong password was measured at 4 provider calls and one `turn_capped`, on a
+    // sentence that invites the retry.
+    //
+    // ONE marking site, because the flow's four post-run arms build one `result`
+    // and share one tail return. That single line is the whole of the exclusion, so
+    // it gets both halves of the pair the `denied` census uses: the count, and a
+    // positive assertion that the arms which must NOT claim a run do not.
+    let flow_ran: Vec<usize> = flow
+        .iter()
+        .filter(|(_, l)| l.contains("(result, false, true)"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        flow_ran.len(),
+        1,
+        "expected exactly 1 `ran` marking in `sudo_run_flow` — the shared tail return \
+         of the four POST-RUN arms (process failure, auth failure, the classifier's \
+         error verdict, success), found {flow_ran:?}. Deleting it re-arms the false \
+         positive that ends a user's prompt mid-authentication: a command that RAN and \
+         FAILED would be counted as an argument refusal again, because the flow \
+         DEFAULTS the `reason` this tool advertises as `required`",
+    );
+    // And the three arms that return BEFORE any run must not claim one. FOUR
+    // `false,` lines in total: the empty-`command` rejection writes both flags
+    // (`denied` then `ran`), and each of the two sub-prompt refusals writes only
+    // its `ran` half — their `denied` half is the `true,` counted above.
+    let flow_not_ran: Vec<usize> = flow
+        .iter()
+        .filter(|(_, l)| l.trim() == "false,")
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        flow_not_ran.len(),
+        4,
+        "expected exactly 4 `false,` flag answers in `sudo_run_flow` (the empty-`command` \
+         arm writing both flags, plus each sub-prompt refusal writing its `ran` half), \
+         found {flow_not_ran:?} — one fewer is an arm that never ran now claiming it did, \
+         which silences the guard on a shape that should still count (the empty-`command` \
+         refusal is the card's headline shape for this tool), and an extra one is a flag \
+         no longer forwarded",
     );
 }
 
