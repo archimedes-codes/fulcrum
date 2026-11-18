@@ -86,6 +86,12 @@
 //! - a `prompt` whose text is `"__stderr__"`: a line on STDERR and NO
 //!   stdout frame (the stderr-drain test — the Supervisor must forward it
 //!   to the debug log, then the turn settles).
+//! - a `prompt` whose text is `"__stderr_badbytes__"`: RAW BYTES on STDERR —
+//!   a good line, a line holding `\xff\xfe` (not valid UTF-8), and a second
+//!   good line — and NO stdout frame (the non-UTF-8 stderr-drain test: the
+//!   Supervisor's drain must drop the undecodable line and STILL forward the
+//!   one after it, then the turn settles). `eprintln!` cannot express an
+//!   invalid byte, hence the raw `write_all`.
 //! - a `subagent-result` line: a `subagent-result-ack` `SinkFrame`
 //!   (the `SubagentResult` round-trip observation point — the
 //!   `outcome` rides verbatim).
@@ -1218,6 +1224,39 @@ pub fn worker_main() {
                 // quiet settle — the ONLY observation is the log line.
                 "__stderr__" => {
                     eprintln!("fake worker: a diagnostic on stderr");
+                    emit(
+                        &mut stdout,
+                        &Outbound::Event {
+                            event: RpcEvent::agent_settled,
+                        },
+                    );
+                }
+                // The non-UTF-8 stderr-drain test input: RAW BYTES on STDERR
+                // — a good line, a line holding an undecodable byte, and a
+                // second good line — then a quiet settle.
+                //
+                // `eprintln!` takes a `&str`, so it CANNOT produce an invalid
+                // byte; the only way to get one onto the pipe a real Worker's
+                // dump would put one on is to write the bytes. `\xff\xfe` is
+                // the shape a raw `&[u8]` dump or a truncated multi-byte char
+                // leaves behind, and each of the three lines is
+                // `\n`-terminated so the bad one is a COMPLETE line (the case
+                // the drain's `InvalidData` arm handles — an unterminated run
+                // at EOF is the `Ok(0)` tail arm instead).
+                //
+                // The flush is not decoration: `Stderr` is line-buffered when
+                // it is a TTY and NOT otherwise guaranteed to be flushed
+                // before the process' final exit, and `write_all` on it does
+                // not flush at all. Without it the whole batch can sit in the
+                // Rust-side buffer while the settle frame goes out on stdout,
+                // and the drain sees nothing.
+                "__stderr_badbytes__" => {
+                    let mut stderr = std::io::stderr();
+                    // The bytes of `ok\n`, an UNDECODABLE line, then `after\n`
+                    // — written as ONE `write_all` so the drain cannot observe
+                    // a torn line between the three.
+                    let _ = stderr.write_all(b"ok\n\xff\xfe\nafter\n");
+                    let _ = stderr.flush();
                     emit(
                         &mut stdout,
                         &Outbound::Event {

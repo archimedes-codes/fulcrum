@@ -235,8 +235,16 @@ impl Clone for WorkerHandle {
 /// Drain a piped child stream line-by-line into `on_line` (a DEDICATED
 /// TASK that only ever awaits the read — never a `select!` arm, because a
 /// dropped tokio `read_line` future takes the bytes it already consumed
-/// with it). The EOF (the child's exit) ends the task, and the read errors
-/// are swallowed (a pipe that dies mid-read has nothing left to say).
+/// with it). The EOF (the child's exit) ends the task.
+///
+/// # What ends the drain, and what does not
+///
+/// A GENUINE read error ends it (a pipe that dies mid-read has nothing left
+/// to say) — as does EOF. An `InvalidData` (one line of the stream is not
+/// valid UTF-8) does NOT: that one line is dropped and the drain continues.
+/// See the arm below for why continuing cannot spin, and for why this channel
+/// takes the permissive rule where the daemon's frame reader takes the strict
+/// one.
 fn spawn_pipe_reader<R, F>(pipe: R, mut on_line: F) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -264,6 +272,40 @@ where
                         on_line(line.to_string());
                     }
                 }
+                // ONE BAD BYTE IS NOT A DEAD PIPE. `read_line` validates the
+                // bytes it read as UTF-8 AFTER reading them, and reports a
+                // failure as `InvalidData`; the bytes of the offending line
+                // were already `consume`d from the reader
+                // (`tokio-1.54.1/src/io/util/read_until.rs:69`, reached from
+                // `read_line.rs:99` BEFORE the `String::from_utf8` at
+                // `read_line.rs:100`), and on the error they are NOT handed
+                // back to the reader — `finish_string_read`'s `InvalidData`
+                // arm (`read_line.rs:77-83`) calls `put_back_original_data`
+                // (`read_line.rs:46-50`), which TRUNCATES the newly read bytes
+                // away and restores only the caller `String`'s pre-existing
+                // prefix. So the bad line has left the stream either way and
+                // the next read starts at the NEXT line — continuing cannot
+                // busy-loop.
+                //
+                // WHY THE PERMISSIVE RULE HERE, AND NOT THERE: the daemon's
+                // frame reader (`fulcrum/src/transport/frame.rs`, the
+                // `String::from_utf8(bytes) else { break }` in its reader
+                // task) deliberately ENDS the stream on a non-UTF-8 line, and
+                // says so — a socket is a PROTOCOL channel, and a byte stream
+                // that is not text is not a peer worth resyncing with. This is
+                // the opposite kind of channel: a DIAGNOSTIC one, whose only
+                // consumer is the log a supporter reads when a Worker dies. A
+                // diagnosis must not be suppressed by bytes in an UNRELATED
+                // line — one stray byte from a raw dump or a truncated
+                // multi-byte char would otherwise silence that Worker for the
+                // rest of its life, with no diagnostic of its own. Losing one
+                // undecodable line costs a line; ending the drain costs
+                // everything after it.
+                Err(ref e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+                // A DEAD PIPE HAS NOTHING LEFT TO SAY. Every other error
+                // (`BrokenPipe`, `ConnectionReset`, `UnexpectedEof`, …) is the
+                // pipe itself failing, not one line of its content — retrying
+                // a dead pipe spins on a permanent error.
                 Err(_) => break,
             }
         }
@@ -1339,6 +1381,117 @@ mod tests {
         debuglog::init(false, None);
     }
 
+    /// End-to-end, through a REAL child process: one non-UTF-8 byte on the
+    /// Worker's stderr must not stop the lines after it reaching the log —
+    /// and the prefix they reach it under must stay BYTE-EXACT.
+    ///
+    /// Why the unit test above is not enough: it drives `spawn_pipe_reader`
+    /// over a `duplex`. This drives the production wiring —
+    /// `WorkerHandle::spawn`'s stderr drain (`debuglog::log_truncated
+    /// ("worker-stderr:", &line)`) fed by a real process writing real bytes —
+    /// which is the only place the two halves of the card meet.
+    ///
+    /// # Why this is a second log-owning test in THIS binary
+    ///
+    /// `debuglog`'s `ENABLED`/`DIR` pair is process-global, so the rule this
+    /// crate inherits from the desktop's `src-tauri/tests/worker_stderr.rs:11-12`
+    /// is that one binary holds that state for one test at a time. This module
+    /// already holds one such test
+    /// (`an_undecodable_inbound_line_is_still_logged_verbatim`) and both it and
+    /// this one serialise on the crate's shared `env_lock()` — the same lock
+    /// every `debuglog` global-state test takes — so neither can have its
+    /// `init` undone mid-flight by the other. A NEW integration binary was the
+    /// alternative; it is not taken because this card's file list is
+    /// `client.rs` + `fixtures/worker.rs` and the lock already buys the
+    /// serialization a new binary would buy.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    // INTENTIONAL, and the same reason the sibling above carries it: the
+    // Worker's stderr drain logs through the PROCESS-GLOBAL `debuglog` dir, so
+    // `env_lock` must stay held across every `.await` below — released early, a
+    // sibling global-state test's `init(false, None)` would silence this test's
+    // own lines mid-flight and it would fail for a reason unrelated to the
+    // drain (`provider_switch.rs` / `policy_gate.rs` precedent).
+    async fn one_bad_byte_on_the_workers_stderr_does_not_silence_the_lines_after_it() {
+        let _g = crate::test_support::env_lock();
+        let dir = crate::test_support::ScratchDir::in_env_temp("client-stderr-log-test-", "log");
+        debuglog::init(true, Some(dir.to_path_buf()));
+
+        let handle = spawn_fixture().expect("the fixture binary exists");
+        handle
+            .wait_ready(Duration::from_secs(15))
+            .await
+            .expect("the ready frame arrives");
+        handle
+            .send_start(&test_env("s-badbytes", Some(vec!["bash".to_string()])))
+            .expect("the start frame is queued");
+
+        // FIRST the plain `__stderr__` prompt, and the desktop's marker
+        // asserted BYTE-EXACT. The desktop's `src-tauri/tests/worker_stderr.rs:87`
+        // greps for this exact string; the prefix in `spawn`'s drain is part of
+        // that contract and this is the engine-side pin that it stays put.
+        handle
+            .send_prompt("__stderr__", &[])
+            .expect("the prompt encodes");
+        let text = await_log_line(dir.join("supervisor.log"), WORKER_STDERR_MARKER).await;
+        assert!(
+            text.contains(WORKER_STDERR_MARKER),
+            "the `worker-stderr:` prefix must stay byte-exact (the desktop's \
+             `worker_stderr.rs` marker):\n{text}"
+        );
+
+        // THEN the raw-bytes prompt: `ok\n`, an UNDECODABLE line, `after\n`.
+        handle
+            .send_prompt("__stderr_badbytes__", &[])
+            .expect("the prompt encodes");
+        let text = await_log_line(dir.join("supervisor.log"), "worker-stderr: after").await;
+
+        // The line BEFORE the bad one arrived (it is what the drain was
+        // already proven to do) — so a missing `after` below means the bad
+        // line ended the drain, not that the fixture wrote nothing.
+        assert!(
+            text.contains("worker-stderr: ok"),
+            "the line before the bad one must reach the log:\n{text}"
+        );
+        // THE CARD: the line AFTER it arrives too.
+        assert!(
+            text.contains("worker-stderr: after"),
+            "one non-UTF-8 line must not end the drain — `after` is the \
+             diagnostic that was lost, and this is the whole point of the card:\n{text}"
+        );
+
+        let _ = handle.send_close();
+        let _ = handle.kill().await;
+        debuglog::init(false, None);
+    }
+
+    /// The desktop's byte-exact stderr marker
+    /// (`archimedes/src-tauri/tests/worker_stderr.rs:87`). Spelled out ONCE
+    /// here so the prefix pin is a single string that cannot drift from the
+    /// `log_truncated("worker-stderr:", …)` call in [`WorkerHandle::spawn`]
+    /// without this test going red.
+    const WORKER_STDERR_MARKER: &str = "worker-stderr: fake worker: a diagnostic on stderr";
+
+    /// Poll the log until `needle` appears in it (or the bound expires — a
+    /// missing line is a failure, never a hang). The drain task writes the log
+    /// BESIDE this test's task, so it must be polled; the shape is the one
+    /// `tests/worker_log_summary.rs` uses.
+    async fn await_log_line(log: std::path::PathBuf, needle: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let text = loop {
+            let now = std::fs::read_to_string(&log).unwrap_or_default();
+            if now.contains(needle) || tokio::time::Instant::now() > deadline {
+                break now;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            text.contains(needle),
+            "`{needle}` never reached the log within 20 s:\n{text}"
+        );
+        text
+    }
+
     // ── (issue #122) the store-row belt ────────────────────────────────
 
     /// The belt clamps an `assistant` row whose WHOLE content is the upstream
@@ -1452,6 +1605,105 @@ mod tests {
             ],
             "every line arrived whole, in order, including the EOF tail"
         );
+    }
+
+    /// One non-UTF-8 line must NOT end the drain — the lines after it are the
+    /// diagnostics the whole function exists to deliver.
+    ///
+    /// Why this is the card's real bug: `tokio::io::AsyncBufReadExt::read_line`
+    /// returns `io::ErrorKind::InvalidData` when the bytes it read are not
+    /// valid UTF-8, and this drain used to answer EVERY error with `break`. A
+    /// Worker that wrote one stray byte (a raw protocol dump, a `println!` of
+    /// a `&[u8]`, a truncated multi-byte char) was therefore silenced for the
+    /// rest of its life, and the silencing had no diagnostic of its own.
+    ///
+    /// # Why `continue` cannot spin
+    ///
+    /// `read_line` delegates to `read_until_internal` and validates the UTF-8
+    /// ONLY AFTERWARDS (`tokio-1.54.1/src/io/util/read_line.rs:99-100`), and
+    /// `read_until_internal` calls `reader.as_mut().consume(used)`
+    /// (`read_until.rs:69`) — the delimiter-terminated bytes leave the reader
+    /// BEFORE validation runs. And on the error they are not restored
+    /// ANYWHERE they could be re-read: `finish_string_read`'s `InvalidData`
+    /// arm (`read_line.rs:77-83`) truncates them off the caller's buffer
+    /// (`read_line.rs:46-50`). So the bad line's bytes are gone from the
+    /// stream either way and the next `read_line` starts at the NEXT line: no
+    /// busy loop.
+    ///
+    /// This test is that proof, empirically: the drain must reach EOF and END.
+    /// A spinning `continue` never reaches EOF, so the `timeout` below — which
+    /// bounds the whole task, not one read — is the no-spin assertion.
+    #[tokio::test]
+    async fn a_non_utf8_line_does_not_end_the_drain_the_lines_after_it_still_arrive() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let got: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let drain = spawn_pipe_reader(rx, move |l| g.lock().unwrap().push(l));
+
+        // One whole BAD line between two good ones. The bad bytes must form a
+        // COMPLETE line (`\n`-terminated) before EOF: `read_until_internal`
+        // only returns once it has seen the delimiter, so an unterminated run
+        // of bad bytes at EOF is a different path (the `Ok(0)` tail arm).
+        tx.write_all(b"good\n\xff\xfe bad\nafter\n").await.unwrap();
+        drop(tx); // EOF.
+
+        // The task ends at EOF — i.e. the bad line did NOT trap it.
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect(
+                "the drain task ends at EOF (a `continue` that re-reads the \
+                 same consumed bytes would spin here forever)",
+            )
+            .expect("the drain task does not panic");
+        assert_eq!(
+            &*got.lock().unwrap(),
+            &["good".to_string(), "after".to_string()],
+            "the undecodable line is dropped, and every line after it still \
+             reaches the sink — `after` is the diagnostic this card is about"
+        );
+    }
+
+    /// A pipe whose first read fails with a GENUINE I/O error ends the drain.
+    ///
+    /// The counterweight to the test above, and the reason the `Err(_) =>
+    /// break` arm must stay: `InvalidData` is tolerated because it is a
+    /// CONTENT problem in one line, every other error is the PIPE itself
+    /// (`BrokenPipe`, `ConnectionReset`, `UnexpectedEof`) and a dead pipe has
+    /// nothing left to say. Were that arm widened to `continue`, this test
+    /// hangs — the `timeout` is the assertion, and it is the same shape the
+    /// sibling test uses so both arms are proven by the same instrument.
+    #[tokio::test]
+    async fn a_genuine_io_error_ends_the_drain() {
+        let got: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let drain = spawn_pipe_reader(FailingPipe(std::io::ErrorKind::ConnectionReset), move |l| {
+            g.lock().unwrap().push(l)
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("a real I/O error ends the drain (it must not retry)")
+            .expect("the drain task does not panic");
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "a pipe that errors has delivered nothing"
+        );
+    }
+
+    /// A pipe whose every read fails with the given error kind — the input for
+    /// [`a_genuine_io_error_ends_the_drain`]. A `duplex` whose writer was
+    /// dropped gives a clean EOF, not an error, so the `break` arm has no
+    /// other reachable input in-process.
+    struct FailingPipe(std::io::ErrorKind);
+
+    impl tokio::io::AsyncRead for FailingPipe {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(self.0)))
+        }
     }
 
     /// The `fake_worker` fixture — resolved through the crate's ONE
