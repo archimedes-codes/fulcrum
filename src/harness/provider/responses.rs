@@ -84,14 +84,32 @@ struct ResponsesStream {
     /// A combined `Usage` was emitted (exactly once — the first terminal
     /// event to carry a `response.usage` with at least one token count).
     usage_emitted: bool,
-    /// A `Done(Length)` was already delivered by a terminal event, so NO
-    /// later terminal's `Done` may follow it (see
-    /// [`Self::push_terminal_done`] — a second `Done` overwrites the
-    /// truncation downstream and makes a never-retried response
-    /// retryable).
-    length_emitted: bool,
+    /// A terminal `Done` carrying a NON-`Stop` disposition (`Length` or
+    /// `Error`) was already delivered, so NO later terminal's `Done` may
+    /// follow it (see [`Self::push_terminal_done`] — a second `Done`
+    /// overwrites the first downstream, which makes a never-retried
+    /// truncation retryable and makes a FAILED response report success).
+    sticky_done_emitted: bool,
     /// The raw stream is exhausted (the stream ends after `pending`).
     exhausted: bool,
+}
+
+/// The `item.type` of an item event, for the post-terminal discard line.
+///
+/// A protocol discriminator (`"function_call"` / `"message"` /
+/// `"reasoning"`) that says which kind of call was lost; `"<none>"` when
+/// the event carries no readable `item.type` at all, which is itself the
+/// interesting answer. It is provider-supplied, so it is a string and not
+/// an enum — but the line it feeds goes to stderr and thence to
+/// `debuglog::log_truncated`, which caps every line at its own
+/// `MAX_LINE_BYTES`, so an absurd value is bounded by the sink rather than
+/// needing a second cap here.
+fn item_type_label(v: &Value) -> String {
+    v.get("item")
+        .and_then(|i| i.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("<none>")
+        .to_string()
 }
 
 impl ResponsesStream {
@@ -104,7 +122,7 @@ impl ResponsesStream {
             tool_acc: BTreeMap::new(),
             terminated: false,
             usage_emitted: false,
-            length_emitted: false,
+            sticky_done_emitted: false,
             exhausted: false,
         }
     }
@@ -175,7 +193,38 @@ impl ResponsesStream {
                 // spec `response.completed` is final and every
                 // `output_item.done` precedes it; this gate is defensive
                 // hardening, not a fix for an observed wire.)
+                //
+                // The discard is LOUD, and that is load-bearing. What this
+                // gate prevents is a duplicate `ToolCall` for a call the
+                // terminal already delivered, and `run_tool_batch` has no `id`
+                // dedupe — the failure mode it guards is a SECOND side effect
+                // on a payment path. If the gate ever engages in the field we
+                // have to be able to tell, and a bare `return` leaves no trace
+                // anywhere: it returns BEFORE touching `tool_acc`, so there is
+                // no accumulator residue to find downstream either. Silent,
+                // this hardening can regress from "loud duplicate write" to
+                // "silently lost call" — the softer failure, not the safer one.
+                //
+                // `eprintln!`, deliberately, and not `debuglog::log` /
+                // `diagnostics::record` (the asymmetry `provider/mod.rs`'s
+                // "Why two sinks" documents in full): the Worker's stderr is
+                // drained by a task in `worker/client.rs` into
+                // `debuglog::log_truncated`, which makes this line the only
+                // Worker-side sink that survives at all — and that sink is
+                // itself gated behind `ARCHIMEDES_DEBUG`, so in a DEFAULT
+                // launch the Worker drops it. That is accepted. `diagnostics`
+                // is the always-on channel and is NOT used here: its rule is
+                // reviewed call sites at low volume, and one line per dropped
+                // item on a stream is not always-on-worthy volume for a shape
+                // that has never been observed on a real wire.
                 if self.terminated {
+                    eprintln!(
+                        "harness: responses post-terminal item dropped: \
+                         `response.output_item.added` after a terminal event, \
+                         item type {} — the terminal already flushed this \
+                         response's calls",
+                        item_type_label(v)
+                    );
                     return;
                 }
                 let Some(item) = v.get("item") else {
@@ -229,7 +278,25 @@ impl ResponsesStream {
                 // (and the `ToolCallDelta` would render a card for a call
                 // that was already delivered — or, with a name in the
                 // item, be flushed a second time).
+                //
+                // Loud for the same reason as the arm above, and this is the
+                // arm most likely to fire in the field — a proxy that
+                // re-orders the tail of the stream sends fragments after the
+                // terminal without ever re-sending the item. There is no item
+                // type on this event, so the line names the `output_index`
+                // instead: which call the provider was still streaming into is
+                // the one fact that identifies the loss.
                 if self.terminated {
+                    eprintln!(
+                        "harness: responses post-terminal item dropped: \
+                         `response.function_call_arguments.delta` after a \
+                         terminal event, output_index {} — the terminal \
+                         already flushed this response's calls",
+                        v.get("output_index")
+                            .and_then(|i| i.as_u64())
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "<none>".to_string())
+                    );
                     return;
                 }
                 let Some(index) = v
@@ -267,7 +334,22 @@ impl ResponsesStream {
                 // twice. (UNVERIFIED upstream — the spec orders every
                 // `output_item.done` BEFORE `response.completed`; this is
                 // defensive.)
+                //
+                // Loud, and this is the gate the whole hardening was written
+                // for: the duplicate `write` on a payment path. A suppressed
+                // call that leaves no trace is the worse outcome, because the
+                // duplicate we would have caught becomes a call the user never
+                // sees and never learns was dropped. Same `eprintln!`-not-
+                // `diagnostics` reasoning as the two arms above.
                 if self.terminated {
+                    eprintln!(
+                        "harness: responses post-terminal item dropped: \
+                         `response.output_item.done` after a terminal event, \
+                         item type {} — this is the arm that duplicates a \
+                         dispatch; the call was already delivered by the \
+                         terminal",
+                        item_type_label(v)
+                    );
                     return;
                 }
                 let Some(item) = v.get("item") else {
@@ -521,34 +603,50 @@ impl ResponsesStream {
             .and_then(cost_usd_from_usage)
     }
 
-    /// Push a terminal event's `Done`, ONCE per disposition: a
-    /// `Done(Length)` is sticky, so a later terminal's `Done` is dropped
-    /// rather than overwriting it.
+    /// Push a terminal event's `Done`, ONCE per disposition: a NON-`Stop`
+    /// disposition is sticky, so a later terminal's `Done` is dropped rather
+    /// than overwriting it.
     ///
-    /// Why only `Length`: the finish reason is not merged downstream, it
-    /// is REWRITTEN (`acc.finish = Some(f)` is unconditional), so
-    /// last-terminal-won. A `response.incomplete{max_output_tokens}`
+    /// Why the latch exists at all: the finish reason is not merged
+    /// downstream, it is REWRITTEN (`acc.finish = Some(f)` is unconditional),
+    /// so last-terminal-won. A `response.incomplete{max_output_tokens}`
     /// followed by a statusless `response.completed` therefore turned
     /// `Length` into `Error` — and `Error` routes through the fabrication
     /// guard to a `Retryable` disposition, so `retry_abandoned_attempt`
     /// RE-ISSUED a request whose response was already truncated. ADR 0108
-    /// Decision 1 forbids replaying a truncated response, and a
-    /// truncation is strictly more specific than a generic error: the
-    /// first terminal knew WHY the turn ended.
+    /// Decision 1 forbids replaying a truncated response, and a truncation is
+    /// strictly more specific than a generic error: the first terminal knew
+    /// WHY the turn ended.
     ///
-    /// The latch is deliberately narrow. A doubled `Done(Stop)` (the
-    /// residue `sse_single_usage_chunk` documents) is a benign
-    /// stop-reason duplication and stays as it was — collapsing it would
-    /// change a vector a test records on purpose. And the `error` arm's
-    /// `ProviderEvent::Error` push is NOT routed through here at all: an
-    /// `Auth` / `ContextOverflow` tier is not a finish reason and must
-    /// reach the loop even after a truncation was reported.
+    /// Why the latch covers `Error` and not only `Length`: the same
+    /// rewrite, read the other way round, is worse.
+    /// `response.failed` followed by `response.completed{status:"completed"}`
+    /// yielded `Error → Stop`, and `Stop` is the SUCCESS disposition — the
+    /// turn takes the success triple and a response the provider called a
+    /// FAILURE reports as a completed turn. That is precisely the fabrication
+    /// the fabrication guard on `acc.finish == Some(Error)` exists to refuse,
+    /// reached by a doubled terminal rather than by a lying provider. The rule
+    /// is therefore about specificity, not about truncation: `Length` and
+    /// `Error` are assertions about WHY the turn ended, `Stop` is the absence
+    /// of one, and a later event cannot assert an absence over an earlier
+    /// event's finding.
+    ///
+    /// The latch stays deliberately narrow in the two directions that are not
+    /// lies. A doubled `Done(Stop)` (the residue `sse_single_usage_chunk`
+    /// documents) is a benign stop-reason duplication and stays as it was —
+    /// collapsing it would change a vector a test records on purpose. And
+    /// `Error → Error` still passes through: the second terminal repeats the
+    /// first's disposition, so nothing is overwritten and the event vector
+    /// keeps describing what the wire actually sent. Nor is the `error` arm's
+    /// `ProviderEvent::Error` push routed through here at all: an
+    /// `Auth` / `ContextOverflow` tier is not a finish reason and must reach
+    /// the loop even after a truncation was reported.
     fn push_terminal_done(&mut self, finish: FinishReason) {
-        if self.length_emitted {
+        if self.sticky_done_emitted {
             return;
         }
-        if matches!(finish, FinishReason::Length) {
-            self.length_emitted = true;
+        if !matches!(finish, FinishReason::Stop) {
+            self.sticky_done_emitted = true;
         }
         self.pending.push_back(ProviderEvent::Done(finish));
     }
@@ -1696,6 +1794,96 @@ mod tests {
             "a later terminal must not overwrite a `Done(Length)` with \
              `Done(Error)` — a truncated response is never re-issued \
              (got {events:?})"
+        );
+    }
+
+    /// A doubled terminal must not turn a FAILED response into a SUCCESS.
+    ///
+    /// The `Length` latch above is narrower than the defect it guards. The
+    /// finish reason is still REWRITTEN downstream (`acc.finish = Some(f)`
+    /// is unconditional in `consume_stream`), so with only `Length` sticky a
+    /// `response.failed` followed by `response.completed{status:"completed"}`
+    /// yielded `[Done(Error), Done(Stop)]` and `acc.finish` ended at `Stop` —
+    /// **a failed response reporting success**. That is the exact fabrication
+    /// the fabrication guard exists to refuse, reached by a doubled terminal
+    /// instead of by a lying provider: the turn takes the success triple, the
+    /// composer unlocks, and the user is told a response the provider called a
+    /// failure completed. Nothing dispatches here either, so this is a
+    /// disposition lie rather than a duplicated side effect — but it is the
+    /// lie on the path that decides whether a turn is a success.
+    ///
+    /// The general rule the latch now implements: a non-`Stop` disposition is
+    /// STICKY. `Length` and `Error` are what a terminal knew about WHY the
+    /// turn ended; `Stop` is the absence of a problem, and the absence cannot
+    /// be asserted by a later event over an earlier event that found one. A
+    /// doubled `Done(Stop)` is still deliberately NOT collapsed (see
+    /// [`Self::push_terminal_done`] and the residue `sse_single_usage_chunk`
+    /// records on purpose), and `Error → Error` still passes through.
+    #[tokio::test]
+    async fn responses_sse_failed_then_completed_keeps_the_error_disposition() {
+        let events = collect(responses_stream(&[
+            "event: response.failed\n\
+             data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done(FinishReason::Error)],
+            "a later `completed` must not overwrite a `Done(Error)` with \
+             `Done(Stop)` — a failed response cannot be reported as a \
+             success (got {events:?})"
+        );
+    }
+
+    /// The other two post-terminal gates: an `output_item.added` and a
+    /// `function_call_arguments.delta` that arrive AFTER `response.completed`
+    /// are dropped, and the event vector carries nothing for them.
+    ///
+    /// The three accumulation arms are gated together, but only the
+    /// `output_item.done` arm has a test of its own (the three
+    /// `*_after_completed_*` cases). This pins the other two, which are the
+    /// arms a proxy that re-orders the tail of the stream would actually
+    /// exercise — it re-sends fragments and items without re-sending the
+    /// terminal.
+    ///
+    /// The assertion is the observable consequence, and it is the honest shape
+    /// for this: an ungated `added` would push a `ToolCallDelta` carrying
+    /// `id` + `name`, and an ungated `delta` would push one per fragment, so
+    /// the ABSENCE of every `ToolCallDelta` after the `Done` is exactly what
+    /// "the gate engaged" looks like from inside the process. The accumulator
+    /// residue the gate also prevents is not observable here — the gate
+    /// returns before touching `tool_acc`, which is the point.
+    ///
+    /// **What this does NOT pin: the `eprintln!` itself.** A lib unit test
+    /// cannot capture the process's stderr — it runs inside cargo's test
+    /// harness, whose stderr goes to the harness, and the only production
+    /// reader of a Worker's stderr is the drain task in `worker/client.rs`,
+    /// which needs a real spawned Worker. So the log line is unpinned, the
+    /// same way `the_chosen_wire_is_logged_at_construction` records its own
+    /// inability to reach the `eprintln!` half. What is pinned is that the
+    /// DISCARD happens; the line is there so that when it does engage in the
+    /// field somebody can find out.
+    #[tokio::test]
+    async fn responses_sse_item_events_after_completed_are_dropped_not_accumulated() {
+        let events = collect(responses_stream(&[
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+             event: response.output_item.added\n\
+             data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_late\",\"name\":\"write\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n\
+             event: response.function_call_arguments.delta\n\
+             data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"/receipts/totals.csv\\\"}\"}\n\n\
+             event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_late\",\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"/receipts/totals.csv\\\"}\",\"status\":\"completed\"}}\n\n",
+        ]))
+        .await;
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done(FinishReason::Stop)],
+            "a terminal ENDS the response: no `ToolCallDelta` and no second \
+             `ToolCall` may follow the `Done` — an ungated `added` or `delta` \
+             would push a `ToolCallDelta` right here (got {events:?})"
         );
     }
 

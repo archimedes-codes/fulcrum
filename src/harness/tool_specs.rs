@@ -1,6 +1,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::harness::provider::{ToolCall, ToolSpec};
+use crate::provider_types::MAX_DEFECT_RAW_BYTES;
 
 /// What the `bash` tool tells the model about the shell it is about to get.
 ///
@@ -556,28 +557,39 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// (issue #193, review FIX 3) The most raw argument text the head arm's refusal
-/// sentence quotes.
-///
-/// WHY A BOUND AT ALL: `raw` is the full accumulated argument stream and no
-/// parser caps it (`parse_arguments` in `provider/openai.rs`, and the two other
-/// wire parsers, keep the text byte-for-byte). The refusal is the WHOLE tool
-/// result, so an unbounded quote makes it an unbounded tool result — the card's
-/// `rawOutput`, a `native_messages` row, and part of the NEXT request body, where
-/// it can itself cause the context overflow the refusal exists to survive.
-///
-/// WHY 2 KB: it is the in-repo precedent for "how much of one oversized thing
-/// does one line carry" — [`crate::debuglog`]'s `MAX_LINE_BYTES` /
-/// `log_truncated` cut every IPC line at 2048 for exactly this reason. A real
-/// tool result is a few KB, and the head of a JSON argument object is where the
-/// keys that arrived live, which is the half the model needs in order to not
-/// re-send the identical call. The number is a shape, not a measurement.
-///
-/// THE FIELD IS NOT CAPPED. `ArgumentDefect::raw` stays byte-exact — that is the
-/// entire point of preserving it, and it is what a resume rebuilds the sentence
-/// from. Only the interpolation into this one sentence is bounded, and the note
-/// it appends names the true length so nothing is hidden by the cut.
-const MAX_DEFECT_RAW_BYTES: usize = 2048;
+// (issue #193, review FIX 3) The most raw argument text the head arm's refusal
+// sentence quotes.
+//
+// **This is [`crate::provider_types::MAX_DEFECT_RAW_BYTES`], re-exported, not
+// a second number.** Two bounds on the same field in two files is one too
+// many — a reader who raises one and not the other gets a sentence that
+// quotes more than the field can hold, or one that cuts bytes the field
+// stored. Fix 4 moved the canonical constant next to the field it bounds
+// (because the field is now bounded at the parse site too); this is the alias
+// that keeps the interpolation site reading the same value.
+//
+// WHY A BOUND AT ALL: `raw` is the accumulated argument stream. The refusal is
+// the WHOLE tool result, so an unbounded quote makes it an unbounded tool
+// result — the card's `rawOutput`, a `native_messages` row, and part of the
+// NEXT request body, where it can itself cause the context overflow the
+// refusal exists to survive.
+//
+// WHY 2 KB: it is the in-repo precedent for "how much of one oversized thing
+// does one line carry" — [`crate::debuglog`]'s `MAX_LINE_BYTES` /
+// `log_truncated` cut every IPC line at 2048 for exactly this reason. A real
+// tool result is a few KB, and the head of a JSON argument object is where the
+// keys that arrived live, which is the half the model needs in order to not
+// re-send the identical call. The number is a shape, not a measurement.
+//
+// WHAT THIS ONE BOUNDS is the interpolation into this single sentence. Since
+// review FIX 4 the FIELD is bounded too, at the parse site
+// (`cap_defect_raw`, `provider_types`), so on the wire this arm quotes a value
+// that is already capped and the cut below fires only on a `defect` built
+// directly by a test or a future producer. Both bounds stay, because the
+// arm's input is any `ArgumentDefect` and not only one this crate parsed.
+//
+// The constant itself is [`crate::provider_types::MAX_DEFECT_RAW_BYTES`],
+// imported at the top of this file — one value, two bound sites.
 
 /// The head arm's quoted raw text: the first [`MAX_DEFECT_RAW_BYTES`] bytes of
 /// `raw`, cut at the last character boundary at or below that index, plus a
@@ -809,17 +821,26 @@ mod tests {
         );
     }
 
-    /// (issue #193, review FIX 3) The refusal SENTENCE bounds the raw text; the
-    /// stored `defect.raw` stays byte-exact.
+    /// (issue #193, review FIX 3) The refusal SENTENCE bounds the raw text.
     ///
-    /// `raw` is the full accumulated argument stream and NO parser caps it, so a
-    /// `write` whose stream died after 8 MB of body produced an 8 MB refusal.
-    /// That sentence becomes the whole tool result, which makes it the card's
-    /// `rawOutput`, a `native_messages` row, AND part of the NEXT request body —
-    /// where it can itself trigger the context overflow the refusal exists to
-    /// avoid. The bound is therefore on the INTERPOLATION, never on the field:
-    /// the field is what makes the honest sentence possible at all, and it is
-    /// what a resume rebuilds from.
+    /// `raw` is the accumulated argument stream, so a `write` whose stream died
+    /// after 8 MB of body produced an 8 MB refusal. That sentence becomes the
+    /// whole tool result, which makes it the card's `rawOutput`, a
+    /// `native_messages` row, AND part of the NEXT request body — where it can
+    /// itself trigger the context overflow the refusal exists to avoid. The
+    /// bound is on the INTERPOLATION, and it is deliberately SEPARATE from the
+    /// one on the field.
+    ///
+    /// Review FIX 4 added a second bound, at the parse site (`cap_defect_raw`,
+    /// `provider_types`), because the field turned out not to be disk-only — it
+    /// rides `content_json` onto the daemon socket. Both bounds are the same
+    /// constant, and BOTH stay: `unknown_param_error` takes any
+    /// `ArgumentDefect`, including one a caller constructed with an uncapped
+    /// `raw`, so the sentence cannot assume the field arrived bounded. That is
+    /// why this test builds its `ToolCall` by hand rather than through
+    /// `parse_arguments` — it pins the interpolation bound against an
+    /// over-cap input, which is exactly the input the field bound cannot be
+    /// relied on to have removed.
     #[test]
     fn a_huge_raw_is_bounded_in_the_sentence_and_the_note_names_the_true_length() {
         // 8 MB of body, the shape the finding names. Multi-byte characters are
@@ -915,6 +936,47 @@ mod tests {
         assert!(
             !past.ends_with(&over),
             "and the tail byte is what was dropped"
+        );
+    }
+
+    /// (review FIX 4) The two bounds on `defect.raw` COMPOSE instead of
+    /// fighting.
+    ///
+    /// The field is now capped at the parse site (`cap_defect_raw`,
+    /// `provider_types`) and quoted through this file's `quoted_defect_raw`, at
+    /// the SAME constant. That is only safe because the parse-site cap counts
+    /// the note inside itself. Were it `cap + note`, this cut would slice the
+    /// field's own note in half and append a fresh one naming the **capped**
+    /// length — an 8 MB payload reported as "2081 bytes total", silently
+    /// undoing the "the note names the true length" property the previous round
+    /// added, and doing it in a way that reads as a passing truncation.
+    ///
+    /// So: a value that came from `cap_defect_raw` must pass through
+    /// `quoted_defect_raw` byte-identical.
+    #[test]
+    fn a_parse_site_capped_raw_passes_through_the_sentence_unchanged() {
+        let huge = format!(
+            r#"{{"path": "/tmp/x", "content": "{}"#,
+            "α".repeat(3_000_000)
+        );
+        let total = huge.len();
+        let capped = crate::provider_types::cap_defect_raw(&huge);
+
+        assert!(
+            capped.len() <= MAX_DEFECT_RAW_BYTES,
+            "the stored field fits the constant ({capped} bytes stored)",
+            capped = capped.len()
+        );
+        assert_eq!(
+            quoted_defect_raw(&capped),
+            capped,
+            "the sentence must not re-cut a value the parse site already \
+             bounded — a re-cut would replace the true length with the cap"
+        );
+        assert!(
+            capped.contains(&format!("(truncated, {total} bytes total)")),
+            "and the note that survives into the sentence names the {total}-byte \
+             payload, not the cap it was cut to"
         );
     }
 

@@ -1207,7 +1207,8 @@ impl AgentLoop {
     /// `tool_execution_start`, and `normalize` renders either as a `tool_call`
     /// frame at `status: "in_progress"`). It leaves `in_progress` ONLY on a
     /// `tool_call_update` carrying `completed`/`failed`, which `normalize`
-    /// derives from `tool_execution_end` ALONE (`normalize.rs:413-423`) — it has
+    /// derives from `tool_execution_end` ALONE (`normalize.rs`, the
+    /// `RpcEvent::tool_execution_end` arm of `normalize`'s `match`) — it has
     /// no arm for `turn_end` / `agent_settled`. So an attempt that announced
     /// calls and then died without dispatching them leaves those rows spinning
     /// forever: the desktop reads a Subagent frozen on a stale tool name with a
@@ -1219,7 +1220,8 @@ impl AgentLoop {
     /// - **The caller passes the ordered `Vec<ToolCall>`, never
     ///   `TurnState::announced_tool_calls`.** That `HashSet` (`normalize.rs:72`)
     ///   is insert-only (no removal anywhere in the file) and it ALSO holds
-    ///   compaction card ids (`compact:N`, `normalize.rs:456`) which are closed
+    ///   compaction card ids (`compact:N`, minted in `normalize`'s
+    ///   `RpcEvent::compaction_start` arm) which are closed
     ///   by `compaction_end`, not by `tool_execution_end` — closing from the set
     ///   would emit a bogus failed tool close for every compaction card the
     ///   session ever opened. The `Vec` is transcript order, which is what the
@@ -1355,12 +1357,18 @@ impl AgentLoop {
     ///   the executor are ever consulted, naming the parse error instead of the
     ///   missing parameter (that arm deliberately fires for EVERY defective call,
     ///   disabled or unknown tool included — see rule 0 in `tool_specs`);
-    /// * and even setting the defect aside, the old chain — `unknown_param_error`
-    ///   PASSING (it checks only EXTRANEOUS keys, and `{}` has none), the
-    ///   permission gate returning `Allow` because there is no `path` to judge,
-    ///   and the executor then refusing with ``write: missing `path` or `content`
-    ///   parameter`` — was already refused at THIS layer, one station earlier, by
-    ///   the per-turn gate below.
+    /// * and this route never reaches the checker at all. The old chain —
+    ///   `unknown_param_error` PASSING (it checks only EXTRANEOUS keys, and `{}`
+    ///   has none), the permission gate returning `Allow` because there is no
+    ///   `path` to judge, and the executor then refusing with ``write: missing
+    ///   `path` or `content` parameter`` — could not run here, because
+    ///   `handle_truncated_turn` settles and returns BEFORE any batch is
+    ///   dispatched. So the accurate verb is not that the calls are REFUSED at
+    ///   this layer, one station earlier: they are never dispatched, and
+    ///   [`Self::close_announced_tool_calls`] CLOSES each one's row with
+    ///   `abandoned_tool_result()`'s sentence — the same treatment this
+    ///   docblock's own first paragraph states ("close what the cut-off attempt
+    ///   announced") and §2's site 9 derives.
     ///
     /// Either way the misleading card never renders: a red refusal blaming the
     /// model for a parameter the output cap never let it send (566 such rows are
@@ -1375,9 +1383,9 @@ impl AgentLoop {
     /// [`Self::close_announced_tool_calls`] already gives each call its own
     /// precise error either way. Decision 2 / ADR 0108. The one thing the defect
     /// does NOT change is that conclusion: a truncated call closes with
-    /// `abandoned_tool_result()`'s sentence, never with the head arm's, because
-    /// this gate reaches it before the batch that would have run the checker —
-    /// pinned by
+    /// `abandoned_tool_result()`'s sentence and NEVER with the head arm's,
+    /// because this route settles before the batch that would have run the
+    /// checker ever starts — pinned by
     /// `a_truncated_turns_tool_calls_are_closed_as_abandoned_and_never_dispatched`.
     pub(super) fn settle_truncated(&mut self, tool_results: Vec<Value>, announced: &[ToolCall]) {
         // Identical to an errored exit — INCLUDING the `turn_abandoned` this used

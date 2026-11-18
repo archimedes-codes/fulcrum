@@ -181,7 +181,37 @@ pub struct ToolCall {
     ///   cannot be rebuilt on a resume — reddens the test's `Some` case.
     ///
     /// What neither case may gain is the OpenAI request shape (`function` /
-    /// `type`) — that is the flat-shape claim this pin is named for.
+    /// `type`) — that is the flat-shape claim this pin is named for. Read the
+    /// two fixtures as ONE key, not two shapes: both serialize to a superset of
+    /// `{id, name, arguments}`, and the pair's entire content is whether
+    /// `defect` is in that set. They are not opposite key sets, and the test's
+    /// own key-list assertion says so ("exactly the three wire keys plus
+    /// `defect`"). If you want the property rather than the proxy,
+    /// `a_transcript_round_trip_rebuilds_the_defect_a_resume_needs` in
+    /// `harness/provider/openai.rs` asserts the `content_json` round-trip a
+    /// resume actually depends on.
+    ///
+    /// # Where the defect travels, and where it never goes
+    ///
+    /// **Disk and daemon-socket clients; never any provider request.** The
+    /// provider half is TRUE and pinned: all three request builders are
+    /// hand-built whitelists that name `id` / `name` / `arguments` and nothing
+    /// else, and none of them derives `Serialize`, so `defect` cannot join a
+    /// request body by a derive change. That half is what
+    /// `estimate_summary_payload` (`harness/compact.rs`) declines to count.
+    ///
+    /// The disk half is NOT the only destination, and a previous round of this
+    /// docblock said it was. `persist_transcript_message`
+    /// (`harness/loop/emit.rs`) serialises the whole `ChatMessage` into
+    /// `content_json`, `IpcStore::insert_message` (`worker/store.rs`) forwards
+    /// that verbatim as `StoreFrame::Insert`, and the daemon's `store_frame`
+    /// (`fulcrum/src/serve.rs`) puts the same `content_json` on the socket as a
+    /// `{"type":"transcript-insert","contentJson":…}` frame — so every socket
+    /// client receives `defect.raw`. That is why the field is bounded at the
+    /// parse site by [`MAX_DEFECT_RAW_BYTES`] rather than left unbounded: the
+    /// data is legitimately disk-shaped (a resume rebuilds the refusal sentence
+    /// from it) and it is not user content going to a hostile party, so the
+    /// store path stays as it is and the value carries a cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defect: Option<ArgumentDefect>,
 }
@@ -199,14 +229,109 @@ pub struct ToolCall {
 /// (440 rows) and `edit` (125), and completing truncated JSON into a written
 /// file is worse than refusing.
 ///
-/// `raw` is verbatim, not trimmed and not re-serialized: the only thing the
-/// model can act on is the text it sent.
+/// `raw` is verbatim up to [`MAX_DEFECT_RAW_BYTES`] — not trimmed, not
+/// re-serialized, not re-parsed: the only thing the model can act on is the
+/// text it sent, and the head of a JSON argument object is where the keys that
+/// arrived live. Past the cap the stored value is that head plus a note naming
+/// the true length; see the constant for why a bound at all.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArgumentDefect {
     /// The `serde_json` parse error, stringified.
     pub error: String,
-    /// The argument text the provider sent, byte-for-byte.
+    /// The argument text the provider sent, byte-for-byte up to
+    /// [`MAX_DEFECT_RAW_BYTES`], then the head plus a note naming the true
+    /// length. Written by [`cap_defect_raw`] — never assign to this field
+    /// directly from provider text, or the bound is silently gone again.
     pub raw: String,
+}
+
+/// The most raw argument text an [`ArgumentDefect`] stores (issue #193, review
+/// FIX 4).
+///
+/// # Why a bound, when the field was called disk-only
+///
+/// The docblock on `ToolCall::defect` used to say the field never leaves the
+/// disk. The provider half of that is TRUE and pinned — all three request
+/// builders are hand-built whitelists that name `id` / `name` / `arguments` and
+/// nothing else, so `defect` cannot reach a provider request by a `serde` derive
+/// change because none of them derives. The disk half was never the whole
+/// story:
+///
+/// * `persist_transcript_message` (`harness/loop/emit.rs`) serialises the WHOLE
+///   `ChatMessage` — `defect` included — into `content_json`;
+/// * `IpcStore::insert_message` (`worker/store.rs`) forwards that string
+///   verbatim as `StoreFrame::Insert`;
+/// * the daemon's `store_frame` (`fulcrum/src/serve.rs`) puts the same
+///   `content_json` on the socket as `{"type":"transcript-insert",
+///   "contentJson": …}`.
+///
+/// So `defect.raw` — documented as unbounded — reaches every daemon socket
+/// client and a transcript row. This is legitimately disk-shaped data (a resume
+/// needs it to rebuild the sentence) and it is not user content travelling to a
+/// hostile party, so the store path is deliberately NOT redesigned; the field
+/// is bounded instead. An 8 MB truncated `write` body should not be broadcast
+/// to satisfy a resume that can only ever quote its head.
+///
+/// # Why 2 KB, and why the number lives HERE
+///
+/// 2048 is the in-repo precedent for how much of one oversized thing a single
+/// line carries: [`crate::debuglog`]`::MAX_LINE_BYTES` cuts every IPC line at
+/// exactly that. The on-disk need is bounded by what a resume can usefully
+/// re-read, and a resume re-reads a sentence, not a payload.
+///
+/// It lives next to the field it bounds rather than beside the sentence that
+/// quotes it, because the field is now the thing the cap protects.
+/// `harness/tool_specs.rs`'s `MAX_DEFECT_RAW_BYTES` — the bound on the
+/// interpolation into the refusal sentence, added by an earlier review round —
+/// is this same constant, re-exported, so the two bounds cannot drift apart.
+pub const MAX_DEFECT_RAW_BYTES: usize = 2048;
+
+/// Bound provider argument text for [`ArgumentDefect::raw`]: byte-exact up to
+/// [`MAX_DEFECT_RAW_BYTES`], then the head plus `… (truncated, N bytes total)`.
+///
+/// The note is part of the stored value on purpose. A silent cut would make a
+/// 2 KB head indistinguishable from a complete 2 KB payload, and the whole
+/// reason this field exists is that a refusal must not misdescribe what
+/// arrived. Naming the true length keeps the truncation honest in the data.
+///
+/// # The cap is on the STORED VALUE, note included
+///
+/// The head is shortened so that head + note fits inside
+/// [`MAX_DEFECT_RAW_BYTES`] — the cap is what a consumer stores and broadcasts,
+/// so that is what must be bounded. It also makes the two bounds on this field
+/// COMPOSE instead of fight: `tool_specs`'s `quoted_defect_raw` cuts at the
+/// same constant, and if this one produced a value of `cap + note` the sentence
+/// would cut the field's own note in half and append a second one naming the
+/// **capped** length (2081) where the payload was 8 MB — silently undoing the
+/// "the note names the true length" property the earlier round added. A stored
+/// value at or under the cap is left alone by the sentence, which then quotes
+/// the note this function wrote.
+///
+/// # Why the cut walks
+///
+/// To a character boundary at or below the head budget:
+/// `str::floor_char_boundary` is still unstable on the pinned toolchain, and a
+/// byte-indexed slice would PANIC on a multi-byte character — which a model
+/// streaming CJK content into a `write` body eventually hits. Bounding the
+/// field must never be able to panic.
+pub fn cap_defect_raw(raw: &str) -> String {
+    if raw.len() <= MAX_DEFECT_RAW_BYTES {
+        return raw.to_string();
+    }
+    // The note is written FIRST because its own length depends on the true
+    // length, and the head budget depends on the note.
+    let note = format!("… (truncated, {} bytes total)", raw.len());
+    // `MAX_DEFECT_RAW_BYTES` (2048) dwarfs any note this can produce (a
+    // `usize`'s 20 digits plus 28 fixed bytes), so the subtraction cannot
+    // underflow; `saturating_sub` keeps it safe if the constant ever shrinks.
+    let budget = MAX_DEFECT_RAW_BYTES.saturating_sub(note.len());
+    // `is_char_boundary` is true at index 0, so this terminates and never
+    // underflows.
+    let mut end = budget;
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &raw[..end], note)
 }
 
 /// The REQUEST-wire shape of a tool call (the OpenAI contract: a nested

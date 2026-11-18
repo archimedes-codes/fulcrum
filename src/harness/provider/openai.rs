@@ -20,9 +20,9 @@ use serde_json::Value;
 
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
-    cost_usd_from_usage, parse_error_chunk, ArgumentDefect, ChatRole, FinishReason, MessageContent,
-    ModelRequest, Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta, Usage,
-    WireToolCall,
+    cap_defect_raw, cost_usd_from_usage, parse_error_chunk, ArgumentDefect, ChatRole, FinishReason,
+    MessageContent, ModelRequest, Provider, ProviderError, ProviderEvent, ToolCall, ToolCallDelta,
+    Usage, WireToolCall,
 };
 use crate::tools::ContentBlock;
 
@@ -652,9 +652,23 @@ fn map_finish_reason(reason: &str) -> FinishReason {
 ///   arguments) → `({}, None)`;
 /// - a payload that parses → `(value, None)`;
 /// - a payload that does NOT parse → `({}, Some(defect))` carrying the parse
-///   error and the raw text verbatim. `{}` — nothing is repaired, and that is
-///   deliberate: the coercion victims are `write` and `edit`, and completing
-///   truncated JSON into a written file is worse than refusing.
+///   error and the raw text up to
+///   [`MAX_DEFECT_RAW_BYTES`](crate::provider_types::MAX_DEFECT_RAW_BYTES)
+///   verbatim. `{}` — nothing is repaired, and that is deliberate: the
+///   coercion victims are `write` and `edit`, and completing truncated JSON
+///   into a written file is worse than refusing.
+///
+/// **The cap is applied HERE, at the parse site** — the single place all three
+/// wire parsers construct an `ArgumentDefect` (this function is imported by
+/// `anthropic.rs` and `responses.rs`, so one bound covers three wires). It is
+/// applied here and not only where the sentence quotes it because the field is
+/// not disk-only after all: `persist_transcript_message` →
+/// `StoreFrame::Insert` → the daemon's `store_frame` puts `content_json` —
+/// `defect.raw` included — on the socket to every client, so an unbounded
+/// `raw` is an unbounded broadcast and an unbounded transcript row. The
+/// interpolation site (`tool_specs.rs`'s `quoted_defect_raw`) keeps its own
+/// bound from an earlier round; both are the same constant, so they cannot
+/// drift. Below the cap the stored bytes are exactly the bytes that arrived.
 ///
 /// The `{}` is unchanged from before this fix; what changes is that the
 /// collapse is no longer the ONLY record of the failure. Before, an unparseable
@@ -683,7 +697,7 @@ pub(super) fn parse_arguments(args: &str) -> (Value, Option<ArgumentDefect>) {
                 Value::Object(Default::default()),
                 Some(ArgumentDefect {
                     error: e.to_string(),
-                    raw: args.to_string(),
+                    raw: cap_defect_raw(args),
                 }),
             )
         }
@@ -1048,6 +1062,10 @@ fn is_gpt_5_5_or_newer_completions_quirk(model: &str) -> bool {
 mod tests {
     use super::super::test_util::{chat_message, collect, keys_of_names};
     use super::super::types::{ChatMessage, ChatRole, MessageContent, ModelOptions, ToolSpec};
+    // The cap on `ArgumentDefect::raw`, asserted by name rather than by a
+    // literal so a change to the constant reddens the tests instead of quietly
+    // making their fixtures shorter than the bound.
+    use super::super::types::MAX_DEFECT_RAW_BYTES;
     use super::*;
     use crate::tools::{ContentBlock, ImageRef};
     // Test-only (the raw-server request counter): importing it at the module
@@ -1696,10 +1714,15 @@ mod tests {
     }
 
     /// (issue #193) The defect names itself: a non-empty parse error and the
-    /// raw text the provider sent, BYTE-IDENTICAL. The verbatim `raw` is the
-    /// half the model needs — the sentence that used to be a lie
+    /// raw text the provider sent, BYTE-IDENTICAL up to the cap. The verbatim
+    /// `raw` is the half the model needs — the sentence that used to be a lie
     /// ("missing `path` parameter") is replaced by one that shows what
     /// actually arrived, which is what stops the identical re-send.
+    ///
+    /// The payload here is far SHORTER than `MAX_DEFECT_RAW_BYTES`, which is
+    /// what makes byte-identity assertable at all: below the cap the stored
+    /// bytes are exactly the sent bytes, and that is the property a resume
+    /// depends on. The over-cap half is the next test's.
     #[test]
     fn a_malformed_payload_carries_the_error_and_the_raw_text() {
         // Truncated mid-object: the shape the real 566 rows carry.
@@ -1715,10 +1738,112 @@ mod tests {
             !defect.error.is_empty(),
             "the parse error is named, not swallowed"
         );
+        assert!(
+            raw.len() < MAX_DEFECT_RAW_BYTES,
+            "the fixture must sit under the cap or this assertion is vacuous"
+        );
         assert_eq!(
             defect.raw.as_bytes(),
             raw.as_bytes(),
-            "`raw` is byte-identical to what the provider sent"
+            "`raw` is byte-identical to what the provider sent, up to the cap"
+        );
+    }
+
+    /// (issue #193, review FIX 4) `defect.raw` is BOUNDED, and the bound is
+    /// named. The field used to be unbounded in all three parsers, on the
+    /// argument that it was disk-only. The provider half of that is true and
+    /// pinned — all three request builders are hand-built whitelists — but the
+    /// disk half was never the only destination:
+    /// `persist_transcript_message` serialises the whole `ChatMessage` into
+    /// `content_json`, `IpcStore::insert_message` forwards it verbatim as
+    /// `StoreFrame::Insert`, and the daemon's `store_frame` puts that same
+    /// `content_json` on the socket as `{"type":"transcript-insert",
+    /// "contentJson": …}`. An 8 MB truncated `write` body was therefore
+    /// broadcast to every socket client and written into a transcript row, on
+    /// the strength of a comment that said it could not leave the disk.
+    ///
+    /// The bound is the same 2 KB the debug log cuts every IPC line at
+    /// (`debuglog::MAX_LINE_BYTES`), it is applied HERE at the parse site
+    /// rather than at the sentence-interpolation site (which a previous commit
+    /// already bounded), and it keeps the stored value byte-exact UP TO the
+    /// cap — a resume rebuilds the sentence from the head of what arrived,
+    /// which is where the keys live. The cut is at a character boundary and
+    /// the stored value names the true length, so the truncation is visible in
+    /// the data rather than something a reader has to infer.
+    #[test]
+    fn a_long_malformed_payload_is_capped_and_names_its_true_length() {
+        let raw = format!(r#"{{"path": "/tmp/x", "content": "{}"#, "あ".repeat(4000));
+        assert!(
+            raw.len() > MAX_DEFECT_RAW_BYTES * 2,
+            "the fixture must clear the cap with room to spare"
+        );
+        let (_, defect) = parse_arguments(&raw);
+        let defect = defect.expect("a payload that failed to parse carries its defect");
+
+        // The STORED VALUE — head and note together — fits the NAMED constant.
+        // The bound is on what a consumer stores and broadcasts, so the note
+        // is inside it rather than added to it.
+        assert!(
+            defect.raw.len() <= MAX_DEFECT_RAW_BYTES,
+            "`raw` is bounded at the parse site INCLUDING its note: {} bytes \
+             stored, cap {}",
+            defect.raw.len(),
+            MAX_DEFECT_RAW_BYTES
+        );
+        // The true length is named, so the cut hides nothing.
+        let note = format!("… (truncated, {} bytes total)", raw.len());
+        assert!(
+            defect.raw.ends_with(&note),
+            "the capped `raw` names the TRUE length of what arrived; the last \
+             60 chars stored are {:?}",
+            defect.raw.chars().rev().take(60).collect::<String>()
+        );
+        // Byte-exact UP TO the head budget: the head is untouched, and the
+        // head is what a resume needs (it is where the keys arrived). The
+        // budget is the cap minus the note's own length, and the cut walks
+        // back to a character boundary, so re-derive it the same way rather
+        // than hard-coding a byte count.
+        let mut end = MAX_DEFECT_RAW_BYTES - note.len();
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        assert_eq!(
+            defect.raw.as_bytes(),
+            format!("{}{}", &raw[..end], note).as_bytes(),
+            "the stored `raw` is the sent bytes up to the last boundary at or \
+             below the head budget, plus the note — nothing else rewritten"
+        );
+        // A multi-byte cut must not panic and must not split a codepoint.
+        assert!(
+            !defect.raw.contains('\u{fffd}'),
+            "the cap lands on a character boundary, never a replacement char"
+        );
+    }
+
+    /// The cap is a cap, not a truncation of everything: a payload at or under
+    /// it is stored byte-exact with NO note appended, so the overwhelmingly
+    /// common case is unchanged by the bound.
+    #[test]
+    fn a_payload_at_the_cap_is_stored_byte_exact_with_no_note() {
+        let exact = "b".repeat(MAX_DEFECT_RAW_BYTES);
+        let (_, defect) = parse_arguments(&exact);
+        assert_eq!(
+            defect.expect("defect").raw,
+            exact,
+            "at the cap: byte-exact, no note"
+        );
+
+        // One byte over the cap: the note appears, and the head shrinks by the
+        // note's length so the whole stored value still fits.
+        let over = "b".repeat(MAX_DEFECT_RAW_BYTES + 1);
+        let (_, defect) = parse_arguments(&over);
+        let stored = defect.expect("defect").raw;
+        let note = format!("… (truncated, {} bytes total)", over.len());
+        assert_eq!(
+            stored,
+            format!("{}{}", "b".repeat(MAX_DEFECT_RAW_BYTES - note.len()), note),
+            "one byte over the cap: the head gives way to the note so the \
+             stored value fits the constant, and the true length is named"
         );
     }
 
@@ -2694,10 +2819,18 @@ mod tests {
     /// re-serialize the message whole into `native_messages.content_json`, so
     /// that mutation loses the defect on disk and a resume can no longer rebuild
     /// the honest sentence. Only a `Some` fixture can see it, so the second case
-    /// asserts the OPPOSITE key set of the first: `defect` is present exactly
-    /// when it is `Some`. Measured both ways — the bare `skip_serializing`
+    /// asserts what the first cannot: `defect` is present exactly when it is
+    /// `Some`. Measured both ways — the bare `skip_serializing`
     /// mutation reddens the second case and leaves the first green, which is the
     /// asymmetry a single-fixture pin hides.
+    ///
+    /// Note what the pair does NOT assert, because this docblock used to claim
+    /// it: the two cases are not OPPOSITE key sets. Both are supersets of
+    /// `{id, name, arguments}` — the first is that set exactly, the second is
+    /// that set plus `defect`. The whole content of the pair is the presence or
+    /// absence of that ONE key; calling it an opposite set oversells a one-key
+    /// difference as a shape difference, and the second case's own key-list
+    /// assertion says so ("exactly the three wire keys plus `defect`").
     ///
     /// What stays flat in BOTH cases is the shape: no nested `function`, no
     /// `type` tag. The frame-level half of this guard — the `toolcall_end`
@@ -2768,9 +2901,85 @@ mod tests {
                 "id".to_string(),
                 "name".to_string()
             ],
-            "exactly the three wire keys plus `defect` — and `raw` is UNTRUNCATED, \
-             which is why FIX-bound truncation happens in the refusal SENTENCE \
-             (`tool_specs`' head arm) and never in this field"
+            "exactly the three wire keys plus `defect` — and `raw` is stored \
+             whole here because this fixture sits under \
+             `MAX_DEFECT_RAW_BYTES`; above it the parse site caps the field \
+             (`cap_defect_raw`) and the refusal sentence caps the interpolation \
+             (`tool_specs`' head arm) at the same constant"
+        );
+    }
+
+    /// (review FIX 6) The property the reasoning above is ACTUALLY about.
+    ///
+    /// The key list is a proxy. What matters is that a RESUME can rebuild the
+    /// honest refusal sentence, and a resume reads a `ChatMessage` back out of
+    /// `content_json` — so the real assertion is
+    /// `to_string` → `from_str` → the defect is still there and still names the
+    /// same error and the same raw text. That is a round-trip, not a key set: a
+    /// key list can be right while a `Deserialize` impl that ignored the field
+    /// still lost the defect, and only the round-trip can see that.
+    #[test]
+    fn a_transcript_round_trip_rebuilds_the_defect_a_resume_needs() {
+        let raw = r#"{"path": "/tmp/x", "content": "truncated he"#.to_string();
+        let message = ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "write".to_string(),
+                arguments: json!({}),
+                defect: Some(ArgumentDefect {
+                    error: "EOF while parsing an object at line 1 column 43".to_string(),
+                    raw: raw.clone(),
+                }),
+            }]),
+        };
+        // Exactly what `persist_transcript_message` writes and what
+        // `load_messages` reads back.
+        let content_json = serde_json::to_string(&message).expect("serializes");
+        let loaded: ChatMessage =
+            serde_json::from_str(&content_json).expect("a transcript row reloads");
+
+        let rebuilt = loaded
+            .tool_calls
+            .as_deref()
+            .and_then(|calls| calls.first())
+            .and_then(|call| call.defect.as_ref())
+            .expect(
+                "a resume rebuilds the defect — this is the whole reason the \
+                     field is serialized at all",
+            );
+        assert_eq!(rebuilt.raw, raw, "the raw text survives the row verbatim");
+        assert_eq!(
+            rebuilt.error,
+            "EOF while parsing an object at line 1 column 43"
+        );
+        assert_eq!(loaded, message, "the message round-trips whole");
+
+        // And the half the `skip_serializing_if` carries: a message with NO
+        // defect must not grow a `null` key on every row.
+        let clean = ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessageContent::Text("hi".to_string()),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                arguments: json!({ "path": "/x" }),
+                defect: None,
+            }]),
+        };
+        let clean_json = serde_json::to_string(&clean).expect("serializes");
+        assert!(
+            !clean_json.contains("defect"),
+            "no `\"defect\":null` on a well-formed row: {clean_json}"
+        );
+        let reloaded: ChatMessage = serde_json::from_str(&clean_json).expect("reloads");
+        assert_eq!(reloaded, clean);
+        assert!(
+            reloaded.tool_calls.as_deref().unwrap()[0].defect.is_none(),
+            "an absent defect stays absent across the row"
         );
     }
 

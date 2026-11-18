@@ -256,16 +256,26 @@ fn estimate_message_tokens(m: &ChatMessage) -> u32 {
 /// wires. `defect` cannot join any of them by a `serde` derive change, because
 /// none of them derives.
 ///
-/// So the field is DISK-ONLY, and it stays there on purpose: `persist_transcript_message`
-/// and `run_compaction` both re-serialize the whole `ChatMessage` into
-/// `native_messages.content_json`, which is what lets a RESUME rebuild the honest
-/// refusal sentence — a real and intended cost, but a cost of the store, not of
-/// the summary request. Counting `raw` here would charge the summary budget for
-/// bytes the summary call never sends, and `raw` is precisely the field a
-/// truncated 8 MB argument stream fills, so the count would then refuse to
-/// compact the very transcript that most needs it. The sentence the model DOES
-/// receive on a defective call is the bounded one — see
-/// `MAX_DEFECT_RAW_BYTES` in `tool_specs`.
+/// So the field never reaches a PROVIDER REQUEST, and never a summary request,
+/// and that is the half this function's arithmetic turns on. It is **not**
+/// disk-only, and a previous round of this docblock said it was:
+/// `persist_transcript_message` (`harness/loop/emit.rs`) and `run_compaction`
+/// both re-serialize the whole `ChatMessage` into `native_messages.content_json`
+/// — which is what lets a RESUME rebuild the honest refusal sentence — and
+/// `IpcStore::insert_message` (`worker/store.rs`) forwards that string verbatim
+/// as `StoreFrame::Insert`, and the daemon's `store_frame`
+/// (`fulcrum/src/serve.rs`) puts the same `content_json` on the socket as a
+/// `{"type":"transcript-insert","contentJson":…}` frame. So a defect costs the
+/// disk AND a broadcast to every socket client. Both are real and intended, and
+/// both are costs of the store, not of the summary request. Counting `raw` here
+/// would charge the summary budget for bytes the summary call never sends, and
+/// `raw` is precisely the field a truncated 8 MB argument stream fills, so the
+/// count would then refuse to compact the very transcript that most needs it.
+/// The field is BOUNDED at the parse site — `cap_defect_raw` /
+/// `MAX_DEFECT_RAW_BYTES` in `provider_types`, the same 2 KB `debuglog` cuts an
+/// IPC line at — precisely because it reaches that socket and that row. The
+/// sentence the model DOES receive on a defective call is bounded by the same
+/// constant, re-exported — see `MAX_DEFECT_RAW_BYTES` in `tool_specs`.
 fn estimate_summary_payload(m: &ChatMessage) -> u32 {
     let arguments = m
         .tool_calls
