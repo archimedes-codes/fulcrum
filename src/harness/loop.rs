@@ -538,9 +538,15 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 /// 3. **A dispatched call the EXECUTOR refused for omitting an advertised
 ///    `required` parameter** — the call carries neither the `required` key nor an
 ///    advertised alias of it, the result came back `is_error`, the call was not
-///    DENIED by the permission gate, and the turn was not cancelled. The
+///    DENIED by the permission gate, no executor attested that it ACCEPTED the
+///    arguments and RAN them, and the turn was not cancelled. The
 ///    executor's ``missing `command` parameter`` family. Pinned by
 ///    `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`.
+///
+///    Read the two negations as one rule with a name: class 3 means **"the executor
+///    rejected the arguments"**, not "it errored and a key happened to be missing".
+///    See "The general weakness class 3 cannot shake" below for what that still
+///    cannot see.
 ///
 /// Class 3 is the one the shape of the field report actually needs, and it is
 /// the reason the guard is not simply "the pre-dispatch checker said no". The
@@ -562,12 +568,12 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 /// and hence the pins on both sides of the line
 /// (`a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run`).
 ///
-/// # Class 3's three exclusions, all load-bearing
+/// # Class 3's four exclusions, all load-bearing
 ///
 /// `is_error` + a missing advertised `required` key is NECESSARY but not
-/// SUFFICIENT, and three real shapes satisfy both halves without being "the
-/// engine told the model to re-send this with correct arguments". All three were
-/// live false positives, and all three are excluded STRUCTURALLY — no result text
+/// SUFFICIENT, and four real shapes satisfy both halves without being "the
+/// engine told the model to re-send this with correct arguments". All four were
+/// live false positives, and all four are excluded STRUCTURALLY — no result text
 /// is matched, so rewording a sentence cannot silently disarm the guard or
 /// silently re-arm it:
 ///
@@ -589,9 +595,9 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 ///   three times had their prompt ended as `turn_capped`. The refusal is built
 ///   inside `sudo_run_flow`, which the gate's two arms never reach, so the flag
 ///   now rides out of the flow itself: `sudo_run_flow` returns
-///   `(ToolResult, bool)` and `dispatch_tool` propagates it, the same pair
-///   `run_nested` already returned. Measured after: the same shape reaches the
-///   64-round ceiling, because nothing refused it any more. Pinned by
+///   `(ToolResult, bool, bool)` and `dispatch_tool` propagates it, the same shape
+///   `run_nested` already returned with two. Measured after: the same shape reaches
+///   the 64-round ceiling, because nothing refused it any more. Pinned by
 ///   `a_sudo_exec_confirm_refusal_is_never_a_refusal_run`.
 /// * **A call that satisfies a `required` key through an advertised ALIAS the
 ///   executor accepts** — `get_search_content` advertises
@@ -601,6 +607,55 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 ///   answers `"Response not found"` and the guard fired — measured at 4 provider
 ///   calls and one `turn_capped` for a normal, recoverable step. Pinned by
 ///   `a_call_using_an_advertised_alias_is_never_a_refusal_run`.
+/// * **A call whose command the executor ACCEPTED and RAN — the mirror of the
+///   second bullet, and the one that ended prompts mid-authentication.** The same
+///   `sudo_exec {"command": "x"}` with `reason` OMITTED, but this time the confirm
+///   is GRANTED, the credential is supplied, the elevated command RUNS and fails on
+///   a wrong password. Nothing refused anything and no argument was rejected, yet
+///   `is_error` + the absent `reason` still satisfied class 3: measured at **4
+///   provider calls and one `turn_capped`**. It is the worst instance in this tree
+///   because the auth-failure arm's own sentence reads "the user will be re-prompted
+///   on the next attempt" — the engine invites the retry, the model obeys, and four
+///   obeyed invitations cut the user's prompt off in the middle of authenticating.
+///   Excluded the same way as the others: `sudo_run_flow` now returns
+///   `(ToolResult, bool, bool)` and its four post-run arms carry a `ran` flag, which
+///   is the one place that can know. `dispatch_tool` forwards it and never decides
+///   it. Pinned by `a_confirmed_sudo_exec_that_fails_is_never_a_refusal_run`.
+///
+///   THE CONSERVATISM THAT KEEPS THE HEADLINE PIN: `ran` means "an executor
+///   ATTESTED that it accepted these arguments and ran them", and only
+///   `sudo_run_flow` can attest it. `execute_tool` returns a plain `ToolResult`
+///   that cannot distinguish a rejected argument list from a failed command, so
+///   `dispatch_tool`'s built-in arm answers `false` and an unattested call STAYS
+///   inside class 3. That is what keeps `bash {}` capping at 4 calls
+///   (`a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`); marking
+///   that arm `true` would silence the guard on the exact 303-call shape the whole
+///   card is about.
+///
+/// # The general weakness class 3 cannot shake
+///
+/// Class 3 is an INFERENCE from two things that do not entail it: the ADVERTISED
+/// shape (a `required` key the call omits) and the executor's VERDICT (`is_error`).
+/// Neither requires the omission to be the CAUSE of the error. The inference is
+/// wrong whenever an executor DEFAULTS a key the schema advertises as `required` —
+/// the schema and the executor disagree about what is mandatory, and class 3 reads
+/// the schema. Two such disagreements live in this tree:
+///
+/// * **`sudo_exec`'s `reason`** — `tool_specs.rs` says `required`, `sudo_run_flow`
+///   reads `.unwrap_or("")`. This one was live, and the `ran` flag above overrules
+///   it.
+/// * **`ls`'s `path`** — advertised `required`, and `exec_ls` defaults it. Excluded
+///   ONLY because the defaulted call succeeds, so `is_error` answers `false` before
+///   the inference is ever drawn. Nothing here understands the disagreement: give
+///   `exec_ls` one more error arm and `ls {}` becomes this same false positive with
+///   no flag available to exclude it, because the built-in arm cannot attest a run.
+///
+/// The full fix is a "the arguments were rejected" signal threaded out of every
+/// executor — `execute_tool` and its arms, the web executors, the seven board
+/// verbs — which is a materially larger change than this false positive warranted,
+/// and one that would have to be built so `bash {}` still counts. See
+/// `refused_before_the_model_could_act` in `loop/turn.rs` for the same statement
+/// beside the predicate itself.
 ///
 /// # The known UNDER-counts (the accepted direction)
 ///
@@ -632,18 +687,18 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 /// leaves it green (measured). Its floor catches the opposite case: every
 /// declaration gone, which is what would make the alias half dead code.
 ///
-/// # What a FOURTH corridor needs, and why the `bool` is not the guard for it
+/// # What a FIFTH corridor needs, and why the `bool`s are not the guard for it
 ///
-/// The flag says only "a person refused this call". It cannot enumerate the
-/// prompts that exist, and a new refusal site that forgets to mark itself is
-/// invisible to every behavioural pin above — each one scripts the shape it
-/// already knows about. A non-exhaustive enum would not help either: an
-/// unhandled variant still compiles at a `matches!`.
+/// The flags say only "a person refused this call" and "an executor attested it
+/// ran this call". Neither can enumerate the prompts or executors that exist, and
+/// a new site that forgets to mark itself is invisible to every behavioural pin
+/// above — each one scripts the shape it already knows about. A non-exhaustive
+/// enum would not help either: an unhandled variant still compiles at a `matches!`.
 ///
-/// What does survive a fourth corridor is
+/// What does survive a corridor nobody thought of is
 /// [`crate::source_lints::every_denial_marking_site_in_the_batch_is_accounted`],
-/// which counts the denial-marking sites in `run_tool_batch`'s region and reddens
-/// on a count nobody chose.
+/// which counts the denial-marking sites AND every flag answer in
+/// `run_tool_batch`'s region and reddens on a count nobody chose.
 ///
 /// Like the round ceiling, 3 is a STARTING value and is NOT a measurement of our
 /// traffic. The upstream band ("stop after 2–3 identical consecutive failures")

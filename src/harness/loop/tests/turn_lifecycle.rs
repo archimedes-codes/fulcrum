@@ -3305,6 +3305,223 @@ async fn a_sudo_exec_confirm_refusal_is_never_a_refusal_run() {
     );
 }
 
+/// Answer `count` `sudo_exec` SUB-prompts, GRANTING each one and supplying the
+/// credential the granted confirm asks for.
+///
+/// `answer_sudo_confirms` cannot serve a GRANTED flow: it answers whichever key it
+/// finds with `{"confirmed": …}`, and a granted confirm is immediately followed by
+/// the `:password` sub-prompt, which needs a `password` key — so feeding it
+/// `{confirmed: true}` reads as an EMPTY password, i.e. a cancel, and the flow
+/// returns before the command ever runs. This responder reads the key's own suffix
+/// and answers the prompt the flow is actually asking.
+///
+/// Rounds after the FIRST have no `:password` prompt ONLY if the credential stuck:
+/// the auth-failure arm CLEARS the per-session cache (a mistyped password must not
+/// stick for the TTL), so a failing run re-prompts EVERY round and each round costs
+/// two prompts. This responder therefore answers whatever key it finds, by its own
+/// suffix, rather than assuming a fixed sequence per round.
+/// Runs until the test ABORTS it, so it can never leave a prompt unanswered (which
+/// would block the turn and turn a red assertion into a `SETTLE` timeout — measured
+/// on the first draft of this pin, which hung at 15 s instead of failing at the
+/// count) and never outlives the turn to bill its idle deadline. That is why this
+/// one takes no `count` where `answer_sudo_confirms` takes one.
+async fn answer_sudo_prompts_granted(pending: crate::interactive::PendingSudo) {
+    loop {
+        let mut map = pending.lock().await;
+        if let Some(key) = map.keys().find(|k| k.starts_with("s1/")).cloned() {
+            let sender = map.remove(&key).expect("the entry is in the map");
+            drop(map);
+            let answer = if key.ends_with(":password") {
+                json!({ "password": "hunter2" })
+            } else {
+                json!({ "confirmed": true })
+            };
+            let _ = sender.send(answer);
+            continue;
+        }
+        drop(map);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// **A `sudo_exec` whose command RAN and FAILED is never a refusal run.**
+///
+/// The false positive is the MIRROR of `a_sudo_exec_confirm_refusal_is_never_a_refusal_run`,
+/// and it is the same call: `{"command": "x"}` — `reason` omitted, which the spec
+/// advertises as `required` — so class 2's `required` half is satisfied. There, the
+/// confirm was DECLINED and the `denied` flag excludes it. Here the confirm is
+/// GRANTED, the credential is supplied, the elevated command RUNS, and it fails on
+/// a wrong password. Nobody refused anything and no argument was rejected, yet
+/// `is_error` + the absent `reason` still satisfied class 2, so four identical
+/// re-sends emitted `turn_capped`.
+///
+/// The user-visible instance is the password prompt. The auth-failure arm's own
+/// sentence is "…the user will be re-prompted on the next attempt" — the engine
+/// INVITES the retry, the model obeys, and four of those end the user's prompt
+/// mid-authentication. That is the false-positive class this branch has spent three
+/// review rounds eliminating, arriving from the opposite direction.
+///
+/// What it exposes in general: class 2 INFERS "the executor rejected these
+/// arguments" from *an advertised-required key is absent* AND *`is_error`*. Nothing
+/// in that pair requires the omission to be the CAUSE of the failure. This call was
+/// structurally accepted, ran, and failed for a reason that has nothing to do with
+/// `reason`. The fix threads what actually happened — the flow REACHED the run —
+/// the same way `denied` is threaded, rather than inferring it.
+///
+/// The `reason` key stays OMITTED on purpose. `{"command":"x","reason":"r"}` also
+/// reaches 64 rounds, but it does so because nothing about it is a refusal at all;
+/// this shape reaches 64 because the guard's inference is wrong, and only this
+/// shape reddens before the fix.
+#[tokio::test]
+async fn a_confirmed_sudo_exec_that_fails_is_never_a_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let round = vec![
+        ProviderEvent::ToolCall(sudo_exec_omitting_reason("echo will-fail-on-auth")),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ];
+    // One more round than the guard tolerates, then a terminal `Done(Stop)`, so a
+    // cap and a natural finish are told apart by the call count alone.
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 2;
+    let mut scripts = vec![round; rounds as usize];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
+    let (ran_flag, mut loop_) = build_failing_sudo_loop(Box::new(provider), events_tx);
+    let pending = loop_.sudo.pending_sudo.clone();
+    // Granted confirms AND a supplied password: the flow must reach the runner.
+    // Every prompt the turn raises is answered — the auth-failure arm clears the
+    // cached credential, so each round costs a confirm AND a password prompt. The
+    // responder runs until the turn finishes and is then ABORTED, so a run that
+    // caps early (the red case) cannot leave a prompt unanswered and block the turn.
+    let answer = tokio::spawn(answer_sudo_prompts_granted(pending));
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let mut loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn TERMINATED (on its terminal script entry)")
+        .expect("the turn task did not panic");
+    answer.abort();
+
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    // THE WITNESS that this is the shape claimed: the elevated command really ran,
+    // and every round answered with the auth-failure sentence. Without these two
+    // the turn could be settling on a declined confirm or a cancelled password —
+    // the shape the OTHER pin already covers — and this test would prove nothing.
+    assert!(
+        ran_flag.load(Ordering::SeqCst),
+        "the confirm was granted and the credential supplied, so the runner MUST have \
+         been reached — a turn that never ran the command is the declined-confirm shape, \
+         not this one, got {kinds:?}"
+    );
+    let texts: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            RpcEvent::tool_execution_end {
+                tool_name, result, ..
+            } if tool_name == "sudo_exec" => Some(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !texts.is_empty(),
+        "the turn really did run `sudo_exec` rounds, got {kinds:?}"
+    );
+    assert!(
+        texts.iter().all(|t| t.contains("authentication failed")),
+        "every round answered the RUN's auth failure (`sudo authentication failed \
+         (incorrect password) …`), which is the sentence that invites the retry. \
+         Anything else means this test is pinning a different shape, got {texts:?}"
+    );
+
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "a sudo command that RAN and FAILED must not arm the refusal guard: the \
+         arguments were never rejected, nobody refused the call, and the engine's own \
+         sentence asked for the retry. Four of these ending the user's prompt \
+         mid-authentication is the false positive this pin refuses, got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        rounds + 1,
+        "the run counter never grew, so the turn reached its terminal script entry \
+         ({rounds} failing rounds + the Stop). A turn that stopped at {} was capped by \
+         the refusal guard over a command that ran and failed — the false positive \
+         measured at 4 provider calls before the fix, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+
+    // ── the structural half: the guard's OWN input, one call at a time ──
+    let pending = loop_.sudo.pending_sudo.clone();
+    let answer = tokio::spawn(answer_sudo_prompts_granted(pending));
+    let (_, refused) = loop_
+        .run_tool_batch(
+            &[sudo_exec_omitting_reason("echo will-fail-on-auth")],
+            &CancellationToken::new(),
+        )
+        .await;
+    answer.abort();
+    assert_eq!(
+        refused,
+        vec![false],
+        "the predicate's answer for a GRANTED sudo run that FAILED while omitting a \
+         required key is `false` — the command ran, so no argument was rejected and no \
+         sentence told the model to re-send the call with a different argument"
+    );
+
+    // And the shape that IS still a refusal stays one: an EMPTY `command` is refused
+    // before any prompt fires and before any run, so nothing was asked, nothing was
+    // executed, and the sentence genuinely is "re-send this with a command".
+    let (_, refused_empty) = loop_
+        .run_tool_batch(
+            &[ToolCall {
+                id: "t2".to_string(),
+                name: "sudo_exec".to_string(),
+                arguments: json!({}),
+                defect: None,
+            }],
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        refused_empty,
+        vec![true],
+        "the pre-prompt empty-`command` refusal is a re-send instruction and stays \
+         counted — this exclusion is about the command that RAN, not about `sudo_exec`"
+    );
+}
+
+/// `build_loop` with a `FailingSudoRunner` installed, returning the `ran` flag.
+///
+/// The twin of `build_sudo_loop` for the shape where the command IS reached: that
+/// one installs a runner whose `run` future is `unreachable!()`, which is correct
+/// for a declined confirm and fatal here.
+fn build_failing_sudo_loop(
+    provider: Box<dyn Provider>,
+    events: mpsc::UnboundedSender<RpcEvent>,
+) -> (Arc<std::sync::atomic::AtomicBool>, AgentLoop) {
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_space, mut loop_) = build_loop(
+        provider,
+        events,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    loop_.sudo.runner = Arc::new(FailingSudoRunner { ran: ran.clone() });
+    (ran, loop_)
+}
+
 /// `build_loop` with a `RecordingSudoRunner` installed, returning the `ran` flag.
 fn build_sudo_loop(
     provider: Box<dyn Provider>,
