@@ -115,6 +115,74 @@ impl Provider for ScriptedProvider {
     }
 }
 
+/// `ScriptedProvider`'s script (repeats the LAST entry, like `ScriptedProvider`),
+/// but with one `yield_now` per `complete`.
+///
+/// THE REASON THIS EXISTS is that four of the five looping tests used to HANG
+/// rather than FAIL when someone disabled the loop's guards, and this provider is
+/// the remedy. A `tokio::time::timeout` around a `tokio::spawn` bounds nothing
+/// unless the task being awaited ever SUSPENDS. `ScriptedProvider` answers from a
+/// `Vec` and the turn loop's body is otherwise synchronous work, so a turn loop
+/// with BOTH its guards disabled is a non-yielding busy loop, and on a
+/// current-thread runtime the timer cannot fire — measured by the reviewer with
+/// both guards at `u32::MAX`: `a_run_of_identical_refused_batches_stops_the_turn_as_capped`,
+/// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`,
+/// `a_turn_that_hits_the_round_ceiling_settles_as_capped` and
+/// `a_mixed_batch_resets_the_identical_refusal_run` all exited 124 (a CI timeout),
+/// while only `a_capped_turn_closes_nothing_and_carries_the_prior_results` — the
+/// one test that had been given this provider — failed correctly at 101. A CI
+/// timeout is a much worse signal than a red test: it names no invariant and it
+/// takes the rest of its process down with it.
+///
+/// One `yield_now` per `complete` gives the scheduler a per-ROUND suspension
+/// point — a real provider has one for free, since it awaits a socket — and it is
+/// what makes the `SETTLE` timeout the load-bearing bound it is written to be.
+/// The pair (the yield AND the timeout) is what makes the disabled-guard case
+/// FAIL at `SETTLE` naming the bound; either half alone leaves the hang. So:
+/// EVERY test whose script repeats forever uses this provider, not
+/// `ScriptedProvider`.
+pub(super) struct YieldingScriptedProvider {
+    pub(super) calls: Arc<AtomicU32>,
+    /// One entry per `complete`, and — exactly as `ScriptedProvider` does — the
+    /// LAST entry repeats once the index runs out. That repetition is what makes
+    /// a stuck turn reproducible from one entry, and the terminal-entry form
+    /// (`[the call] * N` then a `Done(Stop)`) is what lets a test bound its own
+    /// turn BELOW the round ceiling so a `turn_capped` frame can be asserted
+    /// absent rather than merely attributed to the other guard.
+    pub(super) scripts: Vec<Vec<ProviderEvent>>,
+}
+
+impl YieldingScriptedProvider {
+    /// One entry per call (the last repeats). The `ScriptedProvider::new` twin.
+    pub(super) fn new(scripts: Vec<Vec<ProviderEvent>>) -> (Self, Arc<AtomicU32>) {
+        assert!(!scripts.is_empty(), "at least one script");
+        let calls = Arc::new(AtomicU32::new(0));
+        (
+            Self {
+                calls: calls.clone(),
+                scripts,
+            },
+            calls,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for YieldingScriptedProvider {
+    async fn complete(
+        &self,
+        _req: &ModelRequest,
+    ) -> Result<futures_util::stream::BoxStream<'static, ProviderEvent>, ProviderError> {
+        tokio::task::yield_now().await;
+        let i = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
+        let events = self
+            .scripts
+            .get(i)
+            .unwrap_or_else(|| self.scripts.last().expect("at least one script"));
+        Ok(futures_util::stream::iter(events.clone()).boxed())
+    }
+}
+
 /// A `Provider` whose `complete` returns an error (the finding 7 error-
 /// exit test — a non-retryable `Fatal` error ends the turn immediately;
 /// the turn settles `turn_end` + `agent_settled`).

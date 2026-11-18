@@ -68,9 +68,11 @@ pub(super) struct TurnLoopState {
     ///
     /// "Refused" is the predicate in `refused_before_the_model_could_act` (this module):
     /// the pre-dispatch param check, a parse `defect`, or a dispatched call the
-    /// executor refused for omitting an advertised `required` parameter. NOT
-    /// "the tool errored" — see `MAX_IDENTICAL_REFUSAL_RUNS` for why that line
-    /// is where it is.
+    /// EXECUTOR refused for omitting an advertised `required` parameter that no
+    /// advertised alias supplied. NOT "the tool errored" — a permission DENIAL and
+    /// a failing command are both `is_error` and neither is a refusal, so neither
+    /// grows this counter; see `MAX_IDENTICAL_REFUSAL_RUNS` for where the line is
+    /// drawn and which shapes it deliberately lets through.
     pub(super) identical_refusal_runs: u32,
 }
 
@@ -149,6 +151,9 @@ pub(super) fn batch_signature(tool_calls: &[ToolCall], refused: &[bool]) -> Opti
 ///   run is bounded by the round ceiling instead. Narrower than the truth is
 ///   the accepted direction here, because the failure mode of the wider reading
 ///   is ending a user's prompt over a tool call that was fine.
+/// * a `required` key the call satisfies through an **advertised alias** the
+///   executor accepts (see `declared_alias_of` — the second known exclusion,
+///   and the reason satisfaction is not a bare `contains_key`).
 fn missing_required_param(specs: &[ToolSpec], tc: &ToolCall) -> bool {
     let Some(spec) = specs
         .iter()
@@ -167,7 +172,86 @@ fn missing_required_param(specs: &[ToolSpec], tc: &ToolCall) -> bool {
     required
         .iter()
         .filter_map(Value::as_str)
-        .any(|key| keys.is_none_or(|args| !args.contains_key(key)))
+        .any(|key| !required_key_satisfied(spec, keys, key))
+}
+
+/// Whether the call carries the required key `key`, directly **or through an
+/// advertised alias of it that the executor honours**.
+///
+/// The bare `contains_key` was the bug: `get_search_content` advertises
+/// `required: ["response_id"]` while its `properties` ALSO carries `responseId`,
+/// and `exec_get_search_content` reads both spellings
+/// (`params.get("response_id").or_else(|| params.get("responseId"))`). A model
+/// that calls with `{"responseId": …}` therefore omits the spelling `required`
+/// names while sending a key the executor accepts, and when the tool then errors
+/// for an unrelated reason (its `Response not found` cache miss) class 2 fired on
+/// a call that was built correctly. This is the same shape as the `ls` row of
+/// `the_refusal_predicate_is_the_required_key_and_the_error_together` — a call the
+/// executor accepts despite the advertised `required` list — and that one is
+/// excluded only because `exec_ls` defaults `path` and SUCCEEDS.
+///
+/// Satisfaction is membership, whatever the value's type or emptiness — the SAME
+/// rule the direct key is held to two lines up, so the two paths cannot disagree.
+/// `{"responseId": ""}` is therefore a KNOWN UNDER-COUNT (the executor does
+/// reject an empty alias with its own missing-parameter sentence); under-counting
+/// is the accepted direction.
+fn required_key_satisfied(
+    spec: &ToolSpec,
+    keys: Option<&serde_json::Map<String, Value>>,
+    key: &str,
+) -> bool {
+    let Some(args) = keys else {
+        return false;
+    };
+    if args.contains_key(key) {
+        return true;
+    }
+    let Some(properties) = spec.parameters.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    properties.iter().any(|(alias, schema)| {
+        declared_alias_of(schema) == Some(key) && args.contains_key(alias.as_str())
+    })
+}
+
+/// The required key a property schema declares ITSELF an alias of, if it does.
+///
+/// **READ THIS BEFORE TRUSTING THE GUARD'S ALIAS HALF.** There is NO structural
+/// way in this tree to know that one advertised property is an alias of another.
+/// The aliases are only *described*: `tool_specs()` spells them
+/// `"responseId": { "type": "string", "description": "Alias for response_id" }`,
+/// and the pairing that actually matters — the executor reading both spellings —
+/// lives in `src/web/tools.rs`, unlinked to the schema by anything a compiler can
+/// see. So the narrowest rule available reads that one declaration. It is a
+/// prefix test on the ADVERTISED SHAPE (the schema the model was shown), which is
+/// a different thing from the RESULT-text matching this guard forbids: a schema
+/// description is part of the contract the model is handed and it has a pin
+/// (`the_alias_rule_reads_the_wording_tool_specs_actually_uses`), whereas a tool
+/// RESULT sentence is prose someone rewords for tone and no guard may lean on.
+///
+/// What this function returns is only the NAMED key; the caller
+/// (`required_key_satisfied`) additionally requires that key to be in the SAME
+/// `properties`. That conjunct is what keeps the rule narrow: a description
+/// saying `Alias for something-not-advertised` satisfies nothing, and a property
+/// whose description merely MENTIONS an alias mid-sentence is not a declaration
+/// (the prefix is anchored, case-sensitive, with its trailing space).
+///
+/// THE COUPLING THIS CUTS BOTH WAYS: rewording one of those descriptions breaks
+/// the recognition and the alias stops being excluded — the over-count direction,
+/// i.e. the bug coming back. That is why
+/// `the_alias_rule_reads_the_wording_tool_specs_actually_uses` pins the wording
+/// of every `Alias for` declaration in `tool_specs()` rather than only the one
+/// this guard needs.
+pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
+    let description = schema.get("description").and_then(Value::as_str)?;
+    let named = description.strip_prefix("Alias for ")?;
+    let named = named.trim().trim_matches('`').trim_end_matches('.').trim();
+    if named.is_empty() {
+        return None;
+    }
+    // The caller's `properties` membership check needs the raw name; the trim
+    // above only normalises the DECORATION around it.
+    Some(named)
 }
 
 /// Whether the engine refused call `i` in a way whose WHOLE POINT is "re-send
@@ -180,7 +264,8 @@ fn missing_required_param(specs: &[ToolSpec], tc: &ToolCall) -> bool {
 ///    one source of truth for this and it is read, never recomputed.
 /// 2. **Dispatched, and refused by the executor for omitting a required
 ///    parameter**: the advertised `required` list names a key the call does not
-///    carry AND the result came back `is_error`.
+///    carry (nor satisfy through an advertised alias) AND the result came back
+///    `is_error` AND the call was not DENIED by the permission gate.
 ///
 /// Class 2 is what makes the guard fire on the shape that motivated the whole
 /// change. The field report is **303 `{}`-argument `bash` calls in 19 minutes**,
@@ -199,12 +284,50 @@ fn missing_required_param(specs: &[ToolSpec], tc: &ToolCall) -> bool {
 /// is progress, not a stuck loop, and a guard that ends the user's prompt over
 /// one is worse than the loop it prevents; so the `required` half is what makes
 /// the sentence "the engine told the model to re-send this" a fact rather than a
-/// guess. Symmetrically, `ls` DECLARES `path` as required but `exec_ls` defaults
-/// it to the `cwd`, so `ls {}` SUCCEEDS — and it is the `is_error` half that
-/// keeps a succeeding call out of the run. The pair is the narrowest honest
-/// discriminator in the tree: both halves are structural (the advertised shape,
-/// and the executor's own verdict), and NO user-visible sentence is matched, so
-/// rewording ``missing `path` parameter`` cannot silently disarm the guard.
+/// guess.
+///
+/// # The two exclusions class 2 needs beside `is_error`, and what is left
+///
+/// Both halves are necessary and, on their own, NOT sufficient. Two real shapes
+/// satisfy `is_error` + a missing advertised `required` key without being "the
+/// engine told the model to re-send this with correct arguments", and both are
+/// excluded here rather than being argued about in prose:
+///
+/// * **A permission DENIAL** (`denied`). The gate's refusal arms build their
+///   result IN THIS FILE (`run_tool_batch`), with `is_error: true`, so a denied
+///   `edit` that omits `old_text`/`new_text` satisfied class 2 and three
+///   identical re-sends after a user said **no** settled the turn as
+///   `turn_capped`. A denial is a user decision, not a mistake to correct, and
+///   `MAX_IDENTICAL_REFUSAL_RUNS`' docblock already said so; the flag is threaded
+///   from the two arms that construct the denial, exactly as `codemode`'s
+///   `run_nested` threads its own `denied` bool for the same reason. It is
+///   structural — no result text is consulted. Pinned by
+///   `a_permission_denial_is_never_a_refusal_run`.
+/// * **A call that satisfies a required key through an advertised alias**
+///   (`required_key_satisfied`). Pinned by
+///   `a_call_using_an_advertised_alias_is_never_a_refusal_run`.
+///
+/// What is DELIBERATELY NOT covered, all in the under-count direction (a stuck
+/// run reaches the 64-round ceiling instead of 3 — the accepted cost, because the
+/// cost of the opposite error is ending a legitimate prompt):
+///
+/// * `ls {}` — `path` is advertised `required` and IS absent, but `exec_ls`
+///   defaults it and the call SUCCEEDS, so `is_error` excludes it. The case that
+///   proves `required` alone is not enough.
+/// * An advertised alias whose `description` has been reworded away from the
+///   `Alias for <key>` form — the rule above stops seeing it. Pinned so it
+///   reddens rather than silently regressing.
+/// * A `required` key present with the WRONG TYPE or an empty value.
+/// * **A `sudo_exec` confirm refusal.** The user's "no" there is built inside
+///   `sudo_run_flow` (`src/interactive/mod.rs`), which returns a plain
+///   `ToolResult` and is outside the files this change may touch, so the flag
+///   cannot be threaded from the arm that knows. The exposure is much narrower
+///   than the gate's was: it needs `command` present (an empty one is refused
+///   BEFORE the prompt, and that refusal IS a re-send instruction and is counted
+///   correctly) with `reason` omitted, then a declined confirm, then three
+///   identical re-sends. Closing it needs `sudo_run_flow` to report its own
+///   refusal the way `run_nested` does — a change to a file this branch does not
+///   own.
 ///
 /// The `turn.is_cancelled()` half of class 2 keeps the standing
 /// **cancellation beats rejection** rule true of the new class too: every
@@ -220,11 +343,14 @@ fn refused_before_the_model_could_act(
     result: &ToolResult,
     specs: &[ToolSpec],
     turn_cancelled: bool,
+    denied: bool,
 ) -> bool {
     if param_error.is_some() {
         return true;
     }
-    !turn_cancelled && result.is_error && missing_required_param(specs, tc)
+    // A denial is the USER's decision — never a re-send instruction, whatever the
+    // result's `is_error` says. See the docblock's first exclusion.
+    !turn_cancelled && !denied && result.is_error && missing_required_param(specs, tc)
 }
 
 impl AgentLoop {
@@ -810,14 +936,14 @@ impl AgentLoop {
     /// `refused[i]` is true exactly where `refused_before_the_model_could_act`
     /// says the engine told the model to re-send call `i` with correct
     /// arguments — the pre-dispatch `unknown_param_error` refusal (which also
-    /// carries a parse `defect`), or a dispatched call the executor refused for
-    /// omitting a `required` parameter. The first half reads the SAME
-    /// `param_errors` vector the dispatch arms below consult — it is NOT
-    /// recomputed here, and a caller must not recompute it either, because two
-    /// independent readings of the checker is the drift the plan's Decision 2
-    /// rejects. `refused` exists so the caller can build [`batch_signature`]:
-    /// `param_errors` is a local of this function and a signature computed from
-    /// a second pass would be a second source of truth.
+    /// carries a parse `defect`), or a dispatched call the EXECUTOR refused for
+    /// omitting a `required` parameter (and no advertised alias of it). The first
+    /// half reads the SAME `param_errors` vector the dispatch arms below consult
+    /// — it is NOT recomputed here, and a caller must not recompute it either,
+    /// because two independent readings of the checker is the drift the plan's
+    /// Decision 2 rejects. `refused` exists so the caller can build
+    /// [`batch_signature`]: `param_errors` is a local of this function and a
+    /// signature computed from a second pass would be a second source of truth.
     ///
     /// Note what `refused[i]` does NOT claim. It is not "this call produced an
     /// error result": a call that was ACCEPTED and then DENIED by the permission
@@ -825,9 +951,20 @@ impl AgentLoop {
     /// a different problem with a different remedy, and bounding it would end the
     /// user's prompt over a command that merely did not work. The one
     /// dispatched-call shape that DOES count is a call whose advertised
-    /// `required` keys are missing, because that sentence's only possible use is
-    /// "send it again, correctly". Cancellation is never a refusal, on either
-    /// class (see the function above for the arm-by-arm reason).
+    /// `required` keys are missing (with no advertised alias carrying them),
+    /// because that sentence's only possible use is "send it again, correctly".
+    /// Cancellation is never a refusal, on either class (see the function above
+    /// for the arm-by-arm reason).
+    ///
+    /// THE DENIAL HALF IS STRUCTURAL, NOT INFERRED, and that is the whole of the
+    /// first exclusion: the dispatch expression yields `(result, denied)` and the
+    /// two arms that CONSTRUCT a gate denial (`gate_tool` answering `false`, and
+    /// `Decision::Deny`) are the only ones that set `denied: true`. Reading the
+    /// result's text instead would make the guard depend on a sentence someone may
+    /// reword, and a rewording would silently re-arm the false positive that ends
+    /// a user's prompt over their own "no". `codemode`'s `run_nested` returns the
+    /// same pair for the same reason (there it picks `denied` over `error` as the
+    /// row's status).
     ///
     /// The vector is built to the exact length of `tool_calls` — one push per
     /// dispatch arm, in the same loop — and [`batch_signature`] refuses to sign a
@@ -904,7 +1041,15 @@ impl AgentLoop {
         };
 
         for (idx, tc) in tool_calls.iter().enumerate() {
-            let result = if crate::harness::dispatch::is_subagent_call(&tc.name) {
+            // THE PAIR: the result, and whether the PERMISSION GATE refused it.
+            // The second half exists because a gate denial arrives as
+            // `is_error: true` and is a USER decision, not a re-send
+            // instruction — see `refused_before_the_model_could_act`'s first
+            // exclusion. It is threaded from the two arms that CONSTRUCT the
+            // denial rather than inferred from the result text, exactly as
+            // `codemode`'s `run_nested` returns `(ToolResult, bool)` for the same
+            // reason (its `denied` feeds the row's `denied` status, not `error`).
+            let (result, denied) = if crate::harness::dispatch::is_subagent_call(&tc.name) {
                 match subagent_results.remove(&idx) {
                     // A child that ran (or that the `SubagentWait` select
                     // itself cancelled) keeps its own result — unchanged.
@@ -925,30 +1070,31 @@ impl AgentLoop {
                     // a total that spans both.
                     Some((result, child_cost)) => {
                         self.fold_child_cost(child_cost);
-                        result
+                        (result, false)
                     }
                     // CANCELLATION BEATS REJECTION: a call that never ran
                     // because the user stopped the turn must not be told to
                     // "fix the key and retry".
-                    None if turn.is_cancelled() => Self::cancelled_tool_result(),
+                    None if turn.is_cancelled() => (Self::cancelled_tool_result(), false),
                     // A rejected `subagent` was filtered out of the futures
                     // above, so it has NO entry here. This arm MUST precede the
                     // `dispatch_tool` fallback: that fallback routes a subagent
                     // call to `dispatch_subagent` (issue #93), so a rejection
                     // placed after it would dispatch the very child it rejects.
-                    None if param_errors.get(idx).is_some_and(Option::is_some) => {
-                        unknown_param_result(param_errors[idx].as_deref().unwrap_or_default())
-                    }
-                    None => self.dispatch_tool(tc, turn).await,
+                    None if param_errors.get(idx).is_some_and(Option::is_some) => (
+                        unknown_param_result(param_errors[idx].as_deref().unwrap_or_default()),
+                        false,
+                    ),
+                    None => (self.dispatch_tool(tc, turn).await, false),
                 }
             } else if turn.is_cancelled() {
                 // Cancellation beats rejection (same rule, the sequential tools).
-                Self::cancelled_tool_result()
+                (Self::cancelled_tool_result(), false)
             } else if let Some(Some(err)) = param_errors.get(idx) {
                 // REJECTED, not warned: no dispatch, and deliberately NOT
                 // `policy_verdict` / `gate_tool` — a call that will not run
                 // must never raise a permission prompt.
-                unknown_param_result(err)
+                (unknown_param_result(err), false)
             } else {
                 match self.policy_verdict(tc) {
                     Some(Decision::Ask) => {
@@ -961,18 +1107,37 @@ impl AgentLoop {
                         // `allow-directory` would allow.
                         let guard = self.guard_target(tc);
                         if self.gate_tool(tc, turn, guard.as_deref()).await {
-                            self.dispatch_tool(tc, turn).await
+                            (self.dispatch_tool(tc, turn).await, false)
                         } else {
-                            ToolResult {
-                                content: vec![ContentBlock::Text {
-                                    text: "permission denied".to_string(),
-                                }],
-                                details: None,
-                                is_error: true,
-                            }
+                            // THE DENIAL ARM. `gate_tool` answers `false` for a
+                            // `reject` click, a `Cancelled` (a Stop, or a closed
+                            // session) and any outcome that is not one of the
+                            // three ALLOW ids — every one of them a user
+                            // decision. `denied: true` is the whole point of this
+                            // tuple: the result below satisfies class 2 of the
+                            // refusal predicate on its face (`is_error`, and for a
+                            // malformed call a missing `required` key), and only
+                            // this flag says "the user said no" rather than "the
+                            // engine asked for a re-send".
+                            (
+                                ToolResult {
+                                    content: vec![ContentBlock::Text {
+                                        text: "permission denied".to_string(),
+                                    }],
+                                    details: None,
+                                    is_error: true,
+                                },
+                                true,
+                            )
                         }
                     }
-                    Some(Decision::Deny) => self.deny_tool_result(tc),
+                    // The OTHER denial arm: a policy/rule `Deny` never prompts, so
+                    // no user click is involved, but it is still the gate refusing
+                    // rather than the executor — the user's own rule said no, and
+                    // `deny_tool_result`'s wording is deliberately the executor's,
+                    // which is exactly why `is_error` alone cannot tell the two
+                    // apart. `codemode`'s sibling marks this arm `denied` too.
+                    Some(Decision::Deny) => (self.deny_tool_result(tc), true),
                     // (finding 6) What reaches here: `Some(Decision::Allow)`,
                     // `None` (an ungated tool), and `Some(Decision::Confine)`
                     // — and `Confine` can ONLY be `bash`, because
@@ -988,7 +1153,7 @@ impl AgentLoop {
                     // could produce for a path tool — an unsandboxed `read`
                     // under a tier that meant refusal; that combination is now
                     // unrepresentable at the SOURCE rather than explained here.
-                    _ => self.dispatch_tool(tc, turn).await,
+                    _ => (self.dispatch_tool(tc, turn).await, false),
                 }
             };
             let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
@@ -1004,6 +1169,7 @@ impl AgentLoop {
                 &result,
                 &specs,
                 turn.is_cancelled(),
+                denied,
             ));
             turn_tool_results.push(result_value.clone());
             self.emit(RpcEvent::tool_execution_end {

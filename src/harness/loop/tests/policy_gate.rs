@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -2766,5 +2767,217 @@ fn a_path_tool_pattern_map_announces_itself_unsupported() {
             FrontmatterNote::UnsupportedUnvalidatedMatcher(UnsupportedReason::BashPatternRules)
         )),
         "the path-tool announcement is its OWN reason, never bash's: {notes:?}"
+    );
+}
+
+// ── (the refusal guard) a DENIAL is not a refusal ───────────────────
+
+/// The `edit` the refusal-guard denial pin sends: `path` IS there (which is what
+/// makes the gate judge it at all — `policy_verdict` answers `Allow` for a call
+/// with no usable path), and the OTHER two required keys are omitted. That is
+/// exactly the shape class 2 of `refused_before_the_model_could_act` reads as
+/// "the engine told the model to re-send this": the advertised `required` array
+/// names `old_text`/`new_text`, the call carries neither.
+fn edit_omitting_the_required_pair(path: &std::path::Path) -> ToolCall {
+    ToolCall {
+        id: "t1".to_string(),
+        name: "edit".to_string(),
+        arguments: json!({ "path": path.display().to_string() }),
+        defect: None,
+    }
+}
+
+/// Answer `count` permission prompts in a row, each with `option`.
+///
+/// `answer_permission` answers ONE and returns, which is right for every pin
+/// that predates the refusal guard; the guard pins script a REPEATED call, so
+/// the turn raises one prompt per round and a responder that stops after the
+/// first would leave round 2 waiting on a prompt nobody answers — the hang the
+/// house comment at the top of this file exists to avoid. Each round gets its
+/// own bounded poll (the same 10 s per-answer patience, reset per prompt).
+async fn answer_permission_prompts(
+    pending: PendingPermissions,
+    session: &str,
+    option: &str,
+    count: usize,
+) {
+    for _ in 0..count {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut map = pending.lock().await;
+            if let Some(key) = map
+                .keys()
+                .find(|k| k.starts_with(&format!("{session}/")))
+                .cloned()
+            {
+                let sender = map.remove(&key).expect("the entry is in the map");
+                let _ = sender.send(PermissionOutcome::Selected {
+                    option_id: option.to_string(),
+                    value: None,
+                });
+                break;
+            }
+            drop(map);
+            if tokio::time::Instant::now() >= deadline {
+                return; // the test asserts the prompts it expected arrived
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// **A permission DENIAL is never a refusal run.**
+///
+/// `MAX_IDENTICAL_REFUSAL_RUNS`' docblock says it out loud: *"a permission DENIAL
+/// is an `is_error` result too, and it is a user decision, not a mistake to
+/// correct."* Class 2 of the predicate did not honour that. The gate's denial arm
+/// in `run_tool_batch` builds a literal `ToolResult { text: "permission denied",
+/// is_error: true }`, so an `edit` that omits `old_text`/`new_text` and is
+/// **denied** satisfied BOTH halves of class 2 (`is_error`, and a `required` key
+/// the call omits) and was counted as "the engine told the model to re-send this
+/// with correct arguments". Three identical re-sends after a user said **no**
+/// therefore settled the turn as `turn_capped` — the guard ending a user's prompt
+/// over a decision the user made.
+///
+/// The script is `MAX_IDENTICAL_REFUSAL_RUNS + 2` identical denied rounds and
+/// THEN a terminal `Done(Stop)`, so the arithmetic is one-sided: if the guard
+/// counts the denials it fires at call `MAX_IDENTICAL_REFUSAL_RUNS + 1` and the
+/// terminal entry is never reached, and if it does not, the turn ends on the
+/// Stop. Both the frame and the call count are asserted, because the call count
+/// is the only observable of the loop-internal run counter.
+///
+/// The structural half is the `run_tool_batch` probe at the end: it reads the
+/// refusal vector directly (the guard's actual input), which is what names the
+/// invariant rather than inferring it from a turn's shape.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_permission_denial_is_never_a_refusal_run() {
+    let _lock = crate::test_support::env_lock();
+    let home = Tmp::new("denial-run-home");
+    let original = std::env::var_os("HOME");
+    let _restore = RestoreHome(original.clone());
+    // SAFETY: the `ENV_LOCK` is held for the whole set→assert→restore span.
+    unsafe { std::env::set_var("HOME", home.path()) };
+
+    // OUTSIDE the loop's `space_cwd`, which is the write direction's boundary:
+    // that is what makes `writes: ask` raise a prompt at all (an in-boundary
+    // write is `Allow` whatever the posture says).
+    let outside = Tmp::new("denial-run-target");
+    let target = outside.path().join("denied-by-the-user.txt");
+
+    let round = vec![
+        ProviderEvent::ToolCall(edit_omitting_the_required_pair(&target)),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ];
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 2;
+    let mut scripts = vec![round; rounds as usize];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
+
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let sink_events = Arc::new(StdMutex::new(Vec::<(String, Value)>::new()));
+    let (_space, mut loop_, _cfg) = build_policy_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(RecordingSink {
+            events: sink_events.clone(),
+        }),
+        Some(&policy_settings("ask", "ask", "ask")),
+    );
+    let pending = loop_.pending_permissions.clone();
+    // ONE rejection per scripted round, never per turn.
+    let answer = tokio::spawn(answer_permission_prompts(
+        pending,
+        "s1",
+        "reject",
+        rounds as usize,
+    ));
+    bounded_prompt(&mut loop_, "go").await;
+    answer.await.unwrap();
+
+    let prompts = permission_requests(&sink_events.lock().unwrap());
+    assert_eq!(
+        prompts.len(),
+        rounds as usize,
+        "every round really did raise a prompt (a turn that never prompted would \
+         prove nothing about denials), got {prompts:?}"
+    );
+
+    // ONE drain, both reads: `tool_ends` consumes the channel, so the frame list
+    // has to come from the same collected vector rather than a second drain.
+    let mut events = Vec::new();
+    while let Ok(ev) = events_rx.try_recv() {
+        events.push(ev);
+    }
+    let mut ends: HashMap<String, (Value, bool)> = HashMap::new();
+    for ev in &events {
+        if let RpcEvent::tool_execution_end {
+            tool_call_id,
+            result,
+            is_error,
+            ..
+        } = ev
+        {
+            ends.insert(tool_call_id.clone(), (result.clone(), *is_error));
+        }
+    }
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    let (result, is_error) = ends.get("t1").expect("a tool result").clone();
+    assert!(
+        is_error,
+        "a denial reaches the model as an error: {result:?}"
+    );
+    assert_eq!(
+        result["content"][0]["text"], "permission denied",
+        "the shape under test is the gate's own denial arm, not some other error"
+    );
+    assert!(
+        !target.exists(),
+        "the user said no, and nothing was written"
+    );
+
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "a user's DENIAL must not arm the refusal guard: three identical re-sends \
+         after a rejection ending the prompt is the false positive this pin \
+         refuses, got {kinds:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        rounds + 1,
+        "the run counter never grew, so the turn reached its terminal script entry \
+         ({rounds} denied rounds + the Stop). A turn that stopped at {} was capped \
+         by the refusal guard on a user decision, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+
+    // ── the structural half: the guard's OWN input, one call at a time ──
+    let pending = loop_.pending_permissions.clone();
+    let answer = tokio::spawn(answer_permission(pending, "s1", "reject", None));
+    let (results, refused) = tokio::time::timeout(
+        SETTLE,
+        loop_.run_tool_batch(
+            &[edit_omitting_the_required_pair(&target)],
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("the batch settles (a prompt nobody answers would hang this)");
+    answer.await.unwrap();
+    assert_eq!(
+        refused,
+        vec![false],
+        "the predicate's answer for a DENIED call that omits a required key is \
+         `false` — this is the run counter's input, and `true` here is the false \
+         positive that ends the user's prompt"
+    );
+    assert_eq!(
+        results[0]["content"][0]["text"], "permission denied",
+        "and the denial itself is unchanged — the fix excludes it from the run, \
+         it does not soften what the model reads"
     );
 }

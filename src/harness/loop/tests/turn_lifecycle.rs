@@ -2806,10 +2806,15 @@ fn refused_write_call() -> ToolCall {
 #[tokio::test]
 async fn a_run_of_identical_refused_batches_stops_the_turn_as_capped() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+    // THE YIELDING PROVIDER, not `ScriptedProvider` — and the yield is not
+    // decoration. `tokio::time::timeout` bounds a task that SUSPENDS, and with
+    // both loop guards disabled this turn is a non-yielding busy loop whose timer
+    // can never fire: measured by the reviewer with both guards at `u32::MAX`,
+    // this test exited **124 (hang)**. See `YieldingScriptedProvider`'s docblock.
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
         ProviderEvent::ToolCall(refused_write_call()),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ])]);
+    ]]);
     // The scratch guard is the FIRST tuple element (#96) — bind it, never
     // `.0`-project it away: the no-dispatch proof below reads inside it.
     let (space, mut loop_) = build_loop(
@@ -2918,7 +2923,7 @@ async fn a_run_of_identical_refused_batches_stops_the_turn_as_capped() {
 #[tokio::test]
 async fn a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
         ProviderEvent::ToolCall(ToolCall {
             id: "t1".to_string(),
             name: "bash".to_string(),
@@ -2927,7 +2932,7 @@ async fn a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped() {
             defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ])]);
+    ]]);
     let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
@@ -2969,6 +2974,206 @@ async fn a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped() {
     );
 }
 
+/// **A call that satisfies a required key through an ADVERTISED ALIAS is never a
+/// refusal run.**
+///
+/// `get_search_content` advertises `required: ["response_id"]` while its
+/// `properties` also carries `responseId` — described as `"Alias for
+/// response_id"` — and `exec_get_search_content` reads BOTH spellings
+/// (`params.get("response_id").or_else(|| params.get("responseId"))`). The alias
+/// is advertised deliberately (issue #82): `fetch_content`'s own truncation note
+/// provokes the camelCase spelling, so a call built from the tool's own sentence
+/// must not be flagged by issue #78's unknown-param checker.
+///
+/// That leaves a hole in class 2. A model that calls with `{"responseId": …}`
+/// omits the spelling `required` names, so `missing_required_param` answers
+/// `true`; when the cache has evicted the handle the tool answers
+/// `"Response not found"` with `is_error: true`; both halves of class 2 hold, and
+/// the guard counts the run — measured end to end by the reviewer at **4 provider
+/// calls and one `turn_capped`** for a normal, recoverable step. Reading a cache
+/// miss is a step, not a stuck loop.
+///
+/// This is the SAME shape as the `ls` row of
+/// `the_refusal_predicate_is_the_required_key_and_the_error_together` — a call the
+/// executor accepts even though it omits the advertised spelling — and that row
+/// is excluded only because `exec_ls` defaults `path` and SUCCEEDS. Nobody probed
+/// the variant where the alias is accepted and the call then errors. That is this
+/// test.
+///
+/// Scripted as `MAX_IDENTICAL_REFUSAL_RUNS + 2` identical rounds and then a
+/// terminal `Done(Stop)`, so the arithmetic is one-sided exactly as the denial pin
+/// below the burst test explains: if the guard counts these rounds it fires at
+/// call `MAX_IDENTICAL_REFUSAL_RUNS + 1` and never reaches the Stop.
+#[tokio::test]
+async fn a_call_using_an_advertised_alias_is_never_a_refusal_run() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    // A handle nothing ever stores, so the answer is the cache-miss arm and not
+    // whatever a sibling test left in the process-wide cache.
+    let round = vec![
+        ProviderEvent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "get_search_content".to_string(),
+            // The ADVERTISED alias, and NOT the `required` spelling.
+            arguments: json!({ "responseId": "evicted-handle-never-stored-by-this-test" }),
+            defect: None,
+        }),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ];
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 2;
+    let mut scripts = vec![round; rounds as usize];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let task = tokio::spawn(async move {
+        loop_.handle_prompt(&text_prompt("go")).await;
+        loop_
+    });
+    let mut loop_ = tokio::time::timeout(SETTLE, task)
+        .await
+        .expect("the turn TERMINATED (on its terminal script entry)")
+        .expect("the turn task did not panic");
+    let events = drain_events(&mut events_rx);
+    let kinds = capped_kinds(&events);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        rounds + 1,
+        "an alias-satisfied call is not a refusal, so the run never grew and the \
+         turn reached its terminal script entry ({rounds} rounds + the Stop). A turn \
+         that stopped at {} was capped over a cache miss the model could walk away \
+         from, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "the guard must never fire on a call whose required key is satisfied by an \
+         advertised alias the executor accepts, got {kinds:?}",
+    );
+
+    // ── the structural half, and the witness that the shape is the one claimed ──
+    let (results, refused) = loop_
+        .run_tool_batch(
+            &[ToolCall {
+                id: "a1".to_string(),
+                name: "get_search_content".to_string(),
+                arguments: json!({ "responseId": "evicted-handle-never-stored-by-this-test" }),
+                defect: None,
+            }],
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        refused,
+        vec![false],
+        "the predicate's answer for an alias-satisfied call that then errors is \
+         `false` — the executor reads this spelling, so nothing told the model to \
+         re-send the call with a different key"
+    );
+    assert_eq!(
+        results[0]["content"][0]["text"], "Response not found",
+        "the witness: the executor ACCEPTED the alias and answered with its own \
+         cache-miss error. If this reads `missing \\`response_id\\` parameter` the \
+         alias stopped being honoured and this pin is testing the wrong shape"
+    );
+
+    // And the shape that IS a refusal stays one: with NEITHER spelling there is no
+    // alias satisfying `response_id`, and the executor says so.
+    let (_, refused_without_alias) = loop_
+        .run_tool_batch(
+            &[ToolCall {
+                id: "a2".to_string(),
+                name: "get_search_content".to_string(),
+                arguments: json!({}),
+                defect: None,
+            }],
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        refused_without_alias,
+        vec![true],
+        "the alias exclusion is about the ALONE-satisfied case: a call carrying \
+         neither spelling still omits the required key"
+    );
+}
+
+/// The alias rule reads the wording `tool_specs()` ACTUALLY uses.
+///
+/// `declared_alias_of` recognises an advertised alias by its declaration — the
+/// description spelled `"Alias for <key>"`. That is the narrowest rule available
+/// (nothing in the schema MARKS a property as an alias; the pairing with the
+/// executor lives in `src/web/tools.rs`, invisible to this check), and it cuts
+/// both ways: reword one of those descriptions and the alias stops being
+/// recognised, which is the OVER-count direction — the false positive this change
+/// exists to remove, coming back silently.
+///
+/// So this walks every advertised tool and asserts that every description
+/// starting `Alias for ` names a key that (a) is in the same `properties` and
+/// (b) is recognised by the guard's own rule. A rewording reddens HERE, naming
+/// the tool and the key, instead of quietly re-arming the guard.
+///
+/// It also asserts the census is non-vacuous: at least one advertised alias exists
+/// in the tree. Were all of them removed, this test would pass on an empty
+/// iteration and the guard's alias half would be dead code with a green pin.
+#[test]
+fn the_alias_rule_reads_the_wording_tool_specs_actually_uses() {
+    let mut aliases_seen = 0usize;
+    for spec in crate::harness::tool_specs::tool_specs() {
+        let Some(properties) = spec.parameters.get("properties").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, schema) in properties {
+            let Some(description) = schema.get("description").and_then(Value::as_str) else {
+                continue;
+            };
+            if !description.starts_with("Alias for ") {
+                continue;
+            }
+            aliases_seen += 1;
+            let named = turn::declared_alias_of(schema).unwrap_or_else(|| {
+                panic!(
+                    "`{}`'s `{key}` declares `{description:?}` and the guard's rule does NOT \
+                     read it — the alias is advertised and the executor honours it, so a call \
+                     using it would be counted as a refusal. Fix the rule, do not reword the \
+                     description.",
+                    spec.name,
+                )
+            });
+            assert!(
+                properties.contains_key(named),
+                "`{}`'s `{key}` declares itself an alias of `{named}`, which is not an \
+                 advertised property of that tool — the rule requires the target to be \
+                 advertised, so this declaration satisfies nothing",
+                spec.name,
+            );
+            // The rule is one-directional (`alias -> target`), so a description
+            // must never declare an alias of ITSELF: that would make every
+            // required key trivially satisfied by its own name.
+            assert_ne!(
+                named, key,
+                "`{}`'s `{key}` declares itself an alias of itself",
+                spec.name,
+            );
+        }
+    }
+    assert!(
+        aliases_seen > 0,
+        "no advertised `Alias for` property exists in `tool_specs()` — either the \
+         aliases are gone (and the guard's alias half is dead code that should be \
+         deleted with this pin) or the wording changed and the rule no longer sees \
+         them. Either way this pin has stopped proving anything."
+    );
+}
+
 /// The false-positive half, and the reason the broadened predicate is not
 /// `is_error`: a batch whose calls FAILED BUT WERE WELL-FORMED is progress,
 /// not a stuck loop, and bounding it would end the user's prompt over a
@@ -2987,7 +3192,7 @@ async fn a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped() {
 #[tokio::test]
 async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
         ProviderEvent::ToolCall(ToolCall {
             id: "t1".to_string(),
             name: "bash".to_string(),
@@ -2996,7 +3201,7 @@ async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() 
             defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ])]);
+    ]]);
     let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
@@ -3043,7 +3248,7 @@ async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() 
 #[tokio::test]
 async fn a_mixed_batch_resets_the_identical_refusal_run() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
         // ACCEPTED: `list_agents` advertises `{}` (no `properties`), so
         // `unknown_param_error` has nothing to call extraneous and the call
         // dispatches.
@@ -3056,7 +3261,7 @@ async fn a_mixed_batch_resets_the_identical_refusal_run() {
         // REFUSED: the same trigger as the test above.
         ProviderEvent::ToolCall(refused_write_call()),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ])]);
+    ]]);
     let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
@@ -3111,7 +3316,7 @@ async fn a_mixed_batch_resets_the_identical_refusal_run() {
 #[tokio::test]
 async fn a_turn_that_hits_the_round_ceiling_settles_as_capped() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
+    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
         ProviderEvent::ToolCall(ToolCall {
             id: "a1".to_string(),
             name: "list_agents".to_string(),
@@ -3119,7 +3324,7 @@ async fn a_turn_that_hits_the_round_ceiling_settles_as_capped() {
             defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ])]);
+    ]]);
     let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
@@ -3534,10 +3739,17 @@ fn batch_signature_refuses_to_sign_a_length_mismatch() {
 }
 
 /// The discriminator itself, pinned DIRECTLY on `run_tool_batch`'s second return
-/// value rather than inferred from a turn's provider-call count. The two
-/// end-to-end tests above prove the guard fires and does not over-fire; this says
-/// WHY, one call at a time, including the one shape that is the entire
-/// justification for requiring `is_error` beside the `required` test.
+/// value rather than inferred from a turn's provider-call count. The end-to-end
+/// tests above prove the guard fires and does not over-fire; this says WHY, one
+/// call at a time, including the one shape that is the entire justification for
+/// requiring `is_error` beside the `required` test.
+///
+/// The two shapes class 3 must NOT match for a reason `is_error` cannot supply
+/// are pinned where their fixtures live, each with its own direct probe of this
+/// same return value: a permission DENIAL in
+/// `policy_gate::a_permission_denial_is_never_a_refusal_run` (the gate fixture is
+/// that file's) and an advertised-alias call in
+/// `a_call_using_an_advertised_alias_is_never_a_refusal_run`.
 ///
 /// | call | refused | why |
 /// | --- | --- | --- |

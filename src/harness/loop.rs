@@ -535,9 +535,11 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 ///    `a_run_of_identical_refused_batches_stops_the_turn_as_capped`.
 /// 2. **A parse `defect`** — the payload never became a value (issue #193), so
 ///    `unknown_param_error`'s head arm refuses it before any spec lookup.
-/// 3. **A dispatched call that omitted an advertised `required` parameter** and
-///    came back `is_error` — the executor's ``missing `command` parameter``
-///    family. Pinned by
+/// 3. **A dispatched call the EXECUTOR refused for omitting an advertised
+///    `required` parameter** — the call carries neither the `required` key nor an
+///    advertised alias of it, the result came back `is_error`, the call was not
+///    DENIED by the permission gate, and the turn was not cancelled. The
+///    executor's ``missing `command` parameter`` family. Pinned by
 ///    `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`.
 ///
 /// Class 3 is the one the shape of the field report actually needs, and it is
@@ -556,15 +558,60 @@ const MAX_MODEL_ROUNDS_PER_PROMPT: u32 = 64;
 /// **What it is NOT is "the tool returned `is_error`".** That reading was
 /// rejected when the guard was designed and it is still rejected: a `bash`
 /// command that fails twice is progress, not a stuck loop, and a false positive
-/// here ends the user's prompt. `ls` is the sharper case — it DECLARES `path` as
-/// `required` and `exec_ls` defaults it to the `cwd`, so `ls {}` SUCCEEDS; a
-/// permission DENIAL is an `is_error` result too, and it is a user decision, not
-/// a mistake to correct. Hence the `required` conjunct beside `is_error`, and
-/// hence the pins on both sides of the line
+/// here ends the user's prompt. Hence the `required` conjunct beside `is_error`,
+/// and hence the pins on both sides of the line
 /// (`a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run`).
-/// The known UNDER-count that buys: a call carrying a required key of the wrong
-/// TYPE (`bash {"command": 42}`) is not a refusal, so such a run is bounded by
-/// the round ceiling instead. Narrower than the truth is the accepted direction.
+///
+/// # Class 3's two exclusions, both load-bearing
+///
+/// `is_error` + a missing advertised `required` key is NECESSARY but not
+/// SUFFICIENT, and two real shapes satisfy both halves without being "the engine
+/// told the model to re-send this with correct arguments". Both were live false
+/// positives until this commit, and both are excluded STRUCTURALLY — no result
+/// text is matched, so rewording a sentence cannot silently disarm the guard or
+/// silently re-arm it:
+///
+/// * **A permission DENIAL** — the gate's refusal arms in `run_tool_batch` build
+///   `is_error: true` results, so an `edit` omitting `old_text`/`new_text` and
+///   DENIED by the user satisfied class 3, and three identical re-sends after a
+///   user said **no** settled the turn as `turn_capped`. A denial is a user
+///   decision, not a mistake to correct — the claim this paragraph has always
+///   made and which the code now implements. The gate's outcome is threaded to
+///   the predicate as a `denied` flag from the two arms that construct it (the
+///   `Ask`-answered-no arm and `Decision::Deny`), the same shape `codemode`'s
+///   `run_nested` uses for its row status. Pinned by
+///   `a_permission_denial_is_never_a_refusal_run`.
+/// * **A call that satisfies a `required` key through an advertised ALIAS the
+///   executor accepts** — `get_search_content` advertises
+///   `required: ["response_id"]` while `properties` also carries `responseId`,
+///   and the handler reads both spellings. A model calling with `{"responseId":
+///   …}` omits the `required` spelling; when the cache evicts the handle the tool
+///   answers `"Response not found"` and the guard fired — measured at 4 provider
+///   calls and one `turn_capped` for a normal, recoverable step. Pinned by
+///   `a_call_using_an_advertised_alias_is_never_a_refusal_run`.
+///
+/// # The known UNDER-counts (the accepted direction)
+///
+/// Narrower than the truth on purpose: a stuck run that escapes these ends on the
+/// 64-round ceiling, which is a worse turn; a false positive ends the user's
+/// prompt, which is a worse bug. Named so nobody has to rediscover them:
+///
+/// * **`ls {}`** — `path` is advertised `required` and IS absent, but `exec_ls`
+///   defaults it to the `cwd` and the call SUCCEEDS, so the `is_error` half
+///   excludes it. The case that proves `required` alone is not enough, pinned by
+///   the `ls` row of
+///   `the_refusal_predicate_is_the_required_key_and_the_error_together`.
+/// * **The alias case, once its declaration is reworded.** The advertised alias
+///   is only DESCRIBED (`"Alias for response_id"`), never marked, so the rule
+///   reads that wording; `the_alias_rule_reads_the_wording_tool_specs_actually_uses`
+///   reddens if it changes, rather than letting the false positive return green.
+/// * **A `required` key present with the wrong TYPE or an empty value**
+///   (`bash {"command": 42}`) — membership is what is tested, not validity.
+/// * **A `sudo_exec` confirm refusal.** That denial is built inside
+///   `sudo_run_flow`, which returns a plain `ToolResult` from outside this
+///   module's reach, so no `denied` flag can be threaded from the arm that knows.
+///   See the predicate's docblock for the exact (narrow) exposure and what
+///   closing it needs.
 ///
 /// Like the round ceiling, 3 is a STARTING value and is NOT a measurement of our
 /// traffic. The upstream band ("stop after 2–3 identical consecutive failures")
