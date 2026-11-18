@@ -25,6 +25,10 @@ use crate::debuglog;
 use crate::events::RpcEvent;
 use crate::harness::catalog::Model;
 use crate::harness::provider::openai::EMPTY_CONTENT_SANITISE_PLACEHOLDER;
+// The `DisplayUpsert` frame's row type — the same one `protocol.rs` names in
+// the variant (`crate::harness::store` is where `DisplayRow` lives; the wire
+// module does not re-export it).
+use crate::harness::store::DisplayRow;
 use crate::hostenv::EnvPatch;
 use crate::permission::PermissionOutcome;
 use crate::tools::ImageRef;
@@ -439,17 +443,45 @@ impl WorkerHandle {
                         if l.is_empty() {
                             continue;
                         }
-                        // The raw inbound line (the `ARCHIMEDES_DEBUG` log —
-                        // truncated to 2 KB — a streaming token stream would
-                        // otherwise be unbounded; a no-op when unset).
-                        debuglog::log_truncated("←", &l);
+                        // The inbound line in the `ARCHIMEDES_DEBUG` log (a
+                        // no-op when unset) — logged AFTER the decode,
+                        // because the summary needs the typed frame.
                         let frame = match decode_outbound(&l) {
                             Ok(f) => f,
                             Err(e) => {
+                                // The undecodable line is STILL logged
+                                // verbatim, HERE, because the log call
+                                // below is unreachable on this path (this
+                                // arm `continue`s). It used to sit above the
+                                // decode and so covered this case for free;
+                                // moving it down to serve the summary would
+                                // otherwise have lost the single most
+                                // diagnostic line in the stream — a wire the
+                                // two sides disagree about — from the log
+                                // entirely.
+                                debuglog::log_truncated("←", &l);
                                 eprintln!("worker client: bad outbound line: {e}");
                                 continue;
                             }
                         };
+                        // The log line. Every frame type is logged VERBATIM
+                        // (`log_truncated` — 2 KB cap, a no-op under it)
+                        // EXCEPT `display-upsert`, which gets the short
+                        // summary: its `rows` are a re-SERIALISATION of the
+                        // deltas already logged verbatim in this same file,
+                        // so the row content stays recoverable while the
+                        // quadratic body (75 % of a rotated log) is gone.
+                        // Taken from `&frame` — `route_outbound` below takes
+                        // `frame` BY VALUE.
+                        match &frame {
+                            Outbound::DisplayUpsert { session_id, rows } => {
+                                debuglog::log(&format!(
+                                    "← {}",
+                                    summarise_display_upsert(session_id, rows, l.len())
+                                ))
+                            }
+                            _ => debuglog::log_truncated("←", &l),
+                        }
                         // The `hello` handshake (Fulcrum T1): the protocol
                         // version lands on its own watch BEFORE routing,
                         // because `route_outbound` deliberately drops the
@@ -1053,10 +1085,259 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
     })
 }
 
+/// The summary's shape — a struct rather than a `json!` literal, for one
+/// reason that is easy to undo by accident: `serde_json`'s `Map` in this
+/// tree is a `BTreeMap` (`preserve_order` is OFF — the same fact
+/// `src/mcp/http.rs`'s determinism note records), so a `json!` object
+/// serialises in SORTED key order and would emit
+/// `{"bytes":…,"rowKeys":…,"rows":…,"sessionId":…,"type":…}` — `type`
+/// LAST, which makes the instruments' `"type":"` prefix regex miss every
+/// line. A `derive(Serialize)` struct writes its fields in DECLARATION
+/// order, so `type` is first by construction, and every key name is still
+/// serde's own (a field name + the `camelCase` rename), not a hand-typed
+/// copy in a `format!`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DisplayUpsertSummary<'a> {
+    /// The frame's own `type` tag — the SAME literal the wire uses (it is
+    /// `Outbound::DisplayUpsert`'s serde `rename`, restated here because
+    /// this is a log record, not a frame; the unit test pins it).
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    session_id: &'a str,
+    rows: usize,
+    row_keys: Vec<DisplayRowKey>,
+    bytes: usize,
+}
+
+/// One row's identity (the SQLite coalesce triple's two discriminators).
+#[derive(serde::Serialize)]
+struct DisplayRowKey {
+    kind: String,
+    message_key: String,
+}
+
+/// The short log line for a `display-upsert` frame: the frame's identity and size,
+/// never its payload. `bytes` is the PRE-truncation wire length — once the body is
+/// gone this is the only surviving record of the true frame size.
+///
+/// Why a summary at all (measured, `docs/research/`): **75.30 %** of a
+/// rotated `supervisor.log` is `display-upsert` frames — one accumulating
+/// display row re-serialised IN FULL on every streamed token (one
+/// `message_key` re-emitted 1 388× = 2 691 601 B = 51.3 % of a whole 5 MB
+/// file), and 76.5 % of those lines were already cut mid-JSON by the 2 KB
+/// cap, so they were unparseable anyway. Only the LOG pays: SQLite
+/// coalesces by `(session_id, kind, message_key)` and the renderer never
+/// sees a `StoreFrame::Display`, so this is a logging problem, not a
+/// protocol one — the wire and the DB path are untouched.
+///
+/// The body is JSON with `type` as the FIRST key, not prose: the two
+/// measurement instruments in that document regex on `"type":"` and on
+/// `"message_key":"…"`, and prose would make both silently report 0.
+/// `payload_json` and `created_at` are never read — the payload is the
+/// quadratic body this removes, and the deltas that produced it are logged
+/// verbatim in the same file, so the row content stays recoverable.
+fn summarise_display_upsert(session_id: &str, rows: &[DisplayRow], bytes: usize) -> String {
+    // `expect`: every field is a `str` / number / `Vec` of owned strings —
+    // there is no value here that a serialiser can fail on.
+    serde_json::to_string(&DisplayUpsertSummary {
+        frame_type: "display-upsert",
+        session_id,
+        rows: rows.len(),
+        row_keys: rows
+            .iter()
+            .map(|r| DisplayRowKey {
+                kind: r.kind.clone(),
+                message_key: r.message_key.clone(),
+            })
+            .collect(),
+        bytes,
+    })
+    .expect("the summary holds only strings, numbers and an array of strings")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::worker::protocol::PROTOCOL_VERSION;
+
+    // ── the `display-upsert` log summary ───────────────────────────────
+    //
+    // Why these exist: 75.30 % of a rotated `supervisor.log` is
+    // `display-upsert` frames — ONE accumulating display row re-serialised
+    // IN FULL on every streamed token (measured: one `message_key`
+    // re-emitted 1 388× = 2 691 601 B = 51.3 % of a whole 5 MB file). The
+    // log is the ONLY thing that pays (SQLite coalesces by
+    // `(session_id, kind, message_key)` and the renderer never sees a
+    // `StoreFrame::Display`), so the fix is in the log line, not the wire.
+    // The assertions below are the contract the two measurement
+    // instruments in
+    // `docs/research/supervisor-log-quadratic-display-upsert-reemission.md`
+    // regex on — `"type":"` and `"message_key":"…"` — which is why the
+    // body is JSON with `type` FIRST rather than prose (prose would make
+    // them silently report 0).
+
+    /// A display row carrying a payload that MUST NOT survive into the log.
+    fn row_with_payload(kind: &str, message_key: &str) -> DisplayRow {
+        DisplayRow {
+            kind: kind.to_string(),
+            message_key: message_key.to_string(),
+            payload_json: serde_json::json!({ "text": "SECRET-PAYLOAD-MARKER" }),
+            created_at: 1,
+        }
+    }
+
+    /// (a)+(b) `type` is the FIRST key (the instruments' regex) and every
+    /// row's `message_key` is present in the `"message_key":"…"` form.
+    #[test]
+    fn summarise_display_upsert_leads_with_type_and_names_every_row_key() {
+        let rows = vec![
+            row_with_payload("agent-text", "inc1:m1"),
+            row_with_payload("tool-call", "inc1:tc7"),
+        ];
+        let out = summarise_display_upsert("sess-9", &rows, 4096);
+        assert!(
+            out.starts_with(r#"{"type":"display-upsert""#),
+            "`type` must be the first key or the instruments' `\"type\":\"` \
+             regex misses the line:\n{out}"
+        );
+        assert!(
+            out.contains(r#""sessionId":"sess-9""#),
+            "the session id:\n{out}"
+        );
+        assert!(out.contains(r#""rows":2"#), "the row count:\n{out}");
+        for key in ["inc1:m1", "inc1:tc7"] {
+            assert!(
+                out.contains(&format!(r#""message_key":"{key}""#)),
+                "the row key {key:?} must survive in the instrument's exact \
+                 form:\n{out}"
+            );
+        }
+        // The `kind` rides beside it (the SQLite coalesce key triple).
+        assert!(out.contains(r#""kind":"agent-text""#), "\n{out}");
+        // And the whole line IS the documented shape — parseable JSON.
+        let parsed: Value = serde_json::from_str(&out).expect("the summary is valid JSON");
+        assert_eq!(parsed["type"], "display-upsert");
+        assert_eq!(parsed["rows"], 2);
+    }
+
+    /// (c) `bytes` is the PRE-truncation wire length — once the body is
+    /// gone this is the only surviving record of the true frame size.
+    #[test]
+    fn summarise_display_upsert_reports_the_wire_length_it_was_handed() {
+        let rows = vec![row_with_payload("agent-text", "inc1:m1")];
+        // A number larger than `MAX_LINE_BYTES`: the point of the field is
+        // that it survives the 2 KB cap the body used to hit.
+        let out = summarise_display_upsert("s", &rows, 2_691_601);
+        assert!(
+            out.contains(r#""bytes":2691601"#),
+            "`bytes` must be the input length verbatim:\n{out}"
+        );
+        // And it is a NUMBER, not a string (the instruments read it as one).
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["bytes"], 2_691_601);
+    }
+
+    /// (d) The payload NEVER reaches the log — that body is the 75 % of
+    /// the file this change exists to remove.
+    #[test]
+    fn summarise_display_upsert_never_carries_a_row_payload() {
+        let rows = vec![
+            row_with_payload("agent-text", "inc1:m1"),
+            row_with_payload("agent-text", "inc1:m2"),
+        ];
+        let out = summarise_display_upsert("s", &rows, 10);
+        assert!(
+            !out.contains("SECRET-PAYLOAD-MARKER"),
+            "the row payload is the quadratic body; it must not be in the log:\n{out}"
+        );
+        assert!(
+            !out.contains("payload"),
+            "no payload field at all (identity + size only):\n{out}"
+        );
+        // `created_at` is likewise never read.
+        assert!(!out.contains("created_at"), "\n{out}");
+    }
+
+    /// (e) An empty `rows` slice is still a valid, self-describing line.
+    #[test]
+    fn summarise_display_upsert_on_no_rows_is_valid_json_reporting_zero_rows() {
+        let out = summarise_display_upsert("s", &[], 312);
+        let parsed: Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("an empty summary must still parse: {e}\n{out}"));
+        assert_eq!(parsed["type"], "display-upsert");
+        assert_eq!(parsed["rows"], 0);
+        assert_eq!(parsed["bytes"], 312);
+        assert!(out.contains(r#""rows":0"#), "in the raw text too:\n{out}");
+        assert!(out.starts_with(r#"{"type":"display-upsert""#), "\n{out}");
+    }
+
+    /// (f) The regression guard for the MOVED log call.
+    ///
+    /// The log call used to sit ABOVE `decode_outbound`; moving it below is
+    /// what makes a summary possible, and the `Err` arm `continue`s — so a
+    /// line the decoder rejects would be logged NOWHERE unless the `Err`
+    /// arm logs it itself. That line is the single most diagnostic line in
+    /// the stream (a wire the two sides disagree about), so this drives one
+    /// through the REAL read loop.
+    ///
+    /// The seam is a child process: the read loop lives inside `spawn`'s
+    /// stdout task and has no in-process entry point, so the child is a
+    /// two-line shell script rather than the `fake_worker_core` fixture —
+    /// `build_command` appends `--worker` to argv and the script ignores
+    /// its argv entirely. Unix only (a shebang script is not executable on
+    /// Windows); the Windows proof of the same property is the verbatim
+    /// `_` arm plus the unit tests above.
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    // INTENTIONAL: the read task logs through
+    // the PROCESS-GLOBAL `debuglog` dir, so `env_lock` must stay held across the
+    // `.await` below — released early, a sibling global-state test's
+    // `init(false, None)` would silence this test's own line mid-flight (the
+    // `provider_switch.rs` / `policy_gate.rs` precedent for the same reason).
+    #[tokio::test]
+    async fn an_undecodable_inbound_line_is_still_logged_verbatim() {
+        // The debug log's `ENABLED`/`DIR` pair is process-global, so this
+        // test serialises with `debuglog`'s own global-state tests on the
+        // crate's shared lock (they all take it; a sibling's
+        // `init(false, None)` mid-test would silence this one).
+        let _g = crate::test_support::env_lock();
+        let dir = crate::test_support::ScratchDir::in_env_temp("client-log-test-", "log");
+        debuglog::init(true, Some(dir.to_path_buf()));
+
+        let script = dir.join("no-frame.sh");
+        // One line, on stdout, that is not JSON at all.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'NOT-A-FRAME-MARKER this is not json'\n",
+        )
+        .expect("the script is written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("the script is executable");
+        }
+
+        let handle = WorkerHandle::spawn(&script).expect("the script spawns");
+        // The read loop ends at the child's stdout EOF → `exited` (bounded,
+        // so a loop that never reaches the line fails rather than hangs).
+        let code = tokio::time::timeout(Duration::from_secs(20), handle.exited())
+            .await
+            .expect("the child exits and the read loop publishes the code");
+        assert_eq!(code, Some(0), "the script exits 0");
+
+        let text = std::fs::read_to_string(dir.join("supervisor.log"))
+            .expect("the log file exists once enabled");
+        assert!(
+            text.contains("← NOT-A-FRAME-MARKER this is not json"),
+            "an undecodable inbound line must STILL be logged verbatim (the \
+             log call moved below the decode; the `Err` arm `continue`s, so \
+             without its own log call this line is lost):\n{text}"
+        );
+
+        debuglog::init(false, None);
+    }
 
     // ── (issue #122) the store-row belt ────────────────────────────────
 
