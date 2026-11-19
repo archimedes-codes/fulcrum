@@ -25,6 +25,10 @@ use crate::debuglog;
 use crate::events::RpcEvent;
 use crate::harness::catalog::Model;
 use crate::harness::provider::openai::EMPTY_CONTENT_SANITISE_PLACEHOLDER;
+// The `DisplayUpsert` frame's row type — the same one `protocol.rs` names in
+// the variant (`crate::harness::store` is where `DisplayRow` lives; the wire
+// module does not re-export it).
+use crate::harness::store::DisplayRow;
 use crate::hostenv::EnvPatch;
 use crate::permission::PermissionOutcome;
 use crate::tools::ImageRef;
@@ -231,8 +235,16 @@ impl Clone for WorkerHandle {
 /// Drain a piped child stream line-by-line into `on_line` (a DEDICATED
 /// TASK that only ever awaits the read — never a `select!` arm, because a
 /// dropped tokio `read_line` future takes the bytes it already consumed
-/// with it). The EOF (the child's exit) ends the task, and the read errors
-/// are swallowed (a pipe that dies mid-read has nothing left to say).
+/// with it). The EOF (the child's exit) ends the task.
+///
+/// # What ends the drain, and what does not
+///
+/// A GENUINE read error ends it (a pipe that dies mid-read has nothing left
+/// to say) — as does EOF. An `InvalidData` (one line of the stream is not
+/// valid UTF-8) does NOT: that one line is dropped and the drain continues.
+/// See the arm below for why continuing cannot spin, and for why this channel
+/// takes the permissive rule where the daemon's frame reader takes the strict
+/// one.
 fn spawn_pipe_reader<R, F>(pipe: R, mut on_line: F) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -260,6 +272,40 @@ where
                         on_line(line.to_string());
                     }
                 }
+                // ONE BAD BYTE IS NOT A DEAD PIPE. `read_line` validates the
+                // bytes it read as UTF-8 AFTER reading them, and reports a
+                // failure as `InvalidData`; the bytes of the offending line
+                // were already `consume`d from the reader
+                // (`tokio-1.54.1/src/io/util/read_until.rs:69`, reached from
+                // `read_line.rs:99` BEFORE the `String::from_utf8` at
+                // `read_line.rs:100`), and on the error they are NOT handed
+                // back to the reader — `finish_string_read`'s `InvalidData`
+                // arm (`read_line.rs:77-83`) calls `put_back_original_data`
+                // (`read_line.rs:46-50`), which TRUNCATES the newly read bytes
+                // away and restores only the caller `String`'s pre-existing
+                // prefix. So the bad line has left the stream either way and
+                // the next read starts at the NEXT line — continuing cannot
+                // busy-loop.
+                //
+                // WHY THE PERMISSIVE RULE HERE, AND NOT THERE: the daemon's
+                // frame reader (`fulcrum/src/transport/frame.rs`, the
+                // `String::from_utf8(bytes) else { break }` in its reader
+                // task) deliberately ENDS the stream on a non-UTF-8 line, and
+                // says so — a socket is a PROTOCOL channel, and a byte stream
+                // that is not text is not a peer worth resyncing with. This is
+                // the opposite kind of channel: a DIAGNOSTIC one, whose only
+                // consumer is the log a supporter reads when a Worker dies. A
+                // diagnosis must not be suppressed by bytes in an UNRELATED
+                // line — one stray byte from a raw dump or a truncated
+                // multi-byte char would otherwise silence that Worker for the
+                // rest of its life, with no diagnostic of its own. Losing one
+                // undecodable line costs a line; ending the drain costs
+                // everything after it.
+                Err(ref e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+                // A DEAD PIPE HAS NOTHING LEFT TO SAY. Every other error
+                // (`BrokenPipe`, `ConnectionReset`, `UnexpectedEof`, …) is the
+                // pipe itself failing, not one line of its content — retrying
+                // a dead pipe spins on a permanent error.
                 Err(_) => break,
             }
         }
@@ -439,17 +485,72 @@ impl WorkerHandle {
                         if l.is_empty() {
                             continue;
                         }
-                        // The raw inbound line (the `ARCHIMEDES_DEBUG` log —
-                        // truncated to 2 KB — a streaming token stream would
-                        // otherwise be unbounded; a no-op when unset).
-                        debuglog::log_truncated("←", &l);
+                        // The inbound line in the `ARCHIMEDES_DEBUG` log (a
+                        // no-op when unset) — logged AFTER the decode,
+                        // because the summary needs the typed frame.
                         let frame = match decode_outbound(&l) {
                             Ok(f) => f,
                             Err(e) => {
+                                // The undecodable line is STILL logged
+                                // verbatim, HERE, because the log call
+                                // below is unreachable on this path (this
+                                // arm `continue`s). It used to sit above the
+                                // decode and so covered this case for free;
+                                // moving it down to serve the summary would
+                                // otherwise have lost the single most
+                                // diagnostic line in the stream — a wire the
+                                // two sides disagree about — from the log
+                                // entirely.
+                                debuglog::log_truncated("←", &l);
                                 eprintln!("worker client: bad outbound line: {e}");
                                 continue;
                             }
                         };
+                        // The log line. Every frame type is logged VERBATIM
+                        // (`log_truncated` — 2 KB cap, a no-op under it)
+                        // EXCEPT `display-upsert`, which gets the short
+                        // summary: its `rows` are a re-SERIALISATION of the
+                        // deltas already logged verbatim in this same file,
+                        // so the row content stays recoverable while the
+                        // quadratic body (75 % of a rotated log) is gone.
+                        //
+                        // `log` and NOT `log_truncated` — the one asymmetry in
+                        // this match, and it is deliberate. `truncate_line` cuts
+                        // BYTES, so on this line it lands mid-JSON: the `rowKeys`
+                        // array loses its closer, the line stops parsing, and
+                        // `rowKeys` is precisely what the cut removes (76.5 % of
+                        // the verbatim lines this replaced were already cut
+                        // mid-JSON and unparseable — that is the measurement that
+                        // motivated the summary). So the line is bounded by
+                        // CONSTRUCTION instead of by a cut: `rowKeys` is capped at
+                        // `MAX_SUMMARY_ROW_KEYS` entries and every listed field
+                        // (and the `sessionId`) at `MAX_SUMMARY_KEY_BYTES`, which
+                        // makes the whole line `O(1)` in rows and keeps it inside
+                        // the SAME `MAX_SUMMARY_LINE_BYTES` = 2 KB budget every
+                        // other inbound frame is cut at (vs the 2.6 MB one
+                        // verbatim frame reached). It is therefore exempt from the
+                        // truncation MECHANISM and NOT from the size bound — and
+                        // it is the only frame type whose logged line is
+                        // guaranteed to parse, since a byte cut is exactly what
+                        // made 76.5 % of the old lines unparseable. The worst case
+                        // is a `message_retracted` frame (one row per erased
+                        // thought segment); the ordinary frame is ONE row and
+                        // lands near 150 bytes. Both caps, the
+                        // `rowKeysOmitted` field that keeps a capped list from
+                        // reading as a small frame, and the ceiling itself are
+                        // asserted in
+                        // `a_large_row_set_is_capped_and_the_summary_stays_valid_json`.
+                        // Taken from `&frame` — `route_outbound` below takes
+                        // `frame` BY VALUE.
+                        match &frame {
+                            Outbound::DisplayUpsert { session_id, rows } => {
+                                debuglog::log(&format!(
+                                    "← {}",
+                                    summarise_display_upsert(session_id, rows, l.len())
+                                ))
+                            }
+                            _ => debuglog::log_truncated("←", &l),
+                        }
                         // The `hello` handshake (Fulcrum T1): the protocol
                         // version lands on its own watch BEFORE routing,
                         // because `route_outbound` deliberately drops the
@@ -1053,10 +1154,656 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
     })
 }
 
+/// The summary's shape — a struct rather than a `json!` literal, for one
+/// reason that is easy to undo by accident: `serde_json`'s `Map` in this
+/// tree is a `BTreeMap` (`preserve_order` is OFF — the same fact
+/// `src/mcp/http.rs`'s determinism note records), so a `json!` object
+/// serialises in SORTED key order and would emit
+/// `{"bytes":…,"rowKeys":…,"rows":…,"sessionId":…,"type":…}` — `type`
+/// LAST, which makes the instruments' `"type":"` prefix regex miss every
+/// line. A `derive(Serialize)` struct writes its fields in DECLARATION
+/// order, so `type` is first by construction, and every key name is still
+/// serde's own (a field name + the `camelCase` rename), not a hand-typed
+/// copy in a `format!`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DisplayUpsertSummary {
+    /// The frame's own `type` tag — the SAME literal the wire uses (it is
+    /// `Outbound::DisplayUpsert`'s serde `rename`, restated here because
+    /// this is a log record, not a frame; the unit test pins it).
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    /// Cut to [`MAX_SUMMARY_KEY_BYTES`] like the row fields — it is a wire-side
+    /// string too, and an uncut one would make the line `O(session_id)`.
+    session_id: String,
+    /// The frame's TRUE row count — never the (possibly capped) length of
+    /// `rowKeys`. `MAX_SUMMARY_ROW_KEYS` caps what is LISTED, not what is counted.
+    rows: usize,
+    row_keys: Vec<DisplayRowKey>,
+    /// How many row keys the line LEFT OUT because [`MAX_SUMMARY_ROW_KEYS`] was
+    /// reached. `None` (and so absent from the JSON — `skip_serializing_if`) for
+    /// every ordinary frame, so the shape both measurement instruments read is
+    /// unchanged in the one-row case.
+    ///
+    /// It exists so a SHORT `rowKeys` array beside a LARGE `rows` can never be
+    /// misread as "the frame had few rows": `rows` stays the frame's true count and
+    /// this states the difference, so the line is honest about its own truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row_keys_omitted: Option<usize>,
+    bytes: usize,
+}
+
+/// How many row keys a summary line LISTS before it reports the rest as a count.
+///
+/// A SIZE bound, not an aesthetic one. This line is the one inbound frame that does
+/// not go through `debuglog::log_truncated` (see [`summarise_display_upsert`] for
+/// why cutting it would be worse than leaving it alone), so the cap has to live
+/// HERE or the line is `O(rows)` — measured, 600 rows at a realistic key length is
+/// **60 082 bytes** on a file whose every other line is cut at 2 048. With this cap
+/// and [`MAX_SUMMARY_KEY_BYTES`] the line is `O(1)` in rows and stays inside the
+/// SAME 2 KB budget its siblings get, so the frame is exempt from the truncation
+/// MECHANISM and not from the size bound.
+///
+/// A frame with more rows than this is a `message_retracted` (one row per erased
+/// thought segment); the ordinary frame carries exactly ONE row, so the cap never
+/// moves in the case the two measurement instruments were written for.
+const MAX_SUMMARY_ROW_KEYS: usize = 12;
+
+/// The byte budget for each listed `kind` / `message_key` and for `sessionId`, cut
+/// at a char boundary with the same `…` marker `debuglog::truncate_line` uses (see
+/// [`cut_field`], which reserves room for the marker so the result never exceeds
+/// this).
+///
+/// Why the fields and not just the count: all three are strings that cross the
+/// process boundary, so a row cap alone leaves the line `O(longest string)` — a
+/// Worker that sent a 1 MB `message_key` would still write a 1 MB line, which is the
+/// asymmetry this closes. A PER-FIELD cut also makes the total arithmetic provable
+/// ([`MAX_SUMMARY_LINE_BYTES`]), and unlike a whole-line cut it cannot break the
+/// JSON: the quotes and the array closers all survive, so the line stays parseable —
+/// the property `log_truncated` would have destroyed. The three are ids
+/// (`{incarnation}:{id}`, a session id) and a handful of `kind` literals, so 48
+/// bytes never bites a real frame.
+const MAX_SUMMARY_KEY_BYTES: usize = 48;
+
+/// The ceiling for the whole summary line — deliberately `debuglog::MAX_LINE_BYTES`,
+/// the SAME number every other inbound frame is cut at, so this frame type is not
+/// privileged in size, only in mechanism.
+///
+/// Why not just call `log_truncated` then? Because it cuts BYTES and appends `…`, so
+/// on this line it lands mid-JSON: the `rowKeys` array loses its closer, the line
+/// stops parsing, and `rowKeys` is exactly what the cut removes — 76.5 % of the
+/// verbatim `display-upsert` lines this summary replaced were already cut mid-JSON
+/// and unparseable, which is the measurement that prompted the summary. So the line
+/// is bounded BY CONSTRUCTION and never cut: the guarantee is "≤ 2 KB **and** always
+/// parseable", where `log_truncated` can only ever give "≤ 2 KB **or** parseable".
+///
+/// The arithmetic, with each of the three strings at [`MAX_SUMMARY_KEY_BYTES`]:
+/// one entry's overhead is `{"kind":"","message_key":""}` = 28 B, so a row costs
+/// ≤ 28 + 2×48 + 1 (the `,`) = 125 B, and [`MAX_SUMMARY_ROW_KEYS`] of them cost
+/// ≤ 1 500 B. The fixed part — the `type` tag, `sessionId`, `rows`, `bytes`,
+/// `rowKeysOmitted`, the brackets and braces — is ≤ 200 B at any plausible integer
+/// width (every number is a `usize`, and even 20-digit values are counted). Under
+/// 2 048 with headroom, and the unit test
+/// `a_large_row_set_is_capped_and_the_summary_stays_valid_json` asserts the real
+/// serialisation against it at 600 rows.
+const MAX_SUMMARY_LINE_BYTES: usize = crate::debuglog::MAX_LINE_BYTES;
+
+/// One row's identity (the SQLite coalesce triple's two discriminators).
+#[derive(serde::Serialize)]
+struct DisplayRowKey {
+    kind: String,
+    message_key: String,
+}
+
+/// The short log line for a `display-upsert` frame: the frame's identity and size,
+/// never its payload. `bytes` is the PRE-truncation wire length — once the body is
+/// gone this is the only surviving record of the true frame size.
+///
+/// Why a summary at all (measured, `docs/research/`): **75.30 %** of a
+/// rotated `supervisor.log` is `display-upsert` frames — one accumulating
+/// display row re-serialised IN FULL on every streamed token (one
+/// `message_key` re-emitted 1 388× = 2 691 601 B = 51.3 % of a whole 5 MB
+/// file), and 76.5 % of those lines were already cut mid-JSON by the 2 KB
+/// cap, so they were unparseable anyway. Only the LOG pays: SQLite
+/// coalesces by `(session_id, kind, message_key)` and the renderer never
+/// sees a `StoreFrame::Display`, so this is a logging problem, not a
+/// protocol one — the wire and the DB path are untouched.
+///
+/// The body is JSON with `type` as the FIRST key, not prose: the two
+/// measurement instruments in that document regex on `"type":"` and on
+/// `"message_key":"…"`, and prose would make both silently report 0.
+/// `payload_json` and `created_at` are never read — the payload is the
+/// quadratic body this removes, and the deltas that produced it are logged
+/// verbatim in the same file, so the row content stays recoverable.
+fn summarise_display_upsert(session_id: &str, rows: &[DisplayRow], bytes: usize) -> String {
+    // The two caps, and WHY they are here rather than a `log_truncated` at the call
+    // site — the asymmetry the call-site comment refers to:
+    //
+    // The summary is `O(rows)`; every other inbound frame is `O(text)` and gets cut
+    // at `MAX_LINE_BYTES`. Cutting THIS line at 2 KB is the worse option, because
+    // `truncate_line` cuts BYTES and appends `…`: the `rowKeys` array loses its
+    // closer, the line stops parsing, and `rowKeys` — the whole point of the
+    // summary — is what the cut removes. So the line is bounded by CONSTRUCTION
+    // instead (row count × per-field bytes), it is never cut, and it always parses.
+    // The resulting ceiling is [`MAX_SUMMARY_LINE_BYTES`]; the unit test asserts a
+    // 600-row frame lands under it.
+    //
+    // `rows` stays `rows.len()` — the frame's TRUE count — and the number left out
+    // is carried in its own field, so capping what is LISTED never silently becomes
+    // "the frame had fewer rows".
+    let omitted = rows.len().saturating_sub(MAX_SUMMARY_ROW_KEYS);
+    // `expect`: every field is a `str` / number / `Vec` of owned strings —
+    // there is no value here that a serialiser can fail on.
+    let line = serde_json::to_string(&DisplayUpsertSummary {
+        frame_type: "display-upsert",
+        session_id: cut_field(session_id),
+        rows: rows.len(),
+        row_keys: rows
+            .iter()
+            .take(MAX_SUMMARY_ROW_KEYS)
+            .map(|r| DisplayRowKey {
+                kind: cut_field(&r.kind),
+                message_key: cut_field(&r.message_key),
+            })
+            .collect(),
+        row_keys_omitted: (omitted > 0).then_some(omitted),
+        bytes,
+    })
+    .expect("the summary holds only strings, numbers and an array of strings");
+    // The ceiling is an INVARIANT, not a comment: the two caps above are what the
+    // `debuglog::log` call site is exempt BECAUSE of, so if the arithmetic ever
+    // stops holding the exemption has to be revisited — and a debug build / the
+    // test suite is where that must surface, not in a 5 MB rotated log.
+    debug_assert!(
+        line.len() <= MAX_SUMMARY_LINE_BYTES,
+        "the summary is exempt from `log_truncated` only while it is bounded by \
+         construction: {} bytes, over the {MAX_SUMMARY_LINE_BYTES}-byte ceiling \
+         every other inbound frame is cut at",
+        line.len(),
+    );
+    line
+}
+
+/// Cut a wire string to [`MAX_SUMMARY_KEY_BYTES`] IN TOTAL, at a char boundary,
+/// appending the same `…` marker `debuglog::truncate_line` uses (so a cut field
+/// looks like a cut field everywhere else in this file). The marker's own 3 bytes
+/// are reserved out of the budget, so the result never exceeds the constant — that
+/// is what makes [`MAX_SUMMARY_LINE_BYTES`] arithmetic rather than optimism.
+///
+/// Only the listed identity fields and `sessionId` go through this, and they are cut
+/// BEFORE serialisation, so a cut can never split the JSON the way a whole-line cut
+/// would.
+fn cut_field(s: &str) -> String {
+    if s.len() <= MAX_SUMMARY_KEY_BYTES {
+        return s.to_string();
+    }
+    // 3 bytes is `…` in UTF-8; the budget is ≥ 4 everywhere it is used, so the
+    // subtraction below cannot underflow.
+    const MARKER: &str = "…";
+    let mut end = MAX_SUMMARY_KEY_BYTES - MARKER.len();
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut cut = s[..end].to_string();
+    cut.push_str(MARKER);
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::worker::protocol::PROTOCOL_VERSION;
+
+    // ── the `display-upsert` log summary ───────────────────────────────
+    //
+    // Why these exist: 75.30 % of a rotated `supervisor.log` is
+    // `display-upsert` frames — ONE accumulating display row re-serialised
+    // IN FULL on every streamed token (measured: one `message_key`
+    // re-emitted 1 388× = 2 691 601 B = 51.3 % of a whole 5 MB file). The
+    // log is the ONLY thing that pays (SQLite coalesces by
+    // `(session_id, kind, message_key)` and the renderer never sees a
+    // `StoreFrame::Display`), so the fix is in the log line, not the wire.
+    // The assertions below are the contract the two measurement
+    // instruments in
+    // `docs/research/supervisor-log-quadratic-display-upsert-reemission.md`
+    // regex on — `"type":"` and `"message_key":"…"` — which is why the
+    // body is JSON with `type` FIRST rather than prose (prose would make
+    // them silently report 0).
+
+    /// A display row carrying a payload that MUST NOT survive into the log.
+    fn row_with_payload(kind: &str, message_key: &str) -> DisplayRow {
+        DisplayRow {
+            kind: kind.to_string(),
+            message_key: message_key.to_string(),
+            payload_json: serde_json::json!({ "text": "SECRET-PAYLOAD-MARKER" }),
+            created_at: 1,
+        }
+    }
+
+    /// (a)+(b) `type` is the FIRST key (the instruments' regex) and every
+    /// row's `message_key` is present in the `"message_key":"…"` form.
+    #[test]
+    fn summarise_display_upsert_leads_with_type_and_names_every_row_key() {
+        let rows = vec![
+            row_with_payload("agent-text", "inc1:m1"),
+            row_with_payload("tool-call", "inc1:tc7"),
+        ];
+        let out = summarise_display_upsert("sess-9", &rows, 4096);
+        assert!(
+            out.starts_with(r#"{"type":"display-upsert""#),
+            "`type` must be the first key or the instruments' `\"type\":\"` \
+             regex misses the line:\n{out}"
+        );
+        assert!(
+            out.contains(r#""sessionId":"sess-9""#),
+            "the session id:\n{out}"
+        );
+        assert!(out.contains(r#""rows":2"#), "the row count:\n{out}");
+        for key in ["inc1:m1", "inc1:tc7"] {
+            assert!(
+                out.contains(&format!(r#""message_key":"{key}""#)),
+                "the row key {key:?} must survive in the instrument's exact \
+                 form:\n{out}"
+            );
+        }
+        // The `kind` rides beside it (the SQLite coalesce key triple).
+        assert!(out.contains(r#""kind":"agent-text""#), "\n{out}");
+        // And the whole line IS the documented shape — parseable JSON.
+        let parsed: Value = serde_json::from_str(&out).expect("the summary is valid JSON");
+        assert_eq!(parsed["type"], "display-upsert");
+        assert_eq!(parsed["rows"], 2);
+    }
+
+    /// (c) `bytes` is the PRE-truncation wire length — once the body is
+    /// gone this is the only surviving record of the true frame size.
+    #[test]
+    fn summarise_display_upsert_reports_the_wire_length_it_was_handed() {
+        let rows = vec![row_with_payload("agent-text", "inc1:m1")];
+        // A number larger than `MAX_LINE_BYTES`: the point of the field is
+        // that it survives the 2 KB cap the body used to hit.
+        let out = summarise_display_upsert("s", &rows, 2_691_601);
+        assert!(
+            out.contains(r#""bytes":2691601"#),
+            "`bytes` must be the input length verbatim:\n{out}"
+        );
+        // And it is a NUMBER, not a string (the instruments read it as one).
+        let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["bytes"], 2_691_601);
+    }
+
+    /// (d) The payload NEVER reaches the log — that body is the 75 % of
+    /// the file this change exists to remove.
+    #[test]
+    fn summarise_display_upsert_never_carries_a_row_payload() {
+        let rows = vec![
+            row_with_payload("agent-text", "inc1:m1"),
+            row_with_payload("agent-text", "inc1:m2"),
+        ];
+        let out = summarise_display_upsert("s", &rows, 10);
+        assert!(
+            !out.contains("SECRET-PAYLOAD-MARKER"),
+            "the row payload is the quadratic body; it must not be in the log:\n{out}"
+        );
+        assert!(
+            !out.contains("payload"),
+            "no payload field at all (identity + size only):\n{out}"
+        );
+        // `created_at` is likewise never read.
+        assert!(!out.contains("created_at"), "\n{out}");
+    }
+
+    /// (e) An empty `rows` slice is still a valid, self-describing line.
+    #[test]
+    fn summarise_display_upsert_on_no_rows_is_valid_json_reporting_zero_rows() {
+        let out = summarise_display_upsert("s", &[], 312);
+        let parsed: Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("an empty summary must still parse: {e}\n{out}"));
+        assert_eq!(parsed["type"], "display-upsert");
+        assert_eq!(parsed["rows"], 0);
+        assert_eq!(parsed["bytes"], 312);
+        assert!(out.contains(r#""rows":0"#), "in the raw text too:\n{out}");
+        assert!(out.starts_with(r#"{"type":"display-upsert""#), "\n{out}");
+    }
+
+    /// Arms the process-global `debuglog` at a fresh scratch dir for ONE test and
+    /// disables it again on the way out — the `DisableDiagnosticsOnExit`
+    /// (`provider/mod.rs`) / `ArmedDiagnostics` (the three provider files) shape,
+    /// applied to `debuglog`'s `ENABLED`/`DIR` pair.
+    ///
+    /// The trailing-statement shape it replaces does not survive a failure: an
+    /// assertion that panics unwinds past a final `init(false, None)`, the global
+    /// stays armed at THIS test's scratch dir, `ScratchDir::Drop` removes that dir,
+    /// and every later `debuglog` write anywhere calls `create_dir_all` on the
+    /// removed path — resurrecting a deleted directory in `$TMPDIR` and writing
+    /// into it for the rest of the run, never cleaned, while a sibling that armed
+    /// nothing reads lines it did not write. `Drop` runs on the unwind path, so the
+    /// clear happens whether the test passes or fails.
+    ///
+    /// The ORDER inside `drop` is the load-bearing part, and folding the dir into
+    /// the guard is what makes it unbreakable: the global is cleared BEFORE the
+    /// directory it names is removed. As two separate locals, reverse-drop order can
+    /// remove the dir first and reopen the exact window this closes.
+    struct ArmedDebugLog {
+        dir: crate::test_support::ScratchDir,
+    }
+    impl ArmedDebugLog {
+        fn new(prefix: &str, tag: &str) -> Self {
+            let dir = crate::test_support::ScratchDir::in_env_temp(prefix, tag);
+            debuglog::init(true, Some(dir.to_path_buf()));
+            Self { dir }
+        }
+    }
+    impl Drop for ArmedDebugLog {
+        fn drop(&mut self) {
+            debuglog::init(false, None);
+            // Dropping `self.dir` here (after the clear) removes the scratch dir.
+        }
+    }
+    impl std::ops::Deref for ArmedDebugLog {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    /// (f) THE ROW LIST IS BOUNDED — and the bound keeps the line PARSEABLE.
+    ///
+    /// Why this exists: the summary goes out through `debuglog::log`, NOT
+    /// `log_truncated`, so unlike every other inbound frame it is not cut at
+    /// `MAX_LINE_BYTES`. That is a deliberate exemption, not an oversight —
+    /// `truncate_line` cuts BYTES and appends `…`, which for this line means
+    /// mid-JSON: the array loses its closer, the whole line stops parsing, and the
+    /// `rowKeys` it exists to carry are among the first things the cut removes (and
+    /// 76.5 % of the old verbatim `display-upsert` lines were already unparseable
+    /// for exactly this reason). Truncating is therefore the WORST of the two
+    /// options.
+    ///
+    /// The exemption is only safe if the line is bounded by something else, and
+    /// the summary is `O(rows)` while every other frame is `O(text)`. A
+    /// `message_retracted` frame is the shape that makes `rows` large — one row per
+    /// erased thought segment — so the ROW LIST is what gets capped here, and the
+    /// cap is asserted rather than assumed.
+    #[test]
+    fn a_large_row_set_is_capped_and_the_summary_stays_valid_json() {
+        // Well past the cap, with keys long enough that an uncapped line would
+        // blow through `MAX_LINE_BYTES` several times over.
+        let key = |i: usize| format!("inc1:segment-{i:04}-{}", "x".repeat(40));
+        let rows: Vec<DisplayRow> = (0..600)
+            .map(|i| row_with_payload("agent-thought", &key(i)))
+            .collect();
+        let out = summarise_display_upsert("s-big", &rows, 90_000);
+
+        // 0. The budget IS the one every other inbound frame is cut at — the whole
+        //    "exempt in mechanism, not in size" argument rests on this equality.
+        assert_eq!(
+            MAX_SUMMARY_LINE_BYTES,
+            crate::debuglog::MAX_LINE_BYTES,
+            "the summary's ceiling must stay the same number `log_truncated` \
+             enforces, or the exemption becomes a privilege"
+        );
+
+        // 1. BOUNDED: the line is under the cap every other inbound frame obeys,
+        //    so the one exempt call site is exempt in MECHANISM only, not in size.
+        assert!(
+            out.len() <= MAX_SUMMARY_LINE_BYTES,
+            "the summary is the one frame that bypasses `log_truncated`, so it \
+             must be bounded by the two caps instead — got {} bytes, over the \
+             {MAX_SUMMARY_LINE_BYTES}-byte budget the sibling arm's cap gives \
+             every other inbound frame",
+            out.len()
+        );
+
+        // 2. STILL VALID JSON — the property `log_truncated` would have destroyed.
+        let parsed: Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("a capped summary must still parse: {e}"));
+
+        // 3. NO LIE: `rows` stays the frame's TRUE count. Capping what is LISTED
+        //    must not silently become "there were fewer rows" — a supporter
+        //    reading `rows` has to be able to trust it.
+        assert_eq!(parsed["rows"], 600, "`rows` is the frame's real count");
+        assert_eq!(parsed["bytes"], 90_000, "`bytes` is the true wire length");
+
+        // 4. The list is capped AND the line says so, so a reader who sees a short
+        //    `rowKeys` against a large `rows` knows it was cut and not absent.
+        let keys = parsed["rowKeys"].as_array().expect("`rowKeys` is an array");
+        assert!(
+            keys.len() < 600,
+            "the row list must be capped, got {} of 600",
+            keys.len()
+        );
+        assert_eq!(
+            keys.len(),
+            MAX_SUMMARY_ROW_KEYS,
+            "the cap is the named constant, so the number lives in one place"
+        );
+        assert_eq!(
+            parsed["rowKeysOmitted"],
+            600 - MAX_SUMMARY_ROW_KEYS as u64,
+            "the line states how many keys it left out — `rows` minus the listed \
+             count must be recoverable from the line itself"
+        );
+        // The FIRST keys survive (the frame's own order), so the row a
+        // single-row frame is grepped for is never the one dropped — and each is
+        // cut at `MAX_SUMMARY_KEY_BYTES` with the `…` marker, which is the SECOND
+        // cap doing its job (without it the line would still be `O(longest key)`).
+        assert!(
+            keys[0]["message_key"]
+                .as_str()
+                .expect("message_key is a string")
+                .starts_with("inc1:segment-0000-"),
+            "the frame's first row keeps its key:\n{out}"
+        );
+        let listed_len = keys[0]["message_key"].as_str().expect("a string").len();
+        assert!(
+            listed_len <= MAX_SUMMARY_KEY_BYTES,
+            "a listed key is cut at the per-field budget, got {listed_len}"
+        );
+        assert!(
+            keys[0]["message_key"]
+                .as_str()
+                .expect("a string")
+                .ends_with('…'),
+            "the cut is MARKED, so a supporter can tell a cut key from a short \
+             one (an unmarked cut would be a lie about the id): {}",
+            keys[0]["message_key"]
+        );
+
+        // 5. UNDER the cap nothing is capped and no omission field appears — the
+        //    ordinary one-row frame keeps the shape every existing assertion and
+        //    both measurement instruments read.
+        let small =
+            summarise_display_upsert("s-one", &[row_with_payload("agent-text", "inc1:m1")], 400);
+        let small: Value = serde_json::from_str(&small).expect("a one-row summary parses");
+        assert_eq!(small["rowKeys"].as_array().expect("rowKeys").len(), 1);
+        assert_eq!(small["rows"], 1);
+        assert!(
+            small.get("rowKeysOmitted").is_none(),
+            "an uncapped frame must not grow an omission field:\n{small}"
+        );
+    }
+
+    /// (g) The regression guard for the MOVED log call.
+    ///
+    /// The log call used to sit ABOVE `decode_outbound`; moving it below is
+    /// what makes a summary possible, and the `Err` arm `continue`s — so a
+    /// line the decoder rejects would be logged NOWHERE unless the `Err`
+    /// arm logs it itself. That line is the single most diagnostic line in
+    /// the stream (a wire the two sides disagree about), so this drives one
+    /// through the REAL read loop.
+    ///
+    /// The seam is a child process: the read loop lives inside `spawn`'s
+    /// stdout task and has no in-process entry point, so the child is a
+    /// two-line shell script rather than the `fake_worker_core` fixture —
+    /// `build_command` appends `--worker` to argv and the script ignores
+    /// its argv entirely. Unix only (a shebang script is not executable on
+    /// Windows); the Windows proof of the same property is the verbatim
+    /// `_` arm plus the unit tests above.
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    // INTENTIONAL: the read task logs through
+    // the PROCESS-GLOBAL `debuglog` dir, so `env_lock` must stay held across the
+    // `.await` below — released early, a sibling global-state test's
+    // `init(false, None)` would silence this test's own line mid-flight (the
+    // `provider_switch.rs` / `policy_gate.rs` precedent for the same reason).
+    #[tokio::test]
+    async fn an_undecodable_inbound_line_is_still_logged_verbatim() {
+        // The debug log's `ENABLED`/`DIR` pair is process-global, so this
+        // test serialises with `debuglog`'s own global-state tests on the
+        // crate's shared lock (they all take it; a sibling's
+        // `init(false, None)` mid-test would silence this one).
+        let _g = crate::test_support::env_lock();
+        // Armed through the guard, so a panicking assertion below still clears the
+        // global before the scratch dir it names is removed.
+        let dir = ArmedDebugLog::new("client-log-test-", "log");
+
+        let script = dir.join("no-frame.sh");
+        // One line, on stdout, that is not JSON at all.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'NOT-A-FRAME-MARKER this is not json'\n",
+        )
+        .expect("the script is written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("the script is executable");
+        }
+
+        let handle = WorkerHandle::spawn(&script).expect("the script spawns");
+        // The read loop ends at the child's stdout EOF → `exited` (bounded,
+        // so a loop that never reaches the line fails rather than hangs).
+        let code = tokio::time::timeout(Duration::from_secs(20), handle.exited())
+            .await
+            .expect("the child exits and the read loop publishes the code");
+        assert_eq!(code, Some(0), "the script exits 0");
+
+        let text = std::fs::read_to_string(dir.join("supervisor.log"))
+            .expect("the log file exists once enabled");
+        assert!(
+            text.contains("← NOT-A-FRAME-MARKER this is not json"),
+            "an undecodable inbound line must STILL be logged verbatim (the \
+             log call moved below the decode; the `Err` arm `continue`s, so \
+             without its own log call this line is lost):\n{text}"
+        );
+        // No trailing `debuglog::init(false, None)` — `ArmedDebugLog::Drop` clears
+        // the global, and it does so on the panic path too.
+    }
+
+    /// End-to-end, through a REAL child process: one non-UTF-8 byte on the
+    /// Worker's stderr must not stop the lines after it reaching the log —
+    /// and the prefix they reach it under must stay BYTE-EXACT.
+    ///
+    /// Why the unit test above is not enough: it drives `spawn_pipe_reader`
+    /// over a `duplex`. This drives the production wiring —
+    /// `WorkerHandle::spawn`'s stderr drain (`debuglog::log_truncated
+    /// ("worker-stderr:", &line)`) fed by a real process writing real bytes —
+    /// which is the only place the two halves of the card meet.
+    ///
+    /// # Why this is a second log-owning test in THIS binary
+    ///
+    /// `debuglog`'s `ENABLED`/`DIR` pair is process-global, so the rule this
+    /// crate inherits from the desktop's `src-tauri/tests/worker_stderr.rs:11-12`
+    /// is that one binary holds that state for one test at a time. This module
+    /// already holds one such test
+    /// (`an_undecodable_inbound_line_is_still_logged_verbatim`) and both it and
+    /// this one serialise on the crate's shared `env_lock()` — the same lock
+    /// every `debuglog` global-state test takes — so neither can have its
+    /// `init` undone mid-flight by the other. A NEW integration binary was the
+    /// alternative; it is not taken because this card's file list is
+    /// `client.rs` + `fixtures/worker.rs` and the lock already buys the
+    /// serialization a new binary would buy.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    // INTENTIONAL, and the same reason the sibling above carries it: the
+    // Worker's stderr drain logs through the PROCESS-GLOBAL `debuglog` dir, so
+    // `env_lock` must stay held across every `.await` below — released early, a
+    // sibling global-state test's `init(false, None)` would silence this test's
+    // own lines mid-flight and it would fail for a reason unrelated to the
+    // drain (`provider_switch.rs` / `policy_gate.rs` precedent).
+    async fn one_bad_byte_on_the_workers_stderr_does_not_silence_the_lines_after_it() {
+        let _g = crate::test_support::env_lock();
+        // Armed through the guard (see `ArmedDebugLog`): a failing assertion below
+        // must not leave the global aimed at a dir that `Drop` then deletes.
+        let dir = ArmedDebugLog::new("client-stderr-log-test-", "log");
+
+        let handle = spawn_fixture().expect("the fixture binary exists");
+        handle
+            .wait_ready(Duration::from_secs(15))
+            .await
+            .expect("the ready frame arrives");
+        handle
+            .send_start(&test_env("s-badbytes", Some(vec!["bash".to_string()])))
+            .expect("the start frame is queued");
+
+        // FIRST the plain `__stderr__` prompt, and the desktop's marker
+        // asserted BYTE-EXACT. The desktop's `src-tauri/tests/worker_stderr.rs:87`
+        // greps for this exact string; the prefix in `spawn`'s drain is part of
+        // that contract and this is the engine-side pin that it stays put.
+        handle
+            .send_prompt("__stderr__", &[])
+            .expect("the prompt encodes");
+        let text = await_log_line(dir.join("supervisor.log"), WORKER_STDERR_MARKER).await;
+        assert!(
+            text.contains(WORKER_STDERR_MARKER),
+            "the `worker-stderr:` prefix must stay byte-exact (the desktop's \
+             `worker_stderr.rs` marker):\n{text}"
+        );
+
+        // THEN the raw-bytes prompt: `ok\n`, an UNDECODABLE line, `after\n`.
+        handle
+            .send_prompt("__stderr_badbytes__", &[])
+            .expect("the prompt encodes");
+        let text = await_log_line(dir.join("supervisor.log"), "worker-stderr: after").await;
+
+        // The line BEFORE the bad one arrived (it is what the drain was
+        // already proven to do) — so a missing `after` below means the bad
+        // line ended the drain, not that the fixture wrote nothing.
+        assert!(
+            text.contains("worker-stderr: ok"),
+            "the line before the bad one must reach the log:\n{text}"
+        );
+        // THE CARD: the line AFTER it arrives too.
+        assert!(
+            text.contains("worker-stderr: after"),
+            "one non-UTF-8 line must not end the drain — `after` is the \
+             diagnostic that was lost, and this is the whole point of the card:\n{text}"
+        );
+
+        let _ = handle.send_close();
+        let _ = handle.kill().await;
+        // The child is killed BEFORE the guard drops (explicitly above), so the
+        // stderr drain task is done writing before `ArmedDebugLog::Drop` clears the
+        // global — the ordering the trailing `init(false, None)` used to provide by
+        // being the last statement, now provided by the guard on the panic path too.
+    }
+
+    /// The desktop's byte-exact stderr marker
+    /// (`archimedes/src-tauri/tests/worker_stderr.rs:87`). Spelled out ONCE
+    /// here so the prefix pin is a single string that cannot drift from the
+    /// `log_truncated("worker-stderr:", …)` call in [`WorkerHandle::spawn`]
+    /// without this test going red.
+    const WORKER_STDERR_MARKER: &str = "worker-stderr: fake worker: a diagnostic on stderr";
+
+    /// Poll the log until `needle` appears in it (or the bound expires — a
+    /// missing line is a failure, never a hang). The drain task writes the log
+    /// BESIDE this test's task, so it must be polled; the shape is the one
+    /// `tests/worker_log_summary.rs` uses.
+    async fn await_log_line(log: std::path::PathBuf, needle: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let text = loop {
+            let now = std::fs::read_to_string(&log).unwrap_or_default();
+            if now.contains(needle) || tokio::time::Instant::now() > deadline {
+                break now;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            text.contains(needle),
+            "`{needle}` never reached the log within 20 s:\n{text}"
+        );
+        text
+    }
 
     // ── (issue #122) the store-row belt ────────────────────────────────
 
@@ -1171,6 +1918,105 @@ mod tests {
             ],
             "every line arrived whole, in order, including the EOF tail"
         );
+    }
+
+    /// One non-UTF-8 line must NOT end the drain — the lines after it are the
+    /// diagnostics the whole function exists to deliver.
+    ///
+    /// Why this is the card's real bug: `tokio::io::AsyncBufReadExt::read_line`
+    /// returns `io::ErrorKind::InvalidData` when the bytes it read are not
+    /// valid UTF-8, and this drain used to answer EVERY error with `break`. A
+    /// Worker that wrote one stray byte (a raw protocol dump, a `println!` of
+    /// a `&[u8]`, a truncated multi-byte char) was therefore silenced for the
+    /// rest of its life, and the silencing had no diagnostic of its own.
+    ///
+    /// # Why `continue` cannot spin
+    ///
+    /// `read_line` delegates to `read_until_internal` and validates the UTF-8
+    /// ONLY AFTERWARDS (`tokio-1.54.1/src/io/util/read_line.rs:99-100`), and
+    /// `read_until_internal` calls `reader.as_mut().consume(used)`
+    /// (`read_until.rs:69`) — the delimiter-terminated bytes leave the reader
+    /// BEFORE validation runs. And on the error they are not restored
+    /// ANYWHERE they could be re-read: `finish_string_read`'s `InvalidData`
+    /// arm (`read_line.rs:77-83`) truncates them off the caller's buffer
+    /// (`read_line.rs:46-50`). So the bad line's bytes are gone from the
+    /// stream either way and the next `read_line` starts at the NEXT line: no
+    /// busy loop.
+    ///
+    /// This test is that proof, empirically: the drain must reach EOF and END.
+    /// A spinning `continue` never reaches EOF, so the `timeout` below — which
+    /// bounds the whole task, not one read — is the no-spin assertion.
+    #[tokio::test]
+    async fn a_non_utf8_line_does_not_end_the_drain_the_lines_after_it_still_arrive() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let got: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let drain = spawn_pipe_reader(rx, move |l| g.lock().unwrap().push(l));
+
+        // One whole BAD line between two good ones. The bad bytes must form a
+        // COMPLETE line (`\n`-terminated) before EOF: `read_until_internal`
+        // only returns once it has seen the delimiter, so an unterminated run
+        // of bad bytes at EOF is a different path (the `Ok(0)` tail arm).
+        tx.write_all(b"good\n\xff\xfe bad\nafter\n").await.unwrap();
+        drop(tx); // EOF.
+
+        // The task ends at EOF — i.e. the bad line did NOT trap it.
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect(
+                "the drain task ends at EOF (a `continue` that re-reads the \
+                 same consumed bytes would spin here forever)",
+            )
+            .expect("the drain task does not panic");
+        assert_eq!(
+            &*got.lock().unwrap(),
+            &["good".to_string(), "after".to_string()],
+            "the undecodable line is dropped, and every line after it still \
+             reaches the sink — `after` is the diagnostic this card is about"
+        );
+    }
+
+    /// A pipe whose first read fails with a GENUINE I/O error ends the drain.
+    ///
+    /// The counterweight to the test above, and the reason the `Err(_) =>
+    /// break` arm must stay: `InvalidData` is tolerated because it is a
+    /// CONTENT problem in one line, every other error is the PIPE itself
+    /// (`BrokenPipe`, `ConnectionReset`, `UnexpectedEof`) and a dead pipe has
+    /// nothing left to say. Were that arm widened to `continue`, this test
+    /// hangs — the `timeout` is the assertion, and it is the same shape the
+    /// sibling test uses so both arms are proven by the same instrument.
+    #[tokio::test]
+    async fn a_genuine_io_error_ends_the_drain() {
+        let got: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        let drain = spawn_pipe_reader(FailingPipe(std::io::ErrorKind::ConnectionReset), move |l| {
+            g.lock().unwrap().push(l)
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("a real I/O error ends the drain (it must not retry)")
+            .expect("the drain task does not panic");
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "a pipe that errors has delivered nothing"
+        );
+    }
+
+    /// A pipe whose every read fails with the given error kind — the input for
+    /// [`a_genuine_io_error_ends_the_drain`]. A `duplex` whose writer was
+    /// dropped gives a clean EOF, not an error, so the `break` arm has no
+    /// other reachable input in-process.
+    struct FailingPipe(std::io::ErrorKind);
+
+    impl tokio::io::AsyncRead for FailingPipe {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(self.0)))
+        }
     }
 
     /// The `fake_worker` fixture — resolved through the crate's ONE

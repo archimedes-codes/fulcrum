@@ -15,7 +15,10 @@ use futures_util::{Stream, StreamExt};
 use serde_json::json;
 use serde_json::Value;
 
-use super::openai::{parse_arguments, LineAssembler};
+use super::openai::{
+    emit_harness_line, parse_arguments, tool_call_dropped_with_no_name,
+    tool_calls_dropped_at_stream_error, LineAssembler,
+};
 use super::transport::{build_client, litellm_headers, map_response};
 use super::types::{
     cost_usd_from_usage, parse_error_chunk, ChatRole, FinishReason, MessageContent, ModelRequest,
@@ -209,14 +212,18 @@ impl ResponsesStream {
                 // `diagnostics::record` (the asymmetry `provider/mod.rs`'s
                 // "Why two sinks" documents in full): the Worker's stderr is
                 // drained by a task in `worker/client.rs` into
-                // `debuglog::log_truncated`, which makes this line the only
-                // Worker-side sink that survives at all — and that sink is
-                // itself gated behind `ARCHIMEDES_DEBUG`, so in a DEFAULT
-                // launch the Worker drops it. That is accepted. `diagnostics`
-                // is the always-on channel and is NOT used here: its rule is
-                // reviewed call sites at low volume, and one line per dropped
-                // item on a stream is not always-on-worthy volume for a shape
-                // that has never been observed on a real wire.
+                // `debuglog::log_truncated`, and that sink is gated behind
+                // `ARCHIMEDES_DEBUG`, so an unarmed Worker drops this line unless
+                // the var is set. That is accepted. `diagnostics` is the always-on
+                // channel and is STILL not used here, and the reason is unchanged
+                // by the Worker now being armed from the `start` envelope
+                // (`StartEnv::diagnostics_dir`): its rule is reviewed call sites at
+                // LOW VOLUME, and one line per dropped item on a stream is not
+                // always-on-worthy volume for a shape that has never been observed
+                // on a real wire. Arming the Worker is what makes that judgement
+                // load-bearing rather than theoretical — a `record` here would now
+                // really reach the file — so the choice to keep this line off the
+                // channel is a decision, not an oversight.
                 if self.terminated {
                     eprintln!(
                         "harness: responses post-terminal item dropped: \
@@ -403,6 +410,28 @@ impl ResponsesStream {
                             arguments,
                             defect,
                         }));
+                    } else {
+                        // … and it now SAYS so. The comment above has always
+                        // known a `function_call` item with no `name` cannot be
+                        // dispatched; the arm just skipped it in silence, which
+                        // is the exact shape this change exists to close.
+                        //
+                        // The PARSE site is not redundant with the flush-time
+                        // line. They name two different facts a supporter has to
+                        // be able to tell apart: here the PROVIDER sent a
+                        // COMPLETED item with no `name` in it (a proxy that
+                        // stripped it, a gateway's schema mismatch), where the
+                        // flush line says the acc never had one at all. `stage=`
+                        // is what separates them — and a healthy turn's done item
+                        // takes the `name`-present branch above, so this `else`
+                        // never fires on one.
+                        emit_harness_line(&tool_call_dropped_with_no_name(
+                            "responses",
+                            "output-item-done",
+                            index,
+                            id.as_deref(),
+                            &acc.arguments,
+                        ));
                     }
                 }
                 // `message` / `reasoning` items: nothing (their content
@@ -679,11 +708,27 @@ impl ResponsesStream {
     /// `emit_terminal_usage`, so an `error`-then-`completed` stream emits
     /// its `Done` BEFORE its `Usage`.
     fn flush_tool_calls(&mut self) {
-        for (_index, acc) in std::mem::take(&mut self.tool_acc).into_iter() {
+        for (index, acc) in std::mem::take(&mut self.tool_acc).into_iter() {
+            // Deliberate DE-DUPLICATION, not a loss: the `output_item.done` arm
+            // already emitted this acc's `ToolCall`. Left silent on purpose —
+            // this branch fires on EVERY healthy tool call on this wire, and the
+            // `a_healthy_tool_call_turn_records_no_drop_line` test reddens if it
+            // is ever instrumented.
             if acc.done {
                 continue;
             }
+            // The drop is LOUD. It was a bare `continue` — the silent-discard
+            // shape this whole change exists to close: the model made a call, its
+            // `arguments` fragments streamed, and the turn settled as a success
+            // having dispatched nothing, with no line anywhere.
             let Some(name) = acc.name else {
+                emit_harness_line(&tool_call_dropped_with_no_name(
+                    "responses",
+                    "flush",
+                    index,
+                    acc.id.as_deref(),
+                    &acc.arguments,
+                ));
                 continue;
             };
             // (issue #193) The defect rides the call — see `parse_arguments`.
@@ -718,6 +763,43 @@ impl Stream for ResponsesStream {
                 Poll::Ready(Some(Err(e))) => {
                     // A mid-stream transport failure is retryable (the
                     // `AgentLoop`'s `RetryPolicy` re-issues `complete()`).
+                    //
+                    // THE FLUSH-SKIP, reported at the latch — and on this wire
+                    // this is the ONLY site of its class. The four TERMINAL arms
+                    // (`response.completed` / `incomplete` / `failed` and the
+                    // in-stream `error`) each call `flush_tool_calls()` in-arm,
+                    // BEFORE setting `terminated`, precisely because the stream-end
+                    // flush is unreachable once they have; a line at one of them
+                    // would be a provable no-op AND would tell a supporter a call
+                    // was lost when the call was delivered. A transport failure is
+                    // different: `exhausted` here makes `poll_next`'s early
+                    // `if this.exhausted` return `Ready(None)`, the `Ready(None)`
+                    // block is never reached, `terminated` is still false, and the
+                    // flush with it.
+                    //
+                    // The gate counts UNDELIVERED accs only — `!acc.done`, the
+                    // same rule `flush_tool_calls` skips on. On THIS wire a `done`
+                    // acc is NOT an in-flight call: the `output_item.done` arm sets
+                    // `acc.done = true` and pushes its `ProviderEvent::ToolCall`
+                    // AT PARSE TIME, and nothing removes the acc from the map (only
+                    // the flush's `mem::take` does, and it deliberately skips `done`
+                    // accs for that very reason — the de-duplication). So an `added`
+                    // → `done` → transport-error stream arrives here with a `done`
+                    // acc in the map whose call the `AgentLoop` already holds and
+                    // WILL dispatch. Counting it would print "a call the model had
+                    // already streamed was lost" about a call that was delivered —
+                    // the exact lie the terminal arms' docblock refuses to tell.
+                    let in_flight = this.tool_acc.values().filter(|acc| !acc.done).count();
+                    if in_flight > 0 {
+                        emit_harness_line(&tool_calls_dropped_at_stream_error(
+                            "responses",
+                            "transport-error",
+                            in_flight,
+                            this.tool_acc
+                                .values()
+                                .any(|acc| !acc.done && acc.name.is_some()),
+                        ));
+                    }
                     this.exhausted = true;
                     this.pending
                         .push_back(ProviderEvent::Error(ProviderError::Retryable(format!(
@@ -1159,6 +1241,620 @@ mod tests {
                 ),
                 ProviderEvent::Done(FinishReason::Stop),
             ]
+        );
+    }
+
+    /// The same, with a TRANSPORT failure as the LAST item of the raw stream —
+    /// the shape `poll_next`'s `Poll::Ready(Some(Err(e)))` arm sees (a
+    /// `read_timeout` on a stalled provider, a reset connection). The helper
+    /// above cannot express it: it maps every chunk to `Ok`.
+    fn responses_stream_failing(chunks: &[&str]) -> ResponsesStream {
+        let mut data: Vec<Result<Vec<u8>, reqwest::Error>> =
+            chunks.iter().map(|c| Ok(c.as_bytes().to_vec())).collect();
+        data.push(Err(transport_error()));
+        let raw: BoxStream<'static, Result<Vec<u8>, reqwest::Error>> =
+            futures_util::stream::iter(data).boxed();
+        ResponsesStream::new(raw)
+    }
+
+    /// A real `reqwest::Error`, built the only way a test can without a socket:
+    /// `http://` has an empty host, so `RequestBuilder::build` answers `Err` with
+    /// a `Builder`-kind error. All the arm under test does with the value is
+    /// format `{e}` into its own `Retryable`, so the KIND is irrelevant — what the
+    /// fixture needs is an `Err` item AFTER a chunk was consumed.
+    fn transport_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("http://")
+            .build()
+            .expect_err("`http://` has no host, so the request cannot be built")
+    }
+
+    // ── (supervisor-log diagnostics) the tool call the parser discarded ─────
+    //
+    // Three DISCARD paths on this wire were silent: the nameless acc the flush
+    // drops, the nameless `output_item.done` the PARSE site skips, and the call
+    // in flight when the TRANSPORT error makes the stream-end flush unreachable.
+    // (The four TERMINAL arms are not among them — each already calls
+    // `flush_tool_calls` in-arm before setting `terminated`, so nothing is lost
+    // there and a line at one would report a loss that did not happen.)
+    //
+    // Asserted on the `diagnostics::record` half. The `eprintln!` half is not
+    // assertable from a lib unit test — `provider/mod.rs`'s
+    // `the_chosen_wire_is_logged_at_construction` limit, restated: its only
+    // production reader is the Worker-stderr drain task, which needs a spawned
+    // Worker. It is covered here by carrying the SAME payload.
+
+    /// The stems of EVERY line this work adds, on ANY of the three wires. The
+    /// healthy-turn test asserts none appears, so its empty assertion guards
+    /// against instrumenting a site that fires on a GOOD turn — and it
+    /// specifically covers `if acc.done { continue; }`, the deliberate
+    /// de-duplication this change must NOT instrument (it fires on every healthy
+    /// tool call on this wire).
+    const DISCARD_STEMS: [&str; 2] = [
+        "tool call dropped with no name",
+        "tool calls dropped at a stream error",
+    ];
+
+    /// The recorded lines carrying one of those stems — the assertion surface.
+    /// Filtered by stem rather than counted whole, because `diagnostics` is
+    /// process-global: a sibling test that reaches `record` without the env lock
+    /// can append its own line here (the `provider wire=` construction line,
+    /// e.g.), and it must neither satisfy nor spoil these.
+    fn discard_lines(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| DISCARD_STEMS.iter().any(|stem| l.contains(stem)))
+            .cloned()
+            .collect()
+    }
+
+    /// How many of `lines` END with `want` — `record` prefixes `<epoch-millis> `,
+    /// so the match is a suffix match (as `settle_diagnostics.rs` and
+    /// `provider/mod.rs` both do it).
+    fn ending_with(lines: &[String], want: &str) -> usize {
+        lines.iter().filter(|l| l.ends_with(want)).count()
+    }
+
+    /// Arms the process-global diagnostics channel at a fresh scratch dir for ONE
+    /// test and disables it again on the way out — the
+    /// `loop/tests/settle_diagnostics.rs` pair, folded into ONE guard. The fold is
+    /// the point: as two locals the dir can drop BEFORE the global is cleared, and
+    /// the next `record` anywhere then `create_dir_all`s the removed dir back into
+    /// existence and writes into it for the rest of the run.
+    struct ArmedDiagnostics {
+        dir: crate::test_support::ScratchDir,
+    }
+    impl Drop for ArmedDiagnostics {
+        fn drop(&mut self) {
+            crate::diagnostics::init(None);
+        }
+    }
+
+    /// Arm the channel. Every caller holds `test_support::env_lock()` across the
+    /// call AND its assertions — the contract `diagnostics` states for its
+    /// process-global target. The lock is taken ONCE per test: `env_lock` is
+    /// non-reentrant and a second call inside one test self-deadlocks.
+    fn arm_diagnostics(tag: &str) -> ArmedDiagnostics {
+        let dir = crate::test_support::ScratchDir::in_env_temp("responses-discard-diag-", tag);
+        crate::diagnostics::init(Some(dir.to_path_buf()));
+        ArmedDiagnostics { dir }
+    }
+
+    /// The armed file's lines. A missing file means nothing was recorded, which is
+    /// a legitimate answer for the negative tests (`record` creates the file on its
+    /// first write).
+    fn recorded_lines(dir: &std::path::Path) -> Vec<String> {
+        let path = dir.join(crate::diagnostics::FILE_NAME);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => text.lines().map(str::to_string).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("the scratch diagnostics file is readable: {e}"),
+        }
+    }
+
+    /// Truncate the armed file so each assertion is proven by ITS OWN line (the
+    /// `provider/mod.rs::reset_diagnostics_file` precedent).
+    fn reset_diagnostics_file(dir: &std::path::Path) {
+        let path = dir.join(crate::diagnostics::FILE_NAME);
+        match std::fs::write(&path, "") {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("the scratch diagnostics file can be truncated: {e}"),
+        }
+    }
+
+    /// One `response.output_item.added` event for a `function_call` item. Built
+    /// with `json!` rather than the hand-escaped literals the neighbouring fixtures
+    /// use, for ONE reason: the expected lines name `args_bytes`, and an escaped
+    /// literal makes that number a claim about my escaping rather than the data.
+    fn output_item_added(index: u32, id: Option<&str>, name: Option<&str>) -> String {
+        let mut item = serde_json::Map::new();
+        item.insert("type".to_string(), json!("function_call"));
+        if let Some(id) = id {
+            item.insert("id".to_string(), json!(id));
+        }
+        if let Some(name) = name {
+            item.insert("name".to_string(), json!(name));
+        }
+        item.insert("arguments".to_string(), json!(""));
+        item.insert("status".to_string(), json!("in_progress"));
+        format!(
+            "event: response.output_item.added\n\
+             data: {}\n\n\
+             ",
+            json!({ "type": "response.output_item.added", "output_index": index,
+                    "item": Value::Object(item) })
+        )
+    }
+
+    /// One `response.output_item.done` event (the authoritative complete item).
+    fn output_item_done(index: u32, id: Option<&str>, name: Option<&str>, args: &str) -> String {
+        let mut item = serde_json::Map::new();
+        item.insert("type".to_string(), json!("function_call"));
+        if let Some(id) = id {
+            item.insert("id".to_string(), json!(id));
+        }
+        if let Some(name) = name {
+            item.insert("name".to_string(), json!(name));
+        }
+        item.insert("arguments".to_string(), json!(args));
+        item.insert("status".to_string(), json!("completed"));
+        format!(
+            "event: response.output_item.done\n\
+             data: {}\n\n\
+             ",
+            json!({ "type": "response.output_item.done", "output_index": index,
+                    "item": Value::Object(item) })
+        )
+    }
+
+    /// One `response.function_call_arguments.delta` event (an argument fragment).
+    fn arguments_delta(index: u32, fragment: &str) -> String {
+        format!(
+            "event: response.function_call_arguments.delta\n\
+             data: {}\n\n\
+             ",
+            json!({ "type": "response.function_call_arguments.delta",
+                    "output_index": index, "delta": fragment })
+        )
+    }
+
+    /// The argument text the fixtures stream. Its BYTE length is what the expected
+    /// lines name.
+    const ARG_TEXT: &str = "{\"path\":\"/x\"}";
+
+    /// The EXACT payload for a nameless acc dropped at the FLUSH — spelled out in
+    /// full, deliberately NOT re-derived from the message helper. A test that
+    /// called the helper to build its own expectation would pass whatever the
+    /// helper chose to say; a literal reddens when the sentence changes.
+    const WANT_FLUSH_NAMELESS: &str = "tool call dropped with no name: parser=responses \
+         stage=flush index=2 id=\"fc_7\" args_bytes=13 — a call with no name cannot \
+         be dispatched, so the model's call is lost and the turn settles without it";
+
+    /// The EXACT payload for the nameless `output_item.done` the PARSE site
+    /// skips. A different fact from the one above (the provider sent a COMPLETED
+    /// item with no name in it) and a different `stage`, so a reader can tell
+    /// which of the two the wire did.
+    const WANT_DONE_NAMELESS: &str = "tool call dropped with no name: \
+         parser=responses stage=output-item-done index=2 id=\"fc_7\" args_bytes=13 \
+         — a call with no name cannot be dispatched, so the model's call is lost \
+         and the turn settles without it";
+
+    /// The EXACT payload for the call in flight at the TRANSPORT error. The four
+    /// terminal arms already flush in-arm, so this is the only latch on this wire.
+    const WANT_LATCH_TRANSPORT: &str = "tool calls dropped at a stream error: \
+         parser=responses stage=transport-error in_flight=1 named_any=true — the \
+         stream-end flush is unreachable once the stream is exhausted, so a call \
+         the model had already streamed was lost";
+
+    /// A nameless acc dropped at the flush: `output_item.added` with no `name`,
+    /// the argument fragments, then the `response.completed` terminal — whose
+    /// in-arm flush is where the acc dies. NO `output_item.done` in this fixture,
+    /// so the line below is proven to come from the FLUSH and not from the parse
+    /// site.
+    ///
+    /// The "no `ToolCall`" half is a PIN of pre-existing behaviour (a nameless
+    /// call could never be dispatched) and its witness is the two deltas.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_nameless_function_call_is_dropped_at_the_flush_and_recorded() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("flush-nameless");
+        reset_diagnostics_file(armed.dir.path());
+
+        assert_eq!(ARG_TEXT.len(), 13, "the number the expected line quotes");
+        let events = collect(responses_stream(&[
+            &output_item_added(2, Some("fc_7"), None),
+            &arguments_delta(2, "{\"pa"),
+            &arguments_delta(2, "th\":\"/x\"}"),
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"\
+             completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        ]))
+        .await;
+
+        let deltas = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::ToolCallDelta(_)))
+            .count();
+        assert_eq!(
+            deltas, 3,
+            "the `added` delta and both argument fragments reached the acc (the \
+             drop is downstream of them), got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "a call with no name cannot be dispatched, so it is dropped (and \
+             always was), got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&lines, WANT_FLUSH_NAMELESS),
+            1,
+            "the flush records the discard EXACTLY ONCE, with no `harness: ` \
+             prefix (the `log_wire` convention) and naming the parser, the stage, \
+             the index, the id and the argument-buffer length; want a line ending \
+             with {WANT_FLUSH_NAMELESS:?}, got:\n{lines:#?}"
+        );
+        assert_eq!(
+            ending_with(&lines, WANT_DONE_NAMELESS),
+            0,
+            "no `output_item.done` arrived, so the PARSE-site line must not fire \
+             here — the two sites name different facts; got:\n{lines:#?}"
+        );
+    }
+
+    /// THE site the flush-time line alone cannot cover: a
+    /// `response.output_item.done` whose `item` carries no `name` (and whose acc
+    /// has none either, so the `or_else` fallback finds nothing). The arm's own
+    /// comment already says such a call "cannot be dispatched — skip the item
+    /// entirely"; the `if let Some(name) = name` had no `else`, so it never said
+    /// so out loud.
+    ///
+    /// The parse-time line fires HERE, and the flush-time line also fires later
+    /// (the acc is left not-`done` on purpose, so the stream-end flush still sees
+    /// it — that is what keeps the synthetic `Done(Error)`). TWO lines, for two
+    /// distinct facts, distinguishable by `stage=`; both are asserted so neither
+    /// can silently disappear.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_nameless_output_item_done_is_recorded_at_parse_time() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("done-nameless");
+        reset_diagnostics_file(armed.dir.path());
+
+        let events = collect(responses_stream(&[
+            &output_item_added(2, Some("fc_7"), None),
+            // The done item is AUTHORITATIVE for `arguments`: it supplies the full
+            // 13-byte text the acc then holds, so `args_bytes` is 13 whatever the
+            // `added` item seeded.
+            &output_item_done(2, Some("fc_7"), None, ARG_TEXT),
+        ]))
+        .await;
+
+        // The witness: the item was PARSED (its `arguments` overwrote the acc —
+        // proven by the flush line's `args_bytes=13` with no `arguments.delta` in
+        // the fixture at all) and it dispatched nothing.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "a done item with no name dispatches nothing, got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&lines, WANT_DONE_NAMELESS),
+            1,
+            "the PARSE site records the skip EXACTLY ONCE — the flush-time line \
+             alone would not say the provider sent a COMPLETED item with no name \
+             in it; want a line ending with {WANT_DONE_NAMELESS:?}, got:\n\
+             {lines:#?}"
+        );
+        assert_eq!(
+            ending_with(&lines, WANT_FLUSH_NAMELESS),
+            1,
+            "the acc is left not-`done` on purpose, so the stream-end flush sees \
+             it too and records its own line — asserted so a future change that \
+             quiets one site cannot silently drop both; got:\n{lines:#?}"
+        );
+    }
+
+    /// The transport-error arm — the ONLY latch on this wire. The four terminal
+    /// arms (`response.completed` / `incomplete` / `failed` / the in-stream
+    /// `error`) each call `flush_tool_calls()` in-arm before setting
+    /// `terminated`, so nothing is lost at one and a line there would report a
+    /// loss that did not happen. A TRANSPORT failure is different: `poll_next`'s
+    /// `Err` arm sets `exhausted`, the early `if this.exhausted` returns
+    /// `Ready(None)`, and the stream-end flush is never reached.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_transport_failure_with_a_call_in_flight_records_the_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("transport-error");
+        reset_diagnostics_file(armed.dir.path());
+
+        let events = collect(responses_stream_failing(&[
+            &output_item_added(2, Some("fc_7"), Some("write")),
+            &arguments_delta(2, ARG_TEXT),
+        ]))
+        .await;
+
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(m)) if m.contains("stream error")
+            ),
+            "the fixture ends on the transport error, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "the transport arm does not flush — the call is lost, got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&lines, WANT_LATCH_TRANSPORT),
+            1,
+            "the transport latch reports the call it is about to lose, naming the \
+             count; want a line ending with {WANT_LATCH_TRANSPORT:?}, got:\n\
+             {lines:#?}"
+        );
+    }
+
+    /// THE GUARD'S OTHER HALF — and the one that matters on THIS wire alone.
+    ///
+    /// `responses.rs` is the only wire that leaves a DELIVERED acc sitting in
+    /// `tool_acc`: the `output_item.done` arm sets `acc.done = true` AND emits
+    /// the `ProviderEvent::ToolCall` immediately, and never removes the acc. The
+    /// only thing that empties the map is `flush_tool_calls`'s `mem::take`, and
+    /// that SKIPS `done` accs by design (the de-duplication). So
+    /// `added` → `done` → transport error reaches the latch with one acc in the
+    /// map whose call was ALREADY pushed onto the event stream —
+    /// `AgentLoop::consume_stream` has it in `acc.tool_calls` and the turn
+    /// dispatches it.
+    ///
+    /// A bare `!tool_acc.is_empty()` therefore writes "a call the model had
+    /// already streamed was lost" about a call that was DELIVERED, into an
+    /// always-on file. It contradicts this arm's own docblock, which says a line
+    /// at a terminal arm "would tell a supporter a call was lost when the call
+    /// was delivered" — a delivered acc is that same lie by another route. The
+    /// gate is therefore `!acc.done`, `flush_tool_calls`'s own rule.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_transport_failure_after_a_delivered_tool_call_records_no_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("transport-delivered");
+        reset_diagnostics_file(armed.dir.path());
+
+        // `added` → the authoritative `done` (which DELIVERS the call) → the
+        // transport error, with NO terminal event — the exact sequence that
+        // leaves a `done` acc in the map at the latch.
+        let events = collect(responses_stream_failing(&[
+            &output_item_added(2, Some("fc_7"), Some("write")),
+            &output_item_done(2, Some("fc_7"), Some("write"), ARG_TEXT),
+        ]))
+        .await;
+
+        // THE WITNESS: the `ToolCall` was emitted — the path really was walked
+        // and the acc really is `done`, so the empty assertion below measures the
+        // GUARD and not a dead sink (the positive control the healthy-turn test
+        // has to stage by hand, this test gets for free from the wire itself).
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolCall(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "`output_item.done` DELIVERED the call — nothing was lost, so nothing \
+             may be reported as lost; got {events:?}",
+        );
+        assert_eq!(
+            calls[0].name, "write",
+            "the delivered call is the one the fixture streamed"
+        );
+
+        // And the failure is a REAL transport failure — the latch WAS reached.
+        // Without this, the empty assertion could be measuring a fixture that
+        // never got to the arm.
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(m)) if m.contains("stream error")
+            ),
+            "the fixture ends on the transport error, i.e. the latch arm ran; \
+             got {events:?}",
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "the call was DELIVERED at parse time — reporting it as dropped at \
+             the transport error is a lie in an always-on file; the gate must \
+             exclude `done` accs exactly as `flush_tool_calls` does; got:\n\
+             {lines:#?}"
+        );
+    }
+
+    /// THE GUARD ITSELF, on the latch: a transport failure with NO call in flight
+    /// records nothing. This is the assertion that makes
+    /// `!this.tool_acc.is_empty()` load-bearing rather than decorative — a
+    /// transport failure is an ORDINARY failure the loop retries, and every one of
+    /// them would otherwise write a "tool calls dropped" sentence into the
+    /// always-on file for a turn that had no call to lose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_transport_failure_with_nothing_in_flight_records_no_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("transport-empty-acc");
+        reset_diagnostics_file(armed.dir.path());
+
+        // Text only, then the transport failure — no `function_call` item, so the
+        // acc map is NEVER touched and `tool_acc.len()` is 0 at the latch.
+        let events = collect(responses_stream_failing(&[
+            "event: response.output_text.delta\n\
+             data: {\"type\":\"response.output_text.delta\",\"delta\":\"thinking\"}\n\n",
+        ]))
+        .await;
+
+        // The witness: the failure really did land (the latch WAS reached) and no
+        // tool-call fragment ever arrived — so the empty assertion below measures
+        // the gate and not a path that never ran.
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(_))
+            ),
+            "the fixture reached the transport latch, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCallDelta(_))),
+            "no tool-call fragment arrived, so `tool_acc` is empty at the latch, \
+             got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "a transport failure with NO call in flight lost nothing, so the gate \
+             must hold it shut; got:\n{lines:#?}"
+        );
+    }
+
+    /// The guard, on the wire that needs it most: a healthy tool call on this
+    /// parser walks FOUR sites that must stay silent — the `done` de-duplication
+    /// in `flush_tool_calls` (`if acc.done { continue; }`, which fires on every
+    /// healthy call here), the `output_item.done` arm's `name`-present branch,
+    /// and both placeholder-free text arms. The assertion is over BOTH stems, so
+    /// instrumenting any of them reddens this.
+    ///
+    /// WELL-FORMED arguments: `parse_arguments`'s `harness: malformed tool-call
+    /// arguments` line predates this task and would redden the assertion for an
+    /// unrelated reason.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_healthy_tool_call_turn_records_no_drop_line() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("healthy");
+        reset_diagnostics_file(armed.dir.path());
+
+        // The FULL healthy lifecycle, terminal included: `added` → fragments →
+        // the authoritative `done` → `response.completed`. The `done` marks the
+        // acc `done`, so the terminal's in-arm flush walks the
+        // `if acc.done { continue; }` de-duplication — the site this change must
+        // NOT instrument.
+        let events = collect(responses_stream(&[
+            &output_item_added(2, Some("fc_7"), Some("read")),
+            &arguments_delta(2, "{\"pa"),
+            &arguments_delta(2, "th\":\"/x\"}"),
+            &output_item_done(2, Some("fc_7"), Some("read"), ARG_TEXT),
+            "event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"status\":\"\
+             completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        ]))
+        .await;
+
+        // The witness: this IS a healthy turn — exactly one complete call,
+        // dispatched, no defect, and the terminal `Done` after it.
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolCall(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly ONE call dispatched — the de-duplication held, so the \
+             de-dup branch was walked (which is what makes the empty assertion \
+             below measure a guard), got {events:?}"
+        );
+        assert_eq!(
+            calls[0].arguments,
+            json!({ "path": "/x" }),
+            "the `done` item's authoritative arguments parsed cleanly"
+        );
+        assert!(
+            calls[0].defect.is_none(),
+            "well-formed arguments carry no defect — otherwise the pre-existing \
+             malformed-arguments line would fire here too"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "a turn that streamed and dispatched its call lost nothing, so no \
+             discard line may be written; got:\n{lines:#?}"
+        );
+
+        // The POSITIVE CONTROL, so the assertion above cannot be vacuous by way
+        // of a channel that records nothing at all: the same armed channel takes
+        // the same sentence when the guard IS satisfied. If this half stops
+        // writing, the empty assertion above has stopped meaning anything.
+        crate::diagnostics::record(WANT_FLUSH_NAMELESS);
+        let after = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&after, WANT_FLUSH_NAMELESS),
+            1,
+            "the armed channel DOES take this line — so the empty assertion above \
+             measured the guard, not a dead sink; got:\n{after:#?}"
+        );
+    }
+
+    /// The terminal arms are NOT a loss site and must stay silent — the four of
+    /// them already call `flush_tool_calls()` in-arm, which is exactly what
+    /// `responses_sse_error_event_flushes_a_partial_function_call` and its
+    /// sibling pin. Adding a latch line at one of them would be a provable no-op
+    /// AND would tell a supporter a call was lost when the call was delivered.
+    ///
+    /// The in-stream `error` arm is the strongest of the four (it can push an
+    /// `Error` instead of a `Done`, and its `terminated = true` is written before
+    /// the `parse_error_chunk` match so it covers both branches).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_terminal_arm_that_flushes_records_no_drop_line() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("terminal-flush");
+        reset_diagnostics_file(armed.dir.path());
+
+        let events = collect(responses_stream(&[
+            &output_item_added(1, Some("fc_9"), Some("write")),
+            &arguments_delta(1, ARG_TEXT),
+            "event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\
+             \"message\":\"boom\"}}\n\n",
+        ]))
+        .await;
+
+        // The witness: the arm FLUSHED — the call is on the event stream, ahead
+        // of the terminal `Done`. So the absence below is "nothing was lost", not
+        // "the code was never reached".
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "the terminal arm flushed the in-flight call (the pre-existing fix), \
+             got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "a terminal arm that FLUSHED lost nothing, so no latch line may be \
+             written for it — that is why the responses latch exists only at the \
+             transport arm; got:\n{lines:#?}"
         );
     }
 

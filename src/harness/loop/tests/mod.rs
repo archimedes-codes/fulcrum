@@ -5,6 +5,7 @@ mod cost;
 mod param_rejection;
 mod policy_gate;
 mod provider_switch;
+mod settle_diagnostics;
 mod subagents;
 pub(super) mod support;
 mod tool_row_settle;

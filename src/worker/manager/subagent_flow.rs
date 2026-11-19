@@ -898,6 +898,20 @@ pub(crate) fn dispatch_subagent(
     // `settings.json` read used to buy. `DesktopConfig::from_env` exists so a
     // sixth packaged field cannot be silently forgotten in a hand-written copy.
     let env = env.with_desktop_config(DesktopConfig::from_env(&parent_env));
+    // The diagnostics directory, inherited the SAME way — the sixth packaged
+    // value, but NOT folded into `DesktopConfig`, whose doc is "the FIVE
+    // desktop-config fields the Worker used to read out of `settings.json`" and a
+    // diagnostics directory is not one of those (it never lived in that file).
+    //
+    // THE line that makes the child's diagnostics observable at all. The card's
+    // symptom — a tool call dropped, or a turn that settled without an answer —
+    // happens in CHILD Workers as much as in a main session's, and a child built
+    // without this would be armed with nothing: `from_parts` leaves the field
+    // `None`, and the child would inherit the very silence this field exists to
+    // close. Read off the parent's LIVE registry copy, exactly like the five above,
+    // so whatever the Supervisor put on the parent's envelope is what the child
+    // arms with — the Worker resolves no directory of its own at any depth.
+    let env = env.with_diagnostics_dir(parent_env.diagnostics_dir.clone());
     // 6. The `subagent-session-started` UI lifecycle event (the
     // current driver's step 9 — the PARENT session's sink: the
     // `model` in the COMPOSED `provider/id` form, the

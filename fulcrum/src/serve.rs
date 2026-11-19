@@ -2446,6 +2446,17 @@ async fn start(
 /// step). `type` is stripped before the deserialize, because `StartEnv` has no
 /// such field and an unknown-field-tolerant struct would silently ignore a
 /// `type` that is the ONE field the daemon routes on.
+///
+/// `diagnosticsDir` is DELIBERATELY unset here, and this is the site: the daemon
+/// builds no `StartEnv` of its own — it forwards the client's payload verbatim —
+/// so a `start` with no `diagnosticsDir` (which is every `start` this daemon's
+/// clients send today) leaves every Worker it spawns UNARMED. Arming the daemon's
+/// Workers from `default_db_path()`'s data dir is a separate decision about a
+/// deployment nobody has asked about, and `harness/provider/mod.rs`'s "Why two
+/// sinks" already records that `fulcrum serve` arms neither the diagnostics
+/// channel nor the `debuglog` transcript. If that decision is ever taken, it is
+/// taken here (one `.with_diagnostics_dir(…)` on the parsed env), not in the
+/// Worker.
 fn start_env(frame: &serde_json::Value) -> Result<StartEnv, String> {
     let mut payload = frame
         .as_object()

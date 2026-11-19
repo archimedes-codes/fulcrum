@@ -3341,6 +3341,123 @@ async fn the_started_payload_names_a_resolve_miss_and_pins_its_full_key_set() {
     }
 }
 
+/// The child `StartEnv` INHERITS the parent's diagnostics directory — the hop at
+/// `subagent_flow`'s child-envelope construction, pinned end to end rather than by
+/// reading the source.
+///
+/// Why this needs a test of its own and cannot ride the field's wire pins: a child
+/// Worker is never registered in `state.workers` (only `attach` registers, and a
+/// dispatch spawns through the drive task), so not even the test-only
+/// `WorkerManager::test_env_for` can read the child's envelope back. The ONLY
+/// observable is the fixture's `session_info` Start echo, which is exactly how the
+/// `incarnation` stamp's inheritance is pinned two tests up.
+///
+/// What a missing hop looks like from here: the child's `diagnosticsDir` is
+/// `null`, i.e. the child Worker is UNARMED — and the card's symptom (a tool call
+/// dropped, or a turn that settled without an answer) happens in CHILD Workers as
+/// much as in a main session's, so an unarmed child is the bug this test exists to
+/// keep from coming back. The parent's value is read off the parent's LIVE registry
+/// copy, so the assertion also covers the "a `config-update`-style refresh reaches
+/// the next child" posture the five packaged fields rely on.
+#[tokio::test]
+async fn a_child_worker_inherits_the_parents_diagnostics_dir() {
+    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    let parent_dir = std::path::PathBuf::from("/home/u/.local/share/archimedes");
+    let env = test_env("d1", Some(vec!["bash".to_string()]))
+        .with_diagnostics_dir(Some(parent_dir.clone()));
+    manager
+        .attach("d1", &env)
+        .await
+        .expect("the parent attach completes");
+    manager
+        .handle_for("d1")
+        .expect("the parent handle is reachable")
+        .send_prompt("__subagent__", &[])
+        .expect("the prompt encodes");
+
+    // The CHILD's `session_info` Start echo (the `is_subagent` frame the drive's
+    // pump re-emits on the parent's scope) — the same read shape
+    // `the_enabled_tools_wire_convention_is_applied_verbatim` uses.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut child_dir: Option<Value>;
+    loop {
+        let got: Vec<(String, bool, WorkerInboundEvent)> =
+            events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        child_dir = got
+            .iter()
+            .filter(|(_, is_sub, _)| *is_sub)
+            .find_map(|(_, _, e)| match e {
+                WorkerInboundEvent::SinkFrame { event, payload } if event == "session-update" => {
+                    payload
+                        .get("update")
+                        .and_then(|u| u.get("diagnosticsDir"))
+                        .cloned()
+                }
+                _ => None,
+            });
+        if child_dir.is_some() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let child_dir = child_dir.expect("the child's Start echo carries the echoed field");
+    assert_eq!(
+        child_dir,
+        Value::String(parent_dir.display().to_string()),
+        "the child Worker arms with the PARENT's directory — a `null` here means \
+         the child is unarmed and its tool-call drops are invisible again"
+    );
+    // Detached for symmetry with the `d2` half below (and because the `manager`
+    // binding is shadowed by the second fixture immediately after, which drops the
+    // first). The fixture reaps its children on stdin-EOF at drop, so this is
+    // tidiness and not correctness — most attach-using tests in this module skip
+    // it; a test that detaches in one half detaches in both.
+    manager.detach("d1");
+
+    // And the NEGATIVE half, in the same shape: a parent built by `from_parts`
+    // (no setter — every fixture, every old Supervisor) hands the child `null`,
+    // so the unarmed default propagates rather than a self-resolved directory.
+    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    manager
+        .attach("d2", &test_env("d2", Some(vec!["bash".to_string()])))
+        .await
+        .expect("the unarmed parent attach completes");
+    manager
+        .handle_for("d2")
+        .expect("the parent handle is reachable")
+        .send_prompt("__subagent__", &[])
+        .expect("the prompt encodes");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut child_dir: Option<Value>;
+    loop {
+        let got: Vec<(String, bool, WorkerInboundEvent)> =
+            events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        child_dir = got
+            .iter()
+            .filter(|(_, is_sub, _)| *is_sub)
+            .find_map(|(_, _, e)| match e {
+                WorkerInboundEvent::SinkFrame { event, payload } if event == "session-update" => {
+                    payload
+                        .get("update")
+                        .and_then(|u| u.get("diagnosticsDir"))
+                        .cloned()
+                }
+                _ => None,
+            });
+        if child_dir.is_some() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        child_dir.expect("the unarmed child's Start echo carries the echoed field"),
+        Value::Null,
+        "an unarmed parent leaves the child UNARMED — inheritance, never a fallback \
+         to a directory the Worker resolved for itself"
+    );
+    manager.detach("d2");
+}
+
 /// The `enabled_tools` wire convention (reviewer-corrected — the
 /// round-3 fix): a `StartEnv` with `enabled_tools:
 /// Some(vec!["subagent"])` (a `launch.tools` that empties out after

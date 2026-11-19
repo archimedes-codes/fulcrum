@@ -223,6 +223,113 @@ pub struct StartEnv {
     /// hole; a model switch re-resolves from this snapshot, exactly as today).
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// The directory the Worker's ALWAYS-ON diagnostics channel
+    /// ([`crate::diagnostics`], `<datadir>/archimedes/diagnostics.log`) writes to —
+    /// the value `diagnostics::init` takes, carried across the wire.
+    ///
+    /// THE field whose absence made the Worker's own diagnostics unreachable.
+    /// Every `diagnostics::init` in this crate WAS `#[cfg(test)]` before this field
+    /// existed, so `record` was a silent no-op inside a `--worker` child: the
+    /// tool-call-drop line, the silent-settle line and `log_wire`'s provider line all
+    /// reached NO file in a default launch, which is the card's symptom ("a tool call
+    /// dropped or a turn settled without an answer and nothing says so"). The
+    /// Supervisor arms the channel in its own `run()`; a Worker never gets there — so
+    /// the directory now rides this envelope, and `worker/core.rs`'s `Inbound::Start`
+    /// arm is a NON-test `diagnostics::init` that arms what arrives here.
+    ///
+    /// ADDITIVE and camelCase (`diagnosticsDir`) like every other field here —
+    /// `permission`, `cost_usd` and the five packaged config fields are the same
+    /// template — so `from_parts` gains NO positional parameter. A 14th parameter
+    /// would break EVERY call site in BOTH repos against a registry pin neither repo
+    /// can move alone (measured when this field was added: 8 in this repo, 11 in the
+    /// desktop — re-measure with `grep -rn 'from_parts('` in each rather than
+    /// trusting this number) and every existing caller and fixture is unchanged and
+    /// stays **unarmed** (`None` → the old silence, deliberately).
+    ///
+    /// # The two wire directions, VERIFIED rather than assumed
+    ///
+    /// Checked at this struct's declaration and at `worker/protocol.rs`:
+    /// `StartEnv` derives neither `#[non_exhaustive]` nor
+    /// `#[serde(deny_unknown_fields)]`, and `decode_inbound` deliberately ignores
+    /// unknown keys. So the field is compatible in BOTH directions —
+    /// * old Supervisor → new Worker: the key is absent, `Option` +
+    ///   `#[serde(default)]` decodes to `None` → UNARMED, byte-identical to
+    ///   today's Worker;
+    /// * new Supervisor → old Worker (0.4.1): `diagnosticsDir` is an unknown key,
+    ///   the decoder drops it, the frame still decodes and the Worker still runs —
+    ///   it just stays unarmed.
+    ///
+    /// Both are pinned by
+    /// [`the_start_env_carries_the_diagnostics_dir_as_diagnostics_dir`](crate::worker::protocol),
+    /// not asserted here.
+    ///
+    /// # Why `Option<PathBuf>` and not the `String` `config_dir` uses
+    ///
+    /// `config_dir` is a `String` because it is re-parsed as text and compared as
+    /// text — it is a key the frontend joins on and a path `load_settings` opens.
+    /// This value is NEVER re-parsed: it goes straight into
+    /// [`crate::diagnostics::init`], whose parameter IS an `Option<PathBuf>`, so a
+    /// `String` here would buy nothing and cost a `.into()` plus the chance of
+    /// handing `init` a path-shaped string that was never a path. serde writes a
+    /// `PathBuf` as a JSON string and reads one back from a string (its
+    /// `PathBufVisitor` takes `visit_str`/`visit_string` — and the `bytes` pair,
+    /// which a JSON deserializer never calls), so the WIRE FORM is identical to
+    /// `config_dir`'s either way — the type is a statement about the consumer, not
+    /// about the bytes.
+    ///
+    /// `None` (and an absent key, and a JSON `null`) all mean UNARMED. An EMPTY
+    /// string is not special-cased and must not become one: `diagnostics::append_to`
+    /// calls `create_dir_all("")`, which succeeds, and then writes to a
+    /// CWD-relative `diagnostics.log` — the leftover a hand-run once left in this
+    /// repo's own working directory. A host that wants the channel off passes
+    /// `None`; the Supervisor passes the app data dir it already resolves.
+    ///
+    /// # The one cost of the `PathBuf`, stated rather than hidden
+    ///
+    /// serde serializes a `PathBuf` by way of `Path::to_str`, and a path that is
+    /// NOT valid UTF-8 is a serialize ERROR ("path contains invalid UTF-8
+    /// characters") — and [`crate::worker::protocol::encode_inbound`] `.expect`s on
+    /// any encode failure. So a non-UTF-8 directory would PANIC the Supervisor at
+    /// `send_start` rather than come back as a `WorkerError`. Measured, not
+    /// reasoned: a `StartEnv` carrying `/tmp/bad\xffpath` makes `encode_inbound`
+    /// panic with exactly `path contains invalid UTF-8 characters`. A `String`
+    /// could not fail that way, because it cannot hold one. Accepted on three
+    /// grounds: on the DESKTOP surface the value comes from `dirs::data_dir()` / the
+    /// app's own data-dir resolution, which no user types; `SessionInfo::cwd` shows
+    /// this crate already carries a `PathBuf` across a process boundary for the
+    /// reasons its own doc gives, so the posture is existing and not new (it crosses
+    /// TAURI's IPC, NOT the worker boundary, and it has the same non-UTF-8 weakness
+    /// there — it is evidence of posture only, not of a solved problem); and the
+    /// alternative failure a `String` invites — handing `diagnostics::init` a
+    /// path-shaped string that a `PathBuf` would have refused at the door — is the
+    /// worse of the two, because it moves the lossy conversion INTO the Worker's
+    /// `init(PathBuf::from(s))` instead of failing at the Supervisor's encode.
+    ///
+    /// # Where the value can come from, stated honestly
+    ///
+    /// It is NOT true that this value never comes from typed input. On the
+    /// `fulcrum serve` surface it is: `serve.rs`'s `start_env` parses the client's
+    /// `start` payload with `serde_json::from_value::<StartEnv>` and forwards it
+    /// VERBATIM, so a `fulcrum serve` CLIENT can set `diagnosticsDir` and cause a
+    /// Worker to `create_dir_all` and append `diagnostics.log` at a path the client
+    /// chose. The daemon arms nothing of its own — it just does not strip what
+    /// arrived.
+    ///
+    /// Two mitigations are real, and they are the reason this is documented rather
+    /// than closed: (1) a socket peer whose uid is not the daemon's is refused at
+    /// accept (`TransportError::PeerIdentity`, `transport::unix`), so the reachable
+    /// set is same-uid only — and a same-uid process can already open any file this
+    /// field could name, so the field grants no write the peer did not already have;
+    /// (2) what lands in that file is only ever counts, a closed wire-enum name and
+    /// sanitised ids (`log_wire`, `emit_harness_line`, the settle line, `pump.rs`'s
+    /// lag line — each re-verified per site), never prompt text, tool arguments or
+    /// model output, so the worst a client achieves is a stray file of numbers (plus
+    /// an unbounded-but-rotated `diagnostics.log`, the same rotation `debuglog`
+    /// already accepts). What is NOT real is "never from typed input", and this doc
+    /// used to claim it. If the residual ever bites, the follow-up is an error around
+    /// the `encode_line` `.expect` — not a type change here.
+    #[serde(default)]
+    pub diagnostics_dir: Option<std::path::PathBuf>,
 }
 
 // ── `DesktopConfig` ─────────────────────────────────────────────────────────────
@@ -233,12 +340,18 @@ pub struct StartEnv {
 /// constructor.
 ///
 /// The bundle exists for the same reason [`StartEnv::with_seed_cost`] does:
-/// `from_parts` has fourteen call sites and every one of them would gain five
-/// arguments. Here the five types are all DISTINCT, so a swapped slot is a
-/// compile error rather than the silent mis-slot T2 avoided — but the builder
-/// still keeps the fourteen fixtures that need NONE of these fields untouched,
-/// and it names the five as the SET they are: the packaged desktop config, one
-/// concept, one place to look when a sixth field joins it.
+/// `from_parts` is a positional constructor with a call site in EVERY fixture and
+/// production envelope builder in BOTH repos — every one of them would gain five
+/// arguments (measured when the diagnostics directory was added: 8 here, 11 in the
+/// desktop; the "fourteen" this doc used to state predated the T3/T8 moves, and this
+/// census has since been wrong twice more, so the claim that matters is the class:
+/// re-run `grep -rn 'from_parts('` in each repo rather than trusting a number here).
+/// Here the five types
+/// are all DISTINCT, so a swapped slot is a compile error rather than the silent
+/// mis-slot T2 avoided — but the builder still keeps the fixtures that
+/// need NONE of these fields untouched, and it names the five as the SET they are:
+/// the packaged desktop config, one concept, one place to look when a sixth field
+/// joins it.
 ///
 /// Every field is the DESKTOP's own type (T3 moves no types — the definitions
 /// stay in `crate::config` / `agent::policy` and move in T5–T7).
@@ -311,7 +424,10 @@ impl StartEnv {
             // child): nothing is stored yet, so there is nothing to seed. The
             // resume path opts in via [`StartEnv::with_seed_cost`] instead of
             // widening this signature — `from_parts` is a 13-parameter
-            // positional constructor with fourteen call sites, and T3's five
+            // positional constructor with a call site in every fixture and
+            // envelope builder in both repos (8 here, 11 in the desktop when the
+            // diagnostics directory landed — re-measure with
+            // `grep -rn 'from_parts('` rather than trusting it), and T3's five
             // config fields ride [`StartEnv::with_desktop_config`] for the
             // same reason.
             cost_usd: None,
@@ -329,6 +445,15 @@ impl StartEnv {
             mcp_servers: std::collections::HashMap::new(),
             agent_overrides: std::collections::HashMap::new(),
             providers: Vec::new(),
+            // The diagnostics channel stays UNARMED here, and that is the load-
+            // bearing default, not an omission. `from_parts` is what every fixture
+            // in both repos calls, and what the desktop's five real-Worker tests
+            // end up calling through their hand-built envelopes — none of them
+            // isolates `HOME`/`XDG_DATA_HOME`, so an armed default would write into
+            // the developer's real `~/.local/share/archimedes/diagnostics.log` on
+            // every `cargo test`. The Supervisor opts a Worker in explicitly with
+            // [`StartEnv::with_diagnostics_dir`].
+            diagnostics_dir: None,
         }
     }
 
@@ -336,10 +461,14 @@ impl StartEnv {
     /// `StartEnv` (Fulcrum T3). The Supervisor's only edit of these five.
     ///
     /// A builder and NOT five more `from_parts` parameters, following
-    /// [`StartEnv::with_seed_cost`]: the positional constructor has fourteen
-    /// call sites, thirteen of which are fixtures that carry no desktop config
-    /// at all. The Supervisor's session-start site is the ONE place that has a
-    /// `Settings` in scope, and it calls this.
+    /// [`StartEnv::with_seed_cost`]: the positional constructor has a call site in
+    /// every fixture and envelope builder in BOTH repos (8 in this repo, 11 in the
+    /// desktop when the diagnostics directory landed — re-measure with
+    /// `grep -rn 'from_parts('`; the desktop half compiles against the PUBLISHED
+    /// crate, so a positional change there is not even visible from here until the
+    /// pin moves), and every one of them would gain five arguments — except the
+    /// handful that go on to call this builder anyway. The Supervisor's session-start
+    /// site is the ONE place that has a `Settings` in scope, and it calls this.
     ///
     /// The `agent_overrides` half MUST be the POST-FOLD map (ADR 0066) — i.e.
     /// whatever `crate::config::load_settings` produced, never the raw
@@ -357,12 +486,39 @@ impl StartEnv {
     /// (Fulcrum T2). The resume path's only edit of this struct.
     ///
     /// Deliberately a builder and NOT a fourteenth `from_parts` parameter: the
-    /// positional constructor has fourteen call sites (nine in `src/`, five in
-    /// `tests/`), and T3 appends five config fields to that same list — two
-    /// tasks re-plumbing one signature in the same wave is how a positional
-    /// argument lands in the wrong slot. A field-placeholder builder cannot.
+    /// positional constructor has a call site in every fixture and envelope builder
+    /// in BOTH repos (8 in this repo, 11 in the desktop when the diagnostics
+    /// directory landed — re-measure with `grep -rn 'from_parts('`), and T3 appends
+    /// five config fields to that same list — two tasks re-plumbing one signature in
+    /// the same wave is how a positional argument lands in the wrong slot. A
+    /// field-placeholder builder cannot.
     pub fn with_seed_cost(mut self, total: Option<f64>) -> Self {
         self.cost_usd = total;
+        self
+    }
+
+    /// Attach the always-on diagnostics directory (`diagnostics::init`'s target)
+    /// to an already-built `StartEnv`. The Supervisor's only edit of this field,
+    /// and the ONLY way a Worker's diagnostics channel ever gets armed.
+    ///
+    /// Deliberately a builder and NOT a fourteenth `from_parts` parameter,
+    /// following [`StartEnv::with_seed_cost`] and
+    /// [`StartEnv::with_desktop_config`]: the positional constructor is called by
+    /// every fixture and envelope builder in both repos — 8 call sites in this repo
+    /// and 11 in the desktop when this field landed, those 11 spread over 10 files
+    /// (`harness_subagent_worker.rs` has two), which is why a per-file count there
+    /// reads 10 and a per-call count reads 11 — and every one of them would gain
+    /// an argument, against a crates.io pin that is a break neither repo can land
+    /// alone. A builder leaves every one of them compiling and leaves every fixture
+    /// `None`, i.e. unarmed, which is exactly the posture the unisolated real-Worker
+    /// tests require.
+    ///
+    /// `None` UNARMS (the default, an old envelope, and a host's off switch all
+    /// look like this). The value is passed to `diagnostics::init` verbatim by the
+    /// Worker's `Start` handler — it is never resolved, joined onto anything, or
+    /// fallen back to a platform directory here.
+    pub fn with_diagnostics_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.diagnostics_dir = dir;
         self
     }
 }

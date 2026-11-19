@@ -16,7 +16,9 @@ use serde_json::json;
 use serde_json::Value;
 
 use super::openai::{
-    content_is_effectively_empty, parse_arguments, LineAssembler, TOOL_EMPTY_OUTPUT_PLACEHOLDER,
+    content_is_effectively_empty, emit_harness_line, parse_arguments,
+    tool_call_dropped_with_no_name, tool_calls_dropped_at_stream_error, LineAssembler,
+    TOOL_EMPTY_OUTPUT_PLACEHOLDER,
 };
 use super::transport::{build_client, litellm_headers, map_response, ANTHROPIC_API_VERSION};
 use super::types::{
@@ -467,6 +469,26 @@ impl AnthropicStream {
                 // `error` object, so the classifier is always `Some` here
                 // (a `None` would be a wire violation and must panic loudly
                 // rather than fall through to the non-error path).
+                //
+                // THE FLUSH-SKIP, reported at the latch — BEFORE `exhausted` is
+                // written, so the line is out even if the `.expect` below panics.
+                // `exhausted` here makes `poll_next`'s early `if this.exhausted`
+                // return `Ready(None)` without ever reaching the
+                // `Poll::Ready(None)` block, and the stream-end flush sits inside
+                // that block behind `if !this.finished` — so a call in flight at
+                // this moment is never flushed. The line is gated on a NON-EMPTY
+                // `tool_acc` because that is the only condition under which a real
+                // call is being lost, and it is what keeps a healthy turn silent
+                // (an in-stream error with no call in flight is an ordinary failure
+                // the loop retries, not a lost call).
+                if !self.tool_acc.is_empty() {
+                    emit_harness_line(&tool_calls_dropped_at_stream_error(
+                        "anthropic",
+                        "in-stream-error",
+                        self.tool_acc.len(),
+                        self.tool_acc.values().any(|acc| acc.name.is_some()),
+                    ));
+                }
                 self.exhausted = true;
                 self.pending
                     .push_back(ProviderEvent::Error(parse_error_chunk(v).expect(
@@ -531,9 +553,22 @@ impl AnthropicStream {
     /// Emit the accumulated tool calls as complete `ToolCall` events
     /// (dropping any block that never arrived with a `name` — a
     /// `tool_use` block without a `name` cannot be dispatched).
+    ///
+    /// The drop is LOUD. It was a bare `continue` — the silent-discard shape this
+    /// whole change exists to close: the model made a call, its `input` fragments
+    /// streamed, and the turn settled as a success having dispatched nothing, with
+    /// no line anywhere. This is the site the settle-site line's "where the call
+    /// went is the provider parser's account" resolves to.
     fn flush_tool_calls(&mut self) {
-        for (_index, acc) in std::mem::take(&mut self.tool_acc).into_iter() {
+        for (index, acc) in std::mem::take(&mut self.tool_acc).into_iter() {
             let Some(name) = acc.name else {
+                emit_harness_line(&tool_call_dropped_with_no_name(
+                    "anthropic",
+                    "flush",
+                    index,
+                    acc.id.as_deref(),
+                    &acc.arguments,
+                ));
                 continue;
             };
             // (issue #193) The defect rides the call — see `parse_arguments`.
@@ -568,6 +603,18 @@ impl Stream for AnthropicStream {
                 Poll::Ready(Some(Err(e))) => {
                     // A mid-stream transport failure is retryable (the
                     // `AgentLoop`'s `RetryPolicy` re-issues `complete()`).
+                    //
+                    // THE FLUSH-SKIP, reported at the latch — see the in-stream
+                    // `error` arm for why `exhausted` makes the stream-end flush
+                    // unreachable, and why the gate is a non-empty `tool_acc`.
+                    if !this.tool_acc.is_empty() {
+                        emit_harness_line(&tool_calls_dropped_at_stream_error(
+                            "anthropic",
+                            "transport-error",
+                            this.tool_acc.len(),
+                            this.tool_acc.values().any(|acc| acc.name.is_some()),
+                        ));
+                    }
                     this.exhausted = true;
                     this.pending
                         .push_back(ProviderEvent::Error(ProviderError::Retryable(format!(
@@ -1219,6 +1266,525 @@ mod tests {
         // Owned data so the stream is `'static` (independent of `chunks`).
         let data: Vec<Vec<u8>> = chunks.iter().map(|c| c.as_bytes().to_vec()).collect();
         anthropic_stream_bytes(&data)
+    }
+
+    /// The same, with a TRANSPORT failure as the LAST item of the raw stream —
+    /// the shape `poll_next`'s `Poll::Ready(Some(Err(e)))` arm sees (a
+    /// `read_timeout` on a stalled provider, a reset connection). The helper
+    /// above cannot express it: it maps every chunk to `Ok`.
+    fn anthropic_stream_failing(chunks: &[&str]) -> AnthropicStream {
+        let mut data: Vec<Result<Vec<u8>, reqwest::Error>> =
+            chunks.iter().map(|c| Ok(c.as_bytes().to_vec())).collect();
+        data.push(Err(transport_error()));
+        let raw: BoxStream<'static, Result<Vec<u8>, reqwest::Error>> =
+            futures_util::stream::iter(data).boxed();
+        AnthropicStream::new(raw)
+    }
+
+    /// A real `reqwest::Error`, built the only way a test can without a socket:
+    /// `http://` has an empty host, so `RequestBuilder::build` answers `Err` with
+    /// a `Builder`-kind error. All the arm under test does with the value is
+    /// format `{e}` into its own `Retryable`, so the KIND is irrelevant — what the
+    /// fixture needs is an `Err` item AFTER a chunk was consumed.
+    fn transport_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("http://")
+            .build()
+            .expect_err("`http://` has no host, so the request cannot be built")
+    }
+
+    // ── (supervisor-log diagnostics) the tool call the parser discarded ─────
+    //
+    // Both tool-call DISCARD paths on this wire were silent — the nameless acc
+    // the flush drops, and the call in flight when the error latch makes the
+    // stream-end flush unreachable. The settle-site line can only say a call was
+    // STREAMED and never dispatched; these lines say WHERE it went.
+    //
+    // Asserted on the `diagnostics::record` half. The `eprintln!` half is not
+    // assertable from a lib unit test — `provider/mod.rs`'s
+    // `the_chosen_wire_is_logged_at_construction` limit, restated: its only
+    // production reader is the Worker-stderr drain task, which needs a spawned
+    // Worker. It is covered here by carrying the SAME payload.
+
+    /// The stems of EVERY line this work adds, on ANY of the three wires. The
+    /// healthy-turn test asserts none appears, so its empty assertion guards
+    /// against instrumenting a site that fires on a GOOD turn — including one in a
+    /// sibling parser whose code this fixture happens to reach.
+    const DISCARD_STEMS: [&str; 2] = [
+        "tool call dropped with no name",
+        "tool calls dropped at a stream error",
+    ];
+
+    /// The recorded lines carrying one of those stems — the assertion surface.
+    /// Filtered by stem rather than counted whole, because `diagnostics` is
+    /// process-global: a sibling test that reaches `record` without the env lock
+    /// can append its own line here (the `provider wire=` construction line,
+    /// e.g.), and it must neither satisfy nor spoil these.
+    fn discard_lines(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| DISCARD_STEMS.iter().any(|stem| l.contains(stem)))
+            .cloned()
+            .collect()
+    }
+
+    /// How many of `lines` END with `want` — `record` prefixes `<epoch-millis> `,
+    /// so the match is a suffix match (as `settle_diagnostics.rs` and
+    /// `provider/mod.rs` both do it).
+    fn ending_with(lines: &[String], want: &str) -> usize {
+        lines.iter().filter(|l| l.ends_with(want)).count()
+    }
+
+    /// Arms the process-global diagnostics channel at a fresh scratch dir for ONE
+    /// test and disables it again on the way out — the
+    /// `loop/tests/settle_diagnostics.rs` pair, folded into ONE guard. The fold is
+    /// the point: as two locals the dir can drop BEFORE the global is cleared, and
+    /// the next `record` anywhere then `create_dir_all`s the removed dir back into
+    /// existence and writes into it for the rest of the run.
+    struct ArmedDiagnostics {
+        dir: crate::test_support::ScratchDir,
+    }
+    impl Drop for ArmedDiagnostics {
+        fn drop(&mut self) {
+            crate::diagnostics::init(None);
+        }
+    }
+
+    /// Arm the channel. Every caller holds `test_support::env_lock()` across the
+    /// call AND its assertions — the contract `diagnostics` states for its
+    /// process-global target. The lock is taken ONCE per test: `env_lock` is
+    /// non-reentrant and a second call inside one test self-deadlocks.
+    fn arm_diagnostics(tag: &str) -> ArmedDiagnostics {
+        let dir = crate::test_support::ScratchDir::in_env_temp("anthropic-discard-diag-", tag);
+        crate::diagnostics::init(Some(dir.to_path_buf()));
+        ArmedDiagnostics { dir }
+    }
+
+    /// The armed file's lines. A missing file means nothing was recorded, which is
+    /// a legitimate answer for the negative tests (`record` creates the file on its
+    /// first write).
+    fn recorded_lines(dir: &std::path::Path) -> Vec<String> {
+        let path = dir.join(crate::diagnostics::FILE_NAME);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => text.lines().map(str::to_string).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("the scratch diagnostics file is readable: {e}"),
+        }
+    }
+
+    /// Truncate the armed file so each assertion is proven by ITS OWN line (the
+    /// `provider/mod.rs::reset_diagnostics_file` precedent).
+    fn reset_diagnostics_file(dir: &std::path::Path) {
+        let path = dir.join(crate::diagnostics::FILE_NAME);
+        match std::fs::write(&path, "") {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("the scratch diagnostics file can be truncated: {e}"),
+        }
+    }
+
+    /// One `content_block_start` event for a `tool_use` block. Built with `json!`
+    /// rather than the hand-escaped literals the neighbouring fixtures use, for ONE
+    /// reason: the expected line names `args_bytes`, and an escaped literal makes
+    /// that number a claim about my escaping rather than about the data.
+    fn content_block_start(index: u32, id: Option<&str>, name: Option<&str>) -> String {
+        let mut block = serde_json::Map::new();
+        block.insert("type".to_string(), json!("tool_use"));
+        if let Some(id) = id {
+            block.insert("id".to_string(), json!(id));
+        }
+        if let Some(name) = name {
+            block.insert("name".to_string(), json!(name));
+        }
+        block.insert("input".to_string(), json!({}));
+        format!(
+            "event: content_block_start\n\
+             data: {}\n\n\
+             ",
+            json!({ "type": "content_block_start", "index": index,
+                    "content_block": Value::Object(block) })
+        )
+    }
+
+    /// One `input_json_delta` event (an argument fragment).
+    fn input_json_delta(index: u32, fragment: &str) -> String {
+        format!(
+            "event: content_block_delta\n\
+             data: {}\n\n\
+             ",
+            json!({ "type": "content_block_delta", "index": index,
+                    "delta": { "type": "input_json_delta",
+                               "partial_json": fragment } })
+        )
+    }
+
+    /// The terminal `message_delta` (the arm that flushes on a healthy stream).
+    const MESSAGE_DELTA: &str = "event: message_delta\n\
+         data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+
+    /// The argument text every fixture below streams. The nameless fixture splits
+    /// it across two fragments; its BYTE length is what the expected line names.
+    const ARG_TEXT: &str = "{\"path\":\"/x\"}";
+
+    /// The EXACT payload for a nameless acc dropped at the flush — spelled out in
+    /// full, deliberately NOT re-derived from the message helper. A test that
+    /// called the helper to build its own expectation would pass whatever the
+    /// helper chose to say; a literal reddens when the sentence changes.
+    const WANT_NAMELESS: &str = "tool call dropped with no name: parser=anthropic \
+         stage=flush index=1 id=\"tu_9\" args_bytes=13 — a call with no name \
+         cannot be dispatched, so the model's call is lost and the turn settles \
+         without it";
+
+    /// The EXACT payload for the call in flight when the stream dies on the error
+    /// latch. `stage` names the arm, so the two latch sites stay distinguishable in
+    /// a file a supporter reads end to end.
+    const WANT_LATCH_INSTREAM: &str = "tool calls dropped at a stream error: \
+         parser=anthropic stage=in-stream-error in_flight=1 named_any=true — the \
+         stream-end flush is unreachable once the stream is exhausted, so a call \
+         the model had already streamed was lost";
+
+    const WANT_LATCH_TRANSPORT: &str = "tool calls dropped at a stream error: \
+         parser=anthropic stage=transport-error in_flight=1 named_any=true — the \
+         stream-end flush is unreachable once the stream is exhausted, so a call \
+         the model had already streamed was lost";
+
+    /// THE defect on this wire: a `tool_use` block whose `content_block_start`
+    /// carries an `id` and NO `name`. The acc is assembled, the argument fragments
+    /// stream into it, the `message_delta` flushes — and the flush drops the call
+    /// in silence, because `acc.name` is `None` and the `continue` swallows it.
+    ///
+    /// The `record` half is the assertion that reddens. The "no `ToolCall`" half is
+    /// a PIN of the pre-existing behaviour the new line is bolted to (a call with
+    /// no name could never be dispatched, and still cannot), and its witness is the
+    /// deltas — which prove the block opened and its fragments arrived, so the
+    /// recorded line is credited to a DISCARD and not to a fixture that streamed
+    /// nothing.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_tool_use_block_with_no_name_is_dropped_and_the_drop_is_recorded() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("nameless");
+        reset_diagnostics_file(armed.dir.path());
+
+        assert_eq!(ARG_TEXT.len(), 13, "the number the expected line quotes");
+        let events = collect(anthropic_stream(&[
+            &content_block_start(1, Some("tu_9"), None),
+            &input_json_delta(1, "{\"pa"),
+            &input_json_delta(1, "th\":\"/x\"}"),
+            MESSAGE_DELTA,
+        ]))
+        .await;
+
+        // The witness: the block opened and BOTH fragments were accumulated — the
+        // acc existed with arguments in it, so the absence below is the DISCARD.
+        let deltas = events
+            .iter()
+            .filter(|e| matches!(e, ProviderEvent::ToolCallDelta(_)))
+            .count();
+        assert_eq!(
+            deltas, 3,
+            "the `content_block_start` delta and both argument fragments reached \
+             the acc (the drop is downstream of them), got {events:?}"
+        );
+        // The PIN: the nameless call is not dispatched — unchanged behaviour.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "a call with no name cannot be dispatched, so it is dropped (and \
+             always was), got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&lines, WANT_NAMELESS),
+            1,
+            "the discard is recorded EXACTLY ONCE, with no `harness: ` prefix on \
+             the `record` half (the `log_wire` convention) and naming the parser, \
+             the stage, the index, the id and the argument-buffer length; want a \
+             line ending with {WANT_NAMELESS:?}, got:\n{lines:#?}"
+        );
+    }
+
+    /// The in-stream `error` arm: the HTTP status was 200 and the error is IN the
+    /// stream, so the arm sets `exhausted` and pushes the `Error` — and the
+    /// stream-end flush sits inside the `Poll::Ready(None)` block behind
+    /// `if !this.finished`, which `exhausted` makes UNREACHABLE. A call in flight
+    /// at that moment is lost, and until now it was lost silently.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_in_stream_error_with_a_call_in_flight_records_the_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("instream-error");
+        reset_diagnostics_file(armed.dir.path());
+
+        let events = collect(anthropic_stream(&[
+            &content_block_start(1, Some("tu_9"), Some("read")),
+            &input_json_delta(1, ARG_TEXT),
+            "event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\
+             \"message\":\"Overloaded\"}}\n\n",
+        ]))
+        .await;
+
+        // The witness: the call streamed (name and all) and the stream really did
+        // end on the latch this site logs at.
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(m)) if m.contains("Overloaded")
+            ),
+            "the fixture ends on the in-stream error, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "the flush never runs on this path — that IS the loss being reported, \
+             got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&lines, WANT_LATCH_INSTREAM),
+            1,
+            "the error latch reports the call it is about to lose, naming the \
+             count; want a line ending with {WANT_LATCH_INSTREAM:?}, got:\n\
+             {lines:#?}"
+        );
+    }
+
+    /// … and the transport-error arm: the same latch, set from `poll_next` (a
+    /// `read_timeout` on a stalled provider, a reset connection).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_transport_failure_with_a_call_in_flight_records_the_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("transport-error");
+        reset_diagnostics_file(armed.dir.path());
+
+        let events = collect(anthropic_stream_failing(&[
+            &content_block_start(1, Some("tu_9"), Some("read")),
+            &input_json_delta(1, ARG_TEXT),
+        ]))
+        .await;
+
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(m)) if m.contains("stream error")
+            ),
+            "the fixture ends on the transport error, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "the transport arm does not flush — the call is lost, got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&lines, WANT_LATCH_TRANSPORT),
+            1,
+            "the transport latch reports the call it is about to lose; want a line \
+             ending with {WANT_LATCH_TRANSPORT:?}, got:\n{lines:#?}"
+        );
+    }
+
+    /// THE GUARD ITSELF, on the latch: an error with NO call in flight records
+    /// nothing. This is the assertion that makes `!self.tool_acc.is_empty()`
+    /// load-bearing rather than decorative — an in-stream error is an ORDINARY
+    /// failure the loop retries, and every one of them would otherwise write a
+    /// "tool calls dropped" sentence into the always-on file for a turn that had
+    /// no call to lose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_stream_error_with_nothing_in_flight_records_no_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("error-empty-acc");
+        reset_diagnostics_file(armed.dir.path());
+
+        // Text only, then the error — no `tool_use` block, so the acc map is
+        // NEVER touched and `tool_acc.len()` is 0 when the latch is set.
+        let events = collect(anthropic_stream(&[
+            "event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"\
+             content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"\
+             delta\":{\"type\":\"text_delta\",\"text\":\"thinking out loud\"}}\n\n",
+            "event: error\n\
+             data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\
+             \"message\":\"Overloaded\"}}\n\n",
+        ]))
+        .await;
+
+        // The witness: the error really did land (the latch WAS reached) and no
+        // tool-call fragment ever arrived — so the empty assertion below measures
+        // the gate and not a path that never ran.
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(_))
+            ),
+            "the fixture reached the error latch, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCallDelta(_))),
+            "no tool-call fragment arrived, so `tool_acc` is empty at the latch, \
+             got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "an error with NO call in flight lost nothing, so the gate must hold \
+             it shut; got:\n{lines:#?}"
+        );
+    }
+
+    /// The other half of the guard: the SAME call, the stream ending CLEAN. Here
+    /// the flush runs and the call is dispatched, so nothing was lost and the latch
+    /// line must not appear. Without this, the new site would fire at the ordinary
+    /// end of every stream and the always-on file would carry a failure sentence
+    /// for a turn that worked.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_clean_stream_end_with_a_call_in_flight_records_no_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("clean-end");
+        reset_diagnostics_file(armed.dir.path());
+
+        let events = collect(anthropic_stream(&[
+            &content_block_start(1, Some("tu_9"), Some("read")),
+            &input_json_delta(1, ARG_TEXT),
+            // NO `message_delta`: the stream ends with the call still in the acc,
+            // and the stream-end block flushes it and synthesizes the `Done`.
+        ]))
+        .await;
+
+        // The witness: the stream ended with no `stop_reason` and the flush ran
+        // anyway — the call was dispatched, so there is nothing to report.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCall(_))),
+            "a clean end flushes the call — the path the latch line must stay off, \
+             got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "a stream that ended clean dispatched its call, so no latch line may \
+             fire; got:\n{lines:#?}"
+        );
+    }
+
+    /// … and the same gate at the TRANSPORT latch, whose `tool_acc` is reached by
+    /// a different fixture (the `Err` item arrives from `poll_next`, not from
+    /// `handle_chunk`) — so the in-stream test above cannot pin it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_transport_failure_with_nothing_in_flight_records_no_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("transport-empty-acc");
+        reset_diagnostics_file(armed.dir.path());
+
+        // Text only, then the transport failure — no `tool_use` block, so the acc
+        // map is NEVER touched and `tool_acc.len()` is 0 at the latch.
+        let events = collect(anthropic_stream_failing(&[
+            "event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"\
+             content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"\
+             delta\":{\"type\":\"text_delta\",\"text\":\"thinking out loud\"}}\n\n",
+        ]))
+        .await;
+
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(_))
+            ),
+            "the fixture reached the transport latch, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolCallDelta(_))),
+            "no tool-call fragment arrived, so `tool_acc` is empty at the latch, \
+             got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "a transport failure with NO call in flight lost nothing, so the gate \
+             must hold it shut; got:\n{lines:#?}"
+        );
+    }
+
+    /// The healthy-turn guard, and the one that keeps this change from becoming
+    /// noise: a well-formed `tool_use` block, streamed and dispatched, records
+    /// NOTHING.
+    ///
+    /// The fixture uses WELL-FORMED arguments on purpose. `parse_arguments`'s
+    /// `harness: malformed tool-call arguments` line predates this task and fires
+    /// on bad JSON, so a malformed fixture would redden this assertion for a reason
+    /// unrelated to the guard. (A NAMELESS call can never double-fire with it — a
+    /// nameless call is dropped BEFORE `parse_arguments` is reached.)
+    ///
+    /// The assertion covers BOTH stems, so it also reddens if the placeholder
+    /// filters are ever instrumented — they fire on a good turn.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_healthy_tool_call_turn_records_no_drop_line() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("healthy");
+        reset_diagnostics_file(armed.dir.path());
+
+        let events = collect(anthropic_stream(&[
+            &content_block_start(1, Some("tu_9"), Some("read")),
+            &input_json_delta(1, ARG_TEXT),
+            MESSAGE_DELTA,
+        ]))
+        .await;
+
+        // The witness: this IS a healthy turn — the call was assembled and
+        // dispatched with well-formed arguments, so the empty assertion below
+        // measures a guard and not a dead path.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProviderEvent::ToolCall(t) if t.name == "read" && t.defect.is_none()
+            )),
+            "the fixture dispatched a complete, well-formed call, got {events:?}"
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "a turn that streamed and dispatched its call lost nothing, so no \
+             discard line may be written; got:\n{lines:#?}"
+        );
+
+        // The POSITIVE CONTROL, so the assertion above cannot be vacuous by way of
+        // a channel that records nothing at all: the same armed channel takes the
+        // same sentence when the guard IS satisfied. If this half stops writing,
+        // the empty assertion above has stopped meaning anything.
+        crate::diagnostics::record(WANT_NAMELESS);
+        let after = discard_lines(&recorded_lines(armed.dir.path()));
+        assert_eq!(
+            ending_with(&after, WANT_NAMELESS),
+            1,
+            "the armed channel DOES take this line — so the empty assertion above \
+             measured the guard, not a dead sink; got:\n{after:#?}"
+        );
     }
 
     #[test]
