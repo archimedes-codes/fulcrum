@@ -69,17 +69,23 @@ pub use types::{cost_usd_from_usage, parse_error_chunk, WireToolCall};
 ///   `diagnostics::init` or `debuglog::init_from_env` — so in a `fulcrum serve`
 ///   deployment this line reaches neither file, only whatever the daemon does
 ///   with the process's stderr.
-/// * The `eprintln!` half is what covers the WORKER: the Worker's stderr is
-///   drained by a dedicated task in `worker/client.rs`
-///   (`debuglog::log_truncated("worker-stderr:", &line)`), so it is the only
-///   Worker-side sink that survives **with `ARCHIMEDES_DEBUG=1`** — that drain
-///   feeds `debuglog`, which returns immediately without the var. In a DEFAULT
-///   launch, therefore, NEITHER half reaches a file from inside a Worker: the
-///   `record` half is a no-op because the Worker never arms diagnostics (ADR
-///   0110, "What this does not fix"), and the `eprintln!` half is dropped by the
-///   gate. DO NOT delete the `eprintln!` as redundant with the `record` line on
-///   the strength of the sentence above — with the var set it is the Worker's
-///   only reader, and deleting it makes the Worker-side wire unobservable again.
+/// * The `eprintln!` half is what covers the WORKER **when the Worker is
+///   unarmed**: the Worker's stderr is drained by a dedicated task in
+///   `worker/client.rs` (`debuglog::log_truncated("worker-stderr:", &line)`), so
+///   it is the only Worker-side sink that survives **with `ARCHIMEDES_DEBUG=1`** —
+///   that drain feeds `debuglog`, which returns immediately without the var.
+///   Whether the `record` half reaches a file inside a Worker is now a property of
+///   the envelope, not of the process: the Worker arms the channel with the
+///   `start` envelope's `diagnosticsDir` (`worker/core.rs`,
+///   `StartEnv::with_diagnostics_dir`), so a Worker whose Supervisor sent that key
+///   writes this line to `diagnostics.log` **and** to stderr, and one whose
+///   Supervisor did not — an old Supervisor, the `fulcrum serve` daemon, every
+///   `StartEnv::from_parts` fixture — gets the old silence on the `record` side
+///   and the var-gated stderr line on the other. That supersedes ADR 0110's
+///   "What this does not fix" for the wire path. DO NOT delete the `eprintln!` as
+///   redundant with the `record` line on the strength of that — the unarmed Worker
+///   is still a real deployment (it is every Worker an old Supervisor spawns), and
+///   with the var set it is that Worker's only reader.
 ///
 /// # What may appear in the `record` payload
 ///
@@ -587,10 +593,15 @@ pub fn build_provider_with_headers(
     // `AgentLoop::set_model`), so this is the site whose wire a user's session
     // actually ran on. The same resolved-once local and the same [`log_wire`] as
     // [`build_provider`] — one call, so the two builders and the two sinks cannot
-    // drift apart. Reached in the Worker, where the `record` half is a no-op
-    // (never armed) and the `eprintln!` half survives only through the stderr
-    // drain, and in the Supervisor, where the `record` half is the only one with
-    // a reader.
+    // drift apart. Reached in the Worker, where the `record` half lands only if
+    // the `start` envelope carried a diagnostics directory (the Worker arms the
+    // channel from it, before this call — see `worker/core.rs`'s `Inbound::Start`
+    // arm) and the `eprintln!` half survives only through the stderr drain; and in
+    // the Supervisor, where the `record` half is the only one with a reader. The
+    // ORDER matters and is pinned by
+    // `worker::core::tests::a_start_carrying_a_diagnostics_dir_arms_the_channel`:
+    // the arming happens in the `Start` arm, so the line THIS function emits is
+    // already observable — an arming placed after `build_loop` would miss it.
     let wire = crate::harness::WireApi::parse(m.api.as_deref().unwrap_or("openai-completions"))
         .unwrap_or_default();
     log_wire(wire, m);

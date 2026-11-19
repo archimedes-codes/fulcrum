@@ -560,8 +560,13 @@ mod tests {
         )
     }
 
-    /// The `start` envelope as the `Inbound::Start` variant (all 14
-    /// fields, the harness `enabled_tools` convention verbatim).
+    /// The `start` envelope as the `Inbound::Start` variant: EVERY field of
+    /// `StartEnv`, spelled out (the harness `enabled_tools` convention verbatim).
+    ///
+    /// No field COUNT is quoted here on purpose — this literal enumerates all of
+    /// them, so a new field is a compile error at this line and a number here
+    /// would only be a second, staler source of the same truth. It used to say
+    /// "all 14 fields" while the struct already had twenty.
     fn start_inbound() -> Inbound {
         Inbound::Start(Box::new(StartEnv {
             session_id: "s1".to_string(),
@@ -665,6 +670,14 @@ mod tests {
                 use_gcloud_token_auth: false,
                 oidc: None,
             }],
+            // The diagnostics arming directory, NON-`None` ON PURPOSE for the same
+            // reason as the six fields above: this literal is what
+            // `every_inbound_variant_round_trips` encodes and DECODES, so the
+            // `Deserialize` half of the `PathBuf` (its `PathBufVisitor`, which
+            // accepts a string and nothing else) is exercised on every run, and the
+            // camelCase WIRE NAME is pinned byte-wise by
+            // `the_start_env_carries_the_diagnostics_dir_as_diagnostics_dir`.
+            diagnostics_dir: Some(std::path::PathBuf::from("/home/u/.local/share/archimedes")),
         }))
     }
 
@@ -801,6 +814,141 @@ mod tests {
                 .cost_usd,
             Some(0.25)
         );
+    }
+
+    /// The diagnostics arming directory rides the `start` envelope as camelCase
+    /// `diagnosticsDir`, and the two cross-version directions both hold.
+    ///
+    /// Why a byte-level pin rather than the round-trip alone: the same reason
+    /// [`the_start_env_carries_the_stored_cost_as_cost_usd`] gives for `costUsd` —
+    /// a key a hand-written line spells `diagnostics_dir` is an UNKNOWN key to a
+    /// `rename_all = "camelCase"` struct, and it decodes to `None` with no error at
+    /// all. The line below is therefore derived from an ENCODED frame by string
+    /// surgery, so the only thing this test varies is the key it is pinning.
+    ///
+    /// What the three directions mean, and why each is asserted:
+    /// * **round trip** — the value lands on the field, so the Worker can act on
+    ///   it (this is the whole feature: the directory arrives on the wire);
+    /// * **key absent** (old Supervisor → new Worker) — decodes to `None`, which is
+    ///   UNARMED, which is byte-identical to today's Worker. This is the direction
+    ///   the five unisolated real-Worker tests in the desktop suite sit in, and
+    ///   the direction a shipped Supervisor is in until it re-pins;
+    /// * **key present against an old Worker** — the codec ignores unknown keys, so
+    ///   a NEW Supervisor's `start` still decodes against a stale Worker binary
+    ///   that has no field to put it in. Pinned here as the decode of a
+    ///   hand-spliced line, because that IS the old Worker's decoder: `StartEnv`
+    ///   carries no `deny_unknown_fields`.
+    #[test]
+    fn the_start_env_carries_the_diagnostics_dir_as_diagnostics_dir() {
+        let env = test_env().with_diagnostics_dir(Some(std::path::PathBuf::from(
+            "/home/u/.local/share/archimedes",
+        )));
+        let line = encode_inbound(&Inbound::from(&env));
+        assert!(
+            line.contains(r#""diagnosticsDir":"/home/u/.local/share/archimedes""#),
+            "the arming directory rides the wire as camelCase `diagnosticsDir`: {line}"
+        );
+        assert!(
+            !line.contains(r#""diagnostics_dir""#),
+            "no snake_case spelling of the key ever reaches the wire: {line}"
+        );
+
+        // Round trip, through the real `start` decode path.
+        match decode_inbound(&line).expect("the `start` decodes") {
+            Inbound::Start(env_dec) => assert_eq!(
+                env_dec.diagnostics_dir.as_deref(),
+                Some(std::path::Path::new("/home/u/.local/share/archimedes")),
+                "the directory arrives on the field the Worker arms from"
+            ),
+            other => panic!("expected `Start`, got {other:?}"),
+        }
+
+        // The additive direction: an OLD supervisor's `start`, the key REMOVED by
+        // surgery, decodes to `None` — UNARMED, the old silence, deliberately.
+        let old = drop_json_key(&line, "diagnosticsDir");
+        assert_ne!(
+            old, line,
+            "the rewrite happened (the key was actually removed)"
+        );
+        assert!(
+            !old.contains(r#""diagnosticsDir""#),
+            "the old-shape line names the key nowhere: {old}"
+        );
+        match decode_inbound(&old).expect("a `start` without the key decodes") {
+            Inbound::Start(env_dec) => assert_eq!(
+                env_dec.diagnostics_dir, None,
+                "a missing key is `None` (unarmed), never a self-resolved directory"
+            ),
+            other => panic!("expected `Start`, got {other:?}"),
+        }
+
+        // The trap, armed: the SAME key spelled snake_case is not an error and not
+        // an arming — it is silently `None`, exactly as `costUsd`'s is.
+        let misnamed = line.replace(r#""diagnosticsDir":"#, r#""diagnostics_dir":"#);
+        match decode_inbound(&misnamed).expect("a misnamed key does not break the decode") {
+            Inbound::Start(env_dec) => assert_eq!(
+                env_dec.diagnostics_dir, None,
+                "a snake_case `diagnostics_dir` is an UNKNOWN key to this struct — \
+                 the silent-drop direction, documented so nobody hand-writes one"
+            ),
+            other => panic!("expected `Start`, got {other:?}"),
+        }
+
+        // `from_parts` (every fixture, every fresh session and every fresh child)
+        // leaves it `None`; `with_diagnostics_dir` is the Supervisor's setter.
+        assert_eq!(
+            test_env().diagnostics_dir,
+            None,
+            "a constructor-built env arms nothing — the five unisolated real-Worker \
+             tests build through `from_parts` and must stay silent"
+        );
+        assert_eq!(
+            test_env()
+                .with_diagnostics_dir(Some(std::path::PathBuf::from("/d")))
+                .diagnostics_dir
+                .as_deref(),
+            Some(std::path::Path::new("/d")),
+            "`with_diagnostics_dir` sets it verbatim"
+        );
+        // A snapshot builder SETS, it does not append: a second call cannot leave
+        // two candidate targets behind.
+        assert_eq!(
+            test_env()
+                .with_diagnostics_dir(Some(std::path::PathBuf::from("/first")))
+                .with_diagnostics_dir(Some(std::path::PathBuf::from("/second")))
+                .diagnostics_dir
+                .as_deref(),
+            Some(std::path::Path::new("/second")),
+            "the last call wins, and only one target exists"
+        );
+        // `None` is a SETTABLE state, not only an absent one — a host's off switch.
+        assert_eq!(
+            test_env()
+                .with_diagnostics_dir(Some(std::path::PathBuf::from("/first")))
+                .with_diagnostics_dir(None)
+                .diagnostics_dir,
+            None,
+            "`with_diagnostics_dir(None)` UNARMS"
+        );
+
+        // A `None` field still goes out as JSON `null` (this struct uses
+        // `#[serde(default)]`, never `skip_serializing_if` — the same posture as
+        // `permission` / `cost_usd`), and `null` decodes back to `None`. Pinned
+        // because it is what a NEW Supervisor sending no directory puts on the
+        // wire, and what a 0.4.1 Worker's decoder must tolerate as an unknown key.
+        let plain = encode_inbound(&Inbound::from(&test_env()));
+        assert!(
+            plain.contains(r#""diagnosticsDir":null"#),
+            "an env that never set the field emits `null`, not a key it invented: \
+             {plain}"
+        );
+        match decode_inbound(&plain).expect("the `null` form decodes") {
+            Inbound::Start(env_dec) => assert_eq!(
+                env_dec.diagnostics_dir, None,
+                "`null` is `None` — unarmed, not the empty path"
+            ),
+            other => panic!("expected `Start`, got {other:?}"),
+        }
     }
 
     /// (Fulcrum T3) The FIVE packaged desktop-config fields ride the `start`
@@ -1900,6 +2048,11 @@ mod tests {
                 assert_eq!(env_dec.subagent_enabled, env.subagent_enabled);
                 assert_eq!(env_dec.system_prompt, env.system_prompt);
                 assert_eq!(env_dec.incarnation, env.incarnation);
+                // The diagnostics directory, on the same field-identical pin. Its
+                // `None` here is the point as much as its `Some`: this fixture is
+                // built by `from_parts`, so the shape this test proves
+                // field-identical is the UNARMED one every fixture carries.
+                assert_eq!(env_dec.diagnostics_dir, env.diagnostics_dir);
             }
             other => panic!("expected `Start`, got {other:?}"),
         }

@@ -22,18 +22,20 @@
 //! cheerfully): the `eprintln!` half is the Worker's stderr, which the
 //! Supervisor's drain task reads into `debuglog` ONLY with `ARCHIMEDES_DEBUG=1`
 //! set; the `diagnostics::record` half takes no env var but is UNARMED until a
-//! host injects a directory, and inside a Worker it is a no-op today — every
-//! `diagnostics::init` in the crate is a test, arming lives in the desktop's
-//! `run()` (the Supervisor, which a `--worker` child never reaches), and
-//! `run_worker_inner` arms neither channel. So in a DEFAULT launch NEITHER half
-//! reaches a file from inside a Worker (ADR 0110, "What this does not fix");
-//! `provider/mod.rs` states that in full and this file used to contradict it.
+//! host injects a directory. A Worker now injects one itself, from the `start`
+//! envelope's `diagnosticsDir` (`worker/core.rs`'s `Inbound::Start` arm), so
+//! inside a Worker whose Supervisor sent that key the `record` half DOES reach
+//! `diagnostics.log` in a default launch — which is what this file's own
+//! `a_turn_that_streamed_deltas_and_dispatched_none` has always asserted, from
+//! the module side, by arming the channel at a scratch dir (exactly the step
+//! production previously refused to take and now takes on the wire). A Worker
+//! whose envelope carries no directory — an old Supervisor, `fulcrum serve`,
+//! every `StartEnv::from_parts` fixture — still gets the silence ADR 0110
+//! recorded, and `provider/mod.rs` states that split in full.
 //!
-//! What that leaves assertable: a lib unit test can assert the `record` half —
-//! the module arms the channel at a scratch dir itself, which is precisely the
-//! arming production does not do — and CANNOT assert the `eprintln!` half, whose
-//! only production reader is a drain task that needs a real spawned Worker
-//! process. That asymmetry is `provider/mod.rs::the_chosen_wire_is_logged_at_construction`'s
+//! What is still NOT assertable from here: the `eprintln!` half, whose only
+//! production reader is a drain task that needs a real spawned Worker process.
+//! That asymmetry is `provider/mod.rs::the_chosen_wire_is_logged_at_construction`'s
 //! own honest limit, restated here rather than papered over: the stderr line is
 //! covered by sharing the payload this file asserts, not by an assertion on its
 //! bytes.

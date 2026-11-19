@@ -55,19 +55,45 @@
 //! once, beside the `debuglog::init_from_env()` call it already makes. A host that
 //! never calls `init` gets the old silence and nothing else.
 //!
-//! Why the module refuses to resolve `dirs::data_dir()` itself: the pump's
-//! frame-drop line is reached by an existing manager test that inits nothing, so a
-//! lazy default would make `cargo test` write into the developer's real
-//! `~/.local/share/archimedes/`. `debuglog` is test-safe because its default is
-//! off and its tests arm it against a scratch dir; this module keeps that property
-//! rather than trading it for one fewer startup line. It is also what invariant D
-//! in `childproc` argues for — the crate resolves the base dir at install time and
-//! passes it across, and a second module independently resolving it is the drift
-//! that pin exists to catch.
+//! There are now THREE kinds of host, and which one a process is decides whether
+//! anything is written at all:
+//!
+//! * the **desktop Supervisor**, which calls `init` in its own `run()`;
+//! * the **Worker**, which calls `init` in `worker/core.rs`'s `Inbound::Start` arm
+//!   with the `start` envelope's `StartEnv::diagnostics_dir`. This is the arming
+//!   that makes the harness's tool-call-drop and silent-settle lines reachable in a
+//!   shipped build — before it, every `init` in the crate was `#[cfg(test)]` and
+//!   `record` was a silent no-op inside a Worker. A Worker whose envelope carries no
+//!   directory (an old Supervisor, `fulcrum serve`, any `StartEnv::from_parts`
+//!   fixture) stays UNARMED, which is the deliberate default and the reason not one
+//!   test needed editing to add the field;
+//! * the **`fulcrum serve` daemon**, which arms neither this channel nor `debuglog`
+//!   — recorded in `harness/provider/mod.rs`, and unchanged here.
+//!
+//! Why the module still refuses to resolve `dirs::data_dir()` itself, and why the
+//! Worker in particular may not: the pump's frame-drop line is reached by an
+//! existing manager test that inits nothing, so a lazy default would make
+//! `cargo test` write into the developer's real `~/.local/share/archimedes/`. The
+//! Worker has a second, sharper reason — five tests in the desktop suite spawn the
+//! real `--worker` binary, send a real `start` and inherit the developer's real data
+//! dir with no `HOME`/`XDG_DATA_HOME` isolation, and every one of them reaches a
+//! `record`. `debuglog` is test-safe because its default is off and its tests arm it
+//! against a scratch dir; this module keeps that property rather than trading it for
+//! one fewer startup line. It is also what invariant D in `childproc` argues for —
+//! the crate resolves the base dir at install time and passes it across, and a
+//! second module independently resolving it is the drift that pin exists to catch.
+//! The directory therefore travels on the wire, and `worker/core.rs` says so at the
+//! arming site so the next reader does not "simplify" it back.
 //!
 //! **A test must therefore call `init(Some(temp_dir))` before its first
-//! `record`**, under `test_support::env_lock()` (the target is process-global, so
-//! a sibling test's `init` would otherwise race these assertions).
+//! `record`**, under `test_support::env_lock()` (the target is process-global, so a
+//! sibling test's `init` would otherwise race these assertions). The two
+//! `worker::core` tests that assert the HANDLER arms it are the deliberate
+//! exception — they arm nothing themselves, for exactly that reason — and they hold
+//! the lock across the arming and the read, because a `record` from an unlocked
+//! sibling is expected here and a `init(None)` from one is what would break them
+//! (which is why the arming at `worker/core.rs` writes the global ONLY when the
+//! envelope carries a directory).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -125,7 +151,14 @@ pub fn init(dir: Option<PathBuf>) {
 }
 
 /// The effective target (`None` until a host calls [`init`]).
-fn effective_dir() -> Option<PathBuf> {
+///
+/// `pub(crate)` and not private for ONE reason: `worker/core.rs`'s arming test
+/// asserts the handler resolved NO target at all, and that is the only assertion
+/// that distinguishes "armed nothing" from "armed the real data dir somewhere this
+/// test cannot see" — the same reason the `unarmed_it_writes_nothing_anywhere`
+/// test inside this module needs it. A test must never be able to satisfy the
+/// unarmed pin while a lazy `dirs::data_dir()` writes into the developer's home.
+pub(crate) fn effective_dir() -> Option<PathBuf> {
     slot().lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
@@ -150,6 +183,45 @@ pub fn record(line: &str) {
 /// explicitly, so tests exercise it against their own scratch dir and never race
 /// the process-global one — the `debuglog::append_to` shape, and for the same
 /// reason).
+///
+/// # Concurrent writers, and the one thing rotation can lose
+///
+/// Until the Worker was armed (the `start` envelope's `diagnosticsDir`, applied in
+/// `worker/core.rs`), the Supervisor was this file's ONLY writer. It now has
+/// company — the Supervisor plus one Writer per Worker session, all appending to
+/// the SAME `FILE_NAME`, because the file's value is that it is *the one file* a
+/// supporter asks for. Two consequences, and they are not equal:
+///
+/// * **A record is never split, and never interleaved.** The single `write_all`
+///   below plus `O_APPEND` makes the seek-to-end and the write ONE atomic
+///   operation PER INODE, and the handle is opened and closed inside one call, so
+///   a writer's exposure is a single open→write→close window. That guarantee is
+///   per-inode and it survives a rename: a record that lands in the file a
+///   concurrent writer has just renamed into `.old` arrives WHOLE and is NOT lost —
+///   it is in the rotated file, possibly above a line written earlier. Attribution
+///   only.
+/// * **The rotation can lose ALREADY-ROTATED data.** The size check and the
+///   `rename` are not one atomic step, so two writers can both see
+///   `meta.len() >= MAX_DIAGNOSTIC_BYTES` and both rename: the second renames the
+///   fresh, near-empty file over the first's `.old` and clobbers it — up to one
+///   `MAX_DIAGNOSTIC_BYTES` of history gone in a single rotation cycle. On Windows
+///   the losing writer's next `open` can additionally fail inside a delete-pending
+///   window and this function returns early — one record ABSENT, which is the
+///   module's documented "whole or absent" behaviour rather than a violation of it.
+///   The Windows outcome is reasoned from std's `share_mode` (it includes
+///   `FILE_SHARE_DELETE`) and has NOT been measured: no Windows host was available
+///   to the change that recorded it.
+///
+/// DECIDED, NOT SILENTLY ACCEPTED: **the live file never loses a record; only the
+/// already-rotated `.old` can, and only under a double rotation.** This is the same
+/// race `debuglog::append_to` has always had and already accepts, and it is
+/// accepted here for the same reason and with the same remedies refused — a
+/// per-Worker `diagnostics-<pid>.log` would end the race by destroying the
+/// single-file premise (and the "one file a supporter collects" rule above), and a
+/// lock around the rotate+append window buys one megabyte of rotated history at the
+/// price of a new failure mode. Arming the Worker changes the FREQUENCY of the
+/// window, not its KIND: from "the Supervisor rotates alone" to "N + 1 writers
+/// contend at every 1 MB boundary".
 pub fn append_to(dir: &std::path::Path, line: &str) {
     if std::fs::create_dir_all(dir).is_err() {
         return;

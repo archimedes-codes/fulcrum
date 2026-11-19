@@ -755,22 +755,30 @@ pub(super) fn parse_arguments(args: &str) -> (Value, Option<ArgumentDefect>) {
 // # The two sinks, and why both
 //
 // `provider/mod.rs::log_wire` documents this in full and this follows it
-// exactly — including the part this block used to get wrong: in a DEFAULT launch
-// NEITHER half reaches a file from inside a Worker. The `eprintln!` half is the
-// Worker's stderr, whose only reader is the `worker/client.rs` drain task and
-// ONLY with `ARCHIMEDES_DEBUG=1` set (it feeds `debuglog`, which returns at its
-// first statement without the var). The `record` half takes no env var, but it
-// is UNARMED until a host injects a directory and no `diagnostics::init` in the
-// crate is non-test: arming lives in the desktop's `run()` — the Supervisor,
-// which a `--worker` child never reaches — and `run_worker_inner` arms neither
-// channel, so inside a Worker `record` is a no-op today (ADR 0110, "What this
-// does not fix"). Both halves stay anyway: with the var set the `eprintln!` is
-// the Worker's ONLY reader, and `record` is what a host that DOES arm diagnostics
-// receives. Neither half is redundant and neither may be deleted on the strength
-// of the other. `record` takes the line WITHOUT the `harness: ` prefix, as
-// `log_wire`'s and `settled_with_nothing_dispatched`'s do — which is why the
-// builders answer the prefix-free form and `emit_harness_line` adds it for the
-// stderr half.
+// exactly — including the part this block used to get wrong TWICE. It once said
+// neither half reaches a file from inside a Worker; that was true of the Worker
+// that existed then and is no longer true of this one. The Worker now arms the
+// channel with the `start` envelope's `diagnosticsDir` (`worker/core.rs`'s
+// `Inbound::Start` arm), so whether the `record` half lands is a property of the
+// ENVELOPE, not of the process:
+//   * Supervisor sent `diagnosticsDir` → BOTH halves are written: `record` to
+//     `<datadir>/archimedes/diagnostics.log`, `eprintln!` to stderr (and into
+//     `supervisor.log` through the drain, when the var is set). The duplicate is
+//     the design, not a defect — see the paragraph below on what deleting either
+//     half would cost;
+//   * no `diagnosticsDir` (an old Supervisor, the `fulcrum serve` daemon, every
+//     `StartEnv::from_parts` fixture) → the `record` half is a no-op and the
+//     `eprintln!` half survives ONLY with `ARCHIMEDES_DEBUG=1`, because its reader
+//     is the `worker/client.rs` drain task feeding `debuglog`, which returns at its
+//     first statement without the var.
+//
+// Both halves stay in BOTH states. With the var set the `eprintln!` is the only
+// thing an UNARMED Worker writes at all, and `record` is the only thing an ARMED
+// Worker writes in a default launch; neither is redundant and neither may be
+// deleted on the strength of the other. `record` takes the line WITHOUT the
+// `harness: ` prefix, as `log_wire`'s and `settled_with_nothing_dispatched`'s do —
+// which is why the builders answer the prefix-free form and `emit_harness_line`
+// adds it for the stderr half.
 //
 // # What may appear in the `record` payload
 //

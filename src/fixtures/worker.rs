@@ -853,7 +853,17 @@ pub fn worker_main() {
                     // two-incarnation assertion: the e2e resume test reads the
                     // echo to prove two Workers for one Session get
                     // DIFFERENT stamps.
-                    "incarnation": env.incarnation
+                    "incarnation": env.incarnation,
+                    // The diagnostics directory the envelope carried, echoed for
+                    // the same reason as `incarnation`: it is a fact about the
+                    // CHILD's `StartEnv` that nothing else in the crate exposes
+                    // (a child Worker is never registered in `state.workers`, so
+                    // even the test-only `test_env_for` cannot read it back), and
+                    // whether the parent's value reached the child is the whole
+                    // content of the `subagent_flow` inheritance hop.
+                    // `null` — the fixture arms nothing, and this is a fixture,
+                    // not the real Worker's `diagnostics::init` call.
+                    "diagnosticsDir": env.diagnostics_dir
                 });
                 emit(
                     &mut stdout,

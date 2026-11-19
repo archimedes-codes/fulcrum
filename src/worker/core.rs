@@ -639,6 +639,87 @@ impl WorkerCore {
                 // (`StartEnv::from_parts`) — ADR 0049 deliberately declined to
                 // guard this path.
                 self.session_id = Some(env.session_id.clone());
+                // THE arming of the ALWAYS-ON diagnostics channel, applied to the
+                // envelope's directory BEFORE `build_loop` runs — so every `record`
+                // the loop and its provider make is observable, including
+                // `log_wire`'s line, which fires inside `build_loop` itself.
+                //
+                // # Why the directory arrives on the wire, and not resolved here
+                //
+                // The Worker MUST NOT call `dirs::data_dir()` for this. Five tests
+                // in the desktop suite spawn the REAL `archimedes --worker` binary,
+                // send a REAL `start` envelope, and inherit the developer's real
+                // data dir with no `HOME`/`XDG_DATA_HOME` isolation
+                // (`worker_smoke.rs`, `worker_stdin.rs`, and three in
+                // `worker_e2e.rs`) — and every one of them reaches
+                // `default_build_loop` → `build_provider_with_headers` → `log_wire`
+                // → `diagnostics::record`. A self-resolved directory would
+                // therefore write into `~/.local/share/archimedes/diagnostics.log`
+                // on every developer machine and on CI, which is exactly the
+                // failure `diagnostics.rs`'s module doc refuses a lazy default for
+                // — and `childproc.rs`'s invariant-D pin keeps `dirs::data_dir()`
+                // to exactly one occurrence in `worker/mod.rs`'s production region
+                // for the same reason. Passing the directory across the wire is
+                // what makes those fixtures unarmed without editing them: they all
+                // build through `StartEnv::from_parts`, which leaves the field
+                // `None`. DO NOT "simplify" this into a `dirs::data_dir()` call —
+                // `a_start_without_a_diagnostics_dir_leaves_the_channel_unarmed`
+                // reddens, and the suite cannot see its own side effects on `$HOME`.
+                //
+                // # Why arming here is safe against the no-user-content rule
+                //
+                // `diagnostics`' rule is absolute — no transcript, no prompt, no
+                // model answer, no token, no bearer, no file body — and arming the
+                // Worker makes EVERY existing `record` site live in a process that
+                // handles user content. This is armed because each reachable
+                // payload was checked, not as a convenience:
+                //   * `provider/mod.rs::log_wire` — a closed wire enum (one of four
+                //     static strings), `m.id` through `one_field_per_line`, and
+                //     `reduced_base_url` (strips userinfo/query/fragment, gated on
+                //     an allowlisted scheme + a real host);
+                //   * `openai.rs::emit_harness_line` and its two builders — a
+                //     parser name and a stage name (static strings), an integer
+                //     index, `args_bytes` which is `args.len()` (a LENGTH, never the
+                //     arguments), `in_flight`/`named_any` (a count and a bool), and
+                //     a provider-supplied `id` sanitised at the one place the
+                //     sentence is built;
+                //   * `loop.rs`'s settle line via
+                //     `turn::settled_with_nothing_dispatched` — a closed finish-reason
+                //     enum, `acc.text.chars().count()` (the LENGTH of the answer) and
+                //     a delta count; `self.model.id` is deliberately absent;
+                //   * `worker/manager/pump.rs`'s lag line is a count and a session
+                //     id — and is SUPERVISOR-side anyway (`run_pump_loop` is reached
+                //     from `WorkerManager::attach`; a Worker builds no
+                //     `WorkerManager`), so arming here does not make it newly live.
+                //
+                // Nothing `record`s before this point: every pre-`start` failure
+                // path in the Worker is an `eprintln!` (`worker/mod.rs`: bad inbound
+                // line, stdin read failed, stdout write failed). Arming at `start`
+                // therefore loses no line that exists today.
+                //
+                // The arming is deliberately ONE-WAY: it arms, and never disarms.
+                // `None` (every fixture, every old envelope, the daemon) leaves the
+                // target exactly as it found it — which is unarmed, because nothing
+                // else in this process arms it. Two reasons, the second measured:
+                //   * A `Start` that carries no directory must not be able to switch
+                //     OFF a channel its Supervisor turned on. A second `Start` on one
+                //     Worker is test-only today (see the `incarnation` note above),
+                //     and re-arming to the same host's same data dir could only ever
+                //     write where it was already writing — so staying armed loses
+                //     nothing and disarming could.
+                //   * An unconditional `init(env.diagnostics_dir.clone())` — the
+                //     shape this line was first written in, and MEASURED to redden
+                //     the suite — makes every `Start` in the crate a write to the
+                //     process-global target, including the ~10 `worker::core` tests
+                //     that handle a `Start` WITHOUT taking `env_lock()`. Each of
+                //     those then clears a sibling's armed scratch dir between its
+                //     `init` and its read. That is the exact flake class
+                //     `diagnostics::a_sibling_writer_does_not_break_the_timestamp_assertions`
+                //     documents and refuses, so the write is gated on the field
+                //     being present instead.
+                if let Some(dir) = &env.diagnostics_dir {
+                    crate::diagnostics::init(Some(dir.clone()));
+                }
                 // The `StaticTrustSource` flag SET (the source is shared
                 // with the `Start`-built loop — a replace would orphan
                 // the loop's `Arc`; the flag is the single source of
@@ -1972,6 +2053,170 @@ mod tests {
             "the unrelated pending entry is untouched — an unknown id must not \
              clear the map"
         );
+    }
+
+    /// Disables the process-global diagnostics target on the way out, INCLUDING on
+    /// a panicking assertion — the `DisableDiagnosticsOnExit` unit of
+    /// `harness/provider/mod.rs`, and for the reason that file states: a trailing
+    /// `init(None)` is unwound past by a failing assertion, the global stays aimed
+    /// at whatever dir the test armed, and every later `record` anywhere in the
+    /// binary then `create_dir_all`s that dir back into existence (if it has since
+    /// been removed) and writes into it for the rest of the run.
+    ///
+    /// The caller declares it AFTER its `ScratchDir`, so it drops FIRST (locals
+    /// drop in reverse) and the global is cleared before the dir it may name is
+    /// removed — the declaration order `provider/mod.rs` documents as
+    /// load-bearing for this exact pair.
+    ///
+    /// ⚠ **NOTHING HERE CALLS `init(Some(_))`, and nothing may.** These two tests
+    /// assert that the `Start` HANDLER arms the channel, so a guard that armed it
+    /// would make both pass unconditionally — measured: the first draft of this
+    /// file did exactly that, and both tests were green before a line of production
+    /// code existed. The guard owns the DISABLE only; the ARMING belongs to the code
+    /// under test or to neither.
+    struct DisableDiagnosticsOnExit;
+    impl Drop for DisableDiagnosticsOnExit {
+        fn drop(&mut self) {
+            crate::diagnostics::init(None);
+        }
+    }
+
+    /// THE fix: a `start` envelope that carries a diagnostics directory ARMS the
+    /// always-on channel inside the Worker, and the line that was written before
+    /// this change existed is finally in the file.
+    ///
+    /// The envelope reaches the handler through the REAL codec — `encode_inbound`
+    /// then string surgery then `decode_inbound` — and not through a Rust setter,
+    /// for two reasons. (1) It is the path a Supervisor's bytes actually take, so
+    /// the assertion covers the decode and not just the struct. (2) It is what
+    /// makes this test a RED test rather than a compile error: `StartEnv` has no
+    /// `deny_unknown_fields`, so an unknown `diagnosticsDir` key decodes today
+    /// exactly as it will decode against an OLD Supervisor tomorrow — the test
+    /// compiles before the field exists and fails for the RIGHT reason (nothing
+    /// armed, so nothing was written).
+    ///
+    /// The assertion reads the `provider wire=…` line that `log_wire` records from
+    /// inside `default_build_loop` — i.e. the arming is proven to happen BEFORE the
+    /// loop is built, which is the ordering that makes every existing `record` call
+    /// site in the harness observable rather than only the ones added after this
+    /// commit. Asserting on a line the production code already writes is also what
+    /// keeps this test from being satisfied by a `record` call this test itself
+    /// made — and the test arms nothing at all (see [`DiagnosticsDirGuard`]).
+    ///
+    /// `env_lock()` per the `diagnostics` module's stated contract (the target is
+    /// process-global and ~17 unlocked `build_provider` tests reach `record`).
+    /// `#[allow(clippy::await_holding_lock)]` because `handle` is `async` and the
+    /// lock must span the arming and the read; the precedent is
+    /// `harness/loop/tests/param_rejection.rs::a_rejected_call_never_reaches_the_permission_gate`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_start_carrying_a_diagnostics_dir_arms_the_channel() {
+        let _guard = crate::test_support::env_lock();
+        // The unarmed phase, made deterministic: a sibling test's `init` must not
+        // decide what this test observes. NOTHING below arms the channel — the
+        // `Start` handler is what has to.
+        crate::diagnostics::init(None);
+        let dir = crate::test_support::ScratchDir::in_env_temp("worker-core-diag-", "arms");
+        // Declared AFTER the dir so it drops FIRST (locals drop in reverse).
+        let _disable = DisableDiagnosticsOnExit;
+
+        let env = test_env(StartMode::Fresh, None, None);
+        let line =
+            encode_start_with_diagnostics_dir(&env, dir.to_str().expect("a utf-8 temp path"));
+        let msg = crate::worker::protocol::decode_inbound(&line).expect("the frame decodes");
+
+        // The PRODUCTION `default_build_loop` (not the stub): the line asserted
+        // below is written by `build_provider_with_headers`, so the stub would
+        // prove the arming and nothing about the ordering that matters.
+        let (mut core, _out_rx, _in_tx) = production_core();
+        core.handle(msg).await;
+
+        let content = std::fs::read_to_string(dir.join(crate::diagnostics::FILE_NAME))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "`start` armed the channel, so `log_wire`'s line is in the file: \
+                     {e}; the global target is {:?}",
+                    crate::diagnostics::effective_dir()
+                )
+            });
+        assert!(
+            content.contains("provider wire=openai-completions") && content.contains("model=m1"),
+            "the construction line the Worker already writes is in the file the \
+             envelope named:\n{content}"
+        );
+        // And it was the HANDLER that armed it, not a sibling test's `init` that
+        // happened to point the global at a dir with this name in it.
+        assert_eq!(
+            crate::diagnostics::effective_dir().as_deref(),
+            Some(dir.as_ref()),
+            "the target the handler installed IS the directory the envelope named"
+        );
+    }
+
+    /// THE test-safety half, and the reason the directory rides the wire instead
+    /// of being resolved by the Worker: a `start` that carries NO diagnostics
+    /// directory leaves the channel UNARMED — no file, in this dir or anywhere
+    /// else.
+    ///
+    /// Every fixture that builds a `StartEnv` through `StartEnv::from_parts` is in
+    /// exactly this state, and so is every `start` an OLD Supervisor sends. That
+    /// is what keeps the five real-Worker tests that spawn the real binary, send a
+    /// real `start` and inherit the developer's real data dir with no `HOME`/
+    /// `XDG_DATA_HOME` isolation (`worker_smoke.rs`, `worker_stdin.rs`, three in
+    /// `worker_e2e.rs`) writing nothing, and it is what keeps a new Worker
+    /// byte-identical to today's against an old Supervisor.
+    ///
+    /// The scratch dir here is named by NOTHING — the envelope carries no
+    /// directory — so a file appearing in it can only mean the Worker chose a
+    /// target on its own. That is what reddens a `dirs::data_dir()`
+    /// "simplification" of the arming site, together with the second assertion.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_start_without_a_diagnostics_dir_leaves_the_channel_unarmed() {
+        let _guard = crate::test_support::env_lock();
+        crate::diagnostics::init(None);
+        let dir = crate::test_support::ScratchDir::in_env_temp("worker-core-diag-", "unarmed");
+        // Declared AFTER the dir so it drops FIRST (locals drop in reverse): the
+        // global is cleared before the dir it may name is removed.
+        let _disable = DisableDiagnosticsOnExit;
+
+        // `from_parts` — the shape EVERY fixture and every old envelope has.
+        let env = test_env(StartMode::Fresh, None, None);
+        let (mut core, _out_rx, _in_tx) = production_core();
+        core.handle(Inbound::from(&env)).await;
+
+        assert!(
+            !dir.join(crate::diagnostics::FILE_NAME).exists(),
+            "a `start` with no diagnostics directory arms NOTHING — the Worker \
+             must not resolve a data dir for itself, or every unisolated real-Worker \
+             test writes into the developer's real `~/.local/share/archimedes/`"
+        );
+        // The second, load-bearing half: the handler chose NO target at all. A
+        // lazy `dirs::data_dir()` would satisfy the assertion above (its file is
+        // in `$HOME`, not here) while littering the real data dir, so the STATE of
+        // the global is what is actually pinned.
+        assert!(
+            crate::diagnostics::effective_dir().is_none(),
+            "the handler resolved NO target directory"
+        );
+    }
+
+    /// Encode a `start` frame for `env` with one extra top-level key,
+    /// `diagnosticsDir`, spliced in by string surgery.
+    ///
+    /// Deliberately not `serde_json::to_value` + insert + `to_string`: that would
+    /// let a renamed key (or a struct that grew `deny_unknown_fields`) pass
+    /// unnoticed, and the whole point of the additive field is that the codec
+    /// tolerates this key on BOTH sides.
+    fn encode_start_with_diagnostics_dir(env: &StartEnv, dir: &str) -> String {
+        let line = crate::worker::protocol::encode_inbound(&Inbound::from(env));
+        let tail = line.trim_end_matches(['\n', '\r']);
+        assert!(
+            tail.ends_with('}'),
+            "the encoded frame is an object: {line}"
+        );
+        let body = &tail[..tail.len() - 1];
+        format!(r#"{body},"diagnosticsDir":"{dir}"}}"#) + "\n"
     }
 
     /// The handler resolves by the BARE `request_id` — deliberately NOT through a

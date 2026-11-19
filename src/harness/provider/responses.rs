@@ -212,14 +212,18 @@ impl ResponsesStream {
                 // `diagnostics::record` (the asymmetry `provider/mod.rs`'s
                 // "Why two sinks" documents in full): the Worker's stderr is
                 // drained by a task in `worker/client.rs` into
-                // `debuglog::log_truncated`, which makes this line the only
-                // Worker-side sink that survives at all — and that sink is
-                // itself gated behind `ARCHIMEDES_DEBUG`, so in a DEFAULT
-                // launch the Worker drops it. That is accepted. `diagnostics`
-                // is the always-on channel and is NOT used here: its rule is
-                // reviewed call sites at low volume, and one line per dropped
-                // item on a stream is not always-on-worthy volume for a shape
-                // that has never been observed on a real wire.
+                // `debuglog::log_truncated`, and that sink is gated behind
+                // `ARCHIMEDES_DEBUG`, so an unarmed Worker drops this line unless
+                // the var is set. That is accepted. `diagnostics` is the always-on
+                // channel and is STILL not used here, and the reason is unchanged
+                // by the Worker now being armed from the `start` envelope
+                // (`StartEnv::diagnostics_dir`): its rule is reviewed call sites at
+                // LOW VOLUME, and one line per dropped item on a stream is not
+                // always-on-worthy volume for a shape that has never been observed
+                // on a real wire. Arming the Worker is what makes that judgement
+                // load-bearing rather than theoretical — a `record` here would now
+                // really reach the file — so the choice to keep this line off the
+                // channel is a decision, not an oversight.
                 if self.terminated {
                     eprintln!(
                         "harness: responses post-terminal item dropped: \
