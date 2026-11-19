@@ -2741,6 +2741,158 @@ async fn a_truncated_turn_does_not_leave_a_retry_report_for_the_next_prompt_to_c
     );
 }
 
+/// (issue #190, the emission order) On a `Done(Length)` turn that ALSO has a
+/// retired retry report, `turn_truncated` must be emitted AFTER the
+/// `auto_retry_end` that closes the report, and still BEFORE `turn_end` /
+/// `agent_settled`.
+///
+/// Two contracts meet here and only one of them ordered the frames before this
+/// fix:
+///
+/// * `RpcEvent::turn_truncated`'s own contract — the disposition must reach a
+///   peer BEFORE the settle resolves the turn. That half is unchanged, and
+///   `a_turn_cut_off_by_the_output_cap_settles_as_truncated_and_persists_its_text`
+///   keeps pinning it.
+/// * The DESKTOP's positional `dispositionFromRows` rule, which reads the
+///   disposition off the page's LAST row. It can afford to be positional only
+///   because a one-liner on the shared `{stamp}:system` key is an UPSERT that
+///   never gains a newer `id` (`ON CONFLICT … DO UPDATE` writes
+///   `payload_json`/`created_at` but never `id`). Now that the retry line has
+///   its OWN `{stamp}:notice:N` id it is an INSERT, so a `Retry failed` emitted
+///   AFTER the notice outranks it, the notice stops being the tail, and the
+///   truncated-turn footer silently disappears after a restart — on exactly the
+///   sessions most likely to be truncated. Hence the retired-report line moves
+///   FIRST.
+///
+/// Shape copied from
+/// `a_truncated_turn_does_not_leave_a_retry_report_for_the_next_prompt_to_call_success`
+/// (attempt 1 empty so the turn retries, attempt 2 `Done(Length)`), because that
+/// is the only way to get a retired report and a truncation on ONE turn.
+#[tokio::test]
+async fn a_truncated_turn_emits_the_notice_after_the_retry_close_and_before_the_settle() {
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(vec![
+        // Turn 1, attempt 1: the #64 empty turn — this is what leaves a retry
+        // report pending for the truncation to retire.
+        Some(vec![ProviderEvent::Done(FinishReason::Stop)]),
+        // Turn 1, attempt 2: the output cap ends the turn.
+        Some(vec![
+            ProviderEvent::TextDelta("half a sentence, then the cap".to_string()),
+            ProviderEvent::Done(FinishReason::Length),
+        ]),
+    ]);
+    let (_space, mut loop_, db) = build_loop_with_db(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+        vec![fake_model("m1")],
+        None,
+    );
+
+    loop_.handle_prompt(&text_prompt("go")).await;
+    let events: Vec<RpcEvent> = drain_events(&mut events_rx);
+    let kinds: Vec<String> = events.iter().map(|e| e.kind().to_string()).collect();
+
+    // Preconditions: this really is the turn with BOTH a retired report and a
+    // truncation. Without both, the ordering below is vacuous.
+    let closed_at = kinds
+        .iter()
+        .position(|k| k == "auto_retry_end")
+        .expect("the truncated turn closes its own pending retry, got {kinds:?}");
+    let truncated_at = kinds
+        .iter()
+        .position(|k| k == "turn_truncated")
+        .expect("the turn is announced as truncated, got {kinds:?}");
+    let turn_end_at = kinds
+        .iter()
+        .position(|k| k == "turn_end")
+        .expect("the turn settles, got {kinds:?}");
+    let settled_at = kinds
+        .iter()
+        .position(|k| k == "agent_settled")
+        .expect("the turn settles, got {kinds:?}");
+
+    assert!(
+        matches!(
+            events[closed_at],
+            RpcEvent::auto_retry_end { success: false, .. }
+        ),
+        "the close is the `success: false` retirement naming the truncation, got \
+         {:?}",
+        events[closed_at],
+    );
+    assert!(
+        closed_at < truncated_at,
+        "`turn_truncated` ({truncated_at}) comes AFTER the retired-report line \
+         ({closed_at}): the notice must be the NEWEST display row, because the \
+         desktop's `dispositionFromRows` reads only the page's last row and a \
+         `Retry failed` line now INSERTS on its own `{{stamp}}:notice:N` id rather \
+         than UPSERTing the shared `system` row, so emitting it last would bury \
+         the footer, got {kinds:?}",
+    );
+    assert!(
+        truncated_at < turn_end_at,
+        "`turn_truncated` ({truncated_at}) still precedes `turn_end` \
+         ({turn_end_at}) — the disposition must reach a peer while it is \
+         listening, got {kinds:?}",
+    );
+    assert!(
+        truncated_at < settled_at,
+        "`turn_truncated` ({truncated_at}) still precedes `agent_settled` \
+         ({settled_at}) — the same contract, got {kinds:?}",
+    );
+
+    // THE CONSUMER-VISIBLE FACT. Everything above asserts EVENT-KIND ordering,
+    // which is the MECHANISM; what the desktop actually reads is a DISPLAY-ROW
+    // position. `dispositionFromRows` takes `payload_json.disposition` off the
+    // page's LAST row, so what the footer depends on is not "the notice came
+    // after the retry close in the event stream" but "the notice is the newest
+    // row the turn wrote". Those two diverge for any future arm that writes a
+    // fresh-id one-liner AFTER `turn_truncated`: its `closed_at < truncated_at`
+    // would stay TRUE and every assert above would stay GREEN while the footer
+    // silently disappeared. So the ordering asserts are kept (they pin why the
+    // two frames sit in that order) and the row position is asserted here, off
+    // the store the test already builds and used to discard — `MemoryStore`
+    // records EVERY `persist_display` call in write order, with no UPSERT.
+    let rows = db.display_rows();
+    let notice_at = rows
+        .iter()
+        .rposition(|(_sid, kind, key, payload)| {
+            kind == "agent-text"
+                && key.contains(":truncate:")
+                && payload.contains("\"disposition\"")
+        })
+        .expect(
+            "the truncation notice reached the display rows as an `agent-text` \
+                 row carrying a disposition (the tail is printed by the assert below)",
+        );
+    let last_text_at = rows
+        .iter()
+        .rposition(|(_sid, kind, _key, _payload)| kind == "agent-text")
+        .expect("the turn wrote at least one `agent-text` row");
+    assert_eq!(
+        notice_at,
+        last_text_at,
+        "the `{{stamp}}:truncate:N` notice is the NEWEST `agent-text` display row \
+         (row {notice_at} of {}, last is {last_text_at}) — the desktop's \
+         `dispositionFromRows` reads `payload_json.disposition` off the page's \
+         LAST row only, so any row written after the notice buries the \
+         truncated-turn footer. The tail: {rows:?}",
+        rows.len(),
+    );
+    let payload: Value = serde_json::from_str(&rows[notice_at].3)
+        .expect("a display row's payload_json is valid JSON");
+    assert_eq!(
+        payload["disposition"], "length",
+        "the newest `agent-text` row is the truncation notice AND carries the \
+         `length` disposition — that pair is what the footer hydrates from disk \
+         after a restart, got {}",
+        rows[notice_at].3,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // (the turn-loop bound) Two guards on the turn loop's inner `loop`, both
 // producing `RpcEvent::turn_capped`: a ceiling on rounds per prompt, and a

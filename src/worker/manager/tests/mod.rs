@@ -1104,6 +1104,65 @@ fn a_discard_line_is_not_captured_as_child_output() {
     assert_eq!(capture.captured_text(), "");
 }
 
+/// (issue #190, the one-liner weld) THE pin that the bookkeeping word set must
+/// carry `notice`.
+///
+/// The retry / extension-error one-liners moved off the shared `{stamp}:system`
+/// key onto `{stamp}:notice:N`, because two lines on one id weld into one bubble
+/// in the desktop reducer. That move is invisible to
+/// `the_subagent_capture_captures_the_final_text_from_the_sink_frames`, which
+/// hand-writes `"messageId": "system"` — so if `is_bookkeeping_message_id` is
+/// not extended with the `notice` word, that test stays GREEN while production
+/// breaks: `SubagentCapture::observe_sink_frame` skips a delta AND refuses to set
+/// `last_message_id` only for a bookkeeping id, so an unrecognised `notice` id is
+/// both ACCUMULATED and made `last_message_id` — and `captured_text()` returns
+/// the text of `last_message_id`. The PARENT would then read the child harness's
+/// own `"Retrying (attempt 2/5…)"` banner as the child's ANSWER, i.e. as this
+/// tool's result. Feeding the STAMPED family (what production mints, ADR 0049)
+/// rather than the bare `"system"` fixture is the whole point of this test.
+#[test]
+fn a_notice_line_is_not_captured_as_child_output() {
+    let capture = SubagentCapture::new();
+    capture.observe_sink_frame(
+        "session-update",
+        &serde_json::json!({ "sessionId": "s", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Retrying (attempt 2/5…)" },
+                "messageId": "aaaaaa:notice:0" } }),
+    );
+    assert_eq!(
+        capture.captured_text(),
+        "",
+        "the child's captured text must not be the harness's own retry banner — \
+         this text becomes the PARENT's tool result"
+    );
+
+    // And the banner must not become `last_message_id` either: a banner that
+    // arrives BEFORE the real answer would still be welded onto it by the
+    // same-id append rule if the capture accumulated it.
+    let ordered = SubagentCapture::new();
+    ordered.observe_sink_frame(
+        "session-update",
+        &serde_json::json!({ "sessionId": "s", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "The real answer." },
+                "messageId": "aaaaaa:m1" } }),
+    );
+    ordered.observe_sink_frame(
+        "session-update",
+        &serde_json::json!({ "sessionId": "s", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Retrying (attempt 2/5…)" },
+                "messageId": "aaaaaa:notice:0" } }),
+    );
+    assert_eq!(
+        ordered.captured_text(),
+        "The real answer.",
+        "a notice that trails the model's text leaves the capture at the model's \
+         text — the banner is neither appended nor made `last_message_id`"
+    );
+}
+
 // ── The `SubagentLiveness` signal (ADR 0055) ──────────────────────
 
 /// Seed a real `SubagentDrive` in the real `drives` map under

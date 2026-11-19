@@ -520,17 +520,21 @@ them. This section is the whole class, written so the next reader does not have 
 `note_success()` and the new `retire_pending_report()` — and CLEARED in exactly ONE:
 `next_retry_delay()`. `note_success()` returns `Some(attempt)` when `attempt > 1 && !reported`, and the loop
 turns that into `auto_retry_end { success: true }` (`handle_turn`, the `if let Some(attempt) = self.retry.note_success()`
-block, after the emptiness gate), which `normalize` renders as the shared
-system line **"Retry succeeded"** (`normalize.rs`, the `auto_retry_end` arm). So the bit means "this retry's success
-frame has been emitted", and it is the ONLY thing standing between a retried-but-never-settled attempt and a success
+block, after the emptiness gate), which `normalize` renders as the
+one-liner **"Retry succeeded"** on its own `{stamp}:notice:N` id (`normalize.rs`, the `auto_retry_end` arm). So the
+bit means "this retry's success frame has been emitted", and it is the ONLY thing standing between a
+retried-but-never-settled attempt and a success
 banner. Every path that abandons an attempt and settles WITHOUT reaching `note_success()` therefore leaves a report
 pending, and the next ordinary successful prompt — a fresh turn, an unrelated prompt, minutes later — walks into
 `note_success()`, gets `Some(attempt)` for the PREVIOUS turn's retry, and announces that retry a success.
 
-Two properties make this worse than a cosmetic banner. `attempt` is per-turn-but-never-reset-to-zero (both
-`call_with_retry` and `note_success` do `attempt.max(1)`, and only a fresh `next_retry_delay` moves it up), so the
-stale `attempt` number rides the frame; and the success line is a `system_chunk` on the SHARED `{stamp}:system` key,
-so it APPENDS onto whatever system line the session last wrote rather than landing under the turn it describes.
+Two properties make this worse than a cosmetic banner. The `attempt` counter belongs to the **Worker**, not the
+turn, and is NEVER reset at a turn boundary (both `call_with_retry` and `note_success` do `attempt.max(1)`, and only
+a fresh `next_retry_delay` moves it up), so the
+stale `attempt` number rides the frame; and the success line is a one-liner on the `{stamp}:notice:N` family
+(`normalize.rs`, `TurnState::notice_id`) — a UNIQUE id per line, so it no longer APPENDS onto whatever system line the
+session last wrote — while still carrying no turn reference of its own, so it lands wherever the frame arrives rather
+than under the turn it describes.
 
 ### Which settle sites leave it pending
 

@@ -963,9 +963,13 @@ impl AgentLoop {
             acc.text.chars().count(),
             acc.tool_calls.len(),
         );
-        // BEFORE the settle, so a peer stashes the disposition while it is still
-        // listening (`RpcEvent::turn_truncated`'s contract).
-        self.emit(RpcEvent::turn_truncated);
+        // (issue #190, the emission order) `RpcEvent::turn_truncated` USED to be
+        // emitted here, ahead of everything below. It now sits AFTER the
+        // retired-report `auto_retry_end`, immediately before the settle — see
+        // the comment there for why the order is load-bearing rather than
+        // cosmetic. What has NOT changed is the half that matters to a peer: the
+        // notice still precedes `turn_end` / `agent_settled`, so a peer stashes
+        // the disposition while it is still listening.
         if !acc.text.is_empty() {
             let message_value = self.assistant_message_value(acc);
             self.emit(RpcEvent::message_end {
@@ -1003,8 +1007,11 @@ impl AgentLoop {
         // file's tool-row discipline refuses elsewhere.
         //
         // Emitted BEFORE the settle for the same ordering reason as
-        // `turn_truncated` above: nothing a peer still needs arrives after
-        // `agent_settled`.
+        // `turn_truncated` below: nothing a peer still needs arrives after
+        // `agent_settled`. It sits FIRST of the two frames precisely so the
+        // notice is the newest display row — see the comment on the emit below
+        // for the desktop's positional `dispositionFromRows` rule that requires
+        // it.
         if let Some(attempt) = self.retry.retire_pending_report() {
             self.emit(RpcEvent::auto_retry_end {
                 success: false,
@@ -1016,6 +1023,31 @@ impl AgentLoop {
                 ),
             });
         }
+        // THE NOTICE IS THE LAST FRAME OF THE TURN THAT WRITES A DISPLAY ROW, and
+        // that is a positional requirement rather than a style choice. The
+        // DESKTOP's `dispositionFromRows` reads the disposition off the page's
+        // LAST row, and it can afford to be positional only while nothing newer
+        // lands after the notice. While the retry one-liners shared the
+        // `{stamp}:system` key that held by accident: a same-`messageId` line is
+        // an UPSERT that never gains a newer `id` (`ON CONFLICT … DO UPDATE`
+        // writes `payload_json` and `created_at`, never `id`). Now that the
+        // retired-report close above renders as a "Retry failed" line on its OWN
+        // `{stamp}:notice:N` id it is an INSERT, so emitting it AFTER this frame
+        // would outrank the notice, the notice would stop being the tail, and the
+        // truncated-turn footer would silently disappear after a restart — on
+        // exactly the sessions most likely to be truncated. Hence the one-liner
+        // first and the notice last
+        // (`a_truncated_turn_emits_the_notice_after_the_retry_close_and_before_the_settle`).
+        // The settle below keeps the position it already had relative to this
+        // frame — this move changes only the order of the notice against the
+        // retry close, nothing else — and `turn_end` / `agent_settled` /
+        // `note_context`'s count emit no `agent_message_chunk`, so no one-liner
+        // can outrank the notice from below either.
+        //
+        // What did NOT move is the half a peer depends on: still BEFORE the
+        // settle, so a peer stashes the disposition while it is still listening
+        // (`RpcEvent::turn_truncated`'s contract).
+        self.emit(RpcEvent::turn_truncated);
         // Site 9 of the ten in `docs/features/abandoned-tool-rows.md` §2:
         // NOT vacuous. `consume_stream` has just run and this route reaches no
         // batch, so `acc.tool_calls` holds every row the cut-off attempt opened
