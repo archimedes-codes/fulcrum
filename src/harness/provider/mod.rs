@@ -122,11 +122,18 @@ fn log_wire(wire: crate::harness::WireApi, m: &crate::harness::catalog::Model) {
 /// newline-delimited diagnostics file. Both are replaced (not stripped) so the
 /// field stays delimited from the one that follows it.
 ///
-/// `pub(crate)` rather than private: the three provider parsers each put a
-/// provider-supplied tool-call `id` into a `diagnostics::record` payload (see
+/// PRIVATE, and `pub(crate)` would be WIDER than anything needs: the three
+/// provider parsers each put a provider-supplied tool-call `id` into a
+/// `diagnostics::record` payload (see
 /// `openai::tool_call_dropped_with_no_name`), and a `\n` in a provider-supplied
-/// field forges a line in a file a supporter reads. `reduced_base_url` below is
-/// the second consumer, and the existing tests below pin both.
+/// field forges a line in a file a supporter reads — but all three are CHILDREN of
+/// this module and call it as `super::one_field_per_line`, which Rust resolves
+/// against this item's PRIVACY as seen from the child, and a child may see an
+/// ancestor's private items. `reduced_base_url` below is the second consumer, in
+/// this module, and the tests below pin both. So the narrowest visibility that
+/// compiles is plain `fn`, and that is what it is; widening it would only advertise
+/// a sanitizer whose payload rule ("the `record` payload's field separator") is
+/// meaningful only for these `diagnostics`/stderr lines.
 ///
 /// # Why `is_control()` and not just `\n` / `\r`
 ///
@@ -145,7 +152,7 @@ fn log_wire(wire: crate::harness::WireApi, m: &crate::harness::catalog::Model) {
 /// in most viewers and a line separator re-wraps it in anything Unicode-aware. This
 /// closes that corridor because the corridor is new, not because it was ever a
 /// forgery.
-pub(crate) fn one_field_per_line(s: &str) -> String {
+fn one_field_per_line(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {

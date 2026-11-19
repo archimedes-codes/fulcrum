@@ -513,6 +513,33 @@ impl WorkerHandle {
                         // deltas already logged verbatim in this same file,
                         // so the row content stays recoverable while the
                         // quadratic body (75 % of a rotated log) is gone.
+                        //
+                        // `log` and NOT `log_truncated` — the one asymmetry in
+                        // this match, and it is deliberate. `truncate_line` cuts
+                        // BYTES, so on this line it lands mid-JSON: the `rowKeys`
+                        // array loses its closer, the line stops parsing, and
+                        // `rowKeys` is precisely what the cut removes (76.5 % of
+                        // the verbatim lines this replaced were already cut
+                        // mid-JSON and unparseable — that is the measurement that
+                        // motivated the summary). So the line is bounded by
+                        // CONSTRUCTION instead of by a cut: `rowKeys` is capped at
+                        // `MAX_SUMMARY_ROW_KEYS` entries and every listed field
+                        // (and the `sessionId`) at `MAX_SUMMARY_KEY_BYTES`, which
+                        // makes the whole line `O(1)` in rows and keeps it inside
+                        // the SAME `MAX_SUMMARY_LINE_BYTES` = 2 KB budget every
+                        // other inbound frame is cut at (vs the 2.6 MB one
+                        // verbatim frame reached). It is therefore exempt from the
+                        // truncation MECHANISM and NOT from the size bound — and
+                        // it is the only frame type whose logged line is
+                        // guaranteed to parse, since a byte cut is exactly what
+                        // made 76.5 % of the old lines unparseable. The worst case
+                        // is a `message_retracted` frame (one row per erased
+                        // thought segment); the ordinary frame is ONE row and
+                        // lands near 150 bytes. Both caps, the
+                        // `rowKeysOmitted` field that keeps a capped list from
+                        // reading as a small frame, and the ceiling itself are
+                        // asserted in
+                        // `a_large_row_set_is_capped_and_the_summary_stays_valid_json`.
                         // Taken from `&frame` — `route_outbound` below takes
                         // `frame` BY VALUE.
                         match &frame {
@@ -1140,17 +1167,86 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
 /// copy in a `format!`.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DisplayUpsertSummary<'a> {
+struct DisplayUpsertSummary {
     /// The frame's own `type` tag — the SAME literal the wire uses (it is
     /// `Outbound::DisplayUpsert`'s serde `rename`, restated here because
     /// this is a log record, not a frame; the unit test pins it).
     #[serde(rename = "type")]
     frame_type: &'static str,
-    session_id: &'a str,
+    /// Cut to [`MAX_SUMMARY_KEY_BYTES`] like the row fields — it is a wire-side
+    /// string too, and an uncut one would make the line `O(session_id)`.
+    session_id: String,
+    /// The frame's TRUE row count — never the (possibly capped) length of
+    /// `rowKeys`. `MAX_SUMMARY_ROW_KEYS` caps what is LISTED, not what is counted.
     rows: usize,
     row_keys: Vec<DisplayRowKey>,
+    /// How many row keys the line LEFT OUT because [`MAX_SUMMARY_ROW_KEYS`] was
+    /// reached. `None` (and so absent from the JSON — `skip_serializing_if`) for
+    /// every ordinary frame, so the shape both measurement instruments read is
+    /// unchanged in the one-row case.
+    ///
+    /// It exists so a SHORT `rowKeys` array beside a LARGE `rows` can never be
+    /// misread as "the frame had few rows": `rows` stays the frame's true count and
+    /// this states the difference, so the line is honest about its own truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row_keys_omitted: Option<usize>,
     bytes: usize,
 }
+
+/// How many row keys a summary line LISTS before it reports the rest as a count.
+///
+/// A SIZE bound, not an aesthetic one. This line is the one inbound frame that does
+/// not go through `debuglog::log_truncated` (see [`summarise_display_upsert`] for
+/// why cutting it would be worse than leaving it alone), so the cap has to live
+/// HERE or the line is `O(rows)` — measured, 600 rows at a realistic key length is
+/// **60 082 bytes** on a file whose every other line is cut at 2 048. With this cap
+/// and [`MAX_SUMMARY_KEY_BYTES`] the line is `O(1)` in rows and stays inside the
+/// SAME 2 KB budget its siblings get, so the frame is exempt from the truncation
+/// MECHANISM and not from the size bound.
+///
+/// A frame with more rows than this is a `message_retracted` (one row per erased
+/// thought segment); the ordinary frame carries exactly ONE row, so the cap never
+/// moves in the case the two measurement instruments were written for.
+const MAX_SUMMARY_ROW_KEYS: usize = 12;
+
+/// The byte budget for each listed `kind` / `message_key` and for `sessionId`, cut
+/// at a char boundary with the same `…` marker `debuglog::truncate_line` uses (see
+/// [`cut_field`], which reserves room for the marker so the result never exceeds
+/// this).
+///
+/// Why the fields and not just the count: all three are strings that cross the
+/// process boundary, so a row cap alone leaves the line `O(longest string)` — a
+/// Worker that sent a 1 MB `message_key` would still write a 1 MB line, which is the
+/// asymmetry this closes. A PER-FIELD cut also makes the total arithmetic provable
+/// ([`MAX_SUMMARY_LINE_BYTES`]), and unlike a whole-line cut it cannot break the
+/// JSON: the quotes and the array closers all survive, so the line stays parseable —
+/// the property `log_truncated` would have destroyed. The three are ids
+/// (`{incarnation}:{id}`, a session id) and a handful of `kind` literals, so 48
+/// bytes never bites a real frame.
+const MAX_SUMMARY_KEY_BYTES: usize = 48;
+
+/// The ceiling for the whole summary line — deliberately `debuglog::MAX_LINE_BYTES`,
+/// the SAME number every other inbound frame is cut at, so this frame type is not
+/// privileged in size, only in mechanism.
+///
+/// Why not just call `log_truncated` then? Because it cuts BYTES and appends `…`, so
+/// on this line it lands mid-JSON: the `rowKeys` array loses its closer, the line
+/// stops parsing, and `rowKeys` is exactly what the cut removes — 76.5 % of the
+/// verbatim `display-upsert` lines this summary replaced were already cut mid-JSON
+/// and unparseable, which is the measurement that prompted the summary. So the line
+/// is bounded BY CONSTRUCTION and never cut: the guarantee is "≤ 2 KB **and** always
+/// parseable", where `log_truncated` can only ever give "≤ 2 KB **or** parseable".
+///
+/// The arithmetic, with each of the three strings at [`MAX_SUMMARY_KEY_BYTES`]:
+/// one entry's overhead is `{"kind":"","message_key":""}` = 28 B, so a row costs
+/// ≤ 28 + 2×48 + 1 (the `,`) = 125 B, and [`MAX_SUMMARY_ROW_KEYS`] of them cost
+/// ≤ 1 500 B. The fixed part — the `type` tag, `sessionId`, `rows`, `bytes`,
+/// `rowKeysOmitted`, the brackets and braces — is ≤ 200 B at any plausible integer
+/// width (every number is a `usize`, and even 20-digit values are counted). Under
+/// 2 048 with headroom, and the unit test
+/// `a_large_row_set_is_capped_and_the_summary_stays_valid_json` asserts the real
+/// serialisation against it at 600 rows.
+const MAX_SUMMARY_LINE_BYTES: usize = crate::debuglog::MAX_LINE_BYTES;
 
 /// One row's identity (the SQLite coalesce triple's two discriminators).
 #[derive(serde::Serialize)]
@@ -1180,22 +1276,77 @@ struct DisplayRowKey {
 /// quadratic body this removes, and the deltas that produced it are logged
 /// verbatim in the same file, so the row content stays recoverable.
 fn summarise_display_upsert(session_id: &str, rows: &[DisplayRow], bytes: usize) -> String {
+    // The two caps, and WHY they are here rather than a `log_truncated` at the call
+    // site — the asymmetry the call-site comment refers to:
+    //
+    // The summary is `O(rows)`; every other inbound frame is `O(text)` and gets cut
+    // at `MAX_LINE_BYTES`. Cutting THIS line at 2 KB is the worse option, because
+    // `truncate_line` cuts BYTES and appends `…`: the `rowKeys` array loses its
+    // closer, the line stops parsing, and `rowKeys` — the whole point of the
+    // summary — is what the cut removes. So the line is bounded by CONSTRUCTION
+    // instead (row count × per-field bytes), it is never cut, and it always parses.
+    // The resulting ceiling is [`MAX_SUMMARY_LINE_BYTES`]; the unit test asserts a
+    // 600-row frame lands under it.
+    //
+    // `rows` stays `rows.len()` — the frame's TRUE count — and the number left out
+    // is carried in its own field, so capping what is LISTED never silently becomes
+    // "the frame had fewer rows".
+    let omitted = rows.len().saturating_sub(MAX_SUMMARY_ROW_KEYS);
     // `expect`: every field is a `str` / number / `Vec` of owned strings —
     // there is no value here that a serialiser can fail on.
-    serde_json::to_string(&DisplayUpsertSummary {
+    let line = serde_json::to_string(&DisplayUpsertSummary {
         frame_type: "display-upsert",
-        session_id,
+        session_id: cut_field(session_id),
         rows: rows.len(),
         row_keys: rows
             .iter()
+            .take(MAX_SUMMARY_ROW_KEYS)
             .map(|r| DisplayRowKey {
-                kind: r.kind.clone(),
-                message_key: r.message_key.clone(),
+                kind: cut_field(&r.kind),
+                message_key: cut_field(&r.message_key),
             })
             .collect(),
+        row_keys_omitted: (omitted > 0).then_some(omitted),
         bytes,
     })
-    .expect("the summary holds only strings, numbers and an array of strings")
+    .expect("the summary holds only strings, numbers and an array of strings");
+    // The ceiling is an INVARIANT, not a comment: the two caps above are what the
+    // `debuglog::log` call site is exempt BECAUSE of, so if the arithmetic ever
+    // stops holding the exemption has to be revisited — and a debug build / the
+    // test suite is where that must surface, not in a 5 MB rotated log.
+    debug_assert!(
+        line.len() <= MAX_SUMMARY_LINE_BYTES,
+        "the summary is exempt from `log_truncated` only while it is bounded by \
+         construction: {} bytes, over the {MAX_SUMMARY_LINE_BYTES}-byte ceiling \
+         every other inbound frame is cut at",
+        line.len(),
+    );
+    line
+}
+
+/// Cut a wire string to [`MAX_SUMMARY_KEY_BYTES`] IN TOTAL, at a char boundary,
+/// appending the same `…` marker `debuglog::truncate_line` uses (so a cut field
+/// looks like a cut field everywhere else in this file). The marker's own 3 bytes
+/// are reserved out of the budget, so the result never exceeds the constant — that
+/// is what makes [`MAX_SUMMARY_LINE_BYTES`] arithmetic rather than optimism.
+///
+/// Only the listed identity fields and `sessionId` go through this, and they are cut
+/// BEFORE serialisation, so a cut can never split the JSON the way a whole-line cut
+/// would.
+fn cut_field(s: &str) -> String {
+    if s.len() <= MAX_SUMMARY_KEY_BYTES {
+        return s.to_string();
+    }
+    // 3 bytes is `…` in UTF-8; the budget is ≥ 4 everywhere it is used, so the
+    // subtraction below cannot underflow.
+    const MARKER: &str = "…";
+    let mut end = MAX_SUMMARY_KEY_BYTES - MARKER.len();
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut cut = s[..end].to_string();
+    cut.push_str(MARKER);
+    cut
 }
 
 #[cfg(test)]
@@ -1314,7 +1465,164 @@ mod tests {
         assert!(out.starts_with(r#"{"type":"display-upsert""#), "\n{out}");
     }
 
-    /// (f) The regression guard for the MOVED log call.
+    /// Arms the process-global `debuglog` at a fresh scratch dir for ONE test and
+    /// disables it again on the way out — the `DisableDiagnosticsOnExit`
+    /// (`provider/mod.rs`) / `ArmedDiagnostics` (the three provider files) shape,
+    /// applied to `debuglog`'s `ENABLED`/`DIR` pair.
+    ///
+    /// The trailing-statement shape it replaces does not survive a failure: an
+    /// assertion that panics unwinds past a final `init(false, None)`, the global
+    /// stays armed at THIS test's scratch dir, `ScratchDir::Drop` removes that dir,
+    /// and every later `debuglog` write anywhere calls `create_dir_all` on the
+    /// removed path — resurrecting a deleted directory in `$TMPDIR` and writing
+    /// into it for the rest of the run, never cleaned, while a sibling that armed
+    /// nothing reads lines it did not write. `Drop` runs on the unwind path, so the
+    /// clear happens whether the test passes or fails.
+    ///
+    /// The ORDER inside `drop` is the load-bearing part, and folding the dir into
+    /// the guard is what makes it unbreakable: the global is cleared BEFORE the
+    /// directory it names is removed. As two separate locals, reverse-drop order can
+    /// remove the dir first and reopen the exact window this closes.
+    struct ArmedDebugLog {
+        dir: crate::test_support::ScratchDir,
+    }
+    impl ArmedDebugLog {
+        fn new(prefix: &str, tag: &str) -> Self {
+            let dir = crate::test_support::ScratchDir::in_env_temp(prefix, tag);
+            debuglog::init(true, Some(dir.to_path_buf()));
+            Self { dir }
+        }
+    }
+    impl Drop for ArmedDebugLog {
+        fn drop(&mut self) {
+            debuglog::init(false, None);
+            // Dropping `self.dir` here (after the clear) removes the scratch dir.
+        }
+    }
+    impl std::ops::Deref for ArmedDebugLog {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    /// (f) THE ROW LIST IS BOUNDED — and the bound keeps the line PARSEABLE.
+    ///
+    /// Why this exists: the summary goes out through `debuglog::log`, NOT
+    /// `log_truncated`, so unlike every other inbound frame it is not cut at
+    /// `MAX_LINE_BYTES`. That is a deliberate exemption, not an oversight —
+    /// `truncate_line` cuts BYTES and appends `…`, which for this line means
+    /// mid-JSON: the array loses its closer, the whole line stops parsing, and the
+    /// `rowKeys` it exists to carry are among the first things the cut removes (and
+    /// 76.5 % of the old verbatim `display-upsert` lines were already unparseable
+    /// for exactly this reason). Truncating is therefore the WORST of the two
+    /// options.
+    ///
+    /// The exemption is only safe if the line is bounded by something else, and
+    /// the summary is `O(rows)` while every other frame is `O(text)`. A
+    /// `message_retracted` frame is the shape that makes `rows` large — one row per
+    /// erased thought segment — so the ROW LIST is what gets capped here, and the
+    /// cap is asserted rather than assumed.
+    #[test]
+    fn a_large_row_set_is_capped_and_the_summary_stays_valid_json() {
+        // Well past the cap, with keys long enough that an uncapped line would
+        // blow through `MAX_LINE_BYTES` several times over.
+        let key = |i: usize| format!("inc1:segment-{i:04}-{}", "x".repeat(40));
+        let rows: Vec<DisplayRow> = (0..600)
+            .map(|i| row_with_payload("agent-thought", &key(i)))
+            .collect();
+        let out = summarise_display_upsert("s-big", &rows, 90_000);
+
+        // 0. The budget IS the one every other inbound frame is cut at — the whole
+        //    "exempt in mechanism, not in size" argument rests on this equality.
+        assert_eq!(
+            MAX_SUMMARY_LINE_BYTES,
+            crate::debuglog::MAX_LINE_BYTES,
+            "the summary's ceiling must stay the same number `log_truncated` \
+             enforces, or the exemption becomes a privilege"
+        );
+
+        // 1. BOUNDED: the line is under the cap every other inbound frame obeys,
+        //    so the one exempt call site is exempt in MECHANISM only, not in size.
+        assert!(
+            out.len() <= MAX_SUMMARY_LINE_BYTES,
+            "the summary is the one frame that bypasses `log_truncated`, so it \
+             must be bounded by the two caps instead — got {} bytes, over the \
+             {MAX_SUMMARY_LINE_BYTES}-byte budget the sibling arm's cap gives \
+             every other inbound frame",
+            out.len()
+        );
+
+        // 2. STILL VALID JSON — the property `log_truncated` would have destroyed.
+        let parsed: Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("a capped summary must still parse: {e}"));
+
+        // 3. NO LIE: `rows` stays the frame's TRUE count. Capping what is LISTED
+        //    must not silently become "there were fewer rows" — a supporter
+        //    reading `rows` has to be able to trust it.
+        assert_eq!(parsed["rows"], 600, "`rows` is the frame's real count");
+        assert_eq!(parsed["bytes"], 90_000, "`bytes` is the true wire length");
+
+        // 4. The list is capped AND the line says so, so a reader who sees a short
+        //    `rowKeys` against a large `rows` knows it was cut and not absent.
+        let keys = parsed["rowKeys"].as_array().expect("`rowKeys` is an array");
+        assert!(
+            keys.len() < 600,
+            "the row list must be capped, got {} of 600",
+            keys.len()
+        );
+        assert_eq!(
+            keys.len(),
+            MAX_SUMMARY_ROW_KEYS,
+            "the cap is the named constant, so the number lives in one place"
+        );
+        assert_eq!(
+            parsed["rowKeysOmitted"],
+            600 - MAX_SUMMARY_ROW_KEYS as u64,
+            "the line states how many keys it left out — `rows` minus the listed \
+             count must be recoverable from the line itself"
+        );
+        // The FIRST keys survive (the frame's own order), so the row a
+        // single-row frame is grepped for is never the one dropped — and each is
+        // cut at `MAX_SUMMARY_KEY_BYTES` with the `…` marker, which is the SECOND
+        // cap doing its job (without it the line would still be `O(longest key)`).
+        assert!(
+            keys[0]["message_key"]
+                .as_str()
+                .expect("message_key is a string")
+                .starts_with("inc1:segment-0000-"),
+            "the frame's first row keeps its key:\n{out}"
+        );
+        let listed_len = keys[0]["message_key"].as_str().expect("a string").len();
+        assert!(
+            listed_len <= MAX_SUMMARY_KEY_BYTES,
+            "a listed key is cut at the per-field budget, got {listed_len}"
+        );
+        assert!(
+            keys[0]["message_key"]
+                .as_str()
+                .expect("a string")
+                .ends_with('…'),
+            "the cut is MARKED, so a supporter can tell a cut key from a short \
+             one (an unmarked cut would be a lie about the id): {}",
+            keys[0]["message_key"]
+        );
+
+        // 5. UNDER the cap nothing is capped and no omission field appears — the
+        //    ordinary one-row frame keeps the shape every existing assertion and
+        //    both measurement instruments read.
+        let small =
+            summarise_display_upsert("s-one", &[row_with_payload("agent-text", "inc1:m1")], 400);
+        let small: Value = serde_json::from_str(&small).expect("a one-row summary parses");
+        assert_eq!(small["rowKeys"].as_array().expect("rowKeys").len(), 1);
+        assert_eq!(small["rows"], 1);
+        assert!(
+            small.get("rowKeysOmitted").is_none(),
+            "an uncapped frame must not grow an omission field:\n{small}"
+        );
+    }
+
+    /// (g) The regression guard for the MOVED log call.
     ///
     /// The log call used to sit ABOVE `decode_outbound`; moving it below is
     /// what makes a summary possible, and the `Err` arm `continue`s — so a
@@ -1344,8 +1652,9 @@ mod tests {
         // crate's shared lock (they all take it; a sibling's
         // `init(false, None)` mid-test would silence this one).
         let _g = crate::test_support::env_lock();
-        let dir = crate::test_support::ScratchDir::in_env_temp("client-log-test-", "log");
-        debuglog::init(true, Some(dir.to_path_buf()));
+        // Armed through the guard, so a panicking assertion below still clears the
+        // global before the scratch dir it names is removed.
+        let dir = ArmedDebugLog::new("client-log-test-", "log");
 
         let script = dir.join("no-frame.sh");
         // One line, on stdout, that is not JSON at all.
@@ -1377,8 +1686,8 @@ mod tests {
              log call moved below the decode; the `Err` arm `continue`s, so \
              without its own log call this line is lost):\n{text}"
         );
-
-        debuglog::init(false, None);
+        // No trailing `debuglog::init(false, None)` — `ArmedDebugLog::Drop` clears
+        // the global, and it does so on the panic path too.
     }
 
     /// End-to-end, through a REAL child process: one non-UTF-8 byte on the
@@ -1414,8 +1723,9 @@ mod tests {
     // drain (`provider_switch.rs` / `policy_gate.rs` precedent).
     async fn one_bad_byte_on_the_workers_stderr_does_not_silence_the_lines_after_it() {
         let _g = crate::test_support::env_lock();
-        let dir = crate::test_support::ScratchDir::in_env_temp("client-stderr-log-test-", "log");
-        debuglog::init(true, Some(dir.to_path_buf()));
+        // Armed through the guard (see `ArmedDebugLog`): a failing assertion below
+        // must not leave the global aimed at a dir that `Drop` then deletes.
+        let dir = ArmedDebugLog::new("client-stderr-log-test-", "log");
 
         let handle = spawn_fixture().expect("the fixture binary exists");
         handle
@@ -1462,7 +1772,10 @@ mod tests {
 
         let _ = handle.send_close();
         let _ = handle.kill().await;
-        debuglog::init(false, None);
+        // The child is killed BEFORE the guard drops (explicitly above), so the
+        // stderr drain task is done writing before `ArmedDebugLog::Drop` clears the
+        // global — the ordering the trailing `init(false, None)` used to provide by
+        // being the last statement, now provided by the guard on the panic path too.
     }
 
     /// The desktop's byte-exact stderr marker

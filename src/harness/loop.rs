@@ -1809,18 +1809,31 @@ impl AgentLoop {
                 // made, and the user watched a clean, silent stop.
                 //
                 // TWO sinks, on purpose — the same split `log_wire`
-                // (`provider/mod.rs`) documents, and for the same reasons. The
-                // `eprintln!` half is the WORKER's only reader with
-                // `ARCHIMEDES_DEBUG=1` set: the Worker's stderr is drained by a
-                // task in `worker/client.rs` into `debuglog`, which returns at
-                // its first statement without the var. The `record` half is what
-                // a DEFAULT launch leaves the supporter — `diagnostics` is always
-                // on, and it is the half that survives the desktop's Supervisor,
-                // whose stderr is inherited and never persisted (and on a Windows
-                // release build the GUI subsystem discards it outright). Neither
-                // half is redundant with the other: DO NOT delete one because the
-                // other exists. `record` takes the line WITHOUT the `harness: `
-                // prefix, exactly as `log_wire`'s does.
+                // (`provider/mod.rs`) documents, and for the same reasons. Read
+                // that doc, not a paraphrase of it: what it says — and what this
+                // site used to get WRONG — is that in a DEFAULT launch NEITHER
+                // half reaches a file from inside a Worker.
+                //
+                // * `eprintln!` is the WORKER's only reader WITH
+                //   `ARCHIMEDES_DEBUG=1` set: the Worker's stderr is drained by a
+                //   task in `worker/client.rs` into `debuglog`, which returns at
+                //   its first statement without the var. Without the var this
+                //   half goes nowhere a supporter can read.
+                // * `diagnostics::record` is un-gated by env var, but it is
+                //   UNARMED until a host injects a directory, and no `diagnostics::init`
+                //   in the crate is non-test. Arming lives in the DESKTOP's
+                //   `run()` (`src-tauri/src/lib.rs`, the Supervisor); a `--worker`
+                //   child never gets there and `run_worker_inner` arms neither
+                //   channel. So from inside a Worker this half is a NO-OP today —
+                //   ADR 0110, "What this does not fix".
+                //
+                // Both stay. The `eprintln!` because with the var set it is the
+                // only thing a Worker writes; the `record` because it is what any
+                // host that DOES arm diagnostics receives, and deleting it would
+                // make this line unobservable for that host on the strength of a
+                // Worker-only limitation. Neither half is redundant: DO NOT delete
+                // one because the other exists. `record` takes the line WITHOUT the
+                // `harness: ` prefix, exactly as `log_wire`'s does.
                 //
                 // The payload is three counts and a closed enum — which is what
                 // makes the always-on half legal at all. `diagnostics`' rule is

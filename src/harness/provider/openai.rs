@@ -755,15 +755,22 @@ pub(super) fn parse_arguments(args: &str) -> (Value, Option<ArgumentDefect>) {
 // # The two sinks, and why both
 //
 // `provider/mod.rs::log_wire` documents this in full and this follows it
-// exactly: the `eprintln!` half is the WORKER's stderr, whose only reader is the
-// `worker/client.rs` drain task and only with `ARCHIMEDES_DEBUG=1` set; the
-// `record` half is always on and is the half that survives a DEFAULT launch and
-// the Supervisor, whose stderr is inherited and never persisted (and on a
-// Windows release build the GUI subsystem discards it outright). Neither half is
-// redundant and neither may be deleted on the strength of the other. `record`
-// takes the line WITHOUT the `harness: ` prefix, as `log_wire`'s and
-// `settled_with_nothing_dispatched`'s do — which is why the builders answer the
-// prefix-free form and `emit_harness_line` adds it for the stderr half.
+// exactly — including the part this block used to get wrong: in a DEFAULT launch
+// NEITHER half reaches a file from inside a Worker. The `eprintln!` half is the
+// Worker's stderr, whose only reader is the `worker/client.rs` drain task and
+// ONLY with `ARCHIMEDES_DEBUG=1` set (it feeds `debuglog`, which returns at its
+// first statement without the var). The `record` half takes no env var, but it
+// is UNARMED until a host injects a directory and no `diagnostics::init` in the
+// crate is non-test: arming lives in the desktop's `run()` — the Supervisor,
+// which a `--worker` child never reaches — and `run_worker_inner` arms neither
+// channel, so inside a Worker `record` is a no-op today (ADR 0110, "What this
+// does not fix"). Both halves stay anyway: with the var set the `eprintln!` is
+// the Worker's ONLY reader, and `record` is what a host that DOES arm diagnostics
+// receives. Neither half is redundant and neither may be deleted on the strength
+// of the other. `record` takes the line WITHOUT the `harness: ` prefix, as
+// `log_wire`'s and `settled_with_nothing_dispatched`'s do — which is why the
+// builders answer the prefix-free form and `emit_harness_line` adds it for the
+// stderr half.
 //
 // # What may appear in the `record` payload
 //

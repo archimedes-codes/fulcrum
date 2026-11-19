@@ -175,8 +175,57 @@ async fn a_display_upsert_reaches_the_log_as_a_summary_with_no_payload() {
     assert!(body.contains(r#""rows":1"#), "the row count:\n{body}");
     // The row's identity survives (the instruments' `"message_key":"…"` regex).
     assert!(
-        body.contains(r#""kind":"agent-text""#) && body.contains(r#""message_key":""#),
-        "the row's kind + key must survive:\n{body}"
+        body.contains(r#""kind":"agent-text""#),
+        "the row's kind must survive:\n{body}"
+    );
+    // The row's IDENTITY survives — and pinned to the fixture's REAL key, not to
+    // the bare `"message_key":"` prefix. That literal is a PREFIX match and passes
+    // equally for `"message_key":""`, i.e. for a summary that dropped the key it
+    // claims to carry; it asserted the presence of a field name, never of a row.
+    // The fixture stamps `format!("{incarnation}:m1")`
+    // (`src/fixtures/worker.rs:561`), where `incarnation` is the 6-lowercase-hex
+    // stamp ADR 0049 mints per Worker life — so the key is `{6 hex}:m1`.
+    // `crate::test_support::is_incarnation_stamp` is the shared predicate for that
+    // shape but it is `#[cfg(test)] pub(crate)` and an integration target cannot
+    // see it (the same limit the `fixture_bin` note above records), so the rule is
+    // restated here beside the fixture line it mirrors.
+    let keys = serde_json::from_str::<serde_json::Value>(body)
+        .expect("the logged body is valid JSON")
+        .get("rowKeys")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        keys.len(),
+        1,
+        "the fixture emits exactly ONE display row, so the summary names exactly \
+         one key:\n{body}"
+    );
+    // `DisplayRowKey` carries NO `rename_all` (unlike `DisplayUpsertSummary`), so
+    // the field serialises as `message_key` — the exact snake_case form the
+    // measurement instrument's `"message_key":"…"` regex looks for.
+    let message_key = keys[0]
+        .get("message_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("`rowKeys[0].message_key` is a string:\n{body}"));
+    let (incarnation, suffix) = message_key
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("the key is `<incarnation>:m1`, got {message_key:?}"));
+    assert_eq!(
+        suffix, "m1",
+        "the fixture's row id suffix (`worker.rs:561`): {message_key}"
+    );
+    assert_eq!(
+        incarnation.len(),
+        6,
+        "the incarnation stamp is SIX lowercase hex chars (ADR 0049), so a key \
+         that is not that is not the fixture's key: {message_key}"
+    );
+    assert!(
+        incarnation
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "the incarnation stamp is lowercase hex: {message_key}"
     );
     // And `bytes` is the PRE-truncation wire length — bigger than the summary
     // itself, which is what records the size of the body that is no longer here.

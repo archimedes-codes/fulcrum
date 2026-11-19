@@ -771,15 +771,29 @@ impl Stream for ResponsesStream {
                     // different: `exhausted` here makes `poll_next`'s early
                     // `if this.exhausted` return `Ready(None)`, the `Ready(None)`
                     // block is never reached, `terminated` is still false, and the
-                    // flush with it. The gate is a non-empty `tool_acc` — the only
-                    // condition under which a real call is being lost, and what
-                    // keeps a healthy turn silent.
-                    if !this.tool_acc.is_empty() {
+                    // flush with it.
+                    //
+                    // The gate counts UNDELIVERED accs only — `!acc.done`, the
+                    // same rule `flush_tool_calls` skips on. On THIS wire a `done`
+                    // acc is NOT an in-flight call: the `output_item.done` arm sets
+                    // `acc.done = true` and pushes its `ProviderEvent::ToolCall`
+                    // AT PARSE TIME, and nothing removes the acc from the map (only
+                    // the flush's `mem::take` does, and it deliberately skips `done`
+                    // accs for that very reason — the de-duplication). So an `added`
+                    // → `done` → transport-error stream arrives here with a `done`
+                    // acc in the map whose call the `AgentLoop` already holds and
+                    // WILL dispatch. Counting it would print "a call the model had
+                    // already streamed was lost" about a call that was delivered —
+                    // the exact lie the terminal arms' docblock refuses to tell.
+                    let in_flight = this.tool_acc.values().filter(|acc| !acc.done).count();
+                    if in_flight > 0 {
                         emit_harness_line(&tool_calls_dropped_at_stream_error(
                             "responses",
                             "transport-error",
-                            this.tool_acc.len(),
-                            this.tool_acc.values().any(|acc| acc.name.is_some()),
+                            in_flight,
+                            this.tool_acc
+                                .values()
+                                .any(|acc| !acc.done && acc.name.is_some()),
                         ));
                     }
                     this.exhausted = true;
@@ -1585,6 +1599,84 @@ mod tests {
             1,
             "the transport latch reports the call it is about to lose, naming the \
              count; want a line ending with {WANT_LATCH_TRANSPORT:?}, got:\n\
+             {lines:#?}"
+        );
+    }
+
+    /// THE GUARD'S OTHER HALF — and the one that matters on THIS wire alone.
+    ///
+    /// `responses.rs` is the only wire that leaves a DELIVERED acc sitting in
+    /// `tool_acc`: the `output_item.done` arm sets `acc.done = true` AND emits
+    /// the `ProviderEvent::ToolCall` immediately, and never removes the acc. The
+    /// only thing that empties the map is `flush_tool_calls`'s `mem::take`, and
+    /// that SKIPS `done` accs by design (the de-duplication). So
+    /// `added` → `done` → transport error reaches the latch with one acc in the
+    /// map whose call was ALREADY pushed onto the event stream —
+    /// `AgentLoop::consume_stream` has it in `acc.tool_calls` and the turn
+    /// dispatches it.
+    ///
+    /// A bare `!tool_acc.is_empty()` therefore writes "a call the model had
+    /// already streamed was lost" about a call that was DELIVERED, into an
+    /// always-on file. It contradicts this arm's own docblock, which says a line
+    /// at a terminal arm "would tell a supporter a call was lost when the call
+    /// was delivered" — a delivered acc is that same lie by another route. The
+    /// gate is therefore `!acc.done`, `flush_tool_calls`'s own rule.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_transport_failure_after_a_delivered_tool_call_records_no_drop() {
+        let _guard = crate::test_support::env_lock();
+        let armed = arm_diagnostics("transport-delivered");
+        reset_diagnostics_file(armed.dir.path());
+
+        // `added` → the authoritative `done` (which DELIVERS the call) → the
+        // transport error, with NO terminal event — the exact sequence that
+        // leaves a `done` acc in the map at the latch.
+        let events = collect(responses_stream_failing(&[
+            &output_item_added(2, Some("fc_7"), Some("write")),
+            &output_item_done(2, Some("fc_7"), Some("write"), ARG_TEXT),
+        ]))
+        .await;
+
+        // THE WITNESS: the `ToolCall` was emitted — the path really was walked
+        // and the acc really is `done`, so the empty assertion below measures the
+        // GUARD and not a dead sink (the positive control the healthy-turn test
+        // has to stage by hand, this test gets for free from the wire itself).
+        let calls: Vec<&ToolCall> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolCall(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "`output_item.done` DELIVERED the call — nothing was lost, so nothing \
+             may be reported as lost; got {events:?}",
+        );
+        assert_eq!(
+            calls[0].name, "write",
+            "the delivered call is the one the fixture streamed"
+        );
+
+        // And the failure is a REAL transport failure — the latch WAS reached.
+        // Without this, the empty assertion could be measuring a fixture that
+        // never got to the arm.
+        assert!(
+            matches!(
+                &events[events.len() - 1],
+                ProviderEvent::Error(ProviderError::Retryable(m)) if m.contains("stream error")
+            ),
+            "the fixture ends on the transport error, i.e. the latch arm ran; \
+             got {events:?}",
+        );
+
+        let lines = discard_lines(&recorded_lines(armed.dir.path()));
+        assert!(
+            lines.is_empty(),
+            "the call was DELIVERED at parse time — reporting it as dropped at \
+             the transport error is a lie in an always-on file; the gate must \
+             exclude `done` accs exactly as `flush_tool_calls` does; got:\n\
              {lines:#?}"
         );
     }
