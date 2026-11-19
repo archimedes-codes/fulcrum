@@ -9,11 +9,29 @@
 //! is the loop's, via [`RetryPolicy::note_success`]; the exhaustion
 //! `auto_retry_end { success: false }` is emitted here).
 //!
-//! The attempt budget is shared per TURN (the `attempt` counter
-//! persists across `call_with_retry` invocations): a mid-stream
-//! `ProviderEvent::Error(Retryable)` re-enters the budget via
-//! [`RetryPolicy::next_retry_delay`], so a turn can never make more
-//! than `max_attempts` model calls.
+//! The attempt budget is ONE counter (`attempt`) shared by every route that
+//! re-runs an attempt: `call_with_retry`, the mid-stream
+//! `ProviderEvent::Error(Retryable)` route and the emptiness route all reach it
+//! through [`RetryPolicy::next_retry_delay`], so a turn can never make more
+//! than `max_attempts` model calls however many of those fire inside it.
+//!
+//! What that shared counter is NOT is per-turn: it is never reset at a turn
+//! boundary. `RetryPolicy` is `Copy` and is built once per `AgentLoop`
+//! (`RetryPolicy::new()` in `worker/core.rs` — the only non-test
+//! construction), so the counter's lifetime is the **Worker's**, not the
+//! turn's. After four unrelated retries anywhere in a Worker's life `attempt`
+//! is 5, and a LATER turn whose reply comes back empty or truncated gets no
+//! retry at all. Whether that exhaustion is a defect or the price of a single
+//! shared counter is an open question — it belongs on the engine's tracker,
+//! not settled here.
+//!
+//! The per-turn CEILING above is pinned; the Worker-lifetime exhaustion is
+//! **UNTESTED**, and the reason is worth naming:
+//! `an_empty_turn_shares_the_retry_budget_with_the_ladder`
+//! (`loop/tests/turn_lifecycle.rs`) calls `handle_prompt` ONCE, so it pins the
+//! per-turn ceiling and cannot tell a per-turn budget from a Worker-lifetime
+//! one. `docs/features/abandoned-tool-rows.md` §11 is the file that states the
+//! operative fact correctly ("`attempt` is per-turn-but-never-reset-to-zero").
 
 use std::future::Future;
 use std::time::Duration;
@@ -31,8 +49,10 @@ const DEFAULT_MAX_ATTEMPTS: u64 = 5;
 pub struct RetryPolicy {
     max_attempts: u64,
     base_delay: Duration,
-    /// The current attempt number within the turn (the first attempt is
-    /// `1`; `0` before the first call).
+    /// The current attempt number (the first attempt is `1`; `0` before the
+    /// first call). NEVER reset at a turn boundary — see the module docblock:
+    /// the counter outlives the turn that spent it, so the budget is the
+    /// Worker's.
     attempt: u64,
     /// The `auto_retry_end { success: true }` was already reported for
     /// the current retry (cleared by the next `next_retry_delay`, so a
