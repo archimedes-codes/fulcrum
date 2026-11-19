@@ -1961,7 +1961,7 @@ mod normalize_tests {
 
 #[cfg(test)]
 mod compute_display_rows_tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{compute_display_rows, normalize, ThoughtState, TurnState};
     use crate::events::RpcEvent;
@@ -2319,6 +2319,253 @@ mod compute_display_rows_tests {
             rows[0].payload_json,
             json!({ "text": "Hello" }),
             "the ordinary payload is byte-identical to the pre-feature shape"
+        );
+    }
+
+    /// (0.4.2 log summarising) The display row IS recoverable by replaying the
+    /// deltas alone — the claim the release rests on, proven rather than
+    /// believed.
+    ///
+    /// `supervisor.log` used to carry, for every streamed chunk, BOTH the delta
+    /// (the `sink-frame` line) and a full snapshot of the accumulated display
+    /// row (the `display-upsert` line). 0.4.2 stopped logging the snapshot: that
+    /// frame is now one short summary line carrying the row's `kind` +
+    /// `message_key` and a byte count, never its payload. The design's load
+    /// bearing premise is that the content stays recoverable, because
+    /// `compute_display_rows` is a pure reducer over the deltas, which are still
+    /// logged verbatim in the SAME file.
+    ///
+    /// This test proves it by REPLAY, in the shape a log reader would actually
+    /// use: drive a realistic interleaved turn, keep ONLY what the two log lines
+    /// keep (the delta verbatim; `DisplayRow { kind, message_key }` for the
+    /// snapshot — `payload_json` DELIBERATELY DISCARDED, because that is exactly
+    /// what the log no longer carries), then fold the delta fragments by
+    /// `message_key` and compare against what the reducer really accumulated.
+    ///
+    /// **The assertion that matters is the key, not the text.** The specific
+    /// unproven step named in the plan is `message_key = "{messageId}#{segment}"`,
+    /// where `segment` derives from `thought_state.open_key` clearing — "the one
+    /// place summarising could lose information that is not recoverable
+    /// elsewhere". The turn below therefore contains TWO thought segments under
+    /// the SAME `messageId` (the `tool_call` clears the open one between them),
+    /// and the fold is keyed by `message_key` ALONE. Fold by the bare `messageId`
+    /// instead — the exact collapse the plan was afraid of — and `m1#1`, `m1#2`
+    /// and the `m1` reply row weld into one row and the snapshot checks go RED.
+    /// See `fold_key` below; that mutation is what gives this test its teeth.
+    #[test]
+    fn the_display_row_is_recoverable_by_replaying_the_deltas_alone() {
+        let text_acc = StdMutex::new(HashMap::new());
+        let tool_state = StdMutex::new(HashMap::new());
+        let thought_state = StdMutex::new(ThoughtState::default());
+
+        // One realistic turn: reasoning, then reply text, then a tool call
+        // (which CLEARS the open thought segment), then MORE reasoning under the
+        // SAME messageId — the second segment, the named risk — then the rest of
+        // the reply. Interleaved on purpose: the reducer's segmentation depends
+        // on the interleaving, so a per-kind test could not exercise it.
+        let stream = [
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "I should " } }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "read the log. " } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": { "text": "Reading it now. " } }),
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "read" }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "The tail is " } }),
+            json!({ "sessionUpdate": "agent_thought_chunk", "messageId": "m1", "content": { "text": "truncated mid-JSON. " } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": { "text": "It is truncated." } }),
+        ];
+
+        /// One chunk's line-PAIR, as 0.4.2 writes it.
+        struct Logged {
+            /// The `sink-frame` line: the delta, verbatim.
+            delta: Value,
+            /// The summarised `display-upsert` line: `kind` + `message_key`
+            /// ONLY (`src/store_rows.rs`'s `DisplayRow`, minus `payload_json`
+            /// and `created_at`). `payload_json` is DISCARDED here exactly as
+            /// the log discards it — this is the ONLY row state the replay may
+            /// read, and the type is what enforces that.
+            summary: Vec<(String, String)>,
+            /// The ORACLE — what the row held before the snapshot stopped being
+            /// logged. This is NOT the log: it is the truth the replay is graded
+            /// against, read here and nowhere else.
+            snapshots: Vec<(String, String, Value)>,
+        }
+
+        let mut log: Vec<Logged> = Vec::new();
+        for delta in &stream {
+            let rows = compute_display_rows(delta, &text_acc, &tool_state, &thought_state);
+            log.push(Logged {
+                delta: delta.clone(),
+                summary: rows
+                    .iter()
+                    .map(|r| (r.kind.clone(), r.message_key.clone()))
+                    .collect(),
+                snapshots: rows
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.kind.clone(),
+                            r.message_key.clone(),
+                            r.payload_json.clone(),
+                        )
+                    })
+                    .collect(),
+            });
+        }
+
+        // Non-vacuity of the INPUT: the stream must actually have produced the
+        // shape the claim is about — two segments under ONE messageId. Without
+        // this the test would pass on a stream that never opened a second
+        // segment, and the segment suffix (the fold key) would never be
+        // exercised at all.
+        let thought_keys: std::collections::BTreeSet<&str> = log
+            .iter()
+            .flat_map(|entry| entry.summary.iter())
+            .filter(|(kind, _)| kind == "agent-thought")
+            .map(|(_, key)| key.as_str())
+            .collect();
+        assert_eq!(
+            thought_keys,
+            ["m1#1", "m1#2"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the driven stream must contain TWO thought segments of the SAME \
+             messageId (the named risk), got {thought_keys:?}"
+        );
+
+        /// The fold key a log reader would use: `message_key` ALONE. The store's
+        /// own upsert key is `(session_id, kind, message_key)`; `session_id` is
+        /// constant down one session's stream and `kind` rides on the summary
+        /// line, so `message_key` is the whole of the discriminating state.
+        ///
+        /// MUTATION (non-vacuity): replacing the body with
+        /// `message_key.split('#').next().unwrap_or(message_key)` — the bare
+        /// `messageId`, the segment dropped — reddens this test at the third
+        /// chunk, where the reply's `"Reading it now. "` arrives welded onto the
+        /// first thought segment's text. That is precisely the failure mode the
+        /// plan named, so seeing it fail is the proof the test measures the
+        /// thing rather than merely observing it.
+        fn fold_key(message_key: &str) -> &str {
+            message_key
+        }
+
+        // ── the replay: deltas + summary lines in, whole transcript out ──────
+        let mut folded: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut replayed: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+        // Last-wins per key — the UPSERT's own semantics (`storage/batching.rs`:
+        // "a later `Display` row for the same key is a complete snapshot").
+        let mut truth: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+
+        for (step, entry) in log.iter().enumerate() {
+            let text_rows: Vec<&(String, String)> = entry
+                .summary
+                .iter()
+                .filter(|(kind, _)| kind != "tool-call")
+                .collect();
+            assert!(
+                text_rows.len() <= 1,
+                "step {step}: one delta must touch at most ONE text row, or a \
+                 fragment has no unambiguous home; got {:?}",
+                entry.summary
+            );
+            for (kind, key) in text_rows {
+                let fragment = entry
+                    .delta
+                    .get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "step {step}: a {kind} row was written for a delta \
+                             that logged no text fragment: {}",
+                            entry.delta
+                        )
+                    });
+                let home = fold_key(key).to_string();
+                let text = folded.entry(home.clone()).or_default();
+                text.push_str(fragment);
+                let text = text.clone();
+                replayed.insert(home, json!({ "text": text }));
+            }
+
+            for (kind, key, payload) in &entry.snapshots {
+                if kind == "tool-call" {
+                    // A tool-call row is NOT an accumulator: the reducer stores
+                    // the frame it merged, so the verbatim delta rebuilds it.
+                    // Asserted, not assumed.
+                    replayed.insert(fold_key(key).to_string(), entry.delta.clone());
+                }
+                // EVERY intermediate snapshot the log stopped writing is
+                // reproducible from the deltas seen so far, keyed by message_key
+                // — not just the final one.
+                assert_eq!(
+                    replayed.get(fold_key(key)),
+                    Some(payload),
+                    "step {step}: the snapshot the log no longer carries for \
+                     `{key}` is NOT reproducible by replaying the deltas alone"
+                );
+                truth.insert(key.clone(), payload.clone());
+            }
+        }
+
+        // The claim, in one equality: the whole final transcript — every row,
+        // last-wins, exactly as the UPSERT would have stored it — rebuilt from
+        // the deltas and the summary lines alone.
+        assert_eq!(
+            replayed, truth,
+            "the rows the reducer persisted are not what the logged deltas replay to"
+        );
+
+        // And the KEY, stated plainly: three rows share the messageId `m1` and
+        // `message_key` keeps them three separate rows.
+        assert_eq!(
+            replayed.keys().collect::<Vec<_>>(),
+            vec!["m1", "m1#1", "m1#2", "t1"],
+            "message_key alone must be a sufficient fold key — a bare-messageId \
+             fold collapses m1#1/m1#2/m1 into one row"
+        );
+        assert_eq!(
+            replayed["m1#1"]["text"].as_str(),
+            Some("I should read the log. "),
+            "segment 1 of m1 is its own row"
+        );
+        assert_eq!(
+            replayed["m1#2"]["text"].as_str(),
+            Some("The tail is truncated mid-JSON. "),
+            "segment 2 of the SAME messageId is a DIFFERENT row, not welded onto #1"
+        );
+        assert_eq!(
+            replayed["m1"]["text"].as_str(),
+            Some("Reading it now. It is truncated."),
+            "the reply text is a third, separate row, free of any thought text"
+        );
+
+        // `message_key` must ALSO determine `kind`: were one key ever to appear
+        // under two kinds, the summary line's `kind` would be ambiguous and the
+        // key would not be sufficient on its own after all.
+        let mut kinds: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for entry in &log {
+            for (kind, key) in &entry.summary {
+                if let Some(seen) = kinds.insert(key.clone(), kind.clone()) {
+                    assert_eq!(
+                        seen, *kind,
+                        "`{key}` appears under two kinds — the summary line's \
+                         `kind` is not determined by `message_key`"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            kinds
+                .values()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["agent-text", "agent-thought", "tool-call"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "all three row kinds are reachable from the summary line alone"
         );
     }
 }
