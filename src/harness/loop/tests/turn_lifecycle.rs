@@ -2781,7 +2781,7 @@ async fn a_truncated_turn_emits_the_notice_after_the_retry_close_and_before_the_
             ProviderEvent::Done(FinishReason::Length),
         ]),
     ]);
-    let (_space, mut loop_, _db) = build_loop_with_db(
+    let (_space, mut loop_, db) = build_loop_with_db(
         Box::new(provider),
         events_tx,
         Arc::new(StdMutex::new(CancellationToken::new())),
@@ -2842,6 +2842,54 @@ async fn a_truncated_turn_emits_the_notice_after_the_retry_close_and_before_the_
         truncated_at < settled_at,
         "`turn_truncated` ({truncated_at}) still precedes `agent_settled` \
          ({settled_at}) — the same contract, got {kinds:?}",
+    );
+
+    // THE CONSUMER-VISIBLE FACT. Everything above asserts EVENT-KIND ordering,
+    // which is the MECHANISM; what the desktop actually reads is a DISPLAY-ROW
+    // position. `dispositionFromRows` takes `payload_json.disposition` off the
+    // page's LAST row, so what the footer depends on is not "the notice came
+    // after the retry close in the event stream" but "the notice is the newest
+    // row the turn wrote". Those two diverge for any future arm that writes a
+    // fresh-id one-liner AFTER `turn_truncated`: its `closed_at < truncated_at`
+    // would stay TRUE and every assert above would stay GREEN while the footer
+    // silently disappeared. So the ordering asserts are kept (they pin why the
+    // two frames sit in that order) and the row position is asserted here, off
+    // the store the test already builds and used to discard — `MemoryStore`
+    // records EVERY `persist_display` call in write order, with no UPSERT.
+    let rows = db.display_rows();
+    let notice_at = rows
+        .iter()
+        .rposition(|(_sid, kind, key, payload)| {
+            kind == "agent-text"
+                && key.contains(":truncate:")
+                && payload.contains("\"disposition\"")
+        })
+        .expect(
+            "the truncation notice reached the display rows as an `agent-text` \
+                 row carrying a disposition (the tail is printed by the assert below)",
+        );
+    let last_text_at = rows
+        .iter()
+        .rposition(|(_sid, kind, _key, _payload)| kind == "agent-text")
+        .expect("the turn wrote at least one `agent-text` row");
+    assert_eq!(
+        notice_at,
+        last_text_at,
+        "the `{{stamp}}:truncate:N` notice is the NEWEST `agent-text` display row \
+         (row {notice_at} of {}, last is {last_text_at}) — the desktop's \
+         `dispositionFromRows` reads `payload_json.disposition` off the page's \
+         LAST row only, so any row written after the notice buries the \
+         truncated-turn footer. The tail: {rows:?}",
+        rows.len(),
+    );
+    let payload: Value = serde_json::from_str(&rows[notice_at].3)
+        .expect("a display row's payload_json is valid JSON");
+    assert_eq!(
+        payload["disposition"], "length",
+        "the newest `agent-text` row is the truncation notice AND carries the \
+         `length` disposition — that pair is what the footer hydrates from disk \
+         after a restart, got {}",
+        rows[notice_at].3,
     );
 }
 

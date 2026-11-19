@@ -528,8 +528,9 @@ banner. Every path that abandons an attempt and settles WITHOUT reaching `note_s
 pending, and the next ordinary successful prompt — a fresh turn, an unrelated prompt, minutes later — walks into
 `note_success()`, gets `Some(attempt)` for the PREVIOUS turn's retry, and announces that retry a success.
 
-Two properties make this worse than a cosmetic banner. `attempt` is per-turn-but-never-reset-to-zero (both
-`call_with_retry` and `note_success` do `attempt.max(1)`, and only a fresh `next_retry_delay` moves it up), so the
+Two properties make this worse than a cosmetic banner. The `attempt` counter belongs to the **Worker**, not the
+turn, and is NEVER reset at a turn boundary (both `call_with_retry` and `note_success` do `attempt.max(1)`, and only
+a fresh `next_retry_delay` moves it up), so the
 stale `attempt` number rides the frame; and the success line is a one-liner on the `{stamp}:notice:N` family
 (`normalize.rs`, `TurnState::notice_id`) — a UNIQUE id per line, so it no longer APPENDS onto whatever system line the
 session last wrote — while still carrying no turn reference of its own, so it lands wherever the frame arrives rather
