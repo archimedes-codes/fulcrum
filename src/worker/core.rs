@@ -710,9 +710,17 @@ impl WorkerCore {
                 //   * An unconditional `init(env.diagnostics_dir.clone())` — the
                 //     shape this line was first written in, and MEASURED to redden
                 //     the suite — makes every `Start` in the crate a write to the
-                //     process-global target, including the ~10 `worker::core` tests
-                //     that handle a `Start` WITHOUT taking `env_lock()`. Each of
-                //     those then clears a sibling's armed scratch dir between its
+                //     process-global target, including the `worker::core` tests that
+                //     handle a `Start` WITHOUT taking `env_lock()`. Measured at the
+                //     time this was written: NINETEEN of them — every `#[tokio::test]`
+                //     in this module whose CODE (not doc comment) calls
+                //     `handle(Inbound::from(&env))` or the decoded frame of the same,
+                //     minus the two that do take the lock
+                //     (`a_start_carrying_a_diagnostics_dir_arms_the_channel`,
+                //     `a_start_without_a_diagnostics_dir_leaves_the_channel_unarmed`).
+                //     RE-MEASURE rather than re-count from memory — the number moves
+                //     whenever a fixture is added, and it has been wrong before. Each
+                //     of those then clears a sibling's armed scratch dir between its
                 //     `init` and its read. That is the exact flake class
                 //     `diagnostics::a_sibling_writer_does_not_break_the_timestamp_assertions`
                 //     documents and refuses, so the write is gated on the field
@@ -2101,10 +2109,19 @@ mod tests {
     /// site in the harness observable rather than only the ones added after this
     /// commit. Asserting on a line the production code already writes is also what
     /// keeps this test from being satisfied by a `record` call this test itself
-    /// made — and the test arms nothing at all (see [`DiagnosticsDirGuard`]).
+    /// made — and the test arms nothing at all (see [`DisableDiagnosticsOnExit`]).
     ///
-    /// `env_lock()` per the `diagnostics` module's stated contract (the target is
-    /// process-global and ~17 unlocked `build_provider` tests reach `record`).
+    /// `env_lock()` per the `diagnostics` module's stated contract: the target is
+    /// process-global, and an unlocked test that builds a provider reaches `record` —
+    /// directly (`build_provider` / `build_provider_with_headers`, or the
+    /// `record_paths` helper) or transitively, through a loop whose provider
+    /// `default_build_loop` built. The number of such tests is deliberately NOT
+    /// stated here: it drifts with every fixture and this crate has already shipped
+    /// a stale one. Re-measure with
+    /// `grep -rnE 'build_provider(_with_headers)?\(|record_paths\(' src`, code lines
+    /// only. What matters for THIS test is the consequence: a line that is not this
+    /// test's can land in the file this test armed, which is why the assertions below
+    /// read for presence rather than counting lines.
     /// `#[allow(clippy::await_holding_lock)]` because `handle` is `async` and the
     /// lock must span the arming and the read; the precedent is
     /// `harness/loop/tests/param_rejection.rs::a_rejected_call_never_reaches_the_permission_gate`.
@@ -2201,22 +2218,88 @@ mod tests {
         );
     }
 
-    /// Encode a `start` frame for `env` with one extra top-level key,
-    /// `diagnosticsDir`, spliced in by string surgery.
+    /// A path with BACKSLASHES in it must survive the same encode/decode pair.
     ///
-    /// Deliberately not `serde_json::to_value` + insert + `to_string`: that would
-    /// let a renamed key (or a struct that grew `deny_unknown_fields`) pass
-    /// unnoticed, and the whole point of the additive field is that the codec
-    /// tolerates this key on BOTH sides.
-    fn encode_start_with_diagnostics_dir(env: &StartEnv, dir: &str) -> String {
-        let line = crate::worker::protocol::encode_inbound(&Inbound::from(env));
-        let tail = line.trim_end_matches(['\n', '\r']);
-        assert!(
-            tail.ends_with('}'),
-            "the encoded frame is an object: {line}"
+    /// This is the Windows case, and it is not hypothetical: on Windows
+    /// `std::env::temp_dir()` is `C:\Users\<name>\AppData\Local\Temp\…`, so the
+    /// scratch dir `a_start_carrying_a_diagnostics_dir_arms_the_channel` hands to
+    /// the helper is exactly this shape there. Splicing the path into the frame as
+    /// raw text emits `\U`, `\A`, `\L`, `\T` — none of which is a legal JSON
+    /// escape — and the frame then fails to PARSE: the Supervisor's bytes would be
+    /// rejected by the Worker, and the test above would die at `decode_inbound`
+    /// before it ever reached an assertion.
+    ///
+    /// The explicit literal (not just the host's scratch dir) is what makes this
+    /// test worth having on every platform: on Linux the scratch dir has no
+    /// backslash, so a helper that escapes nothing stays green here and RED on CI's
+    /// `windows-latest` leg. That asymmetry is the defect, so the literal is the
+    /// case under test and the test is deliberately NOT `#[cfg(windows)]`.
+    #[test]
+    fn a_diagnostics_dir_with_backslashes_is_a_legal_json_frame() {
+        let env = test_env(StartMode::Fresh, None, None);
+        // Every illegal-escape class a real Windows temp path contains: `\U`ser,
+        // `\A`ppData, `\L`ocal, `\T`emp.
+        let windows_dir = r"C:\Users\test\AppData\Local\Temp\worker-core-diag-arms";
+        let line = encode_start_with_diagnostics_dir(&env, windows_dir);
+        // The key name is still there (the helper pins it) and the frame PARSES.
+        let msg = crate::worker::protocol::decode_inbound(&line).unwrap_or_else(|e| {
+            panic!("a backslash-bearing path must be escaped, not spliced: {e}; frame: {line}")
+        });
+        let Inbound::Start(sent) = msg else {
+            panic!("the frame is a `start`: {msg:?}");
+        };
+        assert_eq!(
+            sent.diagnostics_dir.as_deref(),
+            Some(std::path::Path::new(windows_dir)),
+            "the path the Supervisor meant is the path the Worker decodes"
         );
-        let body = &tail[..tail.len() - 1];
-        format!(r#"{body},"diagnosticsDir":"{dir}"}}"#) + "\n"
+    }
+
+    /// Encode a `start` frame for `env` carrying one top-level key,
+    /// `diagnosticsDir`, built through `serde_json` so the VALUE is escaped.
+    ///
+    /// The value is inserted into the serialized frame rather than spliced in as
+    /// text, because a path is not JSON text: on Windows `std::env::temp_dir()` is
+    /// `C:\Users\<name>\AppData\Local\Temp\…` and splicing it verbatim emits
+    /// `\U`/`\A`/`\L`/`\T`, which are not legal JSON escapes, so the frame does not
+    /// decode at all (`a_diagnostics_dir_with_backslashes_is_a_legal_json_frame`
+    /// pins exactly that, on every platform). Splicing also produced a SECOND
+    /// `diagnosticsDir` key next to the one serde already writes.
+    ///
+    /// The objection to `to_value` + insert + `to_string` was that it lets a
+    /// renamed key pass unnoticed — and that objection is answered by the
+    /// `line.contains` assertion below, which pins the WIRE NAME of the key together
+    /// with its value (measured: asserting on the bare key name does NOT do it,
+    /// because serde writes that very key for the field itself, so a renamed insert
+    /// still satisfies it — the value must be in the asserted substring). What the
+    /// additive field's codec tolerance needs proving is that this key, under this
+    /// name, is accepted on BOTH sides; an assertion on the encoded text is what
+    /// proves the name, and a renamed key now reddens HERE rather than silently
+    /// weakening the pair.
+    fn encode_start_with_diagnostics_dir(env: &StartEnv, dir: &str) -> String {
+        let mut frame = serde_json::to_value(Inbound::from(env)).expect("encodable");
+        frame
+            .as_object_mut()
+            .expect("the encoded frame is an object")
+            .insert(
+                "diagnosticsDir".into(),
+                serde_json::Value::String(dir.to_string()),
+            );
+        let line = serde_json::to_string(&frame).expect("encodable");
+        // The key name AND its value, together: `contains` on the bare key name
+        // would be satisfied by the `diagnosticsDir` serde already writes for the
+        // field, so it proves nothing. Key-plus-value is what a renamed key (or a
+        // value that escaped wrong) fails, which is the guard the original string
+        // surgery got for free from writing the key by hand.
+        assert!(
+            line.contains(&format!(
+                r#""diagnosticsDir":{}"#,
+                serde_json::to_string(dir).expect("a path is a JSON string")
+            )),
+            "the key name and its value are pinned — a renamed `diagnosticsDir` must \
+             redden this helper, not quietly narrow what the round-trip covers: {line}"
+        );
+        line + "\n"
     }
 
     /// The handler resolves by the BARE `request_id` — deliberately NOT through a

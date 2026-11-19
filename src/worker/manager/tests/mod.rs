@@ -3407,6 +3407,12 @@ async fn a_child_worker_inherits_the_parents_diagnostics_dir() {
         "the child Worker arms with the PARENT's directory — a `null` here means \
          the child is unarmed and its tool-call drops are invisible again"
     );
+    // Detached for symmetry with the `d2` half below (and because the `manager`
+    // binding is shadowed by the second fixture immediately after, which drops the
+    // first). The fixture reaps its children on stdin-EOF at drop, so this is
+    // tidiness and not correctness — most attach-using tests in this module skip
+    // it; a test that detaches in one half detaches in both.
+    manager.detach("d1");
 
     // And the NEGATIVE half, in the same shape: a parent built by `from_parts`
     // (no setter — every fixture, every old Supervisor) hands the child `null`,
