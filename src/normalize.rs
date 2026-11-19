@@ -86,6 +86,18 @@ pub struct TurnState {
     /// (`{stamp}:system`) weld into one bubble — and a session that keeps
     /// launching turns that hit the ceiling gets one notice per turn.
     pub cap_seq: u64,
+    /// How many harness one-liners this session has written (issue #190).
+    /// ONE counter across every one-liner arm — the retry start, BOTH arms of
+    /// the retry end, and the extension error — rather than one per arm,
+    /// because the pair that must never weld is `Retrying (attempt N/M…)`
+    /// followed by `Retry failed`, and those come from two DIFFERENT arms: a
+    /// per-arm counter would let them share `:0`. Same role as `truncate_seq`
+    /// and `cap_seq`, same reason: the line needs a messageId UNIQUE per line,
+    /// because two lines on the shared `system` key (`{stamp}:system`) weld into
+    /// one bubble — the desktop reducer appends a same-`messageId`
+    /// `agent_message_chunk` with NO separator, so consecutive one-liners read
+    /// as a single sentence.
+    pub notice_seq: u64,
     /// The card id of the compaction currently in flight, set by
     /// `compaction_start` and taken by `compaction_end` (issue #90: a
     /// compaction renders as a `ToolCallCard`, so the settle must land on the
@@ -148,6 +160,30 @@ impl TurnState {
         self.cap_seq += 1;
         self.id(&format!("cap:{n}"))
     }
+
+    /// Mint the id of the NEXT harness one-liner: `{stamp}:notice:N`.
+    ///
+    /// One counter across every `system_chunk` arm (retry start, retry end,
+    /// extension error) rather than one per arm, because the pair that must
+    /// never weld is `Retrying (attempt N/M…)` followed by `Retry failed` —
+    /// a per-arm counter would let those two share an id. Mirrors `truncate_id`
+    /// and `cap_id`'s convention: the counter is read BEFORE it advances, so the
+    /// first line of a session is `notice:0`. (`message_retracted` pre-increments
+    /// and starts at `retract:1`; that offset is incidental to it — this is the
+    /// convention the truncation and cap pins assert, so it is the one copied
+    /// here.) Stamped, because a Resume restarts these counters and an unstamped
+    /// `notice:0` would land on its predecessor's row (ADR 0049).
+    ///
+    /// `notice` is a LEGAL bookkeeping word — and the predicate's safety rests
+    /// on that fact: it carries the non-hex characters `o`, `t` and `n`, so a
+    /// six-hex incarnation stamp (`types::mint_incarnation`) can never EQUAL it,
+    /// which is what lets `is_bookkeeping_message_id` scan the id's
+    /// `:`-separated fields for a WORD instead of decoding a position.
+    pub fn notice_id(&mut self) -> String {
+        let n = self.notice_seq;
+        self.notice_seq += 1;
+        self.id(&format!("notice:{n}"))
+    }
 }
 
 /// The machine-readable disposition the truncation notice frame carries
@@ -187,9 +223,10 @@ const TRUNCATION_DISPOSITION: &str = "length";
 const TURN_CAPPED_DISPOSITION: &str = "max_turn_requests";
 
 /// A one-line `agent_message_chunk` carrying a UNIQUE messageId — for a line
-/// that must survive being adjacent to another line. `system_chunk`'s shared
-/// key (the stamped `system` key, `{stamp}:system`) APPENDS (that is its
-/// point), so a second line on it welds.
+/// that must survive being adjacent to another line. The shared `system` key
+/// (the stamped `{stamp}:system`) APPENDS (that is its point), so a second line
+/// on it welds — which is why every harness one-liner now mints its own id
+/// through `TurnState::notice_id` instead of using it.
 fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
     let text = text.into();
     json!({
@@ -202,17 +239,20 @@ fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
 /// Is this messageId a harness bookkeeping line rather than model output?
 /// The bookkeeping WORDS are `system` (the shared one-liner key), `retract`
 /// (a discard line, ADR 0048), `truncate` (the output-cap notice, issue
-/// #190 — Decision 5) and `cap` (the turn-loop-bound notice — the same
-/// reasoning as `truncate`: a Subagent's parent-facing captured text must not
-/// quote a notice the harness wrote about its own turn). The fourth is here for
-/// that SAME reason as the second and third: the Subagent capture hands its text
-/// to the PARENT as the tool result, so a notice the harness wrote about its own
-/// turn would otherwise be quoted back as if the child had said it. The
+/// #190 — Decision 5), `cap` (the turn-loop-bound notice) and `notice` (the
+/// harness one-liners — a retry start, a retry end, an extension error — which
+/// moved onto their own `{stamp}:notice:N` ids for the SAME issue #190 weld).
+/// All five are here for ONE reason, stated once: the Subagent capture hands its
+/// text to the PARENT as the tool result, so a line the harness wrote about its
+/// own turn would otherwise be quoted back as if the child had said it — and
+/// `SubagentCapture::observe_sink_frame` both SKIPS the delta and refuses to set
+/// `last_message_id` only for an id this predicate answers `true` for, so a word
+/// MISSING here is a banner that lands in the parent's tool result. The
 /// predicate matches any of them as a
 /// `:`-separated word ANYWHERE in the id — deliberately a word-set, not a
 /// position: the id
-/// `normalize` mints today is `{stamp}:system` / `{stamp}:retract:N` /
-/// `{stamp}:truncate:N` / `{stamp}:cap:N` (ADR 0049), and the BARE shape
+/// `normalize` mints today is `{stamp}:retract:N` /
+/// `{stamp}:truncate:N` / `{stamp}:cap:N` / `{stamp}:notice:N` (ADR 0049), and the BARE shape
 /// (`system`, `retract:1`)
 /// because that is the id shape WITH NO stamp — the test fixtures that
 /// hand-write these ids, and `TurnState::default()`, whose EMPTY stamp mints
@@ -221,15 +261,30 @@ fn unique_system_chunk(message_id: &str, text: impl Into<String>) -> Value {
 /// (`types::mint_incarnation`), and no bookkeeping word is spelled from the hex
 /// alphabet (`system` carries `s`/`y`/`t`/`m`; `retract` is seven chars and
 /// carries `r`/`t`; `truncate` is eight and carries `r`/`u`/`n`; `cap` is three
-/// and carries `p`), so a stamp can
+/// and carries `p`; `notice` is six long — the same length as a stamp, so it is
+/// the word the rule must actually be checked against, and `o`/`t`/`i` are
+/// outside the hex alphabet), so a stamp can
 /// never EQUAL one. `default` is deliberately NOT here: it is the
 /// no-id-open fallback over REAL model text, and the subagent capture must
 /// still hand it to the parent. Anything that must capture ONLY what the model
 /// said — the subagent capture, whose text becomes the PARENT's tool result —
 /// asks this instead of re-deciding the convention.
+///
+/// `system` STAYS in the set even though no arm writes it any more (the four
+/// one-liner arms moved to `notice_id`, and `system_chunk` is deleted): rows
+/// older Workers wrote are ON DISK, and a peer on an older crate can still send
+/// the key. Dropping the word as dead would start accumulating historical
+/// one-liners into a Subagent's parent-facing answer. The word list is also
+/// enumerated in the DESKTOP repo's
+/// `docs/decisions/0049-…` (Consequences) — that ADR lives in the other crate and
+/// is NOT edited from here, so the two lists are kept in step by hand.
 pub fn is_bookkeeping_message_id(id: &str) -> bool {
     id.split(':').any(|field| {
-        field == "system" || field == "retract" || field == "truncate" || field == "cap"
+        field == "system"
+            || field == "retract"
+            || field == "truncate"
+            || field == "cap"
+            || field == "notice"
     })
 }
 
@@ -238,19 +293,6 @@ pub fn is_bookkeeping_message_id(id: &str) -> bool {
 /// `tool_specs()` — it exists only as a display title, so the model can never
 /// call it.
 pub(crate) const COMPACTION_TOOL: &str = "compaction";
-
-/// A one-line `agent_message_chunk` with the dedicated `system` messageId
-/// (the bookkeeping one-liners — never mixed into a real message's
-/// accumulated text). The id is the stamped shared key (`{stamp}:system`) so a
-/// resumed Worker's one-liner does not overwrite its predecessor's (ADR 0049).
-fn system_chunk(message_id: &str, text: impl Into<String>) -> Value {
-    let text = text.into();
-    json!({
-        "sessionUpdate": "agent_message_chunk",
-        "content": { "type": "text", "text": text },
-        "messageId": message_id,
-    })
-}
 
 /// Shallow-merge `patch` into `base`: non-null fields of `patch` win.
 fn merge_json(base: &mut Value, patch: &Value) {
@@ -688,24 +730,33 @@ pub fn normalize(e: &RpcEvent, st: &mut TurnState) -> Vec<Value> {
             "messageId": st.cap_id(),
             "disposition": TURN_CAPPED_DISPOSITION,
         })],
+        // (issue #190, the weld) Every harness one-liner is on its OWN id
+        // (`{stamp}:notice:N`), NOT on the shared `{stamp}:system` key: a
+        // same-`messageId` `agent_message_chunk` is APPENDED by the desktop
+        // reducer with no separator, so consecutive one-liners read as one
+        // sentence (measured on a real database: 103 of 104 `:system` rows
+        // carried two or more welded lines). ONE counter across all four arms
+        // (`notice_id`), because the pair that welds — `Retrying (attempt N/M…)`
+        // then `Retry failed` — comes from two of them. Frame COUNT unchanged:
+        // one frame per event, as before.
         RpcEvent::auto_retry_start {
             attempt,
             max_attempts,
             ..
-        } => vec![system_chunk(
-            &st.id("system"),
+        } => vec![unique_system_chunk(
+            &st.notice_id(),
             format!("Retrying (attempt {attempt}/{max_attempts}…)"),
         )],
         RpcEvent::auto_retry_end { success, .. } => {
             vec![if *success {
-                system_chunk(&st.id("system"), "Retry succeeded")
+                unique_system_chunk(&st.notice_id(), "Retry succeeded")
             } else {
-                system_chunk(&st.id("system"), "Retry failed")
+                unique_system_chunk(&st.notice_id(), "Retry failed")
             }]
         }
         RpcEvent::extension_error { error, .. } => {
-            vec![system_chunk(
-                &st.id("system"),
+            vec![unique_system_chunk(
+                &st.notice_id(),
                 format!("Extension error: {error}"),
             )]
         }
@@ -1699,8 +1750,212 @@ mod normalize_tests {
         );
     }
 
-    /// The bookkeeping set is `system`, `retract`, `truncate` and `cap`, in
-    /// either id shape — and `default` is NOT in it: that id carries real model
+    /// (issue #190, the weld) TWO `auto_retry_start` one-liners must land on
+    /// TWO ids. This arm used to call `system_chunk(&st.id("system"), …)`, so
+    /// every retry line in a session shared ONE `messageId` — and a same-id
+    /// `agent_message_chunk` is APPENDED by the desktop reducer with no
+    /// separator, so consecutive one-liners became a single sentence. Measured
+    /// on a real database: 103 of 104 `:system` rows carried two or more welded
+    /// one-liners, one reading
+    /// `"Retrying (attempt 2/5…)Retry succeededRetrying (attempt 3/5…)Retrying (attempt 4/5…)Retrying (attempt 5/5…)Retry failed"`.
+    ///
+    /// WHOLE-FRAME assertions on purpose: `bookkeeping_events_and_one_liners`
+    /// indexes `[0]` and reads only `content.text`, so it pins neither the id
+    /// NOR the frame count — an arm that emitted a second frame, or that kept
+    /// the shared key, would leave it green.
+    #[test]
+    fn two_retry_start_lines_get_their_own_ids_and_never_the_shared_key() {
+        let mut st = TurnState::stamped("t");
+        let start = |attempt: u64| {
+            ev(json!({
+                "type": "auto_retry_start", "attempt": attempt,
+                "maxAttempts": 5, "delayMs": 1000, "errorMessage": "x",
+            }))
+        };
+        let first = normalize(&start(2), &mut st);
+        let second = normalize(&start(3), &mut st);
+        assert_eq!(
+            first.len(),
+            1,
+            "one event, exactly one frame (the arm's frame count must not change)"
+        );
+        assert_eq!(
+            second.len(),
+            1,
+            "one event, exactly one frame (the arm's frame count must not change)"
+        );
+        assert_eq!(
+            first,
+            vec![json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Retrying (attempt 2/5…)" },
+                "messageId": "t:notice:0",
+            })],
+            "the FIRST one-liner of a session is `notice:0` (read-before-advance, \
+             the `truncate_id`/`cap_id` convention)"
+        );
+        assert_eq!(second[0]["messageId"], "t:notice:1");
+        assert_ne!(
+            first[0]["messageId"], second[0]["messageId"],
+            "two one-liners on one id weld into one bubble"
+        );
+        for frames in [&first, &second] {
+            assert_ne!(
+                frames[0]["messageId"],
+                json!("t:system"),
+                "the shared `{{stamp}}:system` key APPENDS — that is the defect"
+            );
+            assert!(
+                is_bookkeeping_message_id(frames[0]["messageId"].as_str().unwrap()),
+                "whatever id this arm mints MUST be bookkeeping, or the Subagent \
+                 capture hands the parent the harness's own retry banner as the \
+                 child's answer"
+            );
+        }
+        assert_eq!(st.notice_seq, 2, "the counter advanced once per one-liner");
+    }
+
+    /// THE pair that welds today: `Retrying (attempt N/M…)` immediately followed
+    /// by `Retry failed`. They come from DIFFERENT arms (`auto_retry_start`,
+    /// `auto_retry_end`), which is why the counter is ONE across the arms rather
+    /// than one per arm — a per-arm counter would let exactly these two share
+    /// `:0` and weld, which is the bug this task exists to fix.
+    #[test]
+    fn a_retry_start_and_the_retry_end_that_follows_it_do_not_share_an_id() {
+        let mut st = TurnState::stamped("t");
+        let start = normalize(
+            &ev(json!({
+                "type": "auto_retry_start", "attempt": 2, "maxAttempts": 5,
+                "delayMs": 1000, "errorMessage": "x",
+            })),
+            &mut st,
+        );
+        let end = normalize(
+            &ev(json!({
+                "type": "auto_retry_end", "success": false, "attempt": 2,
+                "finalError": "boom",
+            })),
+            &mut st,
+        );
+        assert_eq!(start.len(), 1, "the start arm emits exactly one frame");
+        assert_eq!(end.len(), 1, "the end arm emits exactly one frame");
+        assert_eq!(start[0]["messageId"], "t:notice:0");
+        assert_eq!(end[0]["messageId"], "t:notice:1");
+        assert_ne!(
+            start[0]["messageId"], end[0]["messageId"],
+            "`Retrying (attempt 2/5…)` followed by `Retry failed` is the pair \
+             that reads as one sentence today; a per-arm counter would let them \
+             share an id, so the counter is SHARED across the arms"
+        );
+    }
+
+    /// The success arm of `auto_retry_end` and the `extension_error` arm are on
+    /// the SAME counter — all four one-liner arms are, because any two of them
+    /// can be adjacent and the desktop reducer appends same-id chunks with no
+    /// separator. Covers the remaining two of the four call sites (start and
+    /// failure are pinned above) plus the full five-line sequence the measured
+    /// row showed, so a per-arm counter cannot sneak past.
+    #[test]
+    fn every_one_liner_arm_shares_one_counter_so_no_two_adjacent_lines_weld() {
+        let mut st = TurnState::stamped("t");
+        let frames: Vec<Vec<serde_json::Value>> = [
+            ev(json!({
+                "type": "auto_retry_start", "attempt": 2, "maxAttempts": 5,
+                "delayMs": 1000, "errorMessage": "x",
+            })),
+            ev(json!({
+                "type": "auto_retry_end", "success": true, "attempt": 2,
+                "finalError": null,
+            })),
+            ev(json!({
+                "type": "auto_retry_start", "attempt": 3, "maxAttempts": 5,
+                "delayMs": 1000, "errorMessage": "x",
+            })),
+            ev(json!({
+                "type": "extension_error", "extensionPath": "/e.ts",
+                "event": "turn_start", "error": "nope",
+            })),
+            ev(json!({
+                "type": "auto_retry_end", "success": false, "attempt": 3,
+                "finalError": "boom",
+            })),
+        ]
+        .iter()
+        .map(|e| normalize(e, &mut st))
+        .collect();
+        let ids: Vec<&str> = frames
+            .iter()
+            .map(|f| f[0]["messageId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "t:notice:0",
+                "t:notice:1",
+                "t:notice:2",
+                "t:notice:3",
+                "t:notice:4",
+            ],
+            "five one-liners from three different arms, five distinct ids — the \
+             exact sequence of the measured welded row",
+        );
+        for frames in &frames {
+            assert_eq!(frames.len(), 1, "one event, exactly one frame");
+            assert_ne!(frames[0]["messageId"], json!("t:system"));
+        }
+        assert_eq!(
+            frames[1][0]["content"]["text"], "Retry succeeded",
+            "the success arm's text is unchanged"
+        );
+        assert_eq!(
+            frames[3][0]["content"]["text"], "Extension error: nope",
+            "the extension-error arm's text is unchanged"
+        );
+    }
+
+    /// A stamp is a NAMESPACE (ADR 0049): a resumed Worker restarts `notice_seq`
+    /// at 0, so an unstamped `notice:0` would UPSERT into its predecessor's row.
+    /// Mirrors `two_incarnations_mint_disjoint_truncation_ids`.
+    #[test]
+    fn two_incarnations_mint_disjoint_notice_ids() {
+        let mut st_a = TurnState::stamped("aaaaaa");
+        let mut st_b = TurnState::stamped("bbbbbb");
+        let start = || {
+            ev(json!({
+                "type": "auto_retry_start", "attempt": 1, "maxAttempts": 3,
+                "delayMs": 1000, "errorMessage": "x",
+            }))
+        };
+        let a = normalize(&start(), &mut st_a);
+        let b = normalize(&start(), &mut st_b);
+        assert_eq!(a[0]["messageId"], "aaaaaa:notice:0");
+        assert_eq!(b[0]["messageId"], "bbbbbb:notice:0");
+        assert_eq!(
+            st_a.notice_seq, st_b.notice_seq,
+            "both incarnations are on counter 0 — the collision is the point"
+        );
+        assert_ne!(
+            a[0]["messageId"], b[0]["messageId"],
+            "the same counter value in two incarnations must not collide"
+        );
+    }
+
+    /// `notice_id` follows the read-before-advance convention of `truncate_id`
+    /// and `cap_id` (NOT `retract`'s pre-increment, which starts at `retract:1`),
+    /// and the counter advances once per call.
+    #[test]
+    fn notice_id_reads_before_it_advances_and_stamps_every_id() {
+        let mut st = TurnState::stamped("t");
+        assert_eq!(st.notice_id(), "t:notice:0", "the first is `notice:0`");
+        assert_eq!(st.notice_id(), "t:notice:1");
+        assert_eq!(st.notice_seq, 2, "the counter advanced once per mint");
+        // The EMPTY stamp is a test artifact; production always stamps.
+        let mut unstamped = TurnState::default();
+        assert_eq!(unstamped.notice_id(), ":notice:0");
+    }
+
+    /// The bookkeeping set is `system`, `retract`, `truncate`, `cap` and
+    /// `notice`, in either id shape — and `default` is NOT in it: that id carries real model
     /// text (a
     /// `message_update` before any assistant `message_start`), and the subagent
     /// capture must still hand it to the parent (ADR 0048's fourth consumer).
@@ -1711,10 +1966,12 @@ mod normalize_tests {
             "retract:1",
             "truncate:0",
             "cap:0",
+            "notice:0",
             "a3f9c1:system",
             "a3f9c1:retract:1",
             "a3f9c1:truncate:0",
             "a3f9c1:cap:0",
+            "a3f9c1:notice:0",
         ] {
             assert!(is_bookkeeping_message_id(id), "{id} is bookkeeping");
         }
@@ -1777,6 +2034,51 @@ mod normalize_tests {
             is_bookkeeping_message_id(":cap:0"),
             "the EMPTY-stamp shape (`TurnState::default()`) is bookkeeping too \
              — a position-based rule would miss it"
+        );
+        // `notice` (issue #190, the one-liner weld) joins the set for the same
+        // reason the other four did — and it is the one whose ABSENCE silently
+        // corrupts a tool result: the retry/extension one-liners moved OFF the
+        // shared `system` key onto `{stamp}:notice:N`, so a word set that omits
+        // `notice` lets `SubagentCapture::observe_sink_frame` ACCUMULATE the
+        // banner *and* make it `last_message_id`, which is exactly what
+        // `captured_text()` returns — the parent would read "Retrying (attempt
+        // 2/5…)" as the child's answer. `the_subagent_capture_captures_the_final_text_from_the_sink_frames`
+        // hand-writes `"messageId": "system"`, so it stays GREEN while that
+        // breaks; `a_notice_line_is_not_captured_as_child_output` is the pin that
+        // cannot. `notice` is safe on the hex-alphabet rule — it carries
+        // `n`/`o`/`t`/`i`/`c`, so a 6-hex stamp can never equal it.
+        assert!(
+            is_bookkeeping_message_id("notice"),
+            "the bare pre-stamp one-liner id is bookkeeping"
+        );
+        assert!(
+            is_bookkeeping_message_id("notice:0"),
+            "the first minted one-liner id is bookkeeping"
+        );
+        assert!(
+            is_bookkeeping_message_id("a3f9c1:notice:0"),
+            "the STAMPED shape production mints is bookkeeping"
+        );
+        assert!(
+            is_bookkeeping_message_id("anything:notice:7"),
+            "the predicate matches a WORD, not a position"
+        );
+        assert!(
+            is_bookkeeping_message_id(":notice:0"),
+            "the EMPTY-stamp shape (`TurnState::default()`) is bookkeeping too \
+             — a position-based rule would miss it"
+        );
+        // `system` STAYS in the set even though no arm writes it any more: rows
+        // older Workers wrote are on disk, and a peer on an older crate can
+        // still send the key. Deleting the word as dead code would start
+        // capturing historical one-liners as child output.
+        assert!(
+            is_bookkeeping_message_id("system"),
+            "`system` is no longer MINTED here, but it is still bookkeeping"
+        );
+        assert!(
+            is_bookkeeping_message_id("a3f9c1:system"),
+            "and stamped, for the same historical-rows reason"
         );
     }
 
