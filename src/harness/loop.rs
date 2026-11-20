@@ -490,11 +490,13 @@ impl PermissionContext {
 /// at a time — but only for a call in one of the three classes below. A repeat
 /// in an UNDER-count class (that list's own examples: `ls {}`,
 /// `bash {"command": 42}`, the excluded `sudo_exec` shape) is bounded by nothing
-/// at all, per prompt or otherwise — and neither is the alternation run the
-/// update site describes, which never extends this counter in the first place.
-/// The unbounded surface is wider than this paragraph can enumerate; this
-/// guard's reach is what it is. So "the loop is bounded" is true exactly
-/// where this guard reaches, and "the user must intervene" is true even there;
+/// at all, per prompt or otherwise. Neither is the alternation run the update
+/// site describes — not because a call there escapes the predicate, but because
+/// the counter compares against the previous batch only, so `A, B, A, B` resets
+/// it every time. The unbounded surface is wider than this paragraph can
+/// enumerate; this guard's reach is what it is. So "the loop is bounded" is
+/// true exactly where this guard reaches, and "the user must intervene" is
+/// true even there;
 /// the distinction is worth stating because the frame the user sees says only
 /// the first. Nothing here escalates, disables the tool, or surfaces a
 /// persistent flag — the cap is a per-turn circuit breaker, and the only
