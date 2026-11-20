@@ -159,18 +159,20 @@ and a `Vec::new()` there would silently drop every tool result the turn ever ear
 `a_capped_turn_closes_nothing_and_carries_the_prior_results` (`tool_row_settle.rs`), which asserts the count of
 `turn_end.tool_results` rather than merely its presence, precisely so that regression reddens.
 
-**WHICH of the bound's two guards catches WHICH shape, because the two are
-routinely conflated.** The round ceiling (`MAX_MODEL_ROUNDS_PER_PROMPT`) catches
-everything eventually and catches nothing early; the identical-refusal run
-(`MAX_IDENTICAL_REFUSAL_RUNS`) is the one that stops a stuck turn in four rounds,
-and it fires only on the three shapes `refused_before_the_model_could_act` (`turn.rs`)
+**WHAT the bound catches, and what it does not, because the two are
+routinely conflated.** The identical-refusal run
+(`MAX_IDENTICAL_REFUSAL_RUNS`) is the ONLY bound the turn loop has: it stops a
+stuck turn in four rounds, and it fires only on the three shapes
+`refused_before_the_model_could_act` (`turn.rs`)
 recognizes — an extraneous top-level key, a parse `defect`, or a dispatched call
 that omitted an advertised `required` parameter and came back `is_error`. The
 field report this whole change was written for (`bash` with `arguments: {}`, 303
 times) is the THIRD shape, and for one commit it was not caught: `{}` has no keys
 for the pre-dispatch checker to call extraneous, so the call was dispatched, the
-executor refused it, and a tool-RESULT error reset the run to 0 every round — the
-burst ran to 64 rounds instead of 3. See `MAX_IDENTICAL_REFUSAL_RUNS`' docblock
+executor refused it, and a tool-RESULT error reset the run to 0 every round —
+which on that commit meant the burst ran with no bound at all. Anything a shape
+escapes this guard to is likewise unbounded; that is the accepted residual of
+deleting the per-prompt round cap. See `MAX_IDENTICAL_REFUSAL_RUNS`' docblock
 for the full statement of what is caught, what is deliberately NOT (`is_error`
 alone), and the fact that the bound is PER PROMPT rather than per session.
 
@@ -185,7 +187,7 @@ alone), and the fact that the bound is PER PROMPT rather than per session.
 | 7 | `loop.rs`, `handle_turn`, model call returned `Err` | no | no stream to consume |
 | 8 | `loop.rs`, `handle_turn`, cancel after `consume_stream` | **yes** | Stop pressed mid-stream — the field report |
 | 9 | `turn.rs`, `handle_truncated_turn` → `settle_truncated` → `settle_error` | **yes** | output-cap truncation — issue #190; the same close discipline as site 4, one delegation further down |
-| 10 | `loop.rs`, `handle_turn`, the turn-bound guard (round ceiling / identical-refusal run) | no | no accumulator in scope — but its `tool_results` are every prior batch's, not empty |
+| 10 | `loop.rs`, `handle_turn`, the turn-bound guard (the identical-refusal run) | no | no accumulator in scope — but its `tool_results` are every prior batch's, not empty |
 
 **Every row is a `fn` (or, for 3 and 4, an arm inside one `fn`) plus the file, and deliberately no line number.** Each
 row's function is also the place its own "Site N of the ten" comment lives in the source, so the table and the comments

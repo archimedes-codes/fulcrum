@@ -108,21 +108,6 @@ pub(super) struct TurnLoopState {
     pub(super) turn_tool_results: Vec<Value>,
     pub(super) message_started: bool,
     pub(super) overflow_recovered: bool,
-    /// Rounds through the turn loop for THIS prompt (the round ceiling; see
-    /// `MAX_MODEL_ROUNDS_PER_PROMPT` in `loop.rs` — its unit is one model call
-    /// plus its tool batch, NOT one provider request).
-    ///
-    /// It lives here and not on `RetryPolicy` because `TurnLoopState` is built
-    /// once per prompt at the single construction site in `handle_turn`, which
-    /// is exactly the lifetime a per-prompt ceiling needs. `RetryPolicy.attempt`
-    /// cannot host it: it is built once per Worker, never reset between prompts,
-    /// and its value is already on the wire as the `auto_retry_*` attempt number.
-    ///
-    /// Deliberately NOT reset on the accepted-attempt path (unlike
-    /// `overflow_recovered` below): a round ceiling that forgot the overflow
-    /// retries and the empty-turn retries would not bound the thing it exists to
-    /// bound.
-    pub(super) model_rounds: u32,
     /// How many consecutive batches have been refused with the SAME signature
     /// (see `MAX_IDENTICAL_REFUSAL_RUNS` in `loop.rs` — 3 is the consecutive
     /// run, not a total, and the bound is PER PROMPT because this whole struct
@@ -213,7 +198,7 @@ pub(super) fn batch_signature(tool_calls: &[ToolCall], refused: &[bool]) -> Opti
 /// * a `required` key that IS present, whatever its type — `bash` with
 ///   `{"command": 42}` omits nothing, so the guard does not read the executor's
 ///   type refusal as a re-send instruction. That is a KNOWN UNDER-COUNT: such a
-///   run is bounded by the round ceiling instead. Narrower than the truth is
+///   run is bounded by nothing in the engine. Narrower than the truth is
 ///   the accepted direction here, because the failure mode of the wider reading
 ///   is ending a user's prompt over a tool call that was fine.
 /// * a `required` key the call satisfies through an **advertised alias** the
@@ -349,7 +334,7 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// name, `unknown_param_error` answers `None`, the call is dispatched, and
 /// `exec_bash` answers ``bash: missing `command` parameter``. A tool-RESULT
 /// error, invisible to the pre-dispatch checker — so at class 1 alone the run
-/// reset to 0 every round and the burst ran to the 64-round ceiling. Class 2 is
+/// reset to 0 every round and the burst ran on unbounded. Class 2 is
 /// bounded by two pins:
 /// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped` (it does
 /// fire) and `a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run`
@@ -468,7 +453,7 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// in the under-count direction.
 ///
 /// What is DELIBERATELY NOT covered, all in the under-count direction (a stuck
-/// run reaches the 64-round ceiling instead of 3 — the accepted cost, because the
+/// run runs on unbounded instead of stopping at 3 — the accepted cost, because the
 /// cost of the opposite error is ending a legitimate prompt):
 ///
 /// * `ls {}` — `path` is advertised `required` and IS absent, but `exec_ls`
@@ -479,8 +464,8 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// * **The `sudo_exec` shape itself, on both refusals.** The exclusion is per
 ///   CALL, not per reason, so a model that omits `reason` and re-sends identically
 ///   is no longer counted whichever way its confirm went. That is the residual for
-///   this tool and it is 64 rounds of a doomed call — measured, and the accepted
-///   direction.
+///   this tool and it is a doomed call with no bound at all — measured, and the
+///   accepted direction.
 ///
 /// # Why the flags are `bool`s, and what actually guards a fifth corridor
 ///

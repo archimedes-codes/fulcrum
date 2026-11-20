@@ -72,8 +72,8 @@ pub enum RpcEvent {
     /// resolves the turn.
     turn_truncated,
     /// (the turn-loop bound) The turn was stopped by the AGENT's own turn limit
-    /// — the round ceiling (`MAX_MODEL_ROUNDS_PER_PROMPT`) or a run of identical
-    /// refused tool batches (`MAX_IDENTICAL_REFUSAL_RUNS`) — before it finished.
+    /// — a run of identical refused tool batches (`MAX_IDENTICAL_REFUSAL_RUNS`)
+    /// — before it finished.
     /// Emitted BEFORE `turn_end` so a peer can stash the disposition before the
     /// settle resolves the turn.
     ///

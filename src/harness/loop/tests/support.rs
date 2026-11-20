@@ -171,12 +171,11 @@ impl Provider for ScriptedProvider {
 /// the remedy. A `tokio::time::timeout` around a `tokio::spawn` bounds nothing
 /// unless the task being awaited ever SUSPENDS. `ScriptedProvider` answers from a
 /// `Vec` and the turn loop's body is otherwise synchronous work, so a turn loop
-/// with BOTH its guards disabled is a non-yielding busy loop, and on a
+/// with its only guard disabled is a non-yielding busy loop, and on a
 /// current-thread runtime the timer cannot fire — measured by the reviewer with
-/// both guards at `u32::MAX`: `a_run_of_identical_refused_batches_stops_the_turn_as_capped`,
+/// the guard at `u32::MAX`: `a_run_of_identical_refused_batches_stops_the_turn_as_capped`,
 /// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped`,
-/// `a_turn_that_hits_the_round_ceiling_settles_as_capped` and
-/// `a_mixed_batch_resets_the_identical_refusal_run` all exited 124 (a CI timeout),
+/// and `a_mixed_batch_resets_the_identical_refusal_run` all exited 124 (a CI timeout),
 /// while only `a_capped_turn_closes_nothing_and_carries_the_prior_results` — the
 /// one test that had been given this provider — failed correctly at 101. A CI
 /// timeout is a much worse signal than a red test: it names no invariant and it
@@ -195,8 +194,8 @@ pub(super) struct YieldingScriptedProvider {
     /// LAST entry repeats once the index runs out. That repetition is what makes
     /// a stuck turn reproducible from one entry, and the terminal-entry form
     /// (`[the call] * N` then a `Done(Stop)`) is what lets a test bound its own
-    /// turn BELOW the round ceiling so a `turn_capped` frame can be asserted
-    /// absent rather than merely attributed to the other guard.
+    /// turn just past the refusal-run guard so a `turn_capped` frame can be
+    /// asserted absent rather than merely attributed to that guard firing.
     pub(super) scripts: Vec<Vec<ProviderEvent>>,
 }
 
