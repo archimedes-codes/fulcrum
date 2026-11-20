@@ -3108,21 +3108,14 @@ async fn a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped() {
         MAX_IDENTICAL_REFUSAL_RUNS + 1,
         "the empty-argument burst is bounded at {MAX_IDENTICAL_REFUSAL_RUNS} repeats \
          and the model is called exactly {} times — the 303-call loop is the failure \
-         this pins, and at HEAD the guard never sees this shape, so the turn runs to \
-         the {MAX_MODEL_ROUNDS_PER_PROMPT}-round ceiling instead, got {kinds:?}",
+         this pins, and at HEAD the guard never sees this shape, so the turn kept \
+         calling the model instead, got {kinds:?}",
         MAX_IDENTICAL_REFUSAL_RUNS + 1,
     );
     assert_eq!(
         kinds.iter().filter(|k| *k == "turn_capped").count(),
         1,
         "exactly ONE `turn_capped`, got {kinds:?}",
-    );
-    // And it is the REFUSAL guard, not the round ceiling, that ended it: the
-    // round count is the discriminator, and it is the smaller number.
-    assert!(
-        calls.load(Ordering::SeqCst) < MAX_MODEL_ROUNDS_PER_PROMPT,
-        "the refusal guard fired BEFORE the round ceiling, got {}",
-        calls.load(Ordering::SeqCst),
     );
 }
 
@@ -3322,13 +3315,12 @@ async fn answer_sudo_confirms(pending: crate::interactive::PendingSudo, count: u
 /// Measured before the fix: **4 provider calls and one `turn_capped`** for
 /// `{"command": "x"}` + a declined confirm — a prompt ended as `turn_capped` on
 /// a user's own three "no"s, which is the false positive this branch exists to
-/// eliminate. Measured after: the SAME shape runs to the
-/// `MAX_MODEL_ROUNDS_PER_PROMPT` ceiling at **64 calls** — it moved from the
-/// over-count direction (ends the user's prompt) to the documented under-count
-/// direction (costs rounds), which is the trade every other pin in this file
-/// already makes. The `{"command":"x","reason":"r"}` shape is unaffected: both
-/// required keys are there, nothing refused it, so it was at 64 before and is at
-/// 64 after.
+/// eliminate. Measured after: the SAME shape is not counted at all, so the turn
+/// runs on to its terminal script entry — the refusal counter moved out of the
+/// over-count direction (it used to end the user's prompt) and there is no
+/// longer any round ceiling for it to cost rounds instead. The
+/// `{"command":"x","reason":"r"}` shape is unaffected: both required keys are
+/// there, nothing refused it, so it was never counted and still is not.
 ///
 /// Scripted as `MAX_IDENTICAL_REFUSAL_RUNS + 2` identical declined rounds and
 /// THEN a terminal `Done(Stop)`, so the arithmetic is one-sided exactly as
@@ -3781,19 +3773,25 @@ fn the_alias_rule_reads_the_wording_tool_specs_actually_uses() {
 /// command that simply did not work.
 ///
 /// `bash { "command": "exit 1" }` is the sharpest case available: identical
-/// every round, `is_error: true` every round, and NOTHING but the round
-/// ceiling can stop it. Every required key is present, so the `required`
-/// conjunct answers `false` and the run never grows — which is exactly the
-/// assertion that reddens if someone widens the predicate to "any tool error".
+/// every round, `is_error: true` every round. Every required key is present, so
+/// the `required` conjunct answers `false` and the run never grows — which is
+/// exactly the assertion that reddens if someone widens the predicate to "any
+/// tool error".
 ///
-/// Reads the same way `a_mixed_batch_resets_the_identical_refusal_run` does:
-/// the run counter is loop-internal, so the observable is the provider call
-/// count. A run that grew stops at `MAX_IDENTICAL_REFUSAL_RUNS + 1`; a run
-/// that stays at 0 reaches `MAX_MODEL_ROUNDS_PER_PROMPT`.
+/// HOW the pin reads, now the turn has only ONE bound. The run counter is
+/// loop-internal, so the test makes the guard's fire/no-fire decision the ONLY
+/// question the script asks: the identical failing batch repeats well past what
+/// a counted run would survive (`MAX_IDENTICAL_REFUSAL_RUNS + 3` rounds, three
+/// more than the guard tolerates), and then the script answers in plain text so
+/// the turn TERMINATES ON ITS OWN. A run that grew would cap the turn at
+/// `MAX_IDENTICAL_REFUSAL_RUNS + 1` calls and emit `turn_capped` long before the
+/// script ran out; a run that stays at 0 lets every scripted round dispatch and
+/// the turn finishes clean. So this asserts the run went the distance AND that
+/// no `turn_capped` frame was emitted — a clean finish the guard never touched.
 #[tokio::test]
 async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
+    let failing_round = vec![
         ProviderEvent::ToolCall(ToolCall {
             id: "t1".to_string(),
             name: "bash".to_string(),
@@ -3802,7 +3800,18 @@ async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() 
             defect: None,
         }),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ]]);
+    ];
+    // Three rounds MORE than the guard tolerates, then a terminal `Done(Stop)`,
+    // so the turn ends because the SCRIPT said so and not because a bound said
+    // so. The terminal entry makes the expected call count the script length.
+    let rounds = MAX_IDENTICAL_REFUSAL_RUNS + 3;
+    let mut scripts = vec![failing_round; rounds as usize];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let expected_calls = scripts.len() as u32;
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
     let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
@@ -3813,18 +3822,30 @@ async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() 
     let task = tokio::spawn(async move { loop_.handle_prompt(&text_prompt("go")).await });
     tokio::time::timeout(SETTLE, task)
         .await
-        .expect("the turn TERMINATED (on the round ceiling, not the refusal guard)")
+        .expect("the turn TERMINATED (the script ran out and answered; it did not hang)")
         .expect("the turn task did not panic");
     let events = drain_events(&mut events_rx);
     let kinds = capped_kinds(&events);
 
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "a failing command is NOT a refusal: the run stays at 0 and the turn is \
+         never capped. A `turn_capped` here means the guard fired on `is_error` \
+         alone, which is the false positive the plan rejected and this pin refuses, \
+         got {kinds:?}",
+    );
+    assert!(
+        kinds.iter().any(|k| k == "turn_end") && kinds.iter().any(|k| k == "agent_settled"),
+        "the turn SETTLED (a plain `turn_end` + `agent_settled`, the clean-settle \
+         shape — this is a turn that finished, not one that was stopped), got {kinds:?}"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        MAX_MODEL_ROUNDS_PER_PROMPT,
-        "a failing command is NOT a refusal: the run stays at 0 and the turn \
-         survives to the round ceiling ({MAX_MODEL_ROUNDS_PER_PROMPT} calls). A turn \
-         stopped at {} means the guard fired on `is_error` alone, which is the \
-         false positive the plan rejected and this pin refuses, got {kinds:?}",
+        expected_calls,
+        "every scripted round dispatched: a failing command is NOT a refusal, so \
+         the run stays at 0 and nothing stops the turn early. A turn stopped at {} \
+         means the guard fired on `is_error` alone, which is the false positive the \
+         plan rejected and this pin refuses, got {kinds:?}",
         MAX_IDENTICAL_REFUSAL_RUNS + 1,
     );
 }
@@ -3837,32 +3858,60 @@ async fn a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run() 
 /// fixes one key and re-sends the rest IS making progress.
 ///
 /// HOW the pin reads. `state.identical_refusal_runs` is loop-internal, so the
-/// observable that separates "the run never grew" from "the run grew" is the
-/// PROVIDER CALL COUNT: a run that grew would stop the turn at
-/// `MAX_IDENTICAL_REFUSAL_RUNS + 1` calls; a run that stays at 0 lets the turn
-/// run all the way to the ROUND ceiling. So this asserts the turn reached
-/// `MAX_MODEL_ROUNDS_PER_PROMPT` calls — strictly more than the refusal guard
-/// would ever allow — which is `turn_capped`-by-the-round-guard, and proves the
-/// refusal guard never fired. Asserting "no `turn_capped` at all" would be
-/// unsatisfiable: the round ceiling is the other guard in the same `if`, and a
-/// turn that repeats forever must end somehow.
+/// script is built so the reset is the ONLY thing standing between this turn and
+/// the guard: the refused batch runs THREE times, a mixed batch lands, and the
+/// refused batch runs THREE times again. The consecutive run therefore peaks at
+/// 2 — the largest value that does NOT arm the guard — and the guard
+/// (`MAX_IDENTICAL_REFUSAL_RUNS`) is never reached. Then the script answers in
+/// plain text and the turn finishes on its own.
+///
+/// That makes this a STRONGER pin than the one it replaces. It no longer has to
+/// attribute a `turn_capped` to one guard or the other — it asserts there is NO
+/// `turn_capped` at all. If the reset ever regressed (a mixed batch that
+/// extended the run instead of clearing it), the run would reach 3 at the mixed
+/// round, the guard would cap the turn two rounds early, and this test would see
+/// exactly the frame it forbids.
 #[tokio::test]
 async fn a_mixed_batch_resets_the_identical_refusal_run() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
-        // ACCEPTED: `list_agents` advertises `{}` (no `properties`), so
-        // `unknown_param_error` has nothing to call extraneous and the call
-        // dispatches.
+    // REFUSED WHOLESALE: `refused_write_call` carries the unknown `contentt`
+    // key, so the batch signs and the run grows.
+    let refused_round = vec![
+        ProviderEvent::ToolCall(refused_write_call()),
+        ProviderEvent::Done(FinishReason::ToolCalls),
+    ];
+    // MIXED: one ACCEPTED call and one refused call. `list_agents` advertises
+    // `{}` (no `properties`), so `unknown_param_error` has nothing to call
+    // extraneous and the call dispatches — which is what makes `batch_signature`
+    // answer `None` and the run reset.
+    let mixed_round = vec![
         ProviderEvent::ToolCall(ToolCall {
             id: "a1".to_string(),
             name: "list_agents".to_string(),
             arguments: json!({}),
             defect: None,
         }),
-        // REFUSED: the same trigger as the test above.
         ProviderEvent::ToolCall(refused_write_call()),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ]]);
+    ];
+    // refused x3 (the run reaches 2), MIXED (the run resets), refused x3 (the
+    // run reaches 2 again) — strictly below `MAX_IDENTICAL_REFUSAL_RUNS` at
+    // every point — then a plain answer so the turn terminates on its own.
+    let mut scripts = vec![
+        refused_round.clone(),
+        refused_round.clone(),
+        refused_round.clone(),
+        mixed_round,
+        refused_round.clone(),
+        refused_round.clone(),
+        refused_round,
+    ];
+    scripts.push(vec![
+        ProviderEvent::TextDelta("done".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let expected_calls = scripts.len() as u32;
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
     let (_space, mut loop_) = build_loop(
         Box::new(provider),
         events_tx,
@@ -3876,25 +3925,28 @@ async fn a_mixed_batch_resets_the_identical_refusal_run() {
     });
     let _loop_ = tokio::time::timeout(SETTLE, task)
         .await
-        .expect("the bounded turn TERMINATED")
+        .expect("the turn TERMINATED (the script ran out and answered)")
         .expect("the turn task did not panic");
     let events = drain_events(&mut events_rx);
     let kinds = capped_kinds(&events);
 
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        MAX_MODEL_ROUNDS_PER_PROMPT,
-        "a mixed batch RESETS the run, so the refusal guard never fires and the \
-         turn survives all the way to the round ceiling ({} calls). A run that \
-         counted mixed batches would have stopped at {}, got {kinds:?}",
-        MAX_MODEL_ROUNDS_PER_PROMPT,
-        MAX_IDENTICAL_REFUSAL_RUNS + 1,
+    assert!(
+        !kinds.iter().any(|k| k == "turn_capped"),
+        "a mixed batch RESETS the run, so the refusal guard is never armed and \
+         the turn is never capped. A `turn_capped` here means the mixed batch \
+         EXTENDED the run instead of clearing it — the run reached \
+         {MAX_IDENTICAL_REFUSAL_RUNS} and the guard fired, got {kinds:?}",
+    );
+    assert!(
+        kinds.iter().any(|k| k == "turn_end") && kinds.iter().any(|k| k == "agent_settled"),
+        "the turn SETTLED on its own (a plain `turn_end` + `agent_settled`), got {kinds:?}"
     );
     assert_eq!(
-        kinds.iter().filter(|k| *k == "turn_capped").count(),
-        1,
-        "the turn still ends as capped — by the ROUND guard, which is the only \
-         one a mixed batch can arm, got {kinds:?}",
+        calls.load(Ordering::SeqCst),
+        expected_calls,
+        "the run never grew past 2, so every scripted round ran. A turn stopped \
+         at {} means the mixed batch counted as a repeat, got {kinds:?}",
+        MAX_IDENTICAL_REFUSAL_RUNS + 1,
     );
 }
 
@@ -3981,19 +4033,32 @@ async fn a_turn_that_hits_the_round_ceiling_settles_as_capped() {
 
 /// Cancellation still wins over the bound, when BOTH are armed.
 ///
-/// The two guards sit in one `if` at the top of the iteration, immediately AFTER
-/// the existing cancel guard, and this test arms both at once so the ORDER of
-/// those two checks is what decides the outcome — not which one happens to be
-/// true first in time.
+/// The cancel guard and the bound sit at the TOP of the iteration, the cancel
+/// first, and this test arms both at once so the ORDER of those two checks is
+/// what decides the outcome — not which one happens to be true first in time.
 ///
-/// The instrument is a `subagent` call whose dispatcher cancels the TURN token on
-/// the last round's dispatch. That lands the cancel after the model call and
-/// after the stream check (site 8 — the token is armed inside the batch, so
-/// `consume_stream` finished before it) and before the NEXT iteration's top,
-/// which is the only window where both guards are simultaneously true. The
-/// dispatcher's child never resolves, so the batch ends on `SubagentWait::Cancelled`
-/// and returns normally — the loop reaches the loop top with `model_rounds` at
-/// the ceiling AND the token cancelled.
+/// # Why the instrument is an `EventSink`
+///
+/// A `subagent` dispatcher — the instrument this test used to use — cannot arm
+/// the bound any more, for two structural reasons. (a) A refused batch never
+/// reaches the dispatcher: `run_tool_batch` filters the subagent futures on
+/// `param_errors…is_none()`, so a refused `subagent` call spawns no child and
+/// the dispatcher's counter never advances, while a WELL-FORMED `subagent` call
+/// is never refused, so the run can never grow through it. (b) A CANCELLED batch
+/// can never count as a refusal at all: `refused_before_the_model_could_act`
+/// requires `!turn_cancelled`, so the instant the dispatcher cancelled the token
+/// the run reset to 0. "Both armed at once" is unreachable from a dispatcher.
+///
+/// A sink reaches it, because of the ORDER inside `run_tool_batch`: the refusal
+/// flag for a call is computed BEFORE that call's `tool_execution_end` is
+/// emitted, and the emit is what drives the sink. So a sink that cancels the
+/// turn token when it sees the LAST refused batch's close lands the cancel
+/// AFTER that batch's refusal has been banked and BEFORE the next iteration's
+/// loop top — the only window in which the run is at the bound AND the token is
+/// cancelled at the same moment. The class-1 refusal (`refused_write_call`'s
+/// extraneous key) is what makes that land at all: the predicate answers `true`
+/// on `param_error` alone, so a token cancelled mid-batch does not reset the run
+/// it just armed.
 ///
 /// What it asserts is `settle_cancelled`'s disposition, not `turn_capped`:
 /// telling the desktop the turn was capped when the user pressed Stop would let
@@ -4001,87 +4066,81 @@ async fn a_turn_that_hits_the_round_ceiling_settles_as_capped() {
 /// the reverse (the bound winning) is the regression this pins.
 #[tokio::test]
 async fn a_cancel_beats_the_turn_bound() {
-    struct CancellingOnLastRoundDispatcher {
+    /// A sink that cancels the TURN token on the Nth refused batch's close.
+    ///
+    /// `tool_execution_end` normalizes to exactly one `tool_call_update` frame
+    /// whose `status` is `failed` (a refused call is `is_error`), and nothing
+    /// else in this script produces one — so counting that frame counts refused
+    /// batches, one per round, with no reliance on an id.
+    struct CancellingOnNthRefusalSink {
         turn_cancel: Arc<StdMutex<CancellationToken>>,
-        dispatches: AtomicU32,
+        closes: AtomicU32,
         fire_on: u32,
     }
 
-    impl SubagentDispatcher for CancellingOnLastRoundDispatcher {
-        fn dispatch(
-            &self,
-            _parent_session_id: &str,
-            _parent_cwd: &std::path::Path,
-            _parent_model: &Model,
-            _parent_enabled_tools: Vec<String>,
-            _agent_name: String,
-            _name_resolution: AgentNameResolution,
-            _launch: LaunchConfig,
-            _task: String,
-            _sink: &Arc<dyn crate::events::EventSink>,
-        ) -> (
-            tokio::sync::oneshot::Receiver<SubagentOutcome>,
-            crate::subagent::SubagentCancel,
-        ) {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if self.dispatches.fetch_add(1, Ordering::SeqCst) + 1 >= self.fire_on {
-                // The token `handle_turn` cloned into this same slot.
+    impl EventSink for CancellingOnNthRefusalSink {
+        fn emit(&self, event: &str, payload: Value) {
+            if event != "session-update" {
+                return;
+            }
+            let update = match payload.get("update") {
+                Some(u) => u,
+                None => return,
+            };
+            if update["sessionUpdate"].as_str() != Some("tool_call_update")
+                || update["status"].as_str() != Some("failed")
+            {
+                return;
+            }
+            if self.closes.fetch_add(1, Ordering::SeqCst) + 1 >= self.fire_on {
+                // The token `handle_turn` cloned into this same slot. THIS is the
+                // moment the test exists to place: the refused batch's refusal is
+                // already pushed, its `tool_execution_end` is mid-emit, and the
+                // loop has not reached the loop top yet.
                 self.turn_cancel
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .cancel();
-                // The LAST round's child NEVER resolves (the sender is forgotten,
-                // never sent and never dropped), so the wait runs to the
-                // `select!`'s `turn.cancelled()` arm — the batch ENDS, on cancel,
-                // and returns normally to the loop top.
-                std::mem::forget(tx);
-            } else {
-                // An EARLIER round's child answers immediately. It must, or the
-                // `select!` has nothing to wake on for 63 rounds and the test
-                // hangs for a reason that has nothing to do with the guard.
-                let _ = tx.send(SubagentOutcome::Completed {
-                    output: "done".to_string(),
-                    metrics: crate::subagent::SubagentMetrics {
-                        output: "done".to_string(),
-                        input_tokens: 1,
-                        output_tokens: 1,
-                        cost: None,
-                        duration_ms: 1,
-                    },
-                });
             }
-            (rx, crate::subagent::SubagentCancel::none())
         }
     }
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let turn_cancel = Arc::new(StdMutex::new(CancellationToken::new()));
-    let (provider, calls) = ScriptedProvider::new(vec![Some(vec![
-        ProviderEvent::ToolCall(ToolCall {
-            id: "s1".to_string(),
-            name: "subagent".to_string(),
-            arguments: json!({ "task": "loop forever" }),
-            defect: None,
-        }),
+    // `MAX_IDENTICAL_REFUSAL_RUNS + 1` identical refused batches. The arithmetic
+    // is the pinned one (`a_run_of_identical_refused_batches_stops_the_turn_as_capped`):
+    // the FIRST refused batch cannot be a repeat of anything, so the run reads
+    // 0 / 1 / 2 / 3 across the four — the bound is reached only as the FOURTH
+    // banks it. Three batches would leave the run at 2 and the test would prove
+    // nothing, because an un-armed bound cannot lose a race.
+    let refused_round = vec![
+        ProviderEvent::ToolCall(refused_write_call()),
         ProviderEvent::Done(FinishReason::ToolCalls),
-    ])]);
-    let dispatcher = Arc::new(CancellingOnLastRoundDispatcher {
+    ];
+    let armed = MAX_IDENTICAL_REFUSAL_RUNS + 1;
+    let mut scripts = vec![refused_round; armed as usize];
+    // Never reached when the cancel wins; reached (and repeating) if the bound
+    // ever wins or the cancel is lost, which is why this is the YIELDING
+    // provider — a runaway here FAILS at `SETTLE`, it does not hang CI.
+    scripts.push(vec![
+        ProviderEvent::TextDelta("unreached".to_string()),
+        ProviderEvent::Done(FinishReason::Stop),
+    ]);
+    let (provider, calls) = YieldingScriptedProvider::new(scripts);
+    let sink = Arc::new(CancellingOnNthRefusalSink {
         turn_cancel: turn_cancel.clone(),
-        dispatches: AtomicU32::new(0),
-        fire_on: MAX_MODEL_ROUNDS_PER_PROMPT,
+        closes: AtomicU32::new(0),
+        fire_on: armed,
     });
-    let (_space, mut loop_) = build_loop_with_dispatcher(
+    let (_space, mut loop_, _db) = build_loop_with_sink(
         Box::new(provider),
         events_tx,
         turn_cancel.clone(),
         watch::channel(0u64).0,
         RetryPolicy::new_with(5, Duration::from_millis(1)),
-        Arc::new(TestSink {
-            updates: Arc::new(StdMutex::new(Vec::new())),
-        }),
-        Some(dispatcher as Arc<dyn SubagentDispatcher>),
         vec![fake_model("m1")],
         None,
+        sink,
     );
     let task = tokio::spawn(async move {
         loop_.handle_prompt(&text_prompt("go")).await;
@@ -4094,14 +4153,16 @@ async fn a_cancel_beats_the_turn_bound() {
     let events = drain_events(&mut events_rx);
     let kinds = capped_kinds(&events);
 
-    // Both guards really were armed: the round counter reached the ceiling (the
-    // dispatcher fired on the last round's dispatch, and one dispatch = one
-    // round) and the token is cancelled.
+    // Both halves of the both-armed case really happened: the run reached the
+    // bound (one refused batch per round, so the round count IS the run) and the
+    // token is cancelled — and the cancel arrived at the loop top with the bound
+    // ALREADY true, never before it.
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        MAX_MODEL_ROUNDS_PER_PROMPT,
-        "the turn ran every round up to the ceiling (so `model_rounds` was AT \
-         the bound when the loop top was next reached), got {kinds:?}",
+        armed,
+        "the turn ran exactly as far as the bound (so the run was AT \
+         {MAX_IDENTICAL_REFUSAL_RUNS} when the loop top was next reached, and the \
+         Stop landed after it, not before), got {kinds:?}",
     );
     assert!(
         turn_cancel
@@ -4109,7 +4170,7 @@ async fn a_cancel_beats_the_turn_bound() {
             .unwrap_or_else(|p| p.into_inner())
             .is_cancelled(),
         "the turn token IS cancelled — this is the both-armed case, not a \
-         round-ceiling turn that never saw a Stop, got {kinds:?}",
+         bound turn that never saw a Stop, got {kinds:?}",
     );
 
     // And the cancel won.
