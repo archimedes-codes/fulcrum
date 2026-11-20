@@ -481,17 +481,26 @@ impl PermissionContext {
 /// one key per turn is never bounded, however many rejections it accumulates
 /// over a long prompt.
 ///
-/// **And it is a PER-PROMPT bound.** `TurnLoopState` — which owns this counter —
-/// is built fresh at the top of `handle_turn`, so the counter resets on the next
-/// prompt. A capped turn therefore ends ONE
-/// turn; it does not stop the session from doing it again. A model that repeats
-/// the pathological call across prompts gets `MAX_IDENTICAL_REFUSAL_RUNS + 1`
-/// rounds PER PROMPT, forever, one user message at a time. That is the whole
-/// difference between "the loop is bounded" (true) and "the user must intervene"
-/// (also true), and the distinction is worth stating because the frame the user
-/// sees says only the first. Nothing here escalates, disables the tool, or
-/// surfaces a persistent flag — the cap is a per-turn circuit breaker, and the
-/// only cross-prompt memory in this loop is the transcript itself.
+/// **And it is a bound on the TURN, not a budget for the prompt.**
+/// `TurnLoopState` — which owns this counter — is built fresh at the top of
+/// `handle_turn`, so the counter resets on the next prompt. A capped turn
+/// therefore ends ONE turn; it does not stop the session from doing it again. A
+/// model that repeats the pathological call across prompts gets
+/// `MAX_IDENTICAL_REFUSAL_RUNS + 1` rounds PER PROMPT, forever, one user message
+/// at a time — but only for a call in one of the three classes below. A repeat
+/// in an UNDER-count class (that list's own examples: `ls {}`,
+/// `bash {"command": 42}`, the excluded `sudo_exec` shape) is bounded by nothing
+/// at all, per prompt or otherwise. Neither is the alternation run the update
+/// site describes — not because a call there escapes the predicate, but because
+/// the counter compares against the previous batch only, so `A, B, A, B` resets
+/// it every time. The unbounded surface is wider than this paragraph can
+/// enumerate; this guard's reach is what it is. So "the loop is bounded" is
+/// true exactly where this guard reaches, and "the user must intervene" is
+/// true even there;
+/// the distinction is worth stating because the frame the user sees says only
+/// the first. Nothing here escalates, disables the tool, or surfaces a
+/// persistent flag — the cap is a per-turn circuit breaker, and the only
+/// cross-prompt memory in this loop is the transcript itself.
 ///
 /// # The trigger classes it catches, and the one it deliberately does not
 ///
@@ -632,10 +641,10 @@ impl PermissionContext {
 /// # The known UNDER-counts (the accepted direction)
 ///
 /// Narrower than the truth on purpose, and the trade-off is now unsoftened: a
-/// stuck run that escapes these ends is bounded by NOTHING ELSE in the engine, so
-/// biasing toward a MISS is a heavier decision than it used to be; a false
-/// positive ends the user's
-/// prompt, which is a worse bug, and that is why the classes stay at three. Named so nobody has to rediscover them:
+/// stuck run that escapes these ends is bounded by NOTHING ELSE in the engine,
+/// so biasing toward a MISS is a heavier decision than it used to be; a false
+/// positive ends the user's prompt, which is a worse bug, and that is why the
+/// classes stay at three. Named so nobody has to rediscover them:
 ///
 /// * **`ls {}`** — `path` is advertised `required` and IS absent, but `exec_ls`
 ///   defaults it to the `cwd` and the call SUCCEEDS, so the `is_error` half
@@ -1517,10 +1526,10 @@ impl AgentLoop {
             }
 
             // (the turn-loop bound) The identical-refusal run, checked at the
-            // TOP of every iteration — deliberately AFTER the
-            // cancellation guard above, so a Stop still wins (a user who pressed
-            // Stop gets `settle_cancelled`'s disposition, never the cap: telling
-            // the desktop `Cancelled` is what lets `attention.ts` treat the turn
+            // TOP of every iteration — deliberately AFTER the cancellation
+            // guard above, so a Stop still wins (a user who pressed Stop gets
+            // `settle_cancelled`'s disposition, never the cap: telling the
+            // desktop `Cancelled` is what lets `attention.ts` treat the turn
             // as a user-initiated stop, and the reverse — checking the bound
             // first — would mislabel a Stop as an agent failure on exactly the
             // turn the user just stopped).
