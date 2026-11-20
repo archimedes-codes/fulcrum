@@ -1345,7 +1345,7 @@ async fn a_capped_turn_closes_nothing_and_carries_the_prior_results() {
     // THE TIMEOUT ALONE IS NOT THE FIX, and a reader who copies the two lines
     // below onto another looping test must know why. `tokio::time::timeout` bounds
     // a task that SUSPENDS. `ScriptedProvider` answers from a `Vec` and the turn
-    // body is otherwise synchronous, so with both guards disabled the loop never
+    // body is otherwise synchronous, so with its only guard disabled the loop never
     // yields, and on a current-thread runtime the timer cannot fire — measured: the
     // wrapped test with a 3-SECOND timeout still ran past 60 s and exited 124. The
     // provider above therefore yields once per call, which is the per-round

@@ -2894,9 +2894,10 @@ async fn a_truncated_turn_emits_the_notice_after_the_retry_close_and_before_the_
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (the turn-loop bound) Two guards on the turn loop's inner `loop`, both
-// producing `RpcEvent::turn_capped`: a ceiling on rounds per prompt, and a
-// ceiling on CONSECUTIVE tool batches refused with an identical signature.
+// (the turn-loop bound) The guard on the turn loop's inner `loop` that produces
+// `RpcEvent::turn_capped`: a ceiling on CONSECUTIVE tool batches refused with an
+// identical signature. It is the only bound the loop has — the per-prompt round
+// cap it used to sit beside is gone.
 //
 // Every test here is wrapped in `tokio::time::timeout`. That is not decoration:
 // the thing under test is a loop that does not stop, and an unbounded one hangs
@@ -2960,8 +2961,8 @@ async fn a_run_of_identical_refused_batches_stops_the_turn_as_capped() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     // THE YIELDING PROVIDER, not `ScriptedProvider` — and the yield is not
     // decoration. `tokio::time::timeout` bounds a task that SUSPENDS, and with
-    // both loop guards disabled this turn is a non-yielding busy loop whose timer
-    // can never fire: measured by the reviewer with both guards at `u32::MAX`,
+    // its only guard disabled this turn is a non-yielding busy loop whose timer
+    // can never fire: measured by the reviewer with the guard at `u32::MAX`,
     // this test exited **124 (hang)**. See `YieldingScriptedProvider`'s docblock.
     let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
         ProviderEvent::ToolCall(refused_write_call()),
@@ -3067,7 +3068,8 @@ async fn a_run_of_identical_refused_batches_stops_the_turn_as_capped() {
 /// class: "the engine refused this call and told the model to re-send it with
 /// correct arguments", read off the advertised `required` list plus the
 /// result's own `is_error`. Without that class the 303-call run is stopped by
-/// the 64-round ceiling — 64 rounds of a doomed call instead of 3.
+/// nothing at all — an unbounded run of a doomed call, since this guard is the
+/// only bound the loop has.
 ///
 /// The bound is asserted at the provider, exactly as the extraneous-key test
 /// asserts it, for the same reason: a call count can be right for no wrong
@@ -3300,7 +3302,7 @@ async fn answer_sudo_confirms(pending: crate::interactive::PendingSudo, count: u
 /// `sudo_exec`'s confirm refusal is not built by either of those arms: it is
 /// built INSIDE `sudo_run_flow`, which returns a plain `ToolResult`, so the
 /// flag never reached it and the shape was an OVER-count — the direction that
-/// ends a user's prompt, not the direction that costs 64 rounds.
+/// ends a user's prompt, not the direction that under-counts a stuck run.
 ///
 /// The exact shape, and why it is the narrow one:
 /// * `command` present — an empty `command` is refused BEFORE the confirm
@@ -3318,7 +3320,7 @@ async fn answer_sudo_confirms(pending: crate::interactive::PendingSudo, count: u
 /// eliminate. Measured after: the SAME shape is not counted at all, so the turn
 /// runs on to its terminal script entry — the refusal counter moved out of the
 /// over-count direction (it used to end the user's prompt) and there is no
-/// longer any round ceiling for it to cost rounds instead. The
+/// longer any bound left for it to run into instead. The
 /// `{"command":"x","reason":"r"}` shape is unaffected: both required keys are
 /// there, nothing refused it, so it was never counted and still is not.
 ///
@@ -3513,8 +3515,8 @@ async fn answer_sudo_prompts_granted(pending: crate::interactive::PendingSudo) {
 /// the same way `denied` is threaded, rather than inferring it.
 ///
 /// The `reason` key stays OMITTED on purpose. `{"command":"x","reason":"r"}` also
-/// reaches 64 rounds, but it does so because nothing about it is a refusal at all;
-/// this shape reaches 64 because the guard's inference is wrong, and only this
+/// runs unbounded, but it does so because nothing about it is a refusal at all;
+/// this shape runs unbounded because the guard's inference is wrong, and only this
 /// shape reddens before the fix.
 #[tokio::test]
 async fn a_confirmed_sudo_exec_that_fails_is_never_a_refusal_run() {
@@ -3947,87 +3949,6 @@ async fn a_mixed_batch_resets_the_identical_refusal_run() {
         "the run never grew past 2, so every scripted round ran. A turn stopped \
          at {} means the mixed batch counted as a repeat, got {kinds:?}",
         MAX_IDENTICAL_REFUSAL_RUNS + 1,
-    );
-}
-
-/// A turn that hits the ROUND ceiling settles as `turn_capped`.
-///
-/// The script always returns a DISPATCHABLE tool call whose tool SUCCEEDS
-/// (`list_agents` advertises `{}`, takes no arguments, reads the Agent
-/// definitions from disk and answers — nothing about it can fail, be rejected or
-/// be denied), so NOTHING but the ceiling can stop this turn.
-///
-/// **This test passes only because `ScriptedProvider` never retries, and it pins
-/// the ROUND unit — it must not be described as a provider-call ceiling.**
-/// `MAX_MODEL_ROUNDS_PER_PROMPT` counts rounds through the turn loop (one model
-/// call plus its tool batch). Inside one round `RetryPolicy::call_with_retry` can
-/// issue up to `DEFAULT_MAX_ATTEMPTS` provider calls, and `compact_if_due` issues
-/// an uncounted summary call. A retrying or compacting provider would make the
-/// count exceed the ceiling while the ROUND count stayed exactly at it, and this
-/// assertion would then be false for a reason that has nothing to do with the
-/// guard.
-#[tokio::test]
-async fn a_turn_that_hits_the_round_ceiling_settles_as_capped() {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-    let (provider, calls) = YieldingScriptedProvider::new(vec![vec![
-        ProviderEvent::ToolCall(ToolCall {
-            id: "a1".to_string(),
-            name: "list_agents".to_string(),
-            arguments: json!({}),
-            defect: None,
-        }),
-        ProviderEvent::Done(FinishReason::ToolCalls),
-    ]]);
-    let (_space, mut loop_) = build_loop(
-        Box::new(provider),
-        events_tx,
-        Arc::new(StdMutex::new(CancellationToken::new())),
-        watch::channel(0u64).0,
-        RetryPolicy::new_with(5, Duration::from_millis(1)),
-    );
-    let task = tokio::spawn(async move {
-        loop_.handle_prompt(&text_prompt("go")).await;
-        loop_
-    });
-    let _loop_ = tokio::time::timeout(SETTLE, task)
-        .await
-        .expect("the round ceiling TERMINATED the turn")
-        .expect("the turn task did not panic");
-    let events = drain_events(&mut events_rx);
-    let kinds = capped_kinds(&events);
-
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        MAX_MODEL_ROUNDS_PER_PROMPT,
-        "the ceiling is a ceiling on ROUNDS, and a `ScriptedProvider` issues \
-         exactly one call per round — so exactly {MAX_MODEL_ROUNDS_PER_PROMPT} \
-         calls, got {kinds:?}",
-    );
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "turn_capped").count(),
-        1,
-        "the round ceiling emitted `turn_capped` once, got {kinds:?}",
-    );
-    let capped_at = kinds
-        .iter()
-        .position(|k| k == "turn_capped")
-        .expect("the capped turn emitted `turn_capped`");
-    let settled_at = kinds
-        .iter()
-        .position(|k| k == "agent_settled")
-        .expect("the capped turn settled");
-    assert!(
-        capped_at < settled_at,
-        "`turn_capped` at {capped_at} precedes `agent_settled` ({settled_at}), got {kinds:?}",
-    );
-    // Every round dispatched its call, so every round closed its own row — and
-    // the ceiling settle added nothing (it passes `&[]`). The count is the
-    // discriminator: one close per round, no more.
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "tool_execution_end").count(),
-        MAX_MODEL_ROUNDS_PER_PROMPT as usize,
-        "one close per DISPATCHED call and no synthetic extra from the settle, \
-         got {kinds:?}",
     );
 }
 
