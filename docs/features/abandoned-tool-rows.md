@@ -150,7 +150,7 @@ site can invalidate. `grep` over `src/harness/` finds ELEVEN call lines behind t
 `settle_truncated` that delegates to `settle_error` (§10) — the eleventh is not a site, it is how site 9 gets its close,
 and it passes `announced` through untouched.
 
-**§2 gained its tenth site with the turn-loop bound.** The bound's settle (`loop.rs`, the top-of-loop round / identical-
+**§2 gained its tenth site with the turn-loop bound.** The bound's settle (`loop.rs`, the top-of-loop identical-
 refusal guard) is the fourth producer of a new `RpcEvent` (`turn_capped`) and the fifth vacuous site. It is vacuous by
 the SAME argument as 5, 6 and 7 — it fires at the top of an iteration, before the model call that declares `acc` — and
 its RESULTS argument is the one thing about it that is NOT empty, which is what makes it worth a row: a bounded turn is

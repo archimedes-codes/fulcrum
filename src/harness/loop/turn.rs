@@ -333,8 +333,8 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// and class 1 cannot see it: `{}` has no keys, so there is no extraneous key to
 /// name, `unknown_param_error` answers `None`, the call is dispatched, and
 /// `exec_bash` answers ``bash: missing `command` parameter``. A tool-RESULT
-/// error, invisible to the pre-dispatch checker — so at class 1 alone the run
-/// reset to 0 every round and the burst ran on unbounded. Class 2 is
+/// error, invisible to the pre-dispatch checker — so with class 1 alone the run
+/// would reset to 0 every round and the burst would run on unbounded. Class 2 is
 /// bounded by two pins:
 /// `a_run_of_identical_empty_argument_batches_stops_the_turn_as_capped` (it does
 /// fire) and `a_repeated_batch_of_failing_well_formed_calls_is_never_a_refusal_run`
@@ -463,8 +463,9 @@ pub(super) fn declared_alias_of(schema: &Value) -> Option<&str> {
 /// * A `required` key present with the WRONG TYPE or an empty value.
 /// * **The `sudo_exec` shape itself, on both refusals.** The exclusion is per
 ///   CALL, not per reason, so a model that omits `reason` and re-sends identically
-///   is no longer counted whichever way its confirm went. That is the residual for
-///   this tool and it is a doomed call with no bound at all — measured, and the
+///   is no longer counted whichever way its confirm went. That is the residual
+///   for this tool and it is a doomed call with no bound at all — a consequence
+///   of the exclusion itself rather than something we can still measure, and the
 ///   accepted direction.
 ///
 /// # Why the flags are `bool`s, and what actually guards a fifth corridor
