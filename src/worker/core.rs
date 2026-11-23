@@ -383,6 +383,13 @@ pub fn default_build_loop(
         // implements is a different trait and lives Supervisor-side.
         let task_store: Arc<dyn crate::seams::TaskCaller> =
             Arc::new(crate::worker::task_store::IpcTaskStore::new(
+                // (ADR 0117) The ORIGIN address for every frame this store emits:
+                // `env.session_id`, the SAME non-optional value the `IpcRenderRequester`
+                // two statements above takes, and the CHILD's own id for a Subagent
+                // (not `WorkerCore::session_id`, which is an `Option` still `None`
+                // until `Start` is handled). Without it the desktop can only answer at
+                // the pump's delivery id — the PARENT's — and the child parks forever.
+                Some(env.session_id.clone()),
                 outbound.clone(),
                 pending_task_requests.clone(),
             ));

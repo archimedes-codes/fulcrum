@@ -32,6 +32,20 @@
 //! token. `the_cancel_arm_returns_promptly_when_the_token_fires` is that pin, and it
 //! is why the empty-map tests are paired with a "returns PROMPTLY" test — an empty
 //! map after an awaited cancel proves no leak; it does not prove no hang.
+//!
+//! ## The ORIGIN address on the frame (ADR 0117), and what it does NOT change
+//!
+//! A Subagent's frames are delivered under the PARENT's session id: the manager's
+//! pump re-keys them so the child's UI renders in the parent's scope. That id is a
+//! UI-scope key and ADR 0117's rule is that it is **never a reply address** — so the
+//! frame carries its own origin, `session_id`, the id of the Worker that emitted it
+//! (the CHILD), taken from `StartEnv::session_id` at the construction site in
+//! `core.rs`. `IpcTaskStore` therefore DOES see a session id now, and it puts it on
+//! the FRAME only. The pending map is unchanged: still keyed by the bare `request_id`
+//! (see [`PendingTaskRequests`] for why a compound key would hang every call), and
+//! the `Inbound::TaskResponse` handler still resolves by that bare id alone. Pinned
+//! by `the_task_request_frame_names_the_worker_that_emitted_it` and
+//! `the_pending_map_stays_keyed_by_the_bare_request_id`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -48,10 +62,20 @@ use crate::worker::protocol::Outbound;
 ///
 /// Keyed by the BARE `request_id`, not a `"{session_id}/{request_id}"` compound key
 /// like `permission_key` / `render_key`: the map is per-Worker (one session per
-/// Worker), the id is a fresh uuid v4 this file mints, and the requester that
-/// inserts and the handler that removes must agree on the spelling WITHOUT either
-/// one needing the session id — `IpcTaskStore` never sees it. A compound key here
-/// would miss every answer, and a missed answer is a hang, not an error.
+/// Worker) and the id is a fresh uuid v4 this file mints, so the requester that
+/// inserts and the handler that removes agree on the spelling WITHOUT either one
+/// needing the session id. `IpcTaskStore` now DOES see a session id — its own, for
+/// the `session_id` it stamps on the outgoing FRAME (ADR 0117: a reply must be
+/// addressed to the emitting Worker, not to the pump's UI-scope delivery id) — but
+/// that value never reaches this map: the `Inbound::TaskResponse` carries only the
+/// bare `request_id`, so the handler could not build a compound key if it wanted to.
+/// A compound key here would miss every answer, and a missed answer is a hang, not an
+/// error.
+///
+/// Pinned from both sides: `the_pending_map_stays_keyed_by_the_bare_request_id` (the
+/// insert side, with a non-`None` session id) and `core.rs`'s
+/// `task_response_resolves_by_the_bare_request_id` (the remove side, with
+/// `WorkerCore::session_id` still `None` because no `Start` was handled).
 pub type PendingTaskRequests =
     Arc<TokioMutex<HashMap<String, oneshot::Sender<Result<Value, TaskStoreError>>>>>;
 
@@ -66,13 +90,27 @@ fn mint_request_id() -> String {
 /// [`TaskStore`](crate::seams::TaskStore) — the desktop's `Db` implements that one,
 /// Supervisor-side, because the Supervisor is the sole SQLite writer.
 pub struct IpcTaskStore {
+    /// (ADR 0117) The ORIGIN address stamped on every frame this store emits: the id
+    /// of THIS Worker — the CHILD for a Subagent — so a Supervisor can address its
+    /// `Inbound::TaskResponse` back here instead of to the pump's parent-scoped
+    /// delivery id. Frame freight ONLY: it is deliberately not part of the pending
+    /// map's key ([`PendingTaskRequests`]).
+    session_id: Option<String>,
     outbound: mpsc::UnboundedSender<Outbound>,
     pending: PendingTaskRequests,
 }
 
 impl IpcTaskStore {
-    pub fn new(outbound: mpsc::UnboundedSender<Outbound>, pending: PendingTaskRequests) -> Self {
-        Self { outbound, pending }
+    pub fn new(
+        session_id: Option<String>,
+        outbound: mpsc::UnboundedSender<Outbound>,
+        pending: PendingTaskRequests,
+    ) -> Self {
+        Self {
+            session_id,
+            outbound,
+            pending,
+        }
     }
 }
 
@@ -83,6 +121,7 @@ impl TaskCaller for IpcTaskStore {
     ) -> Pin<Box<dyn Future<Output = Result<Value, TaskStoreError>> + Send>> {
         let outbound = self.outbound.clone();
         let pending = self.pending.clone();
+        let session_id = self.session_id.clone();
         Box::pin(async move {
             let request_id = mint_request_id();
             let (tx, rx) = oneshot::channel();
@@ -103,6 +142,10 @@ impl TaskCaller for IpcTaskStore {
             if outbound
                 .send(Outbound::TaskRequest {
                     request_id: request_id.clone(),
+                    // (ADR 0117) The ORIGIN address. Frame freight only — the insert
+                    // above keyed the map by the bare `request_id`, and the
+                    // `TaskResponse` handler resolves by that bare id alone.
+                    session_id,
                     call,
                 })
                 .is_err()
@@ -248,7 +291,7 @@ mod tests {
     async fn register_happens_before_the_frame_is_emitted() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
-        let store = IpcTaskStore::new(out_tx, pending.clone());
+        let store = IpcTaskStore::new(None, out_tx, pending.clone());
 
         // Hold the map lock for the whole first phase. `call()` must reach its
         // registration and STOP there.
@@ -278,7 +321,12 @@ mod tests {
             .await
             .expect("the frame is emitted once the registration can proceed")
             .expect("the outbound channel is open");
-        let Outbound::TaskRequest { request_id, call } = frame else {
+        let Outbound::TaskRequest {
+            request_id,
+            session_id,
+            call,
+        } = frame
+        else {
             panic!("expected a TaskRequest frame, got {frame:?}");
         };
         assert_eq!(
@@ -286,6 +334,11 @@ mod tests {
             TaskCall::ListBoard {
                 space_path: "/space/a".into()
             }
+        );
+        assert_eq!(
+            session_id, None,
+            "this store was built with no origin id — the field is an honest `None`, \
+             not an empty string"
         );
         assert!(
             request_id.starts_with("task-"),
@@ -334,7 +387,7 @@ mod tests {
     async fn dropping_the_parked_call_removes_the_pending_entry() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
-        let store = IpcTaskStore::new(out_tx, pending.clone());
+        let store = IpcTaskStore::new(None, out_tx, pending.clone());
 
         let mut fut = Box::pin(store.call(list_board()));
         let ready = poll_once(&mut fut);
@@ -374,7 +427,7 @@ mod tests {
     async fn a_cancelled_turn_leaves_the_pending_map_empty() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
-        let store = IpcTaskStore::new(out_tx, pending.clone());
+        let store = IpcTaskStore::new(None, out_tx, pending.clone());
         let cancel = CancellationToken::new();
 
         // Fire the token a moment after the call is in flight (the shape of a real
@@ -429,7 +482,7 @@ mod tests {
     async fn the_cancel_arm_returns_promptly_when_the_token_fires() {
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
         let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
-        let store = IpcTaskStore::new(out_tx, pending.clone());
+        let store = IpcTaskStore::new(None, out_tx, pending.clone());
         let cancel = CancellationToken::new();
 
         let fired = {
@@ -475,7 +528,7 @@ mod tests {
     async fn request_ids_are_unique_and_task_prefixed() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
-        let store = IpcTaskStore::new(out_tx, pending.clone());
+        let store = IpcTaskStore::new(None, out_tx, pending.clone());
 
         let mut a = Box::pin(store.call(list_board()));
         let mut b = Box::pin(store.call(TaskCall::GetTask {
@@ -520,7 +573,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         drop(out_rx);
         let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
-        let store = IpcTaskStore::new(out_tx, pending.clone());
+        let store = IpcTaskStore::new(None, out_tx, pending.clone());
 
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), store.call(list_board()))
             .await
@@ -540,7 +593,7 @@ mod tests {
     async fn the_frame_this_file_emits_decodes_as_a_task_request_line() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
-        let store = IpcTaskStore::new(out_tx, pending.clone());
+        let store = IpcTaskStore::new(None, out_tx, pending.clone());
         let mut fut = Box::pin(store.call(TaskCall::GetArtifact {
             task_id: "tsk_9".into(),
             key: "spec".into(),
@@ -563,5 +616,123 @@ mod tests {
             ),
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// (0.6.0 prep) THE ORIGIN-ADDRESS PIN: the frame this file emits names the
+    /// Worker that emitted it.
+    ///
+    /// Why: the manager's pump re-keys a Subagent's frames to the PARENT's session id
+    /// (`worker/manager/pump.rs`) so the child's UI renders in the parent's scope, and
+    /// a Supervisor that replies to THAT id answers the wrong process — the child's
+    /// oneshot is never resolved and every board verb parks until the turn token
+    /// cancels it. ADR 0117's rule: **a frame's delivery address is a UI-scope key and
+    /// never a reply address.** The frame therefore carries its own origin.
+    ///
+    /// The second half is the OTHER half of the decision, and the one a reviewer is
+    /// most likely to "fix" into a bug: the origin travels on the FRAME, and the
+    /// pending map stays keyed by the BARE `request_id` read off that frame. Keying
+    /// the map by a compound `"{session_id}/{request_id}"` would miss every answer,
+    /// and a missed answer is a hang, not an error.
+    #[tokio::test]
+    async fn the_task_request_frame_names_the_worker_that_emitted_it() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
+        let store = IpcTaskStore::new(Some("child-9".into()), out_tx, pending.clone());
+
+        let mut fut = Box::pin(store.call(list_board()));
+        poll_once(&mut fut);
+        let frame = out_rx.try_recv().expect("the frame was emitted");
+        let Outbound::TaskRequest {
+            request_id,
+            session_id,
+            call,
+        } = frame
+        else {
+            panic!("expected a TaskRequest frame, got {frame:?}");
+        };
+
+        assert_eq!(
+            session_id.as_deref(),
+            Some("child-9"),
+            "the frame names the Worker that EMITTED it (the CHILD for a Subagent) — \
+             a Supervisor that answers the pump's delivery id answers the parent's \
+             process and the caller parks forever"
+        );
+        assert_eq!(
+            call,
+            list_board(),
+            "the call still rides verbatim (the field is additive freight)"
+        );
+        // THE NO-COMPOUND-KEY PIN: the map is addressed by the bare id off the frame.
+        assert!(
+            pending.lock().await.contains_key(&request_id),
+            "the pending map is keyed by the BARE `request_id` (`{request_id}`), not by \
+             a `session_id`-compound key — the `Inbound::TaskResponse` handler cannot \
+             know the origin id and a compound key would miss every answer (a hang)"
+        );
+
+        // Answer it through the bare key, proving the entry the test just checked is
+        // the one the answer resolves.
+        let tx = pending
+            .lock()
+            .await
+            .remove(&request_id)
+            .expect("the entry is keyed by the bare request id");
+        tx.send(Ok(board_answer()))
+            .expect("the caller is still parked");
+        let got = fut.await.expect("the call resolves through the bare key");
+        assert_eq!(got, board_answer(), "the answer rides back verbatim");
+    }
+
+    /// (0.6.0 prep) The pending map stays keyed by the BARE `request_id` even when
+    /// the store knows a session id — the sibling of
+    /// `register_happens_before_the_frame_is_emitted`, spelled the same way on
+    /// purpose: hold the lock, run the call, release, read the frame, then look the
+    /// entry up by the id that frame carries.
+    ///
+    /// This is the pin that keeps `PendingTaskRequests` a `HashMap<String, _>` and
+    /// the `Inbound::TaskResponse` handler unchanged. `core.rs`'s
+    /// `task_response_resolves_by_the_bare_request_id` proves the same thing from the
+    /// handler's side: it resolves with `WorkerCore::session_id` still `None`, so a
+    /// compound key would miss it.
+    #[tokio::test]
+    async fn the_pending_map_stays_keyed_by_the_bare_request_id() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let pending: PendingTaskRequests = Arc::new(TokioMutex::new(HashMap::new()));
+        let store = IpcTaskStore::new(Some("child-42".into()), out_tx, pending.clone());
+
+        // Hold the map lock, then run the call — the registration must complete
+        // before the frame may exist (ADR 0092 rule 1).
+        let guard = pending.lock().await;
+        let caller = tokio::spawn(async move { store.call(list_board()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "the frame reached the wire before the registration (see \
+             `register_happens_before_the_frame_is_emitted`)"
+        );
+        drop(guard);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("the frame is emitted once the registration can proceed")
+            .expect("the outbound channel is open");
+        let Outbound::TaskRequest {
+            request_id,
+            session_id,
+            ..
+        } = frame
+        else {
+            panic!("expected a TaskRequest frame, got {frame:?}");
+        };
+        assert_eq!(session_id.as_deref(), Some("child-42"));
+        assert!(
+            pending.lock().await.contains_key(&request_id),
+            "with a NON-`None` session id the entry is still registered under the bare \
+             `{request_id}` — the answer side has only that id"
+        );
+
+        // Parked, not resolved, and nothing leaked when the caller is dropped.
+        assert!(!caller.is_finished(), "the call is parked, not resolved");
     }
 }

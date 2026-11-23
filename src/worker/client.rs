@@ -136,8 +136,22 @@ pub enum WorkerInboundEvent {
     /// gain an arm, and there are exactly two — the daemon's `worker_frame` (in
     /// this repo, landed here) and the desktop's `route_event` (D2, which must
     /// therefore land its arm in the SAME commit that bumps the crate pin).
+    ///
+    /// `session_id` is the frame's **ORIGIN** address — the id of the Worker that
+    /// emitted it, the **CHILD** for a Subagent — relayed verbatim from
+    /// [`Outbound::TaskRequest`](crate::worker::protocol::Outbound::TaskRequest). The
+    /// desktop's `route_event` MUST address its `Inbound::TaskResponse` by THIS field
+    /// and MUST NOT fall back to the delivery id for a child: the pump re-keys a
+    /// child's frames to the PARENT's session id so the child's UI renders in the
+    /// parent's scope, and ADR 0117's rule is that **a frame's delivery address is a
+    /// UI-scope key and never a reply address**. Answering the delivery id answers the
+    /// parent's process, the child's parked oneshot is never resolved, and every board
+    /// verb hangs until the turn token cancels it. `None` means the Worker predates the
+    /// field — an honest absence, and the desktop must then behave as it does today
+    /// rather than guessing an id.
     TaskRequest {
         request_id: String,
+        session_id: Option<String>,
         call: crate::seams::TaskCall,
     },
     /// The process exited (crash detection — the read loop ended on
@@ -1144,9 +1158,15 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
         // sees this event at all, because its decoder routes `task-request` to
         // `Outbound::Unknown` above and returns `None` (the F1→D2 window, and the
         // reason the Worker's park must race the turn token).
-        Outbound::TaskRequest { request_id, call } => {
-            WorkerInboundEvent::TaskRequest { request_id, call }
-        }
+        Outbound::TaskRequest {
+            request_id,
+            session_id,
+            call,
+        } => WorkerInboundEvent::TaskRequest {
+            request_id,
+            session_id,
+            call,
+        },
         // A newer Worker's frame this build predates — ignored, never an
         // error (the permissive-decoder contract; the overall surface is
         // negotiated on the `hello` frame, handled above).
