@@ -337,8 +337,30 @@ pub enum Outbound {
     ///
     /// The `call` payload is the verb AS DATA ([`TaskCall`](crate::seams::TaskCall)),
     /// so one variant covers all seven verbs and a new verb costs no new frame.
+    ///
+    /// `session_id` is the **ORIGIN** address: the id of the Worker that EMITTED this
+    /// frame, which for a Subagent is the **CHILD** (it comes from
+    /// [`StartEnv::session_id`](crate::worker_types::StartEnv::session_id), the child's
+    /// own id, at the `IpcTaskStore` construction site). It is NOT the pump's delivery
+    /// id — the manager re-keys a child's frames to the PARENT's session id so the
+    /// child's UI renders in the parent's scope
+    /// ([`pump`](crate::worker::manager::pump)), and ADR 0117's rule is that **a
+    /// frame's delivery address is a UI-scope key and never a reply address**. A
+    /// Supervisor that answers a task call at the delivery id answers the parent's
+    /// process, the child's oneshot is never resolved, and every board verb parks
+    /// until the turn token cancels it — which is the hang this field exists to kill.
+    ///
+    /// A reply (`Inbound::TaskResponse`) MUST therefore be addressed by this field and
+    /// NEVER by the delivery id. It is an `Option` so a frame from a Worker that
+    /// predates the field decodes to `None` — an honest absence, and the reason the
+    /// change stays additive (`PROTOCOL_VERSION` remains
+    /// [`PROTOCOL_VERSION`], see `a_task_request_line_with_no_session_id_decodes_as_none`).
     #[serde(rename = "task-request", rename_all = "camelCase")]
-    TaskRequest { request_id: String, call: TaskCall },
+    TaskRequest {
+        request_id: String,
+        session_id: Option<String>,
+        call: TaskCall,
+    },
     /// An outbound `type` this version of the Supervisor doesn't know
     /// (permissive — the raw line is preserved; never an error).
     #[serde(rename = "unknown", rename_all = "camelCase")]
@@ -2180,13 +2202,19 @@ mod tests {
         for expected in calls {
             let frame = Outbound::TaskRequest {
                 request_id: "task-abc".into(),
+                session_id: None,
                 call: expected.clone(),
             };
             let line = encode_outbound(&frame);
             assert!(line.ends_with('\n'), "one JSONL line, newline-terminated");
             match decode_outbound(&line).expect("a `task-request` line decodes") {
-                Outbound::TaskRequest { request_id, call } => {
+                Outbound::TaskRequest {
+                    request_id,
+                    session_id,
+                    call,
+                } => {
                     assert_eq!(request_id, "task-abc");
+                    assert_eq!(session_id, None, "no origin set here, none back");
                     assert_eq!(call, expected, "the call rides verbatim");
                 }
                 other => panic!(
@@ -2208,8 +2236,17 @@ mod tests {
     fn decode_outbound_routes_a_task_request_line_to_its_variant() {
         let line = r#"{"type":"task-request","requestId":"task-7","call":{"verb":"listBoard","spacePath":"/s"}}"#;
         match decode_outbound(line).expect("the `task-request` line decodes") {
-            Outbound::TaskRequest { request_id, call } => {
+            Outbound::TaskRequest {
+                request_id,
+                session_id,
+                call,
+            } => {
                 assert_eq!(request_id, "task-7");
+                assert_eq!(
+                    session_id, None,
+                    "this fixture predates the origin field — an absent key is `None` \
+                     (see `a_task_request_line_with_no_session_id_decodes_as_none`)"
+                );
                 assert_eq!(
                     call,
                     TaskCall::ListBoard {
@@ -2218,6 +2255,101 @@ mod tests {
                 );
             }
             other => panic!("expected `TaskRequest`, got {other:?}"),
+        }
+    }
+
+    /// (0.6.0 prep) The `task-request` frame carries the id of the Worker that
+    /// EMITTED it — the ORIGIN address — because that is not an address it may be
+    /// answered at.
+    ///
+    /// Why the field exists at all: the manager's pump re-keys a Subagent's frames
+    /// to the PARENT's session id (`worker/manager/pump.rs`), because the child's UI
+    /// belongs to the parent's scope, and a Supervisor that uses that delivery id as
+    /// the reply address answers into the PARENT's process. The answer then never
+    /// reaches the oneshot the child parked and every board verb hangs until the turn
+    /// token cancels it. The rule this pins is ADR 0117's: **a frame's delivery
+    /// address is a UI-scope key and never a reply address.**
+    #[test]
+    fn the_task_request_frame_carries_the_emitting_session_id() {
+        let frame = Outbound::TaskRequest {
+            request_id: "task-orig".into(),
+            session_id: Some("child-1".into()),
+            call: TaskCall::ListBoard {
+                space_path: "/s".into(),
+            },
+        };
+        let line = encode_outbound(&frame);
+        assert!(
+            line.contains(r#""sessionId":"child-1""#),
+            "the wire key is `sessionId` (the variant's `rename_all` spells it \
+             camelCase), got {line}"
+        );
+        match decode_outbound(&line).expect("the line round-trips") {
+            Outbound::TaskRequest {
+                request_id,
+                session_id,
+                call,
+            } => {
+                assert_eq!(request_id, "task-orig");
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some("child-1"),
+                    "the ORIGIN address round-trips — this is the id a reply must be \
+                     addressed to, never the delivery id the pump put on the frame"
+                );
+                assert_eq!(
+                    call,
+                    TaskCall::ListBoard {
+                        space_path: "/s".into()
+                    }
+                );
+            }
+            other => panic!("expected `TaskRequest`, got {other:?}"),
+        }
+    }
+
+    /// THE ADDITIVITY PIN: a `task-request` line with NO `sessionId` key — the exact
+    /// shape a Worker that predates the field emits — still decodes to the variant,
+    /// with `session_id` = `None`.
+    ///
+    /// This is what keeps the change additive on the wire and `PROTOCOL_VERSION`
+    /// honestly at `1`: an old peer's line is neither a decode error nor an
+    /// `Unknown { raw }` — and either of those would silently drop every task call
+    /// and hang the tool against a mixed-version peer. The fixture below is the
+    /// pre-change wire spelling, verbatim (it is the fixture
+    /// `decode_outbound_routes_a_task_request_line_to_its_variant` uses).
+    #[test]
+    fn a_task_request_line_with_no_session_id_decodes_as_none() {
+        let line = r#"{"type":"task-request","requestId":"task-7","call":{"verb":"listBoard","spacePath":"/s"}}"#;
+        assert!(
+            !line.contains("sessionId"),
+            "the fixture is the OLD wire shape — it carries no origin key"
+        );
+        match decode_outbound(line).expect("an old `task-request` line still decodes") {
+            Outbound::TaskRequest {
+                request_id,
+                session_id,
+                call,
+            } => {
+                assert_eq!(request_id, "task-7");
+                assert_eq!(
+                    session_id, None,
+                    "a frame from a Worker that predates the field is an honest ABSENCE \
+                     — not an error, and not the empty string (which is exactly why the \
+                     field is `Option<String>` and not `String`)"
+                );
+                assert_eq!(
+                    call,
+                    TaskCall::ListBoard {
+                        space_path: "/s".into()
+                    }
+                );
+            }
+            other => panic!(
+                "a `task-request` line with no `sessionId` must route to the VARIANT, not \
+                 to `Unknown` — the permissive decoder would drop every task call from an \
+                 old peer and hang the tool. got {other:?}"
+            ),
         }
     }
 
@@ -2296,6 +2428,7 @@ mod tests {
         let markdown = "x".repeat(256 * 1024);
         let frame = Outbound::TaskRequest {
             request_id: "task-big".into(),
+            session_id: None,
             call: TaskCall::WriteArtifact {
                 task_id: "tsk_1".into(),
                 key: "spec".into(),
@@ -2357,6 +2490,7 @@ mod tests {
         let md = "# Title\nline two\n\tindented\n";
         let line = encode_outbound(&Outbound::TaskRequest {
             request_id: "task-nl".into(),
+            session_id: None,
             call: TaskCall::WriteArtifact {
                 task_id: "t".into(),
                 key: "spec".into(),

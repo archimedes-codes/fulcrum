@@ -2904,6 +2904,7 @@ mod tests {
     fn a_task_request_gets_a_loud_task_unsupported_refusal() {
         let frame = worker_frame(&WorkerInboundEvent::TaskRequest {
             request_id: "task-abc".into(),
+            session_id: None,
             call: fulcrum_harness::seams::TaskCall::ListBoard {
                 space_path: "/some/space".into(),
             },
@@ -2936,6 +2937,7 @@ mod tests {
             false,
             &WorkerInboundEvent::TaskRequest {
                 request_id: "task-abc".into(),
+                session_id: None,
                 call: fulcrum_harness::seams::TaskCall::ListBoard {
                     space_path: "/some/space".into(),
                 },
@@ -2957,6 +2959,7 @@ mod tests {
     fn the_task_refusal_is_never_a_silent_drop() {
         let frame = worker_frame(&WorkerInboundEvent::TaskRequest {
             request_id: "task-z".into(),
+            session_id: None,
             call: fulcrum_harness::seams::TaskCall::GetTask {
                 task_id: "tsk_1".into(),
             },
