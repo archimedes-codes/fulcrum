@@ -659,6 +659,7 @@ mod tests {
                 brave_api_key: "b-key".to_string(),
                 tavily_api_key: String::new(),
                 perplexity_api_key: String::new(),
+                keenable_api_key: String::new(),
                 searxng_url: String::new(),
                 default_provider: "brave".to_string(),
                 proxy: String::new(),
@@ -1215,7 +1216,7 @@ mod tests {
     /// exists.
     #[test]
     fn decode_inbound_routes_a_config_update_line_to_the_config_update_variant() {
-        let line = r#"{"type":"config-update","filePolicy":{"reads":"ask","writes":"ask","shell":"ask"},"web":{"braveApiKey":"b-key","tavilyApiKey":"","perplexityApiKey":"","searxngUrl":"","defaultProvider":"brave","proxy":""},"agentOverrides":{"scout":{"model":"fake/m3"}}}"#;
+        let line = r#"{"type":"config-update","filePolicy":{"reads":"ask","writes":"ask","shell":"ask"},"web":{"braveApiKey":"b-key","tavilyApiKey":"","perplexityApiKey":"","keenableApiKey":"","searxngUrl":"","defaultProvider":"brave","proxy":""},"agentOverrides":{"scout":{"model":"fake/m3"}}}"#;
         match decode_inbound(line).expect("the `config-update` line decodes") {
             Inbound::ConfigUpdate {
                 file_policy,
