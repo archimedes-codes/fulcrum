@@ -7,12 +7,20 @@ use url::Url;
 use crate::web::config::WebConfig;
 use crate::web::providers::brave::BraveProvider;
 use crate::web::providers::duckduckgo::DuckDuckGoProvider;
+use crate::web::providers::keenable::KeenableProvider;
 use crate::web::providers::perplexity::PerplexityProvider;
 use crate::web::providers::searxng::SearXNGProvider;
 use crate::web::providers::tavily::TavilyProvider;
 use crate::web::providers::types::{SearchOpts, SearchProvider, SearchResultItem};
 
-pub const AVAILABILITY_ORDER: &[&str] = &["brave", "tavily", "perplexity", "searxng", "duckduckgo"];
+pub const AVAILABILITY_ORDER: &[&str] = &[
+    "brave",
+    "tavily",
+    "perplexity",
+    "searxng",
+    "keenable",
+    "duckduckgo",
+];
 
 pub struct ResolvedProvider {
     pub provider: Arc<dyn SearchProvider>,
@@ -31,6 +39,7 @@ pub fn all_providers() -> Vec<Arc<dyn SearchProvider>> {
         Arc::new(TavilyProvider::new()),
         Arc::new(PerplexityProvider::new()),
         Arc::new(SearXNGProvider::new()),
+        Arc::new(KeenableProvider::new()),
         Arc::new(DuckDuckGoProvider::new()),
     ]
 }
@@ -267,11 +276,18 @@ mod tests {
     #[test]
     fn test_all_providers_registered() {
         let providers = all_providers();
-        assert_eq!(providers.len(), 5);
+        assert_eq!(providers.len(), 6);
         let ids: Vec<&str> = providers.iter().map(|p| p.id()).collect();
         assert_eq!(
             ids,
-            vec!["brave", "tavily", "perplexity", "searxng", "duckduckgo"]
+            vec![
+                "brave",
+                "tavily",
+                "perplexity",
+                "searxng",
+                "keenable",
+                "duckduckgo"
+            ]
         );
     }
 
@@ -299,6 +315,11 @@ mod tests {
         assert!(!providers
             .iter()
             .find(|p| p.id() == "searxng")
+            .unwrap()
+            .is_available(&empty_config));
+        assert!(!providers
+            .iter()
+            .find(|p| p.id() == "keenable")
             .unwrap()
             .is_available(&empty_config));
         assert!(providers
@@ -347,6 +368,16 @@ mod tests {
             .find(|p| p.id() == "searxng")
             .unwrap()
             .is_available(&searxng_cfg));
+
+        let keenable_cfg = WebConfig {
+            keenable_api_key: Some("k".into()),
+            ..Default::default()
+        };
+        assert!(providers
+            .iter()
+            .find(|p| p.id() == "keenable")
+            .unwrap()
+            .is_available(&keenable_cfg));
     }
 
     #[test]

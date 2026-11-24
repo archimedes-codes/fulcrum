@@ -1,6 +1,7 @@
 pub mod brave;
 pub mod common;
 pub mod duckduckgo;
+pub mod keenable;
 pub mod perplexity;
 pub mod registry;
 pub mod searxng;

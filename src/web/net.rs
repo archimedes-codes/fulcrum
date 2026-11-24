@@ -114,10 +114,13 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 /// Strip sensitive headers on cross-origin redirects.
+///
+/// Any provider authenticating by a custom header MUST add that header name here.
 fn strip_cross_origin_headers(headers: &mut HeaderMap) {
     headers.remove("authorization");
     headers.remove("cookie");
     headers.remove("x-subscription-token");
+    headers.remove("x-api-key");
 }
 
 fn is_cross_origin(a: &Url, b: &Url) -> bool {
@@ -503,6 +506,8 @@ mod tests {
             "X-Subscription-Token",
             HeaderValue::from_static("api-key-123"),
         );
+        headers.insert("X-Api-Key", HeaderValue::from_static("keen-test-secret"));
+        headers.insert("Cookie", HeaderValue::from_static("session=secret-cookie"));
         let opts = FetchOpts {
             method: Method::POST,
             headers,
@@ -531,6 +536,14 @@ mod tests {
         assert_eq!(req.method, "GET"); // 302 downgraded POST to GET
         assert!(req.headers.get("authorization").is_none());
         assert!(req.headers.get("x-subscription-token").is_none());
+        assert!(
+            req.headers.get("x-api-key").is_none(),
+            "x-api-key leaked across a cross-origin redirect"
+        );
+        assert!(
+            req.headers.get("cookie").is_none(),
+            "cookie leaked across a cross-origin redirect"
+        );
         assert!(req.body.is_empty()); // Body was dropped
     }
 

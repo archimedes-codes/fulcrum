@@ -16,7 +16,14 @@ use serde::{Deserialize, Serialize};
 /// One Search backend `web_search` can query. Always referred to as a
 /// "Search provider"; NEVER just "provider" — bare Provider is the model
 /// endpoint (`CONTEXT.md`).
-pub const SEARCH_PROVIDERS: [&str; 5] = ["brave", "tavily", "perplexity", "searxng", "duckduckgo"];
+pub const SEARCH_PROVIDERS: [&str; 6] = [
+    "brave",
+    "tavily",
+    "perplexity",
+    "searxng",
+    "keenable",
+    "duckduckgo",
+];
 
 /// The `web_search` / `fetch_content` configuration (the settings' `web`
 /// block). Every field is optional; an unset key means "this Search provider
@@ -34,9 +41,10 @@ pub struct WebSettings {
     pub brave_api_key: String,
     pub tavily_api_key: String,
     pub perplexity_api_key: String,
+    pub keenable_api_key: String,
     /// The self-hosted SearXNG instance base URL.
     pub searxng_url: String,
-    /// `"auto"` (default) or one of `brave|tavily|perplexity|searxng|duckduckgo`.
+    /// `"auto"` (default) or one of `brave|tavily|perplexity|searxng|keenable|duckduckgo`.
     pub default_provider: String,
     /// An explicit proxy URL. Empty = fall back to `HTTPS_PROXY`/`HTTP_PROXY`.
     pub proxy: String,
@@ -50,6 +58,7 @@ pub struct WebConfig {
     pub brave_api_key: Option<String>,
     pub tavily_api_key: Option<String>,
     pub perplexity_api_key: Option<String>,
+    pub keenable_api_key: Option<String>,
     pub searxng_url: Option<String>,
     /// `"auto"` or one of `SEARCH_PROVIDERS`.
     pub default_provider: String,
@@ -90,6 +99,8 @@ impl WebConfig {
                 .or_else(|| web.and_then(|w| non_empty_str(&w.tavily_api_key))),
             perplexity_api_key: non_empty_env("PERPLEXITY_API_KEY")
                 .or_else(|| web.and_then(|w| non_empty_str(&w.perplexity_api_key))),
+            keenable_api_key: non_empty_env("KEENABLE_API_KEY")
+                .or_else(|| web.and_then(|w| non_empty_str(&w.keenable_api_key))),
             searxng_url: non_empty_env("SEARXNG_URL")
                 .or_else(|| web.and_then(|w| non_empty_str(&w.searxng_url))),
             default_provider,
@@ -138,6 +149,7 @@ mod tests {
             remove_env("BRAVE_API_KEY"),
             remove_env("TAVILY_API_KEY"),
             remove_env("PERPLEXITY_API_KEY"),
+            remove_env("KEENABLE_API_KEY"),
             remove_env("SEARXNG_URL"),
             remove_env("HTTPS_PROXY"),
             remove_env("HTTP_PROXY"),
@@ -153,6 +165,7 @@ mod tests {
             brave_api_key: "b-key".to_string(),
             tavily_api_key: "t-key".to_string(),
             perplexity_api_key: "p-key".to_string(),
+            keenable_api_key: "k-key".to_string(),
             searxng_url: "https://searx.local".to_string(),
             default_provider: "tavily".to_string(),
             proxy: "http://proxy.local:8080".to_string(),
@@ -162,6 +175,7 @@ mod tests {
         assert_eq!(cfg.brave_api_key.as_deref(), Some("b-key"));
         assert_eq!(cfg.tavily_api_key.as_deref(), Some("t-key"));
         assert_eq!(cfg.perplexity_api_key.as_deref(), Some("p-key"));
+        assert_eq!(cfg.keenable_api_key.as_deref(), Some("k-key"));
         assert_eq!(cfg.searxng_url.as_deref(), Some("https://searx.local"));
         assert_eq!(cfg.default_provider, "tavily");
         assert_eq!(cfg.proxy.as_deref(), Some("http://proxy.local:8080"));
@@ -176,11 +190,13 @@ mod tests {
         let _r4 = set_env("SEARXNG_URL", "https://env-searx.local");
         let _r5 = set_env("HTTPS_PROXY", "http://env-proxy:8080");
         let _r6 = remove_env("HTTP_PROXY");
+        let _r7 = set_env("KEENABLE_API_KEY", "env-keenable");
 
         let web = WebSettings {
             brave_api_key: "settings-brave".to_string(),
             tavily_api_key: "settings-tavily".to_string(),
             perplexity_api_key: "settings-pplx".to_string(),
+            keenable_api_key: "settings-keenable".to_string(),
             searxng_url: "https://settings-searx.local".to_string(),
             default_provider: "duckduckgo".to_string(),
             proxy: "http://settings-proxy:8080".to_string(),
@@ -190,6 +206,7 @@ mod tests {
         assert_eq!(cfg.brave_api_key.as_deref(), Some("env-brave"));
         assert_eq!(cfg.tavily_api_key.as_deref(), Some("env-tavily"));
         assert_eq!(cfg.perplexity_api_key.as_deref(), Some("env-pplx"));
+        assert_eq!(cfg.keenable_api_key.as_deref(), Some("env-keenable"));
         assert_eq!(cfg.searxng_url.as_deref(), Some("https://env-searx.local"));
         assert_eq!(cfg.proxy.as_deref(), Some("http://env-proxy:8080"));
         // default_provider has no env var, so settings value is used
@@ -208,6 +225,7 @@ mod tests {
             brave_api_key: "   ".to_string(),
             tavily_api_key: "\t\n".to_string(),
             perplexity_api_key: "".to_string(),
+            keenable_api_key: "  ".to_string(),
             searxng_url: "  ".to_string(),
             default_provider: "   ".to_string(),
             proxy: "\t ".to_string(),
@@ -217,6 +235,7 @@ mod tests {
         assert_eq!(cfg.brave_api_key, None);
         assert_eq!(cfg.tavily_api_key, None);
         assert_eq!(cfg.perplexity_api_key, None);
+        assert_eq!(cfg.keenable_api_key, None);
         assert_eq!(cfg.searxng_url, None);
         assert_eq!(cfg.default_provider, "auto");
         assert_eq!(cfg.proxy, None);
