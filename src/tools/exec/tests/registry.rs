@@ -5,10 +5,11 @@
 //!
 //! 1. **Object safety + the `Arc` shape.** The trait is unusable if it is not
 //!    object safe, and the failure would be a compile error in `builtins()`
-//!    rather than a red test — so the pin is the one the crate already uses for
-//!    `TaskStore` (`seams.rs`'s `task_store_is_object_safe_and_shareable`): build
-//!    an `Arc<dyn …>`, call through it, assert `Send + Sync`.
-//! 2. **The registry's own membership** — the 19 built-in names, and the fact
+//!    rather than a red test — so the pin copies the shape the crate already used
+//!    for `TaskStore` (`seams.rs`'s `task_store_is_object_safe_and_shareable`, which
+//!    F3 deleted with the Task subsystem): build an `Arc<dyn …>`, call through it,
+//!    assert `Send + Sync`. This is now the crate's only pin of that shape.
+//! 2. **The registry's own membership** — the 12 built-in names, and the fact
 //!    that no built-in is excluded from scripts.
 //! 3. **The composition seam.** `host_entries` is what F2 fills in; its contract
 //!    at F1 is "every spec you hand me comes back, `Allowed`, answering loudly".
@@ -27,11 +28,17 @@ use crate::tools::exec::registry::NativeTool;
 
 use super::support::{ctx, temp_cwd, text_of};
 
-/// The 19 names [`builtins`] must carry: the 12 native/web executors + the 7
-/// board/artifact verbs. FROZEN, for the same reason the advertised-set census is
-/// frozen — a count cannot say WHICH name vanished, and `builtins()` dropping one
-/// is precisely the silent drop this run is most likely to produce (it is the
-/// function F2 edits).
+/// The 12 names [`builtins`] must carry: the native/web executors and nothing
+/// else. FROZEN, for the same reason the advertised-set census is frozen — a count
+/// cannot say WHICH name vanished, and `builtins()` dropping one is precisely the
+/// silent drop this run is most likely to produce (it is the function every wave
+/// edits).
+///
+/// (ADR 0102 / issue #183 F3) This list was 19 through F1 and F2: the 7
+/// board/artifact verbs were engine-side then, because their `exec_*` arms lived in
+/// this crate. F3 deletes those arms, so the 7 leave the registry too and arrive
+/// per session as `StartEnv::host_tools` — engine-owned names are the ones whose
+/// SUBSTANCE the engine confines.
 const BUILTIN_NAMES: &[&str] = &[
     "bash",
     "read",
@@ -45,31 +52,26 @@ const BUILTIN_NAMES: &[&str] = &[
     "web_search",
     "fetch_content",
     "get_search_content",
-    "list_board",
-    "get_task",
-    "create_task",
-    "edit_task",
-    "move_task",
-    "get_artifact",
-    "write_artifact",
 ];
 
 #[test]
-fn builtins_are_the_nineteen_engine_owned_names() {
+fn builtins_are_the_twelve_engine_owned_names() {
     let names: Vec<String> = builtins().into_iter().map(|e| e.spec.name).collect();
     let expected: Vec<String> = BUILTIN_NAMES.iter().map(|s| s.to_string()).collect();
     assert_eq!(
         names, expected,
-        "`builtins()` is no longer the 19 engine-owned names in `tool_specs()` order. \
-         A missing name here is a tool the model is STILL advertised (the advertised \
-         set is `tool_specs()`, which this does not touch) and which now answers \
-         `unknown tool` from `execute_tool` — the advertised-and-unreachable class. \
-         An EXTRA name is a tool the registry dispatches that nobody advertises."
+        "`builtins()` is no longer the 12 engine-owned names in `tool_specs()` order. \
+         A missing name here is a tool the model is STILL advertised (`tool_specs()` \
+         carries it, and the host cannot carry an engine name) and which now answers \
+         `unknown tool` from `execute_tool` — the advertised-and-unreachable class, \
+         and the ENGINE half of the split `tool_specs.rs`'s census reports. An EXTRA \
+         name is a tool the registry dispatches that nobody advertises."
     );
     assert_eq!(
         names.len(),
-        19,
-        "and the count is 19 (12 + the 7 board verbs)"
+        12,
+        "and the count is 12 (the native/web executors; the 7 board verbs left for \
+         `StartEnv::host_tools` in F3)"
     );
 }
 
@@ -121,8 +123,9 @@ fn builtins_exclude_nothing_for_scripts() {
         assert!(
             entry.script.is_callable(),
             "`{}` is a built-in and `ScriptAccess::Excluded` — no built-in was ever \
-             excluded from scripts, and the 7 board verbs in particular are \
-             script-reachable ON PURPOSE (ADR 0092)",
+             excluded from scripts, and the board verbs in particular were \
+             script-reachable ON PURPOSE (ADR 0092); since F3 they reach scripts as \
+             HOST entries, which `host_entries` also marks `Allowed`",
             entry.name()
         );
     }
@@ -230,7 +233,10 @@ fn registry_lookup_hits_a_builtin_and_misses_the_loop_internal_names() {
 
 /// The trait is usable as a trait object behind the `Arc` every entry holds it
 /// in, and the future it returns is `Send` — the shape
-/// `seams::task_store_is_object_safe_and_shareable` pins for `TaskStore`, copied.
+/// `seams::task_store_is_object_safe_and_shareable` used to pin for `TaskStore`,
+/// copied. F3 deleted that one, so this is the crate's only witness that the
+/// object-safety of this trait holds (and it is a compile-failure guard as much as a
+/// runtime one: `Arc<dyn ToolExecutor>` in `builtins()` stops compiling if it breaks).
 #[test]
 fn the_tool_executor_trait_is_object_safe_and_shareable() {
     struct AlwaysOk;
@@ -444,8 +450,11 @@ fn default_registry_is_the_builtins_and_is_shared() {
     );
     assert_eq!(
         default_registry().len(),
-        19,
-        "and the default registry is 19 (the advertised 26 minus the 7 loop arms)"
+        12,
+        "and the default registry is 12 (the advertised 19 `tool_specs()` names minus \
+         the 7 loop arms — the 7 board verbs left `builtins()` in F3 and now arrive as \
+         `StartEnv::host_tools`, which `default_registry` cannot carry because it is \
+         the process-wide built-ins-only registry)"
     );
 }
 

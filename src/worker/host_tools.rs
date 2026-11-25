@@ -2,11 +2,13 @@
 //! call over the protocol as [`Outbound::HostToolCall`] and parks until the
 //! Supervisor answers with [`Inbound::HostToolResponse`].
 //!
-//! This is the generic twin of [`task_store`](crate::worker::task_store) and it
-//! carries **all four** of that file's mechanisms — not as a stylistic echo, but
-//! because every one of them exists to close a hang or a leak this seam would
-//! otherwise reopen. ADR 0092 mandated the first three for the task pair and ADR
-//! 0102 §2.5 restates them for this one verbatim:
+//! This carries **all four** of the mechanisms the deleted
+//! `worker/task_store.rs` carried — not as a stylistic echo, but because every one
+//! of them exists to close a hang or a leak this seam would otherwise reopen. ADR
+//! 0092 mandated the first three for the task frame pair and ADR 0102 §2.5 restates
+//! them for this one verbatim. F3 deleted that file, so this module is now the only
+//! requester of the shape in the crate, and these four rules are the ONLY record of
+//! it: a fifth rule nobody has to pay for is not the loss, a rule quietly dropped is.
 //!
 //! 1. **Register the oneshot BEFORE emitting the frame.** An `HostToolResponse` that
 //!    arrives between "emit" and "insert" finds no entry, is (correctly) ignored, and
@@ -30,8 +32,8 @@
 //!
 //! # Where the TURN token is voted, and why that is this file's problem
 //!
-//! For the seven task verbs the token vote lives in the executor ARM
-//! (`task_tools::parked`), one level ABOVE `IpcTaskStore`. A host tool has no arm —
+//! For the seven task verbs the token vote used to live in the executor ARM
+//! (`task_tools::parked`), one level ABOVE the store. A host tool has no arm —
 //! [`HostTool`](crate::tools::exec::HostTool) IS the whole executor — so the vote
 //! lives here, in [`call_host_tool`], reading [`ToolCtx::cancel`]. That is the field
 //! `PermissionContext::to_tool_ctx` fills with the per-turn token, and it is exactly
@@ -67,8 +69,8 @@ use crate::worker::protocol::Outbound;
 
 /// The Worker's parked host-tool calls: `request_id` → the oneshot to resolve.
 ///
-/// Keyed by the BARE `request_id`, exactly like
-/// [`PendingTaskRequests`](crate::worker::task_store::PendingTaskRequests) and for the
+/// Keyed by the BARE `request_id`, exactly like the deleted
+/// `task_store::PendingTaskRequests` was, and for the
 /// same three reasons: the map is per-Worker (one session per Worker), the id is a
 /// fresh uuid v4 this file mints so the inserter and the handler agree on its spelling
 /// without either one needing a session id, and the `Inbound::HostToolResponse` carries
@@ -81,12 +83,12 @@ use crate::worker::protocol::Outbound;
 /// `a_host_tool_response_resolves_by_the_bare_request_id` (the remove side, with
 /// `WorkerCore::session_id` still `None` because no `Start` was handled).
 ///
-/// A SEPARATE map from `pending_task_requests`, not a widened one: the value types
-/// differ (`Result<ToolResult, String>` vs `Result<Value, TaskStoreError>`), and
-/// merging them would put the host frame's prose error half beside the task frame's
-/// `kind`-carrying one for no gain. The id prefixes (`host-` vs `task-`) keep the two
-/// families distinguishable in a log and stop a stale answer from one resolving an
-/// entry of the other.
+/// It used to be one of TWO maps, kept separate from `pending_task_requests` because
+/// the value types differed (`Result<ToolResult, String>` vs
+/// `Result<Value, TaskStoreError>`). F3 deleted the task half, so this is the only
+/// pending-tool map on `WorkerCore` — and the `host-` id prefix stays, because a
+/// Worker log still has to say which family an id belongs to, and the prefix is what
+/// `mint_request_id` exists to provide.
 pub type PendingHostToolCalls =
     Arc<TokioMutex<HashMap<String, oneshot::Sender<Result<ToolResult, String>>>>>;
 
@@ -133,8 +135,8 @@ impl HostToolChannel {
 }
 
 /// Mint a request id. The `host-` prefix is what makes one recognisable in a Worker
-/// log and — beside `task-` on the other family — keeps a stale or hand-inserted
-/// answer from resolving the wrong family's entry.
+/// log and — since F3 deleted the `task-` family it was one of two — keeps a stale or
+/// hand-inserted answer from resolving an entry of a family this build no longer has.
 fn mint_request_id() -> String {
     format!("host-{}", uuid::Uuid::new_v4())
 }
@@ -243,9 +245,9 @@ pub fn call_host_tool(
             // The answer wins when it arrives, which is the normal path.
             rx = rx => rx,
             // The TURN token — NOT the session-teardown token. `dispatch_tool`'s
-            // loop-internal arms race this same token, and `task_tools::parked` votes
-            // it one level up for the seven task verbs; here there is no arm, so the
-            // vote is this line.
+            // loop-internal arms race this same token, and `task_tools::parked` used
+            // to vote it one level up for the seven task verbs; here there is no arm
+            // and, since F3, no other family, so the vote is this line alone.
             _ = turn.cancelled() => return cancelled_tool_result(),
         };
 
@@ -291,7 +293,7 @@ fn cancelled_tool_result() -> ToolResult {
 
 /// The Drop guard for one parked host-tool call (rule 2).
 ///
-/// A copy of [`TaskRequestCleanup`](crate::worker::task_store::TaskRequestCleanup)
+/// A copy of the deleted `task_store::TaskRequestCleanup`
 /// with the map alias swapped, and it keeps that guard's one deliberate departure from
 /// `SudoPromptCleanup`: the removal tries a synchronous `try_lock` FIRST and only
 /// spawns when the lock is contended. The reason is what makes the leak test
@@ -393,7 +395,6 @@ mod tests {
             web: Default::default(),
             render_requester: None,
             event_sink: None,
-            task_store: None,
         }
     }
 
@@ -465,7 +466,7 @@ mod tests {
             "a `host-tool-call` frame reached the wire while the pending map was still \
              locked — the implementation emits BEFORE it registers the oneshot, so a \
              Supervisor that answers immediately finds no entry and the caller parks \
-             forever (register first, like `IpcTaskStore`, not like \
+             forever (register first, like this function does, not like \
              `IpcDispatcher::dispatch`)"
         );
         assert!(!caller.is_finished(), "the call is parked, not resolved");

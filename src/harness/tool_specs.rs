@@ -444,116 +444,6 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "required": ["response_id"]
             }),
         },
-        // ── (issue #180 F1) the seven board / artifact verbs ───────────────
-        //
-        // HARD CONSTRAINT on every string below (description AND parameter
-        // descriptions — both render into the prompt's `<tools>` section): no
-        // substring `read`, no substring `subagent`, not even inside a word.
-        // `src-tauri/tests/worker_e2e.rs` asserts
-        // `!tools_section.contains("read") && !tools_section.contains("subagent")`
-        // as a SUBSTRING test over the WHOLE rendered section, so a description
-        // carrying either word makes that assertion PASS WHILE PROVING NOTHING —
-        // a silent CI weakening, not a failure, and it only shows on the Windows
-        // leg. Hence "fetch" / "load" / "show" instead of "read", and no
-        // `thread` / `already` / `spread` / `reads` either (all contain `read`).
-        // `no_task_tool_description_names_read_or_subagent` keeps the ban visible
-        // from Linux, over the WHOLE spec, not just the description.
-        ToolSpec {
-            name: "list_board".into(),
-            description: "List the task board for a space — one row per card (titles, \
-                          stage slugs, artifact key names only; never content)."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "space_path": { "type": "string", "description": "The space whose board to list" }
-                },
-                "required": ["space_path"]
-            }),
-        },
-        ToolSpec {
-            name: "get_task".into(),
-            description: "Fetch one task's full row by id.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "The task id" }
-                },
-                "required": ["task_id"]
-            }),
-        },
-        ToolSpec {
-            name: "create_task".into(),
-            description: "Create a task on a space's board (a space starts on its first \
-                          stage)."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "space_path": { "type": "string", "description": "The space to create the task in" },
-                    "title": { "type": "string", "description": "The task title" },
-                    "body": { "type": "string", "description": "Optional task body (prose)" },
-                    "stage_slug": { "type": "string", "description": "Optional starting stage (defaults to the space's first stage)" }
-                },
-                "required": ["space_path", "title"]
-            }),
-        },
-        ToolSpec {
-            name: "edit_task".into(),
-            description: "Edit a task's title, body or spec path by id.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "The task id" },
-                    "title": { "type": "string", "description": "Optional new title" },
-                    "body": { "type": "string", "description": "Optional new body (prose)" },
-                    "spec_path": { "type": "string", "description": "Optional new spec path" }
-                },
-                "required": ["task_id"]
-            }),
-        },
-        ToolSpec {
-            name: "move_task".into(),
-            description: "Move a task to another stage.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "space_path": { "type": "string", "description": "The space the task lives in" },
-                    "task_id": { "type": "string", "description": "The task id" },
-                    "to_stage": { "type": "string", "description": "The destination stage slug" }
-                },
-                "required": ["space_path", "task_id", "to_stage"]
-            }),
-        },
-        ToolSpec {
-            name: "get_artifact".into(),
-            description: "Fetch a task's named artifact as full markdown (the board row \
-                          lists key names only)."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "The task id" },
-                    "key": { "type": "string", "description": "The artifact key" }
-                },
-                "required": ["task_id", "key"]
-            }),
-        },
-        ToolSpec {
-            name: "write_artifact".into(),
-            description: "Write a named markdown artifact for a task (upserts; refused \
-                          over 256 KiB)."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "The task id" },
-                    "key": { "type": "string", "description": "The artifact key" },
-                    "markdown": { "type": "string", "description": "The full markdown to store" }
-                },
-                "required": ["task_id", "key", "markdown"]
-            }),
-        },
     ]
 }
 
@@ -1031,7 +921,7 @@ mod tests {
         );
     }
 
-    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 20] {
+    fn exec_param_keys() -> [(&'static str, &'static [&'static str]); 13] {
         [
             ("bash", &["command", "timeout_ms"]),
             ("codemode", &["code"]),
@@ -1070,22 +960,13 @@ mod tests {
                     "findText",
                 ],
             ),
-            // (issue #180 F1) The seven board / artifact verbs. Each row is EXACTLY
-            // the key set its `tool_specs()` block advertises and exactly the keys
-            // its arm reads — the exact-equality census below is what makes those
-            // three agree, so adding a fourth place for a key to disagree is not
-            // possible. snake_case, like every other tool's params (the camelCase
-            // rule is the WORKER PROTOCOL's, not the tool-argument vocabulary's).
-            ("list_board", &["space_path"]),
-            ("get_task", &["task_id"]),
-            (
-                "create_task",
-                &["space_path", "title", "body", "stage_slug"],
-            ),
-            ("edit_task", &["task_id", "title", "body", "spec_path"]),
-            ("move_task", &["space_path", "task_id", "to_stage"]),
-            ("get_artifact", &["task_id", "key"]),
-            ("write_artifact", &["task_id", "key", "markdown"]),
+            // (ADR 0102 / issue #183 F3) The table ends at the 13 engine-owned
+            // names. The 7 board / artifact verbs were here until F3 moved their
+            // SPECS to the desktop, where they ride `StartEnv::host_tools`; a host
+            // spec's parameter keys are now the desktop's business and this crate
+            // cannot see them from here. The censuses below therefore compare
+            // specs ↔ the REGISTRY, not specs ↔ `execute_tool`'s `match` — the
+            // `match` is gone and `BUILTIN_TOOLS` is the list that replaced it.
         ]
     }
 
@@ -1104,112 +985,70 @@ mod tests {
         "mcp",
     ];
 
-    /// (issue #180 F1) No Task tool spec renders the substring `read` or
-    /// `subagent` anywhere a model can see it.
-    ///
-    /// Why this is worth a separate pin from the two above it: the failure is not
-    /// a red test, it is a GREEN ONE THAT STOPS PROVING ANYTHING.
-    /// `worker_e2e.rs`'s `full_turn_real_worker_canned_provider` asserts the
-    /// rendered section omits both words to prove `enabled_tools` filtering works;
-    /// a task description carrying `read` makes that assertion pass while proving
-    /// nothing — a silently weakened CI check, on the Windows leg only. So the ban
-    /// covers words that CONTAIN the substring too (`thread`, `already`, `spread`,
-    /// `reads`), which is why these descriptions say "fetch" and "list".
-    ///
-    /// The scope is the RENDERER'S OWN SHAPE: `prompt.rs` emits one
-    /// `- {name}: {description}` line per spec, so a NAME is in scope exactly as a
-    /// description is — checking only descriptions would miss a tool named, say,
-    /// `spread_notes`. (The seven names here are clean; the pre-existing
-    /// `read` / `read_skill` specs are legitimately in the full section, which is why
-    /// the desktop's e2e renders that assertion with ONLY `bash` enabled. So this pin
-    /// checks the seven names SEPARATELY from their descriptions — folding names and
-    /// descriptions into one string would trip on `read_skill` and teach nothing.)
-    /// The parameter descriptions ride along as a belt: they are part of the
-    /// `tools[]` API payload even where this particular renderer drops them.
-    #[test]
-    fn no_task_tool_description_names_read_or_subagent() {
-        const TASK_TOOLS: &[&str] = &[
-            "list_board",
-            "get_task",
-            "create_task",
-            "edit_task",
-            "move_task",
-            "get_artifact",
-            "write_artifact",
-        ];
-        let specs = tool_specs();
-        for name in TASK_TOOLS {
-            let spec = specs
-                .iter()
-                .find(|s| s.name == *name)
-                .unwrap_or_else(|| panic!("`{name}` must be advertised by `tool_specs()`"));
-            // The NAME half of the rendered line, checked separately (see the doc:
-            // folding every advertised name into one string would trip the real
-            // `read` / `read_skill` specs and prove nothing).
-            let rendered_name = format!("- {}", spec.name);
-            // The exact line `prompt.rs` renders into `<tools>` (ADR 0017 renders
-            // the same specs into `tools[]`).
-            let rendered_line = format!("{rendered_name}: {}", spec.description);
-            // The full advertised surface, parameter descriptions included.
-            let rendered = format!(
-                "{rendered_line}{}",
-                serde_json::to_string(&spec.parameters).expect("a spec is serializable")
-            );
-            for banned in ["read", "subagent"] {
-                assert!(
-                    !spec.name.contains(banned),
-                    "`{name}`'s NAME contains `{banned}`, and the name is rendered \
-                     into `<tools>` — that makes `worker_e2e.rs`'s assertion pass \
-                     while proving nothing. got {:?}",
-                    spec.name
-                );
-                assert!(
-                    !spec.description.contains(banned),
-                    "`{name}`'s DESCRIPTION contains `{banned}` — that makes \
-                     `worker_e2e.rs`'s `full_turn_real_worker_canned_provider` \
-                     assertion PASS WHILE PROVING NOTHING (a silent CI weakening on \
-                     the Windows leg, not a failure). Say \"fetch\" / \"load\". \
-                     got {:?}",
-                    spec.description
-                );
-                assert!(
-                    !rendered.contains(banned),
-                    "`{name}`'s full advertised surface (params included) contains \
-                     `{banned}`. got {rendered:?}"
-                );
-            }
-        }
-        // And the ban is not accidentally vacuous: these seven really are advertised.
-        assert_eq!(
-            specs
-                .iter()
-                .filter(|s| TASK_TOOLS.contains(&s.name.as_str()))
-                .count(),
-            7,
-            "all seven task tools are advertised"
-        );
-    }
+    // (issue #180 F1, retired by F3) The seven Task specs used to be advertised
+    // from here, and `no_task_tool_description_names_read_or_subagent` kept their
+    // descriptions free of the substrings `read` / `subagent` so the desktop's
+    // `worker_e2e.rs` substring assertion stayed honest. F3 moves those seven SPECS
+    // desktop-side, so there is nothing left here to census — the test goes with
+    // them rather than being re-pointed at an empty list, which would be a pin that
+    // passes on nothing. (A `//` block and not a doc comment: no item follows it.)
+    //
+    // What SURVIVES, and why the Windows-leg guard is not weakened: the ban was
+    // about the seven specs specifically because the pre-existing `read` /
+    // `read_skill` specs are legitimately in the full section (the desktop's e2e
+    // renders that assertion with ONLY `bash` enabled). The two descriptions that
+    // render alone in that fixture are pinned by
+    // `the_bash_description_never_names_another_advertised_tool` and
+    // `the_codemode_description_never_names_another_advertised_tool`, both of which
+    // are untouched. The obligation for the 7 moved specs transfers to the desktop,
+    // which now owns their text.
 
-    /// `tool_specs()` is 26 = the 19 this file shipped before issue #180 + the seven
-    /// task verbs. The count is pinned because the two censuses above are
-    /// SUBSET-shaped (`every spec is in the table` / `every table row has a spec`)
-    /// and both stay green if a spec is DELETED — a deleted spec silently un-advertises
-    /// a tool the desktop's `toolDetailsRegistry` still expects. The `odd` fixture in
-    /// this module's own tests is NOT in `tool_specs()` and must not be counted.
+    /// `tool_specs()` is **19**: the 12 native/web built-ins + the 7 loop-internal
+    /// arms. It was 26 until F3, which moved the 7 board/artifact verbs to the
+    /// desktop as `StartEnv::host_tools`.
+    ///
+    /// The count is pinned because the two censuses below are SUBSET-shaped
+    /// (`every spec is in the table` / `every table row has a spec`) and both stay
+    /// green if a spec is DELETED — a deleted spec silently un-advertises a tool.
+    /// The `odd` fixture in this module's own tests is NOT in `tool_specs()` and
+    /// must not be counted.
+    ///
+    /// # The split the message names
+    ///
+    /// 19 is the ENGINE's table and it is no longer the model's surface. The model
+    /// is still shown 26 names: 19 here + 7 host-owned board/artifact verbs that
+    /// arrive per session as data. A count of this table alone therefore says
+    /// nothing about whether the model's surface moved — that claim is the composed
+    /// census, `the_composed_advertised_set_is_exactly_the_twenty_six_names` — and
+    /// this pin's job is narrower: catch a name leaving the ENGINE's table without
+    /// anyone meaning it to.
     #[test]
-    fn tool_specs_advertises_twenty_six_tools() {
+    fn tool_specs_advertises_the_nineteen_engine_owned_tools() {
         assert_eq!(
             tool_specs().len(),
-            26,
-            "19 pre-existing + the 7 task verbs (the `odd` test fixture is not a \
-             production spec — if this count moved by accident, a task tool was \
-             dropped or a fixture leaked into `tool_specs()`)"
+            19,
+            "`tool_specs()` is the ENGINE's table: 12 native/web built-ins + the 7 \
+             loop-internal arms = 19. The model is still advertised 26 names — the \
+             other 7 are the host-owned board/artifact verbs, which F3 moved to the \
+             desktop and which arrive as `StartEnv::host_tools`, NOT from this \
+             function. If this count moved by accident, an engine tool was dropped \
+             or a test fixture leaked into `tool_specs()`; the 26-name invariant \
+             lives in `the_composed_advertised_set_is_exactly_the_twenty_six_names`."
         );
     }
 
     #[test]
     fn every_tool_spec_is_in_the_param_key_table() {
         let param_keys = exec_param_keys();
+        // (ADR 0102 / issue #183 F3) The registry is the third side of this
+        // comparison now. F1 replaced `execute_tool`'s `match` with
+        // `BUILTIN_TOOLS`, so "the executor's param keys" means "the param keys of
+        // a name the REGISTRY carries" — and after F3 the registry's engine half is
+        // exactly the non-loop-internal half of `tool_specs()`. Asserting that
+        // equality is what stops the table from quietly keeping a row for a name no
+        // executor exists for any more (which is precisely what deleting the 7 board
+        // verbs would leave behind if the rows were left in place).
+        let registry = crate::tools::exec::builtins();
         for spec in tool_specs() {
             if LOOP_INTERNAL_TOOLS.contains(&spec.name.as_str()) {
                 continue;
@@ -1218,6 +1057,35 @@ mod tests {
                 param_keys.iter().any(|(name, _)| *name == spec.name),
                 "tool `{}` from `tool_specs()` is missing from `exec_param_keys()`",
                 spec.name
+            );
+            // `codemode` is the one name `exec_param_keys()` carries that is NOT a
+            // registry entry — its handler is a loop arm — so the registry half of
+            // this census skips the loop-internal set, not just the six names
+            // `LOOP_INTERNAL_TOOLS` lists.
+            if LOOP_INTERNAL_SET.contains(&spec.name.as_str()) {
+                continue;
+            }
+            assert!(
+                crate::tools::exec::lookup(&registry, &spec.name).is_some(),
+                "tool `{}` is advertised and NOT loop-internal, so it must be a \
+                 registry entry — `builtins()` (`tools/exec/registry.rs`) is the only \
+                 thing that can answer it now that `execute_tool` is a thin wrapper",
+                spec.name
+            );
+        }
+        // And the reverse: no row without a name the registry can answer. The
+        // loop-internal names are exempt for the reason their own census gives —
+        // `codemode` HAS a row here (its spec advertises `code`) and is not an
+        // entry, because its executor is `&mut AgentLoop`.
+        for (name, _) in param_keys {
+            if LOOP_INTERNAL_SET.contains(&name) {
+                continue;
+            }
+            assert!(
+                crate::tools::exec::lookup(&registry, name).is_some(),
+                "`exec_param_keys()` still carries a row for `{name}` and no registry \
+                 entry answers it — a stranded row makes this census prove less than \
+                 it appears to",
             );
         }
     }
@@ -1905,20 +1773,29 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // (ADR 0102 / issue #183 F1) The 26-name advertised-set INVARIANCE census.
+    // (ADR 0102 / issue #183 F1, re-anchored by F3) The 26-name advertised-set
+    // INVARIANCE census.
     //
-    // This is written BEFORE the registry exists, on the untouched tree, and it
-    // stays green through all three commits of the run. It is what makes "the
-    // crate forgets Tasks exist" (F3) a SAFE claim rather than a hopeful one:
-    // the same 26 names to the model, different owners underneath.
+    // F1 wrote this on the untouched tree, where it passed against `tool_specs()`
+    // directly. F3 is the commit the run's safety claim is about — "the crate
+    // forgets Tasks exist" while "the model is still advertised the same 26 names"
+    // — and it makes the SUBJECT of this census no longer a single in-crate
+    // function: `tool_specs()` drops to 19 and the other 7 names arrive per
+    // session as `StartEnv::host_tools`, framed by F2's
+    // `host_entries_attached`. So the census moved from "what `tool_specs()`
+    // returns" to "what the model is actually SHOWN", which is the composition
+    // `default_build_loop` performs: `builtins()` ++ the host specs, and the loop
+    // arms beside them. Same 26 names, different owners — and the claim is only
+    // honest if the census walks all three owners, which it now does.
     //
     // # Why a frozen literal and not `tool_specs().len()`
     //
-    // `tool_specs_advertises_twenty_six_tools` above pins the COUNT. A count is
-    // the wrong shape for what is coming: once the engine composes its advertised
-    // set from a registry it was handed, a dropped entry and an added entry cancel
-    // out in the arithmetic and the count stays 26 while the model's surface
-    // silently changes. A SET literal cannot be satisfied by a swap.
+    // `tool_specs_advertises_nineteen_tools` above pins the COUNT of the engine's
+    // own table. A count is the wrong shape for the invariant: a dropped entry and
+    // an added entry cancel out in the arithmetic and the count holds while the
+    // model's surface silently changes. A SET literal cannot be satisfied by a
+    // swap — and since F3 the composed set is built from THREE sources, so a swap
+    // across two of them is now an easier mistake to make than it was.
     //
     // # Why the failure message names the SPLIT
     //
@@ -1926,7 +1803,9 @@ mod tests {
     // `list_board` vanished without saying whether the ENGINE lost a built-in or
     // the HOST lost a verb it was supposed to be handing over. Those are opposite
     // bugs in opposite repos, so the message classifies every missing name into
-    // the half it belongs to and prints both halves.
+    // the half it belongs to and prints both halves. Since F3 this is not a
+    // nicety: the two halves now live in different repos, so a message that
+    // cannot say which one broke sends the reader to the wrong checkout.
     // ─────────────────────────────────────────────────────────────────────────
 
     /// The 26 names the model is advertised. FROZEN — this is the invariant the
@@ -1968,10 +1847,16 @@ mod tests {
     /// The 7 board / artifact verbs — the names whose SUBSTANCE is the desktop's
     /// SQLite and which F2 therefore hands over as data.
     ///
-    /// Today they are engine-side (arms of `execute_tool`, entries of the registry
-    /// F1 builds). After F2/F3 they arrive over the wire as `StartEnv::host_tools`
-    /// and the crate holds no idea a Task exists. The count on BOTH sides of that
-    /// move is 7, and this split is what the failure message below reports on.
+    /// **F3 is the commit that completes that move**: they are no longer engine
+    /// names at all (no `tool_specs()` entry, no `builtins()` entry, no
+    /// `dispatch_tool` arm), and this list is now a FROZEN FIXTURE standing in for
+    /// what the desktop puts in `StartEnv::host_tools` — not a description of
+    /// anything this crate owns. The count on BOTH sides of the move is 7, and
+    /// this split is what the failure messages below report on.
+    ///
+    /// The names stay frozen HERE on purpose. This crate can no longer see them
+    /// from production code, so the only remaining in-repo witness that the 7 the
+    /// desktop hands over are the 7 the model was promised is this literal.
     const HOST_BOUND_SET: &[&str] = &[
         "list_board",
         "get_task",
@@ -1981,6 +1866,26 @@ mod tests {
         "get_artifact",
         "write_artifact",
     ];
+
+    /// The 7 host-bound verbs AS DATA — the fixture stand-in for
+    /// `StartEnv::host_tools`, the same shape `host_entries_attached` consumes in
+    /// production (`worker/core.rs::default_build_loop`).
+    ///
+    /// The descriptions and `parameters` are FIXTURES, not the 0.7.0 text: the
+    /// real specs moved desktop-side with F3 and byte-identity of the DESCRIPTION
+    /// is now the desktop's obligation (its `toolDetailsRegistry.test.ts` is the
+    /// guard). Only the NAMES are load-bearing here — this census is about which
+    /// names the model is shown, and it cannot see a desktop string from here.
+    fn host_bound_specs() -> Vec<ToolSpec> {
+        HOST_BOUND_SET
+            .iter()
+            .map(|name| ToolSpec {
+                name: (*name).to_string(),
+                description: format!("a host-owned board verb ({name})"),
+                parameters: json!({"type": "object", "properties": {}}),
+            })
+            .collect()
+    }
 
     /// The 7 loop-internal names — the tools whose executor is `&mut AgentLoop`
     /// and NOT a `ToolCtx`, so they are advertised and engine-owned but they are
@@ -2000,27 +1905,46 @@ mod tests {
     ];
 
     /// The names the engine can actually REACH, as opposed to the names it
-    /// advertises: the registry's entries plus the loop-internal arms. This is the
-    /// composed set the invariant is asserted over — and it STAYS exactly this
-    /// through F2, which is purely additive: `builtins()` keeps all 19 names and a
-    /// session's extra HOST entries are per-loop (`AgentLoop::tool_registry`), never
-    /// a change to this static view. **F3 is the deletion owner** — it drops the 7
-    /// board verbs from `builtins()` (this helper then returns 12 + 7 arms) in the
-    /// same commit that takes `tool_specs()` 26 → 19, and the frozen 26 above moves
-    /// with it, not before it.
+    /// advertises: the COMPOSED registry's entries plus the loop-internal arms.
+    ///
+    /// **F3 re-anchors this from 19 built-ins to 12 built-ins ++ the 7 host
+    /// specs**, which is exactly what `default_build_loop` composes in production
+    /// (`builtins() ++ host_entries_attached(env.host_tools, …)`). The 26-name
+    /// invariant therefore still holds after F3, but it is now a statement about a
+    /// composition and not about one table — which is the whole point the run
+    /// exists to prove: same 26 names to the model, different owners underneath.
+    ///
+    /// `host_entries` and not `host_entries_attached`: F2's attached builder CALLS
+    /// `host_entries` and replaces only each entry's `executor`, so the names, the
+    /// order and the specs are identical by construction (pinned there, by
+    /// `host_entries_attached`'s own census). This census is about NAMES, and it
+    /// cannot build a Worker channel from a unit test in this module.
     fn reachable_names() -> Vec<String> {
-        // The registry's own membership, plus the seven names whose executor is
-        // `&mut AgentLoop` and which are therefore NOT entries — permanently, and
-        // for the reasons at `LOOP_INTERNAL_SET`.
-        let mut names: Vec<String> = crate::tools::exec::builtins()
-            .into_iter()
-            .map(|entry| entry.spec.name)
-            .collect();
+        // The composed registry's membership, plus the seven names whose executor
+        // is `&mut AgentLoop` and which are therefore NOT entries — permanently,
+        // and for the reasons at `LOOP_INTERNAL_SET`.
+        let mut names: Vec<String> = composed_registry_names();
         names.extend(LOOP_INTERNAL_SET.iter().map(|s| s.to_string()));
         names
     }
 
-    /// The registry's own membership (the half that is entries, not loop arms).
+    /// The COMPOSED registry: the engine's built-ins plus the host-bound specs
+    /// arriving as data. This is the set a session's loop dispatches through.
+    fn composed_registry_names() -> Vec<String> {
+        let mut names: Vec<String> = crate::tools::exec::builtins()
+            .into_iter()
+            .map(|entry| entry.spec.name)
+            .collect();
+        names.extend(
+            crate::tools::exec::host_entries(host_bound_specs())
+                .into_iter()
+                .map(|entry| entry.spec.name),
+        );
+        names
+    }
+
+    /// The ENGINE registry's own membership (the half that is entries the crate
+    /// builds itself — not loop arms, and not host entries).
     fn registry_names() -> Vec<String> {
         crate::tools::exec::builtins()
             .into_iter()
@@ -2028,12 +1952,30 @@ mod tests {
             .collect()
     }
 
-    /// The invariant itself: the advertised set is EXACTLY the 26 names, the
-    /// engine can reach every one of them, and what it reaches is the registry
-    /// disjoint-union the loop arms.
+    /// The invariant itself: the set the model is SHOWN is EXACTLY the 26 names,
+    /// the engine can reach every one of them, and what it reaches is the COMPOSED
+    /// registry disjoint-union the loop arms.
+    ///
+    /// # What F3 changed, and what it did not
+    ///
+    /// The NAME said "advertised", and the subject used to be `tool_specs()` alone.
+    /// Since F3 `tool_specs()` is 19 and the other 7 names ride in per session as
+    /// `StartEnv::host_tools`, so the name now says COMPOSED and the subject is
+    /// `tool_specs()` ++ the host specs — the same composition
+    /// `advertised_tool_specs` performs for a real loop and
+    /// `default_build_loop` performs for a real Worker. **The 26 did not move; the
+    /// number of tables it is built from did.** The invariant the run's safety
+    /// claim rests on is that the model still sees all 26, and asserting that over
+    /// a 19-entry table would have been the lie.
     #[test]
-    fn the_advertised_set_is_exactly_the_twenty_six_names() {
-        let advertised: BTreeSet<String> = tool_specs().into_iter().map(|spec| spec.name).collect();
+    fn the_composed_advertised_set_is_exactly_the_twenty_six_names() {
+        // The composed set: what `tool_specs()` advertises (the engine's own
+        // table, 19 since F3) PLUS the host-bound specs arriving as data (7),
+        // which `advertised_tool_specs` appends from the registry. Deduped into a
+        // set below, so an engine name a host also handed over cannot inflate it.
+        let mut shown: Vec<String> = tool_specs().into_iter().map(|spec| spec.name).collect();
+        shown.extend(host_bound_specs().into_iter().map(|spec| spec.name));
+        let advertised: BTreeSet<String> = shown.into_iter().collect();
         let expected: BTreeSet<String> = ADVERTISED_SET.iter().map(|s| s.to_string()).collect();
 
         let missing: Vec<&str> = ADVERTISED_SET
@@ -2057,11 +1999,12 @@ mod tests {
             .collect();
 
         // The split, computed BEFORE the assert so the message can name it.
-        let engine_half = ADVERTISED_SET
-            .iter()
-            .filter(|name| !HOST_BOUND_SET.contains(name))
-            .count();
+        // Since F3 the ENGINE half is measured, not derived — `builtins()` ++ the
+        // loop arms is the crate's own contribution and `tool_specs()`'s count is
+        // exactly that (12 + 7 = 19), which is what makes the message able to say
+        // WHICH half of the model's surface vanished instead of guessing.
         let host_half = HOST_BOUND_SET.len();
+        let engine_half = registry_names().len() + LOOP_INTERNAL_SET.len();
         let missing_host: Vec<&str> = missing
             .iter()
             .filter(|name| HOST_BOUND_SET.contains(name))
@@ -2088,35 +2031,55 @@ mod tests {
 
         assert!(
             missing.is_empty() && extra.is_empty(),
-            "the advertised tool set is no longer the 26 names ADR 0102 pins as \
-             invariant.\n  \
+            "the COMPOSED advertised tool set is no longer the 26 names ADR 0102 \
+             pins as invariant.\n  \
              split: engine-owned {engine_half} + host-bound {host_half} = {} \
-             (engine-owned = the {} that stay in the engine: the built-ins the \
-             registry carries + the {} loop-internal arms; host-bound = the {} \
-             board/artifact verbs F2 hands to the desktop)\n  \
+             (engine-owned = the {} `tool_specs()` advertises, i.e. the built-ins \
+             `builtins()` carries + the {} loop-internal arms; host-bound = the {} \
+             board/artifact verbs that arrive as `StartEnv::host_tools` and are \
+             OWNED BY THE DESKTOP since F3)\n  \
              MISSING {missing:?}  →  HOST half {missing_host:?} | ENGINE half \
              {missing_engine:?}\n  \
              EXTRA   {extra:?}  →  HOST half {extra_host:?} | ENGINE half \
              {extra_engine:?}\n  \
-             A drop in the HOST half means the board/artifact verbs left the crate \
-             without arriving as `host_tools` — the model keeps being told they \
-             exist and nothing answers them. A drop in the ENGINE half means a \
-             built-in or a loop arm was lost. Either way the model's surface \
-             changed; the fix is on the side the list above names.",
+             A drop in the HOST half means a board/artifact verb left THIS fixture \
+             — the desktop's `host_tools` list and the model's promised surface have \
+             parted, and the fix is in the desktop repo. A drop in the ENGINE half \
+             means a built-in or a loop arm was lost, and the fix is in \
+             `tools/exec/registry.rs` or `loop/tools.rs`. Either way the model's \
+             surface changed; the fix is on the side the list above names.",
             ADVERTISED_SET.len(),
-            ADVERTISED_SET.len() - host_half,
+            engine_half,
             LOOP_INTERNAL_SET.len(),
             host_half,
         );
 
+        // The split must ADD UP, and when it does not the message has to say which
+        // half is wrong. `engine_half` is MEASURED (`builtins()` + the loop arms),
+        // so an excess here is an ENGINE-side over-count and a shortfall can only
+        // come from the host fixture — which is exactly the attribution the rest of
+        // this census is about. Signed arithmetic, because the drift goes BOTH
+        // ways: F3's tree lands on 26, a registry that keeps the 7 lands on 33, and
+        // an unsigned subtraction panics on the first one instead of reporting it.
+        let measured_total = engine_half + host_half;
+        let engine_expected = ADVERTISED_SET.len() - HOST_BOUND_SET.len();
         assert_eq!(
-            engine_half + host_half,
+            measured_total,
             ADVERTISED_SET.len(),
-            "the split must ADD UP to the invariant: engine-owned {engine_half} + \
-             host-bound {host_half} != {} — the two halves are not a partition of \
-             `ADVERTISED_SET`, so the failure message above would blame the wrong \
-             half",
+            "the split must ADD UP to the invariant: measured engine-owned \
+             {engine_half} + host-bound {host_half} = {measured_total}, and the \
+             invariant is {}. The engine half is supposed to be {engine_expected} \
+             (`builtins()`'s entries + the {} loop arms) and the host half \
+             {host_half}. The drift is {drift:+}, and it is ENTIRELY on the engine \
+             side ({} measured against {engine_expected} expected) — the host-bound \
+             fixture contributes exactly {host_half} either way, so a name the ENGINE \
+             owns is in `builtins()` (`tools/exec/registry.rs`) or a loop arm \
+             (`loop/tools.rs`) when it should not be, or missing from them when it \
+             should. Without this the census above would blame the wrong half.",
             ADVERTISED_SET.len(),
+            LOOP_INTERNAL_SET.len(),
+            engine_half,
+            drift = measured_total as i64 - ADVERTISED_SET.len() as i64,
         );
         // `HOST_BOUND_SET` ⊆ `ADVERTISED_SET`, else the split above double-counts.
         for name in HOST_BOUND_SET {
@@ -2126,19 +2089,38 @@ mod tests {
                  above silently over-counts"
             );
         }
+        // Since F3 the two halves must be DISJOINT, and that is a real constraint
+        // and not a tidiness rule: `advertised_tool_specs` appends only the
+        // registry entries the table does NOT carry, so a host spec that reused an
+        // engine name would be dropped from the advertised set while still being
+        // dispatched through the engine's entry — a name counted twice here and
+        // shown once to the model.
+        for name in HOST_BOUND_SET {
+            assert!(
+                !tool_specs().iter().any(|spec| spec.name == *name),
+                "`{name}` is host-bound AND still in `tool_specs()` — F3 is the \
+                 commit that removes it from the table, and while it is in both the \
+                 composed set above double-counts it (`advertised_tool_specs` \
+                 appends only names the table lacks, so the model sees it once)"
+            );
+        }
         assert!(
             unreachable.is_empty(),
-            "advertised and UNREACHABLE: {unreachable:?} — `tool_specs()` tells the \
-             model these exist and `reachable_names()` cannot reach them. That is \
-             the failure class this census exists for: a tool the model calls for \
-             the whole session and gets `unknown tool` for."
+            "advertised and UNREACHABLE: {unreachable:?} — the composed advertised \
+             set shows the model these names and `reachable_names()` cannot reach \
+             them. That is the failure class this census exists for: a tool the model \
+             calls for the whole session and gets `unknown tool` for."
         );
 
-        // ── the partition: registry set ⊎ loop-internal set = advertised set ──
+        // ── the partition: COMPOSED registry set ⊎ loop-internal set = advertised ──
         // The BOUNDED claim of ADR 0102 §2.2, asserted rather than asserted-about.
-        // `builtins()` returning an empty Vec reddens here as loudly as it reddens
-        // the set check above, because the union below loses 19 of its 26 members.
-        let registry: BTreeSet<String> = registry_names().into_iter().collect();
+        // Since F3 the registry side is the COMPOSED one — `builtins()` (12) plus
+        // the host entries (7) — because that is the registry a loop actually
+        // dispatches through. `builtins()` returning an empty Vec reddens here as
+        // loudly as it reddens the set check above: the union below loses 12 of its
+        // 26 members, and the message classifies the loss into the ENGINE half so
+        // the reader knows which repo to fix.
+        let registry: BTreeSet<String> = composed_registry_names().into_iter().collect();
         let loop_internal: BTreeSet<String> =
             LOOP_INTERNAL_SET.iter().map(|s| s.to_string()).collect();
 
@@ -2164,13 +2146,40 @@ mod tests {
             .chain(loop_internal.iter())
             .cloned()
             .collect();
+        // The missing names, classified into the half that owns them — the same
+        // split the assert above reports, because the failure mode differs by
+        // owner: an ENGINE name missing from the union is a `builtins()`/loop-arm
+        // drop in THIS repo, a HOST name missing is the desktop failing to hand the
+        // spec over. A bare set difference cannot say which checkout to open.
+        let union_missing: Vec<&str> = expected
+            .iter()
+            .filter(|name| !union.contains::<str>(*name))
+            .map(String::as_str)
+            .collect();
+        let union_missing_host: Vec<&str> = union_missing
+            .iter()
+            .filter(|name| HOST_BOUND_SET.contains(name))
+            .copied()
+            .collect();
+        let union_missing_engine: Vec<&str> = union_missing
+            .iter()
+            .filter(|name| !HOST_BOUND_SET.contains(name))
+            .copied()
+            .collect();
         assert_eq!(
             union,
             expected,
-            "registry set ⊎ loop-internal set != advertised set. Registry has {} \
-             entries, the loop arms contribute {}, the union is {} and the \
-             invariant is {}. Registry-only: {:?}. Advertised-but-in-neither: {:?}",
+            "COMPOSED registry set ⊎ loop-internal set != advertised set. The \
+             composed registry has {} entries ({} built-ins + {} host entries), the \
+             loop arms contribute {}, the union is {} and the invariant is {}. \
+             Registry-only: {:?}. Advertised-but-in-neither: {union_missing:?}  →  \
+             HOST half {union_missing_host:?} | ENGINE half {union_missing_engine:?}. \
+             An ENGINE-half name is `builtins()` (`tools/exec/registry.rs`) or a loop \
+             arm (`loop/tools.rs`) losing a name in THIS repo; a HOST-half name is \
+             the desktop's `host_tools` list, in the other repo.",
             registry.len(),
+            registry_names().len(),
+            HOST_BOUND_SET.len(),
             loop_internal.len(),
             union.len(),
             expected.len(),
@@ -2178,35 +2187,47 @@ mod tests {
                 .iter()
                 .filter(|name| !expected.contains::<str>(name))
                 .collect::<Vec<_>>(),
-            expected
-                .iter()
-                .filter(|name| !union.contains::<str>(name))
-                .collect::<Vec<_>>(),
         );
     }
 
     /// The partition's counts, pinned separately so a drift names the number that
-    /// moved: 19 registry entries ⊎ 7 loop arms = the 26 advertised names.
+    /// moved: **12 engine built-ins ⊎ 7 loop arms = the 19 names `tool_specs()`
+    /// advertises**, and the other 7 of the model's 26 arrive as host data.
+    ///
+    /// F1 wrote this against 19 registry entries and its own message said F3 was
+    /// the commit that moved the 7 and dropped this to 12, in the same commit that
+    /// took `tool_specs()` 26 → 19. That is what happened, and the message now
+    /// states the post-F3 arithmetic.
     #[test]
     fn the_registry_and_the_loop_arms_partition_the_advertised_set() {
         let registry = registry_names();
         assert_eq!(
             registry.len(),
-            19,
-            "the registry carries 19 entries (12 native/web + the 7 board verbs). \
-             F2 is ADDITIVE and leaves this at 19; F3 is the commit that moves the 7 \
-             to `host_entries(env.host_tools)`, and this drops to 12 there — in the \
-             same commit that takes `tool_specs()` 26 → 19."
+            12,
+            "the engine registry carries 12 entries (the native/web built-ins). F2 \
+             was ADDITIVE and left this at 19; F3 is the commit that moved the 7 \
+             board verbs out of `builtins()` and out of `tool_specs()` — this dropped \
+             to 12 in the same commit that took `tool_specs()` 26 → 19, and the 7 are \
+             now the desktop's, arriving as `StartEnv::host_tools`."
         );
         assert_eq!(
             LOOP_INTERNAL_SET.len(),
             7,
-            "and 7 names are loop arms, so 19 + 7 = the advertised 26"
+            "and 7 names are loop arms, so 12 + 7 = the 19 names `tool_specs()` \
+             still advertises (the model's other 7 come from the host)"
         );
         assert_eq!(
             registry.len() + LOOP_INTERNAL_SET.len(),
+            tool_specs().len(),
+            "12 + 7 must be `tool_specs()`'s 19 — the arithmetic the census above \
+             asserts as sets (the engine's own table; the 26-name invariant is the \
+             composed set and is asserted there, not here)"
+        );
+        assert_eq!(
+            tool_specs().len() + HOST_BOUND_SET.len(),
             ADVERTISED_SET.len(),
-            "19 + 7 must be 26 — the arithmetic the census above asserts as sets"
+            "and `tool_specs()`'s 19 plus the 7 host-bound names must be the \
+             advertised 26 — the run's safety claim, in one line"
         );
     }
 

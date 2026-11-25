@@ -12,10 +12,12 @@
 //! After it, an engine is handed a set of [`ToolEntry`] and dispatches through
 //! it. The swappable end is the ENGINE: Archimedes Desktop may one day run a
 //! harness that is not fulcrum, so the desktop owns the tool surface and any
-//! engine must accept a registry handed to it. This commit is the INVERSION only
-//! — nothing is deleted and the advertised set stays at exactly the same 26 names
-//! ([`crate::harness::tool_specs::tool_specs`]'s; the invariant is pinned by
-//! `harness::tool_specs::tests::the_advertised_set_is_exactly_the_twenty_six_names`).
+//! engine must accept a registry handed to it. F1 was the INVERSION and F2 the
+//! generic frame; F3 then deleted the Task subsystem, which is what took
+//! `tool_specs()` 26 → 19 while the model kept being shown the same 26 names —
+//! 19 from [`crate::harness::tool_specs::tool_specs`] plus 7 arriving as
+//! `StartEnv::host_tools`. The invariant is pinned by
+//! `harness::tool_specs::tests::the_composed_advertised_set_is_exactly_the_twenty_six_names`.
 //!
 //! # The bound on the claim, and why it is a bound
 //!
@@ -40,7 +42,7 @@
 //! [`dispatch_nested`](crate::harness::r#loop::codemode) (the codemode bridge).
 //! The second is load-bearing, not tidiness: left calling `execute_tool`, a host
 //! entry would be advertised to scripts and DEAD to them — `ALL_TOOLS` is built
-//! from the advertised set minus the excluded names, so `tools.create_task(…)`
+//! from the advertised set minus the excluded names, so `tools.<host_verb>(…)`
 //! would be discoverable while the dispatch answered `unknown tool`. The
 //! advertised-set census does not catch that, because it drives `dispatch_tool`.
 
@@ -60,7 +62,7 @@ use crate::tools::types::{ToolCtx, ToolResult};
 /// The `match`-arm-to-adapter shim: wraps a free `async fn(&ToolCtx, &Value) ->
 /// ToolResult` as the [`NativeRun`] the registry stores.
 ///
-/// A macro because the body is identical 19 times, and a `fn` ITEM is what makes
+/// A macro because the body is identical twelve times, and a `fn` ITEM is what makes
 /// the coercion to a `fn` POINTER check: the `async move` block OWNS the `ctx` and
 /// the `params`, which is what lets the boxed future be `'static` while the `exec_*`
 /// function behind it still takes them by reference.
@@ -77,12 +79,11 @@ macro_rules! native {
 ///
 /// # Why this shape and not `#[async_trait]`
 ///
-/// This crate has TWO live precedents for "an async capability that must live in
-/// an `Arc` a `ToolCtx` can clone", and both spell the return type out by hand
-/// rather than reaching for the macro:
-/// [`TaskCaller::call`](crate::seams::TaskCaller) and
-/// [`RenderRequester::request_render`](crate::web::RenderRequester). They do it
-/// for a reason that is a fact about the language, not a style choice: **`async
+/// This crate spells this shape out by hand rather than reaching for the macro:
+/// [`RenderRequester::request_render`](crate::web::RenderRequester) is the live
+/// precedent, and `seams::TaskCaller::call` was the second until F3 deleted the
+/// Task subsystem. They spell it out for a reason that is a fact about the
+/// language, not a style choice: **`async
 /// fn` in a trait is not object safe**, because it returns an unnameable
 /// `impl Future` whose lifetime is tied to `&self` — so `Arc<dyn ToolExecutor>`
 /// (which is exactly what [`ToolEntry::executor`] must be, for the same reason
@@ -94,11 +95,11 @@ macro_rules! native {
 /// performance. It is about which of the crate's two existing idioms this
 /// hot-path trait joins: `#[async_trait]` is used for [`Provider`] and
 /// `SearchProvider`, whose impls are only ever behind `Box<dyn Provider>` at a
-/// call site that already costs a network round trip. The two that were hand-
-/// rolled were hand-rolled precisely because a `ToolCtx`-clonable `Arc` was the
-/// requirement — which is precisely the requirement here. A third spelling of
-/// the same pattern in the same crate is a tax on the next reader for no gain,
-/// so this trait copies the closer analogue and stays macro-free.
+/// call site that already costs a network round trip. The one that was hand-
+/// rolled (`RenderRequester`) was hand-rolled precisely because a `ToolCtx`-clonable
+/// `Arc` was the requirement — which is precisely the requirement here. A second
+/// spelling of the same pattern in the same crate is a tax on the next reader for
+/// no gain, so this trait copies the closer analogue and stays macro-free.
 ///
 /// # The `'static` bound on the returned future, and what it costs
 ///
@@ -177,7 +178,7 @@ pub struct ToolEntry {
     /// is shown, byte-identical to what `tool_specs()` produces today.
     pub spec: ToolSpec,
     /// The code that answers. `Arc`, not `Box`, for the reason
-    /// `ToolCtx::event_sink` and `ToolCtx::task_store` are `Arc`: the derived
+    /// `ToolCtx::event_sink` and `ToolCtx::render_requester` are `Arc`: the derived
     /// `Clone` must SHARE the handle, not duplicate it.
     pub executor: std::sync::Arc<dyn ToolExecutor>,
     /// The script reach. Replaces the 6-name `EXCLUDED_FROM_SCRIPT` list; see
@@ -195,13 +196,13 @@ impl ToolEntry {
 
 /// The executor for a built-in whose substance is an existing `exec_*` function.
 ///
-/// Registering the 19 built-ins through this adapter is **behaviour-neutral by
+/// Registering the 12 built-ins through this adapter is **behaviour-neutral by
 /// construction**: the `match` in `execute_tool` becomes the code that BUILDS the
 /// default registry rather than the code that DISPATCHES, and every arm body is
 /// the same `exec_*` call with the same `&ToolCtx` and the same `&Value`.
 #[derive(Clone)]
 pub struct NativeTool(
-    // A plain `fn` pointer, not a boxed `Fn`: every one of the 19 is a
+    // A plain `fn` pointer, not a boxed `Fn`: every one of the 12 is a
     // non-capturing adapter over a free `async fn`, so the cheaper type is also
     // the honest one, and `Send + Sync` is then automatic.
     NativeRun,
@@ -213,7 +214,7 @@ pub type NativeRun = fn(ToolCtx, Value) -> Pin<Box<dyn Future<Output = ToolResul
 
 impl NativeTool {
     /// Wrap one `exec_*` function. Prefer the [`native!`] macro, which writes the
-    /// adapter body once instead of nineteen times.
+    /// adapter body once instead of twelve times.
     pub fn new(run: NativeRun) -> Self {
         NativeTool(run)
     }
@@ -227,7 +228,7 @@ impl ToolExecutor for NativeTool {
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send>> {
         // Everything the future needs is MOVED in here, because the boxed future
         // is `'static` and the `&ToolCtx` is not. `ToolCtx: Clone` shares both
-        // `Arc` handles (`event_sink`, `task_store`) exactly as the codemode
+        // `Arc` handles (`event_sink`, `render_requester`) exactly as the codemode
         // bridge already does when it clones the ctx into its `Bridge`.
         let ctx = ctx.clone();
         let run = self.0;
@@ -260,8 +261,8 @@ impl ToolExecutor for NativeTool {
 /// A `HostTool` with no channel ([`HostTool::detached`]) REFUSES LOUDLY. That is not a
 /// stub awaiting a real body — it is the answer for a loop handed host specs with no
 /// Worker channel to put them on, and the loudness is the point: an unhosted tool must
-/// answer a `ToolResult::fail`, never a silent park (the daemon's `task-unsupported` /
-/// `host-tool-unsupported` refusals in `fulcrum/src/serve.rs` are the same discipline,
+/// answer a `ToolResult::fail`, never a silent park (the daemon's
+/// `host-tool-unsupported` refusal in `fulcrum/src/serve.rs` is the same discipline,
 /// and a parked answer on a path with no Supervisor is a hang until the turn is
 /// cancelled). [`host_entries`] builds detached entries and that refusal is its pinned
 /// contract;
@@ -346,24 +347,30 @@ impl ToolExecutor for HostTool {
     }
 }
 
-/// The engine's built-ins: the 19 tools whose substance the engine owns TODAY.
+/// The engine's built-ins: the **12** tools whose substance the engine owns.
 ///
-/// Twelve native/web executors (`bash`, the six file/search tools, the two skill
-/// tools, the three web tools) plus the seven board/artifact verbs. The seven are
-/// here because at F1 their substance IS engine-side — arms of `execute_tool`,
-/// reached by codemode on a cloned `ToolCtx` (ADR 0092's deliberate choice).
+/// The 12 native/web executors (`bash`, the six file/search tools, the two skill
+/// tools, the three web tools). Their substance IS engine-side: `exec_*` functions
+/// in this crate, reached by codemode on a cloned `ToolCtx`, acting on the Space's
+/// files under the Boundary the engine confines.
 ///
-/// # Who moves the seven, and who does not
+/// # The seven board/artifact verbs are NOT here, and never will be again
 ///
-/// **F2 does not.** F2 is purely additive: it lands the generic `HostToolCall`
-/// frame, `StartEnv::host_tools` and the composition, and the seven verbs STAY in
-/// this function, in `execute_tool`, in `dispatch_tool`'s OR-list and in
-/// `tool_specs()` — so `builtins()` STAYS at 19 through F2 and the desktop, still on
-/// 0.7.0, sees no behavioural change at all. **F3 is the deletion owner**: it moves
-/// the seven to `host_entries(env.host_tools)` on the desktop's say-so and this
-/// function drops to 12, in the same commit that takes `tool_specs()` 26 → 19 and
-/// deletes `TaskRequest`/`TaskResponse`. Reading "F2 moves them" as a to-do would
-/// delete a working dispatch path one wave early.
+/// They were here through F1 and F2 — 19 entries — because at F1 their substance
+/// WAS engine-side (arms of `execute_tool`). **F3 deleted those arms**: the board is
+/// the desktop's SQLite, so by ADR 0102 §1's own rule the seven are host tools, and
+/// they arrive per session through [`host_entries`] on the specs in
+/// `StartEnv::host_tools`. That is the commit that takes `tool_specs()` 26 → 19, and
+/// the model's 26 names are unchanged by it because the composition
+/// (`builtins() ++ host_entries_attached(env.host_tools, …)` in
+/// `worker/core.rs::default_build_loop`) still reaches all 26.
+///
+/// Do not read "the seven used to be here" as a to-do to put them back. A name
+/// whose substance acts on HOST state does not belong in a registry the engine
+/// builds for itself — that is the ownership rule this function encodes, and
+/// `the_composed_advertised_set_is_exactly_the_twenty_six_names`
+/// (`harness/tool_specs.rs`) is the census that keeps the model's surface whole
+/// while ownership moves.
 ///
 /// The SPECS are read from [`tool_specs`](crate::harness::tool_specs::tool_specs),
 /// not re-stated: ADR 0102's byte-identity rule is that the model sees ONE
@@ -374,7 +381,7 @@ impl ToolExecutor for HostTool {
 /// panicked on — a panic here would be inside `AgentLoop::new`. The drift is
 /// caught loudly instead, by the two censuses that read this function:
 /// `every_advertised_tool_reaches_an_executor` (advertised and unreachable) and
-/// `builtins_are_the_nineteen_engine_owned_names` (this set's own membership).
+/// `builtins_are_the_twelve_engine_owned_names` (this set's own membership).
 pub fn builtins() -> Vec<ToolEntry> {
     let specs = crate::harness::tool_specs::tool_specs();
     BUILTIN_TOOLS
@@ -412,11 +419,15 @@ pub fn builtins() -> Vec<ToolEntry> {
 /// is its pinned contract (see [`HostTool`]).
 ///
 /// `ScriptAccess::Allowed` for every host entry, and that is a preservation rule
-/// rather than a default: the seven board verbs are script-reachable TODAY, and
-/// ADR 0092 chose `execute_tool` arms for them SPECIFICALLY so a `roadmap` run
-/// could turn an approved backlog into N Tasks in one script with a loop. When the
-/// specs leave the crate the entries carry that property with them; a `Default`
-/// of `Excluded` here would silently delete it with every existing test green.
+/// rather than a default: the seven board verbs WERE script-reachable as engine
+/// arms, and ADR 0092 chose `execute_tool` arms for them SPECIFICALLY so a
+/// `roadmap` run could turn an approved backlog into N Tasks in one script with a
+/// loop. F3 moves the specs out of the crate and the entries carry that property
+/// across with them; a `Default` of `Excluded` here would silently delete it with
+/// every existing test green. `a_host_tool_is_script_reachable_through_the_composed_registry`
+/// is the pin, and its fixture deliberately uses a name NO built-in owns — with a
+/// board verb here, `script_access`'s first-wins lookup would find the built-in's
+/// `Allowed` and the test would pass on the broken thing.
 pub fn host_entries(tools: Vec<ToolSpec>) -> Vec<ToolEntry> {
     tools
         .into_iter()
@@ -431,13 +442,16 @@ pub fn host_entries(tools: Vec<ToolSpec>) -> Vec<ToolEntry> {
         .collect()
 }
 
-/// The 19 names [`builtins`] registers, in `tool_specs()`' own order (so the
+/// The 12 names [`builtins`] registers, in `tool_specs()`' own order (so the
 /// registry's order and the advertised order agree, which is what lets the
 /// censuses compare them by position as well as by set).
 ///
-/// This is `execute_tool`'s old `match` list, and the pair is pinned by
-/// `builtins_are_the_nineteen_engine_owned_names`. The seven loop-internal names
-/// are NOT here and never will be — see the module doc's bound.
+/// This is `execute_tool`'s old `match` list MINUS the 7 board/artifact verbs F3
+/// deleted, and the pair is pinned by
+/// `builtins_are_the_twelve_engine_owned_names`. The seven loop-internal names are
+/// NOT here and never will be — see the module doc's bound — and the seven
+/// board/artifact verbs are not here either, because their executor is the host's
+/// (see [`builtins`]).
 pub const BUILTIN_TOOLS: &[(&str, NativeRun)] = &[
     ("bash", native!(crate::tools::exec::bash::exec_bash)),
     ("read", native!(crate::tools::exec::fs_tools::exec_read)),
@@ -462,34 +476,6 @@ pub const BUILTIN_TOOLS: &[(&str, NativeRun)] = &[
     (
         "get_search_content",
         native!(crate::web::tools::exec_get_search_content),
-    ),
-    (
-        "list_board",
-        native!(crate::tools::exec::task_tools::exec_list_board),
-    ),
-    (
-        "get_task",
-        native!(crate::tools::exec::task_tools::exec_get_task),
-    ),
-    (
-        "create_task",
-        native!(crate::tools::exec::task_tools::exec_create_task),
-    ),
-    (
-        "edit_task",
-        native!(crate::tools::exec::task_tools::exec_edit_task),
-    ),
-    (
-        "move_task",
-        native!(crate::tools::exec::task_tools::exec_move_task),
-    ),
-    (
-        "get_artifact",
-        native!(crate::tools::exec::task_tools::exec_get_artifact),
-    ),
-    (
-        "write_artifact",
-        native!(crate::tools::exec::task_tools::exec_write_artifact),
     ),
 ];
 

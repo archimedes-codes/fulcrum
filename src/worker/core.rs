@@ -113,16 +113,9 @@ pub struct WorkerCore {
     pub(crate) pending_bridge: PendingInteractive,
     pub(crate) pending_sudo: PendingSudo,
     pub(crate) pending_render: PendingRender,
-    /// (issue #180 F1) The parked task-board calls, keyed by the bare `request_id`
-    /// the Worker minted (`task_store::IpcTaskStore` inserts before it emits, this
-    /// map's `TaskResponse` handler removes). Per-Worker, so no session-id prefix.
-    pub(crate) pending_task_requests: crate::worker::task_store::PendingTaskRequests,
     /// (ADR 0102 / issue #183 F2) The parked HOST-tool calls, keyed by the bare
-    /// `request_id` the Worker minted — the generic twin of the map above, and a
-    /// SEPARATE one because the answer types differ (`Result<ToolResult, String>` vs
-    /// `Result<Value, TaskStoreError>`) and the `host-` / `task-` id prefixes must keep
-    /// the two families from resolving each other's entries.
-    /// `host_tools::call_host_tool` inserts before it emits, this map's
+    /// `request_id` the Worker minted. `host_tools::call_host_tool` inserts before it
+    /// emits, this map's
     /// `HostToolResponse` handler removes. Per-Worker, so no session-id prefix.
     pub(crate) pending_host_tool_calls: crate::worker::host_tools::PendingHostToolCalls,
     /// The `IpcDispatcher`'s waiter map (shared — the `SubagentResult`
@@ -276,19 +269,19 @@ impl crate::web::RenderRequester for IpcRenderRequester {
 /// the DESKTOP shell's `run_worker_inner()` wrapper is the call site that
 /// supplies it.
 //
-// 10 args (+3 over the `clippy::too_many_arguments` threshold of 7) — the seventh
-// was the `trust` source, the eighth this commit's injected opener, the ninth
-// issue #180 F1's `pending_task_requests`, and the TENTH ADR 0102 F2's
-// `pending_host_tool_calls`. Both maps MUST be parameters rather than constructed
-// here: the `WorkerCore::TaskResponse` handler resolves the SAME map the
-// `IpcTaskStore` this closure builds inserts into, and the `HostToolResponse` handler
-// resolves the SAME map the `HostTool` executors this closure composes insert into — a
-// map built inside the closure would silently answer nothing (a hang, not an error).
+// 9 args (+2 over the `clippy::too_many_arguments` threshold of 7) — the seventh is
+// the `trust` source, the eighth this file's injected opener, and the NINTH ADR 0102
+// F2's `pending_host_tool_calls`. (Issue #180 F1's `pending_task_requests` was the
+// ninth until F3 deleted the task pair, which is what returns this to 9; `AgentLoop::new`
+// is untouched at 23 because its task handle was a SETTER, not an argument.)
+// The map MUST be a parameter rather than constructed here: the
+// `WorkerCore::HostToolResponse` handler resolves the SAME map the `HostTool`
+// executors this closure composes insert into — a map built inside the closure would
+// silently answer nothing (a hang, not an error).
 // Kept rather than collapsed into a params struct: the crate's own precedent is
 // `harness/loop.rs`'s 23-arg `AgentLoop::new`, whose `#[allow]` carries the same
 // reasoning (the commit is the seam, not a lint refactor), and a params struct
-// here would rewrite every field-line of a 23-arg call for a lint. F3 drops
-// `pending_task_requests` when it deletes the task pair, returning this to 9.
+// here would rewrite every field-line of a 23-arg call for a lint.
 //
 // (The lint `the_crate_threads_the_opener_into_its_production_loop` reads THIS
 // signature as a region — from the `pub fn default_build_loop(` line to the first
@@ -304,7 +297,6 @@ pub fn default_build_loop(
     pending_bridge: PendingInteractive,
     pending_sudo: PendingSudo,
     pending_render: PendingRender,
-    pending_task_requests: crate::worker::task_store::PendingTaskRequests,
     pending_host_tool_calls: crate::worker::host_tools::PendingHostToolCalls,
     trust: Option<Arc<StaticTrustSource>>,
     open_requester: Arc<dyn crate::mcp::OpenRequester>,
@@ -394,25 +386,6 @@ pub fn default_build_loop(
             pending_render.clone(),
         ));
         loop_.set_render_requester(Some(render_req));
-        // (issue #180 F1) THE task-store handle, wired the SAME way as the render
-        // requester right above it — a setter called AFTER `AgentLoop::new`, not a
-        // 25th constructor argument (the 24-arg `AgentLoop::new` has several call
-        // sites in-crate; a setter touches none of them). `IpcTaskStore` implements
-        // the crate-internal async `TaskCaller`; the SYNC `TaskStore` the desktop
-        // implements is a different trait and lives Supervisor-side.
-        let task_store: Arc<dyn crate::seams::TaskCaller> =
-            Arc::new(crate::worker::task_store::IpcTaskStore::new(
-                // (ADR 0117) The ORIGIN address for every frame this store emits:
-                // `env.session_id`, the SAME non-optional value the `IpcRenderRequester`
-                // two statements above takes, and the CHILD's own id for a Subagent
-                // (not `WorkerCore::session_id`, which is an `Option` still `None`
-                // until `Start` is handled). Without it the desktop can only answer at
-                // the pump's delivery id — the PARENT's — and the child parks forever.
-                Some(env.session_id.clone()),
-                outbound.clone(),
-                pending_task_requests.clone(),
-            ));
-        loop_.set_task_store(Some(task_store));
         // (ADR 0102 / issue #183 F2) THE COMPOSITION, ENGINE-SIDE:
         // `builtins() ++ host_entries_attached(env.host_tools, …)`.
         //
@@ -423,7 +396,7 @@ pub fn default_build_loop(
         // boundary; ADR 0091's "the desktop drives; the crate never pulls" holds
         // verbatim.
         //
-        // The setter, not a 24th `AgentLoop::new` argument — the `set_task_store`
+        // The setter, not a 24th `AgentLoop::new` argument — the `set_render_requester`
         // precedent directly above, for the same reason. REPLACES the field, and the
         // replacement starts from `builtins()` so the engine half is the SAME set F1
         // installed (the census `the_composed_advertised_set_reaches_its_executors`
@@ -597,12 +570,8 @@ impl WorkerCore {
         let pending_bridge: PendingInteractive = Arc::new(TokioMutex::new(HashMap::new()));
         let pending_sudo: PendingSudo = Arc::new(TokioMutex::new(HashMap::new()));
         let pending_render: PendingRender = Arc::new(TokioMutex::new(HashMap::new()));
-        // (issue #180 F1) Same shape, same reason: created BEFORE the `build_loop`
-        // seam so the closure captures the SAME map the `TaskResponse` handler
-        // resolves — a second map here would mean answers nobody receives.
-        let pending_task_requests: crate::worker::task_store::PendingTaskRequests =
-            Arc::new(TokioMutex::new(HashMap::new()));
-        // (ADR 0102 F2) The same shape and the same reason one level over: created
+        // (ADR 0102 F2) The same shape and the same reason the other pending maps
+        // use: created
         // BEFORE the `build_loop` seam so the closure captures the SAME map the
         // `HostToolResponse` handler resolves. A second map here means answers nobody
         // receives, which is a hang and not an error.
@@ -616,7 +585,6 @@ impl WorkerCore {
             pending_bridge: pending_bridge.clone(),
             pending_sudo: pending_sudo.clone(),
             pending_render: pending_render.clone(),
-            pending_task_requests: pending_task_requests.clone(),
             pending_host_tool_calls: pending_host_tool_calls.clone(),
             subagent_waiters: subagent_waiters.clone(),
             trust: trust.clone(),
@@ -631,7 +599,6 @@ impl WorkerCore {
                 pending_bridge,
                 pending_sudo,
                 pending_render,
-                pending_task_requests,
                 pending_host_tool_calls,
                 trust,
                 open_requester,
@@ -1023,29 +990,14 @@ impl WorkerCore {
                 }
                 Vec::new()
             }
-            Inbound::TaskResponse { request_id, result } => {
-                // Resolve the parked `IpcTaskStore` call by its BARE `request_id`
-                // (no session-id compound key — see `PendingTaskRequests`' docs for
-                // why this one differs from `permission_key` / `render_key`).
-                //
-                // An absent entry is IGNORED, never an error and never a panic: the
-                // ordinary reason it is absent is that the turn was cancelled and
-                // `TaskRequestCleanup` already removed the entry, so a Supervisor
-                // that answers late is answering a call that no longer exists. The
-                // same reasoning makes the removal-before-send the right order
-                // (mirrors `PermissionResponse` above): the entry is consumed by the
-                // answer, so nothing can resolve a second caller with it.
-                if let Some(tx) = self.pending_task_requests.lock().await.remove(&request_id) {
-                    let _ = tx.send(result);
-                }
-                Vec::new()
-            }
             Inbound::HostToolResponse { request_id, result } => {
                 // (ADR 0102 / issue #183 F2) Resolve the parked `HostTool` call by its
-                // BARE `request_id` — the same rule as the arm above and for the same
-                // reason (see `PendingHostToolCalls` for why this differs from
-                // `permission_key` / `render_key`: the answer frame carries ONLY the
-                // bare id, so a compound key would miss every call).
+                // BARE `request_id` — NOT a session-id compound key like the
+                // `permission_key` / `render_key` arms above (see
+                // `PendingHostToolCalls` for why: the answer frame carries ONLY the
+                // bare id, so a compound key would miss every call). F3 deleted the
+                // `TaskResponse` arm that used to sit here and used the identical rule;
+                // this is now the only bare-id resolver in the file.
                 //
                 // An absent entry is IGNORED, never an error and never a panic. The
                 // ordinary reason it is absent is that the turn was cancelled and
@@ -1076,10 +1028,6 @@ impl WorkerCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // (issue #180 F1) The `Inbound::TaskResponse` payload's error half. Inside the
-    // test module on purpose: the production handler MOVES the `result` without ever
-    // naming the type, so a file-level import would be an unused-import warning in a
-    // non-test build — the exact `#[cfg]`-scoped-import lint class this gate catches.
     use crate::events::RpcEvent;
     use crate::harness::catalog::Model;
     use crate::harness::provider::{
@@ -1087,7 +1035,6 @@ mod tests {
     };
     use crate::harness::{RetryPolicy, Store, SudoDeps};
     use crate::permission::{permission_key, PendingPermissions, PermissionOutcome};
-    use crate::seams::TaskStoreError;
     use crate::subagent::SubagentOutcome;
     use crate::todo::TodoStore;
     use crate::worker::protocol::StartMode;
@@ -2042,121 +1989,6 @@ mod tests {
         );
     }
 
-    // ── (issue #180 F1) the `TaskResponse` handler ────────────────────────
-
-    /// A `TaskResponse` resolves the matching `pending_task_requests` oneshot AND
-    /// removes the entry (the sibling of
-    /// `permission_response_resolves_the_pending_oneshot`).
-    ///
-    /// The removal is half the point: a map whose entries survive an answered call
-    /// is the leak ADR 0092 names, and the `Drop` guard would later remove a
-    /// DIFFERENT call's entry if ids were ever reused.
-    #[tokio::test]
-    async fn task_response_resolves_the_pending_oneshot() {
-        let (mut core, _out_rx, _in_tx) = stub_core();
-        let env = test_env(StartMode::Fresh, None, None);
-        core.handle(Inbound::from(&env)).await;
-        let (tx, mut rx) = oneshot::channel::<Result<Value, TaskStoreError>>();
-        {
-            core.pending_task_requests
-                .lock()
-                .await
-                .insert("task-r1".to_string(), tx);
-        }
-        let answer = serde_json::json!([
-            { "id": "tsk_1", "spacePath": "/s", "artifactKeys": [] }
-        ]);
-        core.handle(Inbound::TaskResponse {
-            request_id: "task-r1".to_string(),
-            result: Ok(answer.clone()),
-        })
-        .await;
-        let got = rx
-            .try_recv()
-            .expect("the oneshot resolved with the board answer");
-        assert_eq!(got.expect("the Ok arm"), answer, "the value rides verbatim");
-        assert!(
-            !core
-                .pending_task_requests
-                .lock()
-                .await
-                .contains_key("task-r1"),
-            "the entry is removed after the answer (a surviving entry is the leak)"
-        );
-    }
-
-    /// An `Err` answer resolves the oneshot with the SAME error the Supervisor
-    /// built — the model's tool result is that message, so a lost variant would
-    /// silently turn "invalid artifact key" into a hang or a generic io failure.
-    #[tokio::test]
-    async fn a_task_response_error_arm_resolves_the_oneshot() {
-        let (mut core, _out_rx, _in_tx) = stub_core();
-        let env = test_env(StartMode::Fresh, None, None);
-        core.handle(Inbound::from(&env)).await;
-        let (tx, mut rx) = oneshot::channel::<Result<Value, TaskStoreError>>();
-        core.pending_task_requests
-            .lock()
-            .await
-            .insert("task-e1".to_string(), tx);
-        core.handle(Inbound::TaskResponse {
-            request_id: "task-e1".to_string(),
-            result: Err(TaskStoreError::Invalid {
-                message: "artifact key `a b` is not a slug".to_string(),
-            }),
-        })
-        .await;
-        let got = rx
-            .try_recv()
-            .expect("an Err answer still resolves the caller (it must not park)");
-        assert_eq!(
-            got.expect_err("the Err arm"),
-            TaskStoreError::Invalid {
-                message: "artifact key `a b` is not a slug".to_string()
-            }
-        );
-    }
-
-    /// A `TaskResponse` whose `request_id` matches NOTHING is IGNORED — no panic,
-    /// and an unrelated pending entry is left ALONE (the sibling of the
-    /// unknown-id pin every other response handler carries).
-    ///
-    /// This is the ordinary shape of a cancelled turn: the `Drop` guard removed the
-    /// entry, and the Supervisor's answer arrives a moment later. A `expect("…")`
-    /// here would panic in the Worker's message loop over a race the crate itself
-    /// created on purpose.
-    #[tokio::test]
-    async fn task_response_with_an_unknown_request_id_is_ignored() {
-        let (mut core, _out_rx, _in_tx) = stub_core();
-        let env = test_env(StartMode::Fresh, None, None);
-        core.handle(Inbound::from(&env)).await;
-        // Seed ONE entry under a different id, and keep its receiver alive so the
-        // send-on-drop reasoning cannot confuse the assertion.
-        let (kept_tx, _kept_rx) = oneshot::channel::<Result<Value, TaskStoreError>>();
-        core.pending_task_requests
-            .lock()
-            .await
-            .insert("task-live".to_string(), kept_tx);
-        // An id nobody is waiting for. No panic, and no frame out.
-        let frames = core
-            .handle(Inbound::TaskResponse {
-                request_id: "task-stale".to_string(),
-                result: Ok(serde_json::json!(null)),
-            })
-            .await;
-        assert!(
-            frames.is_empty(),
-            "a stale answer produces no outbound frame, got {frames:?}"
-        );
-        assert!(
-            core.pending_task_requests
-                .lock()
-                .await
-                .contains_key("task-live"),
-            "the unrelated pending entry is untouched — an unknown id must not \
-             clear the map"
-        );
-    }
-
     /// Disables the process-global diagnostics target on the way out, INCLUDING on
     /// a panicking assertion — the `DisableDiagnosticsOnExit` unit of
     /// `harness/provider/mod.rs`, and for the reason that file states: a trailing
@@ -2396,35 +2228,6 @@ mod tests {
         line + "\n"
     }
 
-    /// The handler resolves by the BARE `request_id` — deliberately NOT through a
-    /// `"{session_id}/{request_id}"` compound key like `permission_key` /
-    /// `render_key`. The task map is per-Worker and the id is a fresh uuid, so a
-    /// compound key would silently miss every answer (a hang, not an error), and it
-    /// would make `IpcTaskStore`, which knows only its own id, compute a key too.
-    #[tokio::test]
-    async fn task_response_resolves_by_the_bare_request_id() {
-        let (mut core, _out_rx, _in_tx) = stub_core();
-        // NOTE: NO `Start` handled first — `session_id` is still `None`. Every
-        // compound-key handler in this file no-ops in exactly this state; this one
-        // must still resolve, which is what proves the key is bare.
-        let (tx, mut rx) = oneshot::channel::<Result<Value, TaskStoreError>>();
-        core.pending_task_requests
-            .lock()
-            .await
-            .insert("task-bare".to_string(), tx);
-        core.handle(Inbound::TaskResponse {
-            request_id: "task-bare".to_string(),
-            result: Ok(serde_json::json!(7)),
-        })
-        .await;
-        assert_eq!(
-            rx.try_recv()
-                .expect("resolves with no session id known")
-                .expect("Ok"),
-            serde_json::json!(7)
-        );
-    }
-
     /// (ADR 0102 / issue #183 F2) The generic answer handler, from the REMOVE side:
     /// `Inbound::HostToolResponse` resolves the parked `HostTool` by its BARE
     /// `request_id`.
@@ -2553,8 +2356,12 @@ mod tests {
             "and its DESCRIPTION rides (the spec travels as data, verbatim — not a              placeholder the engine invented)"
         );
         // An engine-owned name is still there: the composition ADDS.
+        // (F3) This used to assert `list_board`, and `list_board` is no longer
+        // engine-owned — it is one of the 7 the desktop now hands over. `bash` is
+        // the engine's ownmost name and it is what `narrow()`/the prompt render
+        // cannot lose, so the "adds, never displaces" half is re-anchored there.
         assert!(
-            seq0.contains("list_board"),
+            seq0.contains("bash"),
             "an engine-owned tool vanished from the prompt — the composition must not              displace `tool_specs()`' entries"
         );
 
@@ -2583,8 +2390,30 @@ mod tests {
             "an envelope with no `hostTools` advertises no host tool — the desktop is              still on 0.7.0 and sends nothing, so F2 must not change its prompt at all"
         );
         assert!(
-            plain.contains("list_board"),
+            plain.contains("bash"),
             "and the engine half is untouched: {plain}"
         );
+        // (F3) THE DELETION HALF of this pin, and the only place the production
+        // composition is checked for it: a Worker whose envelope carries no
+        // `hostTools` must NOT advertise a board verb. `tool_specs()` no longer
+        // carries one and `builtins()` no longer has an entry for one, so a
+        // surviving `- list_board:` line here would mean the spec came back from
+        // somewhere — and the crate would be advertising a tool nothing can answer.
+        for verb in [
+            "list_board",
+            "get_task",
+            "create_task",
+            "edit_task",
+            "move_task",
+            "get_artifact",
+            "write_artifact",
+        ] {
+            assert!(
+                !plain.contains(&format!("- {verb}:")),
+                "`{verb}` is still advertised by a Worker with no host tools — F3 is \
+                 the commit that makes the crate forget Tasks exist, and the prompt is \
+                 where that would show"
+            );
+        }
     }
 }

@@ -323,12 +323,6 @@ pub(crate) struct PermissionContext {
     /// nested-call rows. `None` until attached (and in every harness-free
     /// fixture, where emitting is a silent no-op).
     pub(super) tool_event_sink: Option<Arc<dyn crate::tools::ToolEventSink>>,
-    /// (issue #180 F1) The task-board seam handle, copied into the ONE `ToolCtx`
-    /// construction like the two handles above it. `None` in every harness-free
-    /// fixture — where a task tool answers `ToolResult::fail` ("no task store")
-    /// rather than panicking — and set in production by `core.rs`'s
-    /// `default_build_loop` through [`AgentLoop::set_task_store`].
-    pub(super) task_store: Option<Arc<dyn crate::seams::TaskCaller>>,
 }
 
 impl PermissionContext {
@@ -378,10 +372,6 @@ impl PermissionContext {
             // (B1) `None` until `AgentLoop::new` attaches the loop's sink
             // (this constructor cannot see the loop's sink/store/events).
             tool_event_sink: None,
-            // (issue #180 F1) `None` until `default_build_loop` calls
-            // `AgentLoop::set_task_store` — the same construction-time `None` as
-            // the two handles above it.
-            task_store: None,
         }
     }
 
@@ -464,10 +454,6 @@ impl PermissionContext {
             // Arc handle is COPIED so every ctx — and every clone of one —
             // streams through the SAME sink.
             event_sink: self.tool_event_sink.clone(),
-            // (issue #180 F1) The task-board handle travels with the cluster, so a
-            // task arm cannot reach a seam its gate never saw (the same one-bundle
-            // rule the two handles above it exist for).
-            task_store: self.task_store.clone(),
         }
     }
 }
@@ -1194,23 +1180,8 @@ impl AgentLoop {
         self.permissions.render_requester = requester;
     }
 
-    /// Attach the task-board seam (issue #180 F1) — the mirror of
-    /// [`Self::set_render_requester`] directly above, for the same reason: the
-    /// handle is built by `worker::core.rs`'s `default_build_loop` AFTER the loop
-    /// exists (it needs the Worker's outbound channel and its pending map), and
-    /// adding a 25th `AgentLoop::new` argument would rewrite every call site in the
-    /// crate for a handle three of them do not have.
-    ///
-    /// `None` is a legitimate value, not a degraded one: it means "this loop has no
-    /// board to talk to", and the seven task arms answer
-    /// [`ToolResult::fail`](crate::tools::ToolResult) with that reason instead of
-    /// panicking or hanging.
-    pub fn set_task_store(&mut self, store: Option<Arc<dyn crate::seams::TaskCaller>>) {
-        self.permissions.task_store = store;
-    }
-
     /// (ADR 0102 / issue #183 F1) Replace this loop's tool registry — the
-    /// [`Self::set_task_store`] precedent directly above, for the same reason: the
+    /// [`Self::set_render_requester`] precedent directly above, for the same reason: the
     /// composed set is not available at `AgentLoop::new`'s call site (F2 builds it
     /// from `StartEnv::host_tools`, which arrives on the envelope), and a 24th
     /// positional argument would rewrite every call site in the crate for a value
@@ -2141,8 +2112,12 @@ impl AgentLoop {
     /// [`AgentLoop::set_tool_registry`], because the specs arrive on the envelope
     /// and `new` is already a 23-positional-argument constructor with a
     /// source-lint reading its call-site shape. A loop that is never given a
-    /// registry keeps F1's `builtins()` and therefore advertises exactly the 26
-    /// names it did before F2 — which is what "purely additive" means here.
+    /// registry keeps `builtins()` — the 12 engine-owned entries — and therefore
+    /// advertises `tool_specs()`'s 19 names and NO host tool. That is the state a
+    /// Supervisor that sends no `hostTools` gets, and since F3 it is 19 and not the
+    /// 26 it was while the board verbs were still engine names. Every one of the
+    /// model's 26 names is present only when the host specs arrive; nothing in this
+    /// crate can supply the other 7 any more.
     pub fn tool_registry(&self) -> &[crate::tools::exec::ToolEntry] {
         &self.tool_registry
     }
@@ -2164,9 +2139,13 @@ impl AgentLoop {
     /// registry's entries take their specs FROM `tool_specs()`
     /// (`registry::builtins` reads it), so the composed set is byte-identical
     /// either way for every engine-owned name, and keeping the table as the
-    /// primary half is what pins F2 as additive: `tool_specs()` STAYS at 26
-    /// through F2 (F3 moves it to 19) and a session with no host tools gets
-    /// exactly the list it got before.
+    /// primary half is what pins F2 as additive: a session with no host tools
+    /// gets exactly the engine's own list. (Since F3 that list is 19 names, not
+    /// the 26 it was while the board verbs were engine entries — so the
+    /// "additive" claim now has a cost attached: a Supervisor that sends no
+    /// `hostTools` gets a SMALLER surface than 0.7.0 gave it, by exactly the 7
+    /// verbs it must now send. That is the whole design, and it is why the
+    /// desktop's pin bump and its `host_tools` list cannot half-ship.)
     ///
     /// # The two ordering decisions, both deliberate
     ///

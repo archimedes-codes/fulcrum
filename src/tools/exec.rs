@@ -11,7 +11,6 @@ pub mod fs_tools;
 pub mod registry;
 pub mod search;
 pub mod skills;
-pub mod task_tools;
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +51,7 @@ pub(crate) use skills::{exec_list_skills, exec_read_skill, model_skills_for, ski
 /// (ADR 0102 / issue #183 F1) This is a THIN WRAPPER over the registry, and it
 /// keeps its exact public signature. The `match` that used to live here is now
 /// [`registry::BUILTIN_TOOLS`] — the list that BUILDS the default registry rather
-/// than the thing that dispatches — so registering the 19 built-ins through
+/// than the thing that dispatches — so registering the 12 built-ins through
 /// [`NativeTool`] is behaviour-neutral by construction: same `exec_*` function,
 /// same `&ToolCtx`, same `&Value`, same `unknown tool: {name}` fall-through.
 ///

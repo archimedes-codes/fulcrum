@@ -1151,11 +1151,15 @@ async fn the_discovery_globals_describe_the_advertised_set() {
     // 26 − 6 = 20 was meant, and the pin would then assert a number nobody chose.
     //
     // The old expression was also accidentally right rather than right: this
-    // fixture's loop is a CHILD (`subagent: None`), so `advertised_specs()` is 24,
-    // not 26 — and only 4 of the 6 excluded names are still in it (`subagent` and
-    // `list_agents` were already dropped by the child filter). 24 − 4 = 20 and
-    // 26 − 6 = 20 agree by coincidence. The two asserts below say WHICH six and
-    // WHICH four, so neither half of that coincidence is load-bearing any more.
+    // fixture's loop is a CHILD (`subagent: None`), so `advertised_specs()` was 24,
+    // not 26 — and only 4 of the 6 excluded names were still in it (`subagent` and
+    // `list_agents` had already been dropped by the child filter). 24 − 4 = 20 and
+    // 26 − 6 = 20 agreed by coincidence. The two asserts below say WHICH six and
+    // WHICH four, so neither half of that coincidence is load-bearing any more —
+    // which is exactly why F3's drop of the 7 board verbs from `tool_specs()` moved
+    // this fixture's number (the child's advertised set is 17 now, 13 of them
+    // callable) WITHOUT reddening it: the asserts are a set and a derivation, and
+    // the only thing they are load-bearing against is `ScriptAccess`, not a count.
     let registry = loop_.tool_registry().to_vec();
     let advertised = loop_.advertised_specs();
     let callable: Vec<&str> = advertised
@@ -1227,7 +1231,13 @@ async fn a_nested_call_reaches_a_host_entry() {
             parameters: json!({"type": "object", "properties": {}}),
         },
     ]));
-    assert_eq!(registry.len(), 20, "the 19 built-ins + the one host entry");
+    assert_eq!(
+        registry.len(),
+        13,
+        "the 12 built-ins + the one host entry (F3 moved the 7 board verbs out of \\
+         `builtins()`, so the engine half of every composed registry in this file is \\
+         12 now, not 19)"
+    );
     loop_.set_tool_registry(registry);
 
     let result = loop_

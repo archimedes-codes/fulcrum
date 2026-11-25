@@ -2,16 +2,17 @@
 //! per Worker process — spawns `<exe> --worker` (piped stdio), speaks the
 //! JSONL protocol, and routes the Worker's `Outbound` frames into the
 //! `WorkerInboundEvent` vocabulary (the 4 store-frame variants →
-//! `Store(StoreFrame::…)`; the control frames verbatim; the two REQUEST
-//! frames — `TaskRequest` (issue #180 F1) and `HostToolCall` (ADR 0102 F2) —
-//! as their own events, because the crate holds no substance to answer them
-//! with and the consumer must decide). Crash detection
+//! `Store(StoreFrame::…)`; the control frames verbatim; the one REQUEST
+//! frame — `HostToolCall` (ADR 0102 F2) — as its own event, because the crate
+//! holds no substance to answer it with and the consumer must decide). Crash
+//! detection
 //! is the process exit (the read loop ends on the stdout EOF →
 //! `Exited` + the `exited` watch).
 //!
-//! (ADR 0102 F2) The vocabulary's variant COUNT is deliberately not stated
-//! anywhere in this file — it is 13 as F2 lands, and every earlier prose
-//! number in this module was already stale when written. What is stated is the
+//! (ADR 0102 F2, restated by F3) The vocabulary's variant COUNT is deliberately
+//! not stated anywhere in this file — F2 landed 13 and F3 deleted one with the
+//! task pair, and every prose number in this module was already stale when it was
+//! written. What is stated is the
 //! rule: `WorkerInboundEvent` is a CRATE type the desktop's
 //! `session/router.rs::route_event` matches EXHAUSTIVELY with no `_` arm, so
 //! adding a variant is a SOURCE break for the sibling repo and must land in the
@@ -133,42 +134,10 @@ pub enum WorkerInboundEvent {
     /// A Worker-side error (e.g. the loop task panicked — the crash
     /// log is already written; the process exits right after).
     WorkerError { code: String, message: String },
-    /// A task-board call from the Worker's `IpcTaskStore` (issue #180 F1).
-    ///
-    /// The Supervisor-side consumer must ANSWER it — the Worker parked a oneshot
-    /// before emitting the frame and is waiting on it, racing the turn token. In
-    /// the desktop that is D2's `route_event` branch (answering with
-    /// `Inbound::TaskResponse` through the handle's inbound writer); the daemon
-    /// carries a loud refusal instead (see `fulcrum/src/serve.rs::worker_frame`),
-    /// because it has no `TaskStore` to answer from yet.
-    ///
-    /// THIS VARIANT IS THE CRATE-SIDE FREIGHT of F1 and it is a breaking change
-    /// for SOURCE, not for the wire: every exhaustive `match` over this enum must
-    /// gain an arm, and there are exactly two — the daemon's `worker_frame` (in
-    /// this repo, landed here) and the desktop's `route_event` (D2, which must
-    /// therefore land its arm in the SAME commit that bumps the crate pin).
-    ///
-    /// `session_id` is the frame's **ORIGIN** address — the id of the Worker that
-    /// emitted it, the **CHILD** for a Subagent — relayed verbatim from
-    /// [`Outbound::TaskRequest`](crate::worker::protocol::Outbound::TaskRequest). The
-    /// desktop's `route_event` MUST address its `Inbound::TaskResponse` by THIS field
-    /// and MUST NOT fall back to the delivery id for a child: the pump re-keys a
-    /// child's frames to the PARENT's session id so the child's UI renders in the
-    /// parent's scope, and ADR 0117's rule is that **a frame's delivery address is a
-    /// UI-scope key and never a reply address**. Answering the delivery id answers the
-    /// parent's process, the child's parked oneshot is never resolved, and every board
-    /// verb hangs until the turn token cancels it. `None` means the Worker predates the
-    /// field — an honest absence, and the desktop must then behave as it does today
-    /// rather than guessing an id.
-    TaskRequest {
-        request_id: String,
-        session_id: Option<String>,
-        call: crate::seams::TaskCall,
-    },
     /// One host-owned tool call from the Worker's `HostTool` executor (ADR 0102 /
-    /// issue #183 F2) — the GENERIC half of this vocabulary, and the one that outlives
-    /// the variant above (F3 deletes `TaskRequest` and the seven board verbs ride
-    /// THIS).
+    /// issue #183 F2) — the GENERIC half of this vocabulary, and now the ONLY
+    /// request event in it: F3 deleted `TaskRequest`, so the seven board verbs ride
+    /// THIS variant.
     ///
     /// # The consumer must ANSWER it
     ///
@@ -180,14 +149,20 @@ pub enum WorkerInboundEvent {
     /// (`fulcrum/src/serve.rs`'s `host-tool-unsupported` arm), because it has no host to
     /// answer from and its `on_event` carries no inbound writer at all.
     ///
-    /// # This is the crate-side SOURCE break, and it is a second one
+    /// # This is the crate-side SOURCE break, and it is a third one
     ///
-    /// The rule [`Self::TaskRequest`]'s docblock states verbatim applies here
-    /// unchanged: every exhaustive `match` over this enum must gain an arm, and there
-    /// are exactly two — the daemon's `worker_frame` (in this repo, landed here) and
-    /// the desktop's `route_event` (which must therefore land its arm in the SAME
-    /// commit that bumps the crate pin). The wire is unaffected: a new `type` is
+    /// The rule this variant's docblock has always stated: every exhaustive `match`
+    /// over this enum must change with it, and there are exactly two consumers — the
+    /// daemon's `worker_frame` (in this repo) and the desktop's `route_event` (which
+    /// must therefore land its arm in the SAME commit that bumps the crate pin).
+    /// `WorkerInboundEvent` has no `_` arm in either, which is what makes the pairing
+    /// structural rather than a convention. The wire is unaffected: a new `type` is
     /// additive and `PROTOCOL_VERSION` stays 1.
+    ///
+    /// (F3 deleted `TaskRequest`, so THIS arm is now the one the desktop's
+    /// `route_event` answers board verbs through — and deleting a variant is the
+    /// safe direction for an exhaustive match: leaving the old arm behind is an
+    /// `E0532` unreachable pattern, not a silent hole.)
     ///
     /// # `session_id` is the ORIGIN, and the hang it prevents is a measured one
     ///
@@ -278,8 +253,8 @@ pub struct WorkerHandle {
     /// `route_event`, to account for a frame the UI never sees).
     ///
     /// (ADR 0102 F2) This comment used to say "a 12th variant", and it was
-    /// already stale when it was written — the enum had 12 variants then and has
-    /// 13 now (`TaskRequest` landed in F1, `HostToolCall` in F2). The COUNT is
+    /// already stale when it was written — `TaskRequest` had landed in F1 and
+    /// `HostToolCall` in F2, and F3 then deleted the first of those. The COUNT is
     /// deliberately not restated: a number here goes stale on every variant
     /// while the reason above never does.
     protocol_version: watch::Sender<Option<u32>>,
@@ -1212,33 +1187,13 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
             message,
             backtrace: _,
         } => WorkerInboundEvent::WorkerError { code, message },
-        // (issue #180 F1) The task-board call. Routing it DESKTOP-side is D2's
-        // half (a branch in `agent/session/router.rs::route_event` that answers
-        // with `Inbound::TaskResponse`); the crate's job here is only to carry the
-        // variant across the boundary, because `WorkerInboundEvent` is what the
-        // desktop's pump consumes.
-        //
-        // NOTE the deliberate asymmetry with `Outbound::TranscriptInsert`: the
-        // store frames land on `WorkerInboundEvent::Store` because the Supervisor
-        // ANSWERS them by writing SQLite. This one has no crate-side answer — the
-        // crate holds no `TaskStore` (the Supervisor's `Db` is the only impl) — so
-        // it is relayed as its own event and the consumer decides. `IpcStore`'s
-        // write-only sibling behaviour is NOT mirrored: an older Supervisor never
-        // sees this event at all, because its decoder routes `task-request` to
-        // `Outbound::Unknown` above and returns `None` (the F1→D2 window, and the
-        // reason the Worker's park must race the turn token).
-        Outbound::TaskRequest {
-            request_id,
-            session_id,
-            call,
-        } => WorkerInboundEvent::TaskRequest {
-            request_id,
-            session_id,
-            call,
-        },
         // (ADR 0102 / issue #183 F2) The GENERIC host-tool frame, relayed as its own
-        // event for the same reason as the arm above: the crate holds no host's
-        // substance, so it cannot answer and the consumer decides. The four fields ride
+        // event and NOT folded into `Store` the way the store frames are: the
+        // Supervisor answers a store frame by writing SQLite, whereas this one has no
+        // crate-side answer at all — the crate holds no host's substance, so it cannot
+        // answer and the consumer decides. (That was the same reasoning that carried
+        // `Outbound::TaskRequest` until F3 deleted it; the host frame inherits it.)
+        // The four fields ride
         // VERBATIM — including `session_id`, which is the reply address and must not be
         // replaced by anything this side knows (see the variant's doc: the delivery id
         // is a UI-scope key, and answering at it is the recorded `get_artifact` hang).
@@ -2891,14 +2846,20 @@ mod host_tool_routing_tests {
 
     /// THE CONTRAST that keeps the two assertions above from being a tautology about
     /// "everything routes": the two frames with no consumer-facing meaning still return
-    /// `None`, and a host-tool event is a DISTINCT variant from the task one (F3 deletes
-    /// the task half; the host half must not be folded into it).
+    /// `None`, while the one request frame the vocabulary carries does route.
+    ///
+    /// (F3) This test used to end with a second half proving the host event and the
+    /// task event were DISTINCT variants, and it went with `TaskRequest`. What it
+    /// still proves — and the reason it is not just deleted — is the negative: `Hello`
+    /// and `Unknown` must NEVER reach the desktop's exhaustive `route_event`, because
+    /// a variant added to this vocabulary for a frame the UI never sees forces both
+    /// consumers to account for it.
     #[test]
-    fn hello_and_unknown_still_route_to_nothing_and_the_two_request_events_differ() {
+    fn hello_and_unknown_still_route_to_nothing_and_the_request_event_does() {
         assert!(
             route_outbound(Outbound::Hello {
                 protocol_version: PROTOCOL_VERSION,
-                client_version: "0.7.0".to_string(),
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
             })
             .is_none(),
             "`Hello` stays off the event vocabulary (it lands on the version watch)"
@@ -2917,23 +2878,11 @@ mod host_tool_routing_tests {
             params: serde_json::json!({}),
         })
         .expect("routes");
-        let task = route_outbound(Outbound::TaskRequest {
-            request_id: "task-1".to_string(),
-            session_id: None,
-            call: crate::seams::TaskCall::ListBoard {
-                space_path: "/s".to_string(),
-            },
-        })
-        .expect("routes");
         assert!(
-            !matches!(host, WorkerInboundEvent::TaskRequest { .. }),
-            "the generic frame is NOT folded into the task event — F3 deletes the task \
-             variant and the host one outlives it"
-        );
-        assert!(
-            !matches!(task, WorkerInboundEvent::HostToolCall { .. }),
-            "and the task frame is still its own event (F2 is additive: nothing about \
-             the seven verbs changes)"
+            matches!(host, WorkerInboundEvent::HostToolCall { .. }),
+            "and the host frame DOES route — since F3 it is the only request event the \
+             vocabulary carries, so if this returns `None` the desktop's `route_event` \
+             stops being able to answer a board verb at all"
         );
     }
 }

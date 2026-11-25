@@ -296,7 +296,4 @@ pub mod fixtures;
 // crate standalone — nothing desktop is named.
 pub use worker::run_worker;
 
-pub use seams::{
-    Artifact, ArtifactMeta, BoardRow, Dispatcher, FulcrumPersistence, MoveOutcome, StoreError,
-    TaskCall, TaskCaller, TaskDetail, TaskRow, TaskStore, TaskStoreError,
-};
+pub use seams::{Dispatcher, FulcrumPersistence, StoreError};

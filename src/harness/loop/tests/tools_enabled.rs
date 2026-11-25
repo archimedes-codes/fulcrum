@@ -578,10 +578,25 @@ async fn list_agents_tool_flattens_block_scalar_descriptions() {
 /// (a lookup that runs in the wrong place, a name shadowed by a loop arm) is caught
 /// only by actually dispatching. So: dispatch every advertised name that is not
 /// loop-internal and assert the answer is not the `unknown tool` sentence, THEN
-/// assert the partition over the sets. No task store is attached — these fixtures
-/// build a loop with no Supervisor — which is the point: a routed task arm answers
-/// "no task store", an UNROUTED one answers "unknown tool", and the two sentences
-/// are what this test tells apart.
+/// assert the partition over the sets.
+///
+/// # What F3 changed about the sentence this test distinguishes
+///
+/// F1 wrote the reason for the dispatch half as: "no task store is attached, so a
+/// routed task arm answers `no task store` and an unrouted one answers `unknown
+/// tool`, and the two sentences are what this test tells apart". That was true at
+/// F1 and it is gone now — the task arms do not exist, so neither sentence is
+/// reachable from this fixture. What SURVIVES is the distinction itself, with a new
+/// pair of sentences: every name this census walks is either a registry entry or a
+/// loop arm, so it answers SOMETHING (a param refusal, a cancelled flow, a
+/// `tool not enabled` verdict), and only a name in NEITHER half answers `unknown
+/// tool`. That is still the one failure this refactor can hide, and it is still only
+/// detectable by dispatching.
+///
+/// What this census CANNOT see is a HOST entry — it iterates `tool_specs()`, which
+/// since F3 holds only engine names. That gap is closed by
+/// `the_composed_advertised_set_reaches_its_executors` below, which is the same
+/// census over the composed registry.
 #[tokio::test]
 async fn every_advertised_tool_reaches_an_executor() {
     let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
@@ -639,8 +654,8 @@ async fn every_advertised_tool_reaches_an_executor() {
         checked += 1;
     }
     assert!(
-        checked >= 19,
-        "the census must actually walk the advertised set, counted {checked}"
+        checked >= 12,
+        "the census must actually walk the advertised set, counted {checked}. The          floor is 12 because since F3 `tool_specs()` carries 19 names and 7 of them          are loop-internal (`ask`, `sudo_exec`, `manage_todo_list`, `subagent`,          `list_agents`, `mcp`, `codemode` — 19 − 7 = 12); `dispatch_subagent` is in          the skip list above but is an ALIAS and not advertised, so it does not          change the arithmetic. Before F3 the floor was 19 against a 26-name table.          A drop here is a name leaving the walked set, not the set changing shape."
     );
 
     // ── the partition, over the loop's OWN registry ───────────────────────────
@@ -690,14 +705,20 @@ async fn every_advertised_tool_reaches_an_executor() {
         registry.len(),
         LOOP_INTERNAL.len(),
     );
-    // And the registry's own size is the 19 the split is stated against. A registry
+    // And the registry's own size is the 12 the split is stated against. A registry
     // that drops a name reddens THIS as well as the walk above and the frozen-name
     // census in `tool_specs.rs` — three independent sentences about the same drop,
-    // because `checked >= 19` has exactly zero slack by design.
+    // because `checked >= 12` has exactly zero slack by design.
+    //
+    // This is the loop's OWN registry, and this fixture was never handed host tools,
+    // so it is `builtins()` alone: the 12 engine names. The model still sees 26 in
+    // production because `default_build_loop` composes `builtins() ++ host_entries_attached(…)`,
+    // and that half is censused by
+    // `the_composed_advertised_set_reaches_its_executors` below — not here.
     assert_eq!(
         registry.len(),
-        19,
-        "the loop's registry carries {} entries, not 19 — {}",
+        12,
+        "the loop's registry carries {} entries, not 12 — {}",
         registry.len(),
         if registry.is_empty() {
             "an EMPTY registry is the loudest possible form of this failure: every \
@@ -707,49 +728,6 @@ async fn every_advertised_tool_reaches_an_executor() {
             format!("registry: {registry:?}")
         },
     );
-}
-
-/// The seven task verbs specifically are reachable AND answer the seam sentence (the
-/// loop's `ToolCtx` carries no task store, so "no task store" is the correct, routed
-/// answer — proof the name reached `execute_tool` and its arm).
-#[tokio::test]
-async fn the_seven_task_tools_are_dispatchable() {
-    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
-    let (_space, mut loop_) = build_loop(
-        Box::new(provider),
-        mpsc::unbounded_channel().0,
-        Arc::new(StdMutex::new(CancellationToken::new())),
-        watch::channel(0u64).0,
-        RetryPolicy::new_with(5, Duration::from_millis(1)),
-    );
-    for name in [
-        "list_board",
-        "get_task",
-        "create_task",
-        "edit_task",
-        "move_task",
-        "get_artifact",
-        "write_artifact",
-    ] {
-        let r = loop_
-            .dispatch_tool(
-                &ToolCall {
-                    id: "t1".to_string(),
-                    name: name.to_string(),
-                    arguments: json!({}),
-                    defect: None,
-                },
-                &CancellationToken::new(),
-            )
-            .await
-            .0;
-        let text = result_text(&r);
-        assert!(
-            text.contains("no task store"),
-            "`{name}` answered {text:?} — it must reach its arm and report the \
-             missing seam, not `unknown tool`"
-        );
-    }
 }
 
 /// (issue #193, review FIX 5) The defect arm of `unknown_param_error` PRECEDES
@@ -855,11 +833,13 @@ fn a_defective_call_to_a_disabled_tool_reports_the_defect_not_the_disablement() 
 
 // ── ADR 0102 / issue #183 F2 — the COMPOSED advertised set ───────────────────
 //
-// Everything above this line reasons about `tool_specs()`, which STAYS at 26
-// through F2 (F3 moves it to 19). Everything below reasons about the set the model
-// is ACTUALLY shown — `advertised_specs()`, which after F2 is
-// `tool_specs() ++ (registry entries the table does not carry)` — and the two are
-// the same set until a session is handed host tools.
+// Everything above this line reasons about `tool_specs()`, the ENGINE's own table —
+// 26 names through F2, 19 since F3 deleted the 7 board verbs from it. Everything
+// below reasons about the set the model is ACTUALLY shown — `advertised_specs()`,
+// which F2 made
+// `tool_specs() ++ (registry entries the table does not carry)`. Since F3 the two
+// are NEVER the same set in production: the composition is where the model's other
+// 7 names come from, which is precisely why this half of the file exists.
 //
 // Why these tests are here and not beside `every_advertised_tool_reaches_an_executor`:
 // that census iterates `tool_specs()`, so a host tool is INVISIBLE to it. That is
@@ -914,15 +894,20 @@ fn compose(
 }
 
 /// THE CENSUS OVER THE COMPOSED ADVERTISED SET: every name the model is shown
-/// reaches an executor, and the set the model is shown is the engine's 26 names
-/// PLUS exactly the host names — no more, no fewer, no duplicates.
+/// reaches an executor, and the set the model is shown is the engine's OWN names
+/// (`tool_specs()`, 17 of them for this child fixture) PLUS exactly the host names —
+/// no more, no fewer, no duplicates.
 ///
 /// # Why `every_advertised_tool_reaches_an_executor` cannot see this
 ///
 /// It iterates `tool_specs()`. A host tool is not in that table (and must never be
-/// — four tests there pin `tool_specs()` at 26), so a host tool advertised and
-/// UNREACHABLE — the one failure that census exists to catch — walks through it
-/// green. This is the same census with the composed set as its subject.
+/// — `tool_specs_advertises_the_nineteen_engine_owned_tools` pins the count and
+/// `the_composed_advertised_set_is_exactly_the_twenty_six_names` pins the split), so
+/// a host tool advertised and UNREACHABLE — the one failure that census exists to
+/// catch — walks through it green. This is the same census with the composed set as
+/// its subject, and since F3 it is the ONLY in-crate witness that the 7 board verbs
+/// still reach an executor at all: their `exec_*` arms are gone, and what answers
+/// them now is whatever the desktop hands back over `host_tools`.
 ///
 /// # Why the dispatch half drives a real `dispatch_tool`
 ///
@@ -943,10 +928,14 @@ async fn the_composed_advertised_set_reaches_its_executors() {
 
     // ── the set half ─────────────────────────────────────────────────────────
     // NOTE the fixture loop is a CHILD (`build_loop` gives it `subagent: None`), so
-    // the engine half of its advertised set is 24, not 26 — the two dispatch tools
-    // are dropped for a child (the rule `the_child_tool_set_is_pinned` pins). The
-    // arithmetic below is therefore 24 + 2, and it is stated as `tool_specs()` minus
-    // the two rather than as a bare 26 so the test says WHY.
+    // the engine half of its advertised set is `tool_specs()` minus 2 — `subagent`
+    // and `list_agents` are dropped for a child (the rule
+    // `the_child_tool_set_is_pinned` pins). Since F3 `tool_specs()` is the 19
+    // ENGINE-owned names, so the engine half here is 17 and the arithmetic below is
+    // 17 + 2. It is stated as `tool_specs()` minus the two rather than as a bare
+    // number so the test says WHY, and the number it pins is what makes the F3 move
+    // visible from this side: before F3 it was 26 − 2 = 24, and the 26 included the
+    // 7 board verbs that are now the host's half of the composition.
     let advertised: Vec<String> = loop_
         .advertised_specs()
         .into_iter()
@@ -959,16 +948,19 @@ async fn the_composed_advertised_set_reaches_its_executors() {
         .collect();
     let engine_len = expected.len();
     assert_eq!(
-        engine_len, 24,
-        "the fixture loop is a CHILD, so the engine half is 26 − 2 = 24 (if this is \
-         not 24 the fixture stopped being a child and the arithmetic below is lying)"
+        engine_len, 17,
+        "the fixture loop is a CHILD, so the engine half is `tool_specs()`'s 19 − 2 = \
+         17 (if this is not 17, either the fixture stopped being a child — in which \
+         case the arithmetic below is lying — or `tool_specs()` moved away from the \
+         19 engine-owned names F3 set it to, which is the ENGINE half of the split \
+         `tool_specs.rs`'s composed census reports)"
     );
     expected.extend(["mark_ready".to_string(), "set_space_icon".to_string()]);
     assert_eq!(
         advertised.len(),
         expected.len(),
-        "the composed advertised set has {} names, not the child engine half (24) + \
-         the 2 host names (26): {advertised:?}",
+        "the composed advertised set has {} names, not the child engine half (17) + \
+         the 2 host names (19): {advertised:?}",
         advertised.len()
     );
     for name in &expected {
@@ -1053,19 +1045,48 @@ async fn the_composed_advertised_set_reaches_its_executors() {
         "{shadowed:?} is BOTH a registry entry and a loop-internal arm — the registry \
          lookup in `dispatch_tool` shadows the loop arm",
     );
-    // The composition's own arithmetic: 19 built-ins + 2 host entries.
+    // The composition's own arithmetic: 12 built-ins + 2 host entries.
     assert_eq!(
         registry.len(),
-        21,
-        "the composed registry is `builtins()` (19) ++ the host entries (2), got {} \
-         entries: {registry:?}",
+        14,
+        "the composed registry is `builtins()` (12 since F3 deleted the 7 board verbs \
+         from it) ++ the host entries (2), got {} entries: {registry:?}",
         registry.len()
     );
-    // And the engine half is UNCHANGED — F2 adds, it does not replace.
-    for name in crate::tools::exec::builtins().iter().map(|e| e.name()) {
+    // And every ENGINE name is still there. This assertion was F2's — "F2 is additive
+    // and `builtins()` stays whole" — and F3 is the commit that legitimately moved 7
+    // names out of `builtins()`, so a test that asserted the pre-F3 whole would be
+    // arguing against the design it now guards. Re-anchored to the fact that still
+    // holds: the composition ADDS host entries and DISPLACES no engine name, so the
+    // 12 the engine still owns are all present. The 7 that left are not forgotten
+    // here — they are censused where they now live, in
+    // `the_composed_advertised_set_is_exactly_the_twenty_six_names` (`tool_specs.rs`),
+    // which asserts the host half arrives and names it as the HOST half when it does not.
+    let engine: Vec<String> = crate::tools::exec::builtins()
+        .iter()
+        .map(|e| e.name().to_string())
+        .collect();
+    assert_eq!(
+        engine.len(),
+        12,
+        "`builtins()` is no longer the 12 engine-owned names, so the loop below is \
+         walking a set that has already moved"
+    );
+    for name in &engine {
+        assert!(
+            registry.contains(&name.as_str()),
+            "`{name}` left the registry — the composition must ADD host entries and \
+             never DISPLACE an engine name (F3 moved the 7 board verbs out of \
+             `builtins()` itself; nothing after it may drop an engine name on the way \
+             through the composition)"
+        );
+    }
+    // And the two host entries are the ones the fixture asked for — so the loop
+    // below cannot be passing on the engine half alone.
+    for name in ["mark_ready", "set_space_icon"] {
         assert!(
             registry.contains(&name),
-            "`{name}` left the registry — F2 is additive and `builtins()` stays whole"
+            "the host entry `{name}` is missing from the composed registry"
         );
     }
 }
@@ -1197,12 +1218,12 @@ fn enabled_tools_filters_the_composed_advertised_set() {
     loop_.set_enabled_tools(None);
     assert_eq!(
         loop_.advertised_specs().len(),
-        25,
-        "with no allowlist the child's composed set is the 24 engine names + the 1 \
-         host name"
+        18,
+        "with no allowlist the child's composed set is the 17 engine names \
+         (`tool_specs()`'s 19 minus the two the child filter drops) + the 1 host name"
     );
     // THE PARENT CASE, through the same filter with `is_child: false` — the shape a
-    // main session composes: the FULL 26 engine names + the host name.
+    // main session composes: the FULL 19 engine names + the host name.
     let parent_registry = {
         let mut registry = crate::tools::exec::builtins();
         registry.extend(crate::tools::exec::host_entries(vec![
@@ -1217,10 +1238,12 @@ fn enabled_tools_filters_the_composed_advertised_set() {
     let parent = AgentLoop::advertised_tool_specs(&None, false, &parent_registry);
     assert_eq!(
         parent.len(),
-        27,
-        "a PARENT's composed set is `tool_specs()`'s 26 + the 1 host name — the \
-         number the desktop's session is shown, and the proof F2 ADDS to the surface \
-         rather than reshaping it"
+        20,
+        "a PARENT's composed set is `tool_specs()`'s 19 + the 1 host name — the \
+         number THIS fixture's session is shown. The desktop's real session is shown \
+         26, because it hands 7 board verbs in `hostTools` rather than the 1 here; the \
+         proof this line carries is that the composition ADDS to the surface rather \
+         than reshaping it, which is the same proof at 1 host name as at 7."
     );
     assert!(
         parent.iter().any(|s| s.name == "subagent"),

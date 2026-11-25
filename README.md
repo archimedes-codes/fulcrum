@@ -348,6 +348,18 @@ The registry route is verified end to end, not assumed: a scratch crate dependin
 `fulcrum-harness = "0.1.0"` resolved from the sparse index, compiled, and ran
 (`SessionId::mint()`), and docs.rs renders the rustdoc.
 
+**And it is the route the real consumer takes.** Archimedes Desktop pins
+`fulcrum-harness` by **version** in `src-tauri/Cargo.toml` — no `rev`, no `tag` — and its
+`Cargo.lock` resolves the crate from `registry+https://github.com/rust-lang/crates.io-index`
+with a checksum. So the crate's version number is a live dependency edge, not a label: a
+BREAKING release that is never published is a change the desktop cannot take at any version.
+(Older prose in this file and in `AGENTS.md` says the desktop compiles the engine from
+source as a **git** dependency pinned by `rev`. That was the state at extraction and it is
+superseded — the consumer's manifest is the authority, and it says crates.io.) The
+consequence for a release is that the bump and the publish are one obligation, not two:
+`cargo publish -p fulcrum-harness` is what makes `0.8.0` reachable, and the desktop's pin
+moves with it.
+
 **A pre-rename git pin keeps working only if you leave the dep line alone.** Measured
 against two scratch consumers at `rev = "ae1fe97"`, which predates PR #17:
 
