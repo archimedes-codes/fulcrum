@@ -863,7 +863,18 @@ pub fn worker_main() {
                     // content of the `subagent_flow` inheritance hop.
                     // `null` — the fixture arms nothing, and this is a fixture,
                     // not the real Worker's `diagnostics::init` call.
-                    "diagnosticsDir": env.diagnostics_dir
+                    "diagnosticsDir": env.diagnostics_dir,
+                    // The HOST-TOOL specs, echoed for the same reason and against
+                    // the same objection: `StartEnv::host_tools` is the field
+                    // `subagent_flow.rs`'s inheritance line copies off the
+                    // parent's live registry copy, and until this key existed NO
+                    // test in either repo could see a child's value for it — which
+                    // is precisely why "children lose host tools" was arguable at
+                    // all rather than settled. `[]` for an envelope that carries
+                    // none (the `from_parts` default every fixture sends), so the
+                    // NEGATIVE half of the inheritance pin is distinguishable from
+                    // a missing key.
+                    "hostTools": env.host_tools
                 });
                 emit(
                     &mut stdout,
