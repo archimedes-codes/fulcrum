@@ -1,7 +1,16 @@
-//! The Rust tool executors (native) + the shared tool types. The native
-//! `AgentLoop` executes its built-ins in-process through
-//! [`execute_tool`] (the `tools/exec.rs` executor — a submodule of this
-//! file; there is deliberately NO `tools/mod.rs`).
+//! The Rust tool executors (native) + the shared tool types.
+//!
+//! (ADR 0102 / issue #183 F1) The native `AgentLoop` no longer executes its
+//! built-ins by calling [`execute_tool`] from a `match`: it resolves them through
+//! a tool registry — [`exec::ToolEntry`] + [`exec::ToolExecutor`], built by
+//! [`exec::builtins`] — which is the engine's sole dispatch authority for every
+//! tool whose executor is a `ToolCtx`. [`execute_tool`] STAYS, as a thin wrapper
+//! over the default registry, both because 105 of this crate's test call sites and
+//! two of the sibling desktop repo's integration tests name it and because a
+//! caller holding a `ToolCtx` and no `AgentLoop` still wants it.
+//!
+//! The `tools/exec.rs` executor is a submodule of this file; there is
+//! deliberately NO `tools/mod.rs`.
 
 pub mod exec;
 pub mod types;

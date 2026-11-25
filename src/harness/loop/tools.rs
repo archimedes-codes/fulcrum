@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -5,7 +7,7 @@ use super::AgentLoop;
 use crate::harness::provider::ToolCall;
 use crate::interactive::{sudo_run_flow, todo_apply};
 use crate::mcp::mcp_tool;
-use crate::tools::{execute_tool, ContentBlock, ToolResult};
+use crate::tools::{ContentBlock, ToolResult};
 
 pub(super) fn cancelled_tool_result() -> ToolResult {
     ToolResult {
@@ -52,12 +54,11 @@ impl AgentLoop {
         sudo_cancelled_result()
     }
 
-    /// The native `ToolRegistry`: a `match` on the tool name — the
-    /// built-ins (Task 1's `execute_tool`, in-process, `ToolCtx { cwd,
-    /// cancel }`) + the suite tools (the in-process cores of the
-    /// interactive channel, called in-process — NOT over a socket) +
-    /// `subagent` (a native parent spawns an IN-PROCESS native child via
-    /// `dispatch_native`).
+    /// The native `ToolRegistry`: the tool registry's entries (the built-ins —
+    /// in-process, `ToolCtx { cwd, cancel }`) resolved FIRST, then the suite
+    /// tools (the in-process cores of the interactive channel, called
+    /// in-process — NOT over a socket) + `subagent` (a native parent spawns an
+    /// IN-PROCESS native child via `dispatch_native`) as the loop arms below.
     /// Dispatch a single call. Returns the [`ToolResult`], whether a PERSON
     /// refused it, and whether the executor ACCEPTED the arguments and RAN —
     /// the same `(ToolResult, bool)` shape `codemode::run_nested` returns, for
@@ -132,59 +133,55 @@ impl AgentLoop {
             // child's result carries no verdict about this call's arguments.
             return (result, false, false);
         }
+        // (ADR 0102 / issue #183 F1) THE REGISTRY IS THE DISPATCH AUTHORITY.
+        //
+        // What used to live here was a 19-name OR-list naming the built-ins, and
+        // forgetting a name in it was not a compile error — the `match` fell
+        // through to `unknown tool`, so the model was told a tool existed and got
+        // that sentence for the whole session. Now the engine asks the registry it
+        // was handed, and the set of names it can reach is the registry's own
+        // membership plus the loop arms below.
+        //
+        // The lookup runs BEFORE the `match` and not as one of its arms, because
+        // the registry's names and the loop arms' names are DISJOINT — that
+        // disjointness is not a hope, it is the census
+        // (`every_advertised_tool_reaches_an_executor`), and it is what makes the
+        // reordering behaviour-identical rather than a coin flip on precedence.
+        //
+        // The ONE `ToolCtx` construction is still `PermissionContext::to_tool_ctx`
+        // (finding 6): the frozen boundary + guard list, the per-turn rule list +
+        // policy, the web config and the render requester all come from the SAME
+        // bundle the gate judged with, so the executor cannot re-decide
+        // differently from its gate. `cwd` is the loop's own `space_cwd` (not
+        // permission state) and `cancel` is the TURN token.
+        //
+        // An executor's own verdict (a missing or malformed parameter, a failed
+        // command) is the ENGINE refusing — counted. No person is involved here:
+        // the permission gate decided that BEFORE this point, and its denial is
+        // marked in `run_tool_batch`.
+        //
+        // The third flag is `false` HERE, and that is a deliberate CONSERVATISM,
+        // not a claim — the same reason it was `false` as a `match` arm, now with
+        // a type-level one behind it. The flag means "the executor accepted these
+        // arguments and RAN them", and [`ToolExecutor::execute`] returns a bare
+        // [`ToolResult`] that cannot say which of the two happened, so this arm
+        // cannot attest it and an unattested call stays inside class 2. That is
+        // what keeps the card's headline pin: `bash {}` omits the advertised-
+        // required `command`, `exec_bash` answers ``bash: missing `command`
+        // parameter``, and the 303-call burst must still cap at 4. Widening the
+        // trait to carry a `ran` bool would let an implementer mark built-ins
+        // `true` and silence the guard on the exact shape it exists for.
+        if let Some(entry) = crate::tools::exec::lookup(&self.tool_registry, &tc.name) {
+            let tool_ctx = self
+                .permissions
+                .to_tool_ctx(self.space_cwd.clone(), turn.clone());
+            let params = tc.arguments.clone();
+            // `entry.executor` is an `Arc`, so the borrow of `self.tool_registry`
+            // ends here and the call itself is on the shared handle.
+            let executor = Arc::clone(&entry.executor);
+            return (executor.execute(&tool_ctx, params).await, false, false);
+        }
         match tc.name.as_str() {
-            "bash" | "read" | "write" | "edit" | "find" | "grep" | "ls" | "list_skills"
-            | "read_skill" | "web_search" | "fetch_content" | "get_search_content"
-            // (issue #180 F1) The seven board / artifact verbs. They join the
-            // BUILT-IN list — not the loop-internal arms below — because their
-            // executors are `execute_tool` arms, and every one of them races the
-            // turn token INSIDE the arm (`task_tools::parked`), so this dispatch
-            // needs no `select!` for these names. Forgetting a name here does not
-            // fail to compile: `dispatch_tool` falls through to `unknown tool`, so
-            // the tool is advertised and dead. That is what
-            // `every_advertised_tool_reaches_an_executor` is for.
-            | "list_board" | "get_task" | "create_task" | "edit_task" | "move_task"
-            | "get_artifact" | "write_artifact" => {
-                // The ONE `ToolCtx` construction is `PermissionContext::to_tool_ctx`
-                // (finding 6): the frozen boundary + guard list, the per-turn
-                // rule list + policy, the web config and the render requester
-                // all come from the SAME bundle the gate judged with, so the
-                // executor cannot re-decide differently from its gate. `cwd` is
-                // the loop's own `space_cwd` (not permission state) and `cancel`
-                // is the TURN token.
-                // An executor's own verdict (a missing or malformed parameter, a
-                // failed command) is the ENGINE refusing — counted. No person is
-                // involved here: the permission gate decided that BEFORE this
-                // arm, and its denial is marked in `run_tool_batch`.
-                //
-                // The third flag is `false` HERE, and that is a deliberate
-                // CONSERVATISM, not a claim. The flag means "the executor
-                // accepted these arguments and RAN them", and `execute_tool`
-                // returns a plain `ToolResult` that cannot say which of the two
-                // happened — so this arm cannot attest it, and an unattested call
-                // stays inside class 2. That is what keeps the card's headline
-                // pin: `bash {}` omits the advertised-required `command`,
-                // `exec_bash` answers ``bash: missing `command` parameter``, and
-                // the 303-call burst must still cap at 4. Marking this arm `true`
-                // would silence the guard on the exact shape it exists for.
-                // The residual is documented in
-                // `refused_before_the_model_could_act`'s docblock: a built-in that
-                // DEFAULTS an advertised-required key and then errors would be a
-                // false positive of the same class as `sudo_exec`'s `reason`, and
-                // this arm cannot see one.
-                (
-                    execute_tool(
-                        &self
-                            .permissions
-                            .to_tool_ctx(self.space_cwd.clone(), turn.clone()),
-                        &tc.name,
-                        &tc.arguments,
-                    )
-                    .await,
-                    false,
-                    false,
-                )
-            }
             "manage_todo_list" => {
                 // RACED against the TURN token (finding 8b, round 2 —
                 // a cancel stops the turn, it is never waited out; the

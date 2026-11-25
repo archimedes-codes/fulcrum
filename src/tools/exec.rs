@@ -8,6 +8,7 @@
 pub mod access;
 pub mod bash;
 pub mod fs_tools;
+pub mod registry;
 pub mod search;
 pub mod skills;
 pub mod task_tools;
@@ -20,6 +21,12 @@ use serde_json::Value;
 pub use super::types::*;
 
 pub use access::protected_refusal_text;
+// (ADR 0102 F1) The registry's public surface, re-exported alongside
+// `execute_tool` so a host composes a registry without reaching into `exec`.
+pub use registry::{
+    builtins, default_registry, host_entries, lookup, script_access, HostTool, NativeRun,
+    NativeTool, ScriptAccess, ToolEntry, ToolExecutor, BUILTIN_TOOLS, LOOP_INTERNAL_SCRIPT,
+};
 
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -41,33 +48,38 @@ pub(crate) use skills::{exec_list_skills, exec_read_skill, model_skills_for, ski
 
 /// Dispatch a tool call to its executor (the entry point the native
 /// harness calls).
+///
+/// (ADR 0102 / issue #183 F1) This is a THIN WRAPPER over the registry, and it
+/// keeps its exact public signature. The `match` that used to live here is now
+/// [`registry::BUILTIN_TOOLS`] — the list that BUILDS the default registry rather
+/// than the thing that dispatches — so registering the 19 built-ins through
+/// [`NativeTool`] is behaviour-neutral by construction: same `exec_*` function,
+/// same `&ToolCtx`, same `&Value`, same `unknown tool: {name}` fall-through.
+///
+/// # Why it stays `pub` with this signature
+///
+/// Two reasons, and the second is the one that cannot be checked from here. 105
+/// of this crate's own test call sites name it, which is churn. But the sibling
+/// desktop repo's integration tests (`archimedes/src-tauri/tests/skill_tools_boundary.rs`
+/// and `skill_catalog_drift.rs`) import it through
+/// `archimedes_lib::agent::tools::execute_tool`, and the desktop consumes a
+/// crates.io revision — so **NO test in this workspace can see that breakage**.
+/// Removing it or re-signaturing it is a cross-repo breaking change with zero
+/// in-repo witness. It is also what a loop-internal-free caller (a test, a host
+/// probe) reaches for when it has a `ToolCtx` and no `AgentLoop`.
+///
+/// # What it does NOT consult
+///
+/// A LOOP's registry, which after F2 may carry host entries this free function
+/// has never seen. Both loop dispatch paths (`dispatch_tool` and the codemode
+/// bridge's `dispatch_nested`) resolve through the loop's own registry instead;
+/// this one resolves through [`default_registry`], the built-ins.
 pub async fn execute_tool(ctx: &ToolCtx, tool: &str, params: &Value) -> ToolResult {
-    match tool {
-        "bash" => bash::exec_bash(ctx, params).await,
-        "read" => fs_tools::exec_read(ctx, params).await,
-        "write" => fs_tools::exec_write(ctx, params).await,
-        "edit" => fs_tools::exec_edit(ctx, params).await,
-        "find" => search::exec_find(ctx, params).await,
-        "grep" => search::exec_grep(ctx, params).await,
-        "ls" => fs_tools::exec_ls(ctx, params).await,
-        "list_skills" => skills::exec_list_skills(ctx, params).await,
-        "read_skill" => skills::exec_read_skill(ctx, params).await,
-        "web_search" => crate::web::tools::exec_web_search(ctx, params).await,
-        "fetch_content" => crate::web::tools::exec_fetch_content(ctx, params).await,
-        "get_search_content" => crate::web::tools::exec_get_search_content(ctx, params).await,
-        // (issue #180 F1) The seven board / artifact verbs. Arms of `execute_tool`
-        // and NOT loop-internal, so codemode reaches them on a cloned `ToolCtx`
-        // (ADR 0092) — and they are absent from `EXCLUDED_FROM_SCRIPT` for the same
-        // reason: none of them is interactive or recursive. Each arm races the turn
-        // token internally (`task_tools::parked`), which is why `dispatch_tool`
-        // needs no `select!` for these names.
-        "list_board" => task_tools::exec_list_board(ctx, params).await,
-        "get_task" => task_tools::exec_get_task(ctx, params).await,
-        "create_task" => task_tools::exec_create_task(ctx, params).await,
-        "edit_task" => task_tools::exec_edit_task(ctx, params).await,
-        "move_task" => task_tools::exec_move_task(ctx, params).await,
-        "get_artifact" => task_tools::exec_get_artifact(ctx, params).await,
-        "write_artifact" => task_tools::exec_write_artifact(ctx, params).await,
-        other => ToolResult::fail(format!("unknown tool: {other}"), None),
+    // The miss sentence is VERBATIM what the old `other =>` arm produced —
+    // `unknown_tool_is_error` pins it byte-for-byte, and a registry that drops a
+    // name has to be distinguishable from a name that was never a built-in.
+    match registry::lookup(registry::default_registry(), tool) {
+        Some(entry) => entry.executor.execute(ctx, params.clone()).await,
+        None => ToolResult::fail(format!("unknown tool: {tool}"), None),
     }
 }

@@ -1903,4 +1903,329 @@ mod tests {
             .expect("`bash` is in `tool_specs()`")
             .description
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // (ADR 0102 / issue #183 F1) The 26-name advertised-set INVARIANCE census.
+    //
+    // This is written BEFORE the registry exists, on the untouched tree, and it
+    // stays green through all three commits of the run. It is what makes "the
+    // crate forgets Tasks exist" (F3) a SAFE claim rather than a hopeful one:
+    // the same 26 names to the model, different owners underneath.
+    //
+    // # Why a frozen literal and not `tool_specs().len()`
+    //
+    // `tool_specs_advertises_twenty_six_tools` above pins the COUNT. A count is
+    // the wrong shape for what is coming: once the engine composes its advertised
+    // set from a registry it was handed, a dropped entry and an added entry cancel
+    // out in the arithmetic and the count stays 26 while the model's surface
+    // silently changes. A SET literal cannot be satisfied by a swap.
+    //
+    // # Why the failure message names the SPLIT
+    //
+    // The whole job is to catch a SILENT drop, and a bare set difference says
+    // `list_board` vanished without saying whether the ENGINE lost a built-in or
+    // the HOST lost a verb it was supposed to be handing over. Those are opposite
+    // bugs in opposite repos, so the message classifies every missing name into
+    // the half it belongs to and prints both halves.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The 26 names the model is advertised. FROZEN — this is the invariant the
+    /// whole run exists to preserve, so it is spelled out and not derived.
+    ///
+    /// `dispatch_subagent` is deliberately ABSENT: it is an ALIAS resolved by
+    /// `dispatch::is_subagent_call` BEFORE the `match`, never a `tool_specs()`
+    /// entry, so it is reachable-but-not-advertised. Listing it here would birth
+    /// this census red on a tree that is fine.
+    const ADVERTISED_SET: &[&str] = &[
+        "bash",
+        "codemode",
+        "read",
+        "write",
+        "edit",
+        "find",
+        "grep",
+        "ls",
+        "list_skills",
+        "read_skill",
+        "ask",
+        "sudo_exec",
+        "manage_todo_list",
+        "subagent",
+        "list_agents",
+        "mcp",
+        "web_search",
+        "fetch_content",
+        "get_search_content",
+        "list_board",
+        "get_task",
+        "create_task",
+        "edit_task",
+        "move_task",
+        "get_artifact",
+        "write_artifact",
+    ];
+
+    /// The 7 board / artifact verbs — the names whose SUBSTANCE is the desktop's
+    /// SQLite and which F2 therefore hands over as data.
+    ///
+    /// Today they are engine-side (arms of `execute_tool`, entries of the registry
+    /// F1 builds). After F2/F3 they arrive over the wire as `StartEnv::host_tools`
+    /// and the crate holds no idea a Task exists. The count on BOTH sides of that
+    /// move is 7, and this split is what the failure message below reports on.
+    const HOST_BOUND_SET: &[&str] = &[
+        "list_board",
+        "get_task",
+        "create_task",
+        "edit_task",
+        "move_task",
+        "get_artifact",
+        "write_artifact",
+    ];
+
+    /// The 7 loop-internal names — the tools whose executor is `&mut AgentLoop`
+    /// and NOT a `ToolCtx`, so they are advertised and engine-owned but they are
+    /// NOT registry entries, permanently and honestly. `codemode`'s bridge needs
+    /// the live loop (that is precisely why it is excluded from scripts at all),
+    /// `subagent` needs the parent's catalog and the cost fold, `ask` needs the
+    /// pending-gate map, and `mcp_tool(&McpManager, …)` is not expressible as a
+    /// `ToolExecutor` over `&ToolCtx` at all.
+    const LOOP_INTERNAL_SET: &[&str] = &[
+        "ask",
+        "sudo_exec",
+        "manage_todo_list",
+        "subagent",
+        "list_agents",
+        "mcp",
+        "codemode",
+    ];
+
+    /// The names the engine can actually REACH, as opposed to the names it
+    /// advertises: the registry's entries plus the loop-internal arms. This is the
+    /// composed set the invariant is asserted over — the read site F2 and F3 move
+    /// to `builtins() ++ host_entries(env.host_tools)` while the frozen 26 above
+    /// does not move with them.
+    fn reachable_names() -> Vec<String> {
+        // The registry's own membership, plus the seven names whose executor is
+        // `&mut AgentLoop` and which are therefore NOT entries — permanently, and
+        // for the reasons at `LOOP_INTERNAL_SET`.
+        let mut names: Vec<String> = crate::tools::exec::builtins()
+            .into_iter()
+            .map(|entry| entry.spec.name)
+            .collect();
+        names.extend(LOOP_INTERNAL_SET.iter().map(|s| s.to_string()));
+        names
+    }
+
+    /// The registry's own membership (the half that is entries, not loop arms).
+    fn registry_names() -> Vec<String> {
+        crate::tools::exec::builtins()
+            .into_iter()
+            .map(|entry| entry.spec.name)
+            .collect()
+    }
+
+    /// The invariant itself: the advertised set is EXACTLY the 26 names, the
+    /// engine can reach every one of them, and what it reaches is the registry
+    /// disjoint-union the loop arms.
+    #[test]
+    fn the_advertised_set_is_exactly_the_twenty_six_names() {
+        let advertised: BTreeSet<String> = tool_specs().into_iter().map(|spec| spec.name).collect();
+        let expected: BTreeSet<String> = ADVERTISED_SET.iter().map(|s| s.to_string()).collect();
+
+        let missing: Vec<&str> = ADVERTISED_SET
+            .iter()
+            .filter(|name| !advertised.contains::<str>(*name))
+            .copied()
+            .collect();
+        let extra: Vec<&str> = advertised
+            .iter()
+            .filter(|name| !expected.contains::<str>(*name))
+            .map(String::as_str)
+            .collect();
+
+        // The reachable half, counted SEPARATELY — a name can be advertised and
+        // unreachable, which is the one failure this refactor can hide.
+        let reachable: BTreeSet<String> = reachable_names().into_iter().collect();
+        let unreachable: Vec<&str> = ADVERTISED_SET
+            .iter()
+            .filter(|name| advertised.contains::<str>(*name) && !reachable.contains::<str>(*name))
+            .copied()
+            .collect();
+
+        // The split, computed BEFORE the assert so the message can name it.
+        let engine_half = ADVERTISED_SET
+            .iter()
+            .filter(|name| !HOST_BOUND_SET.contains(name))
+            .count();
+        let host_half = HOST_BOUND_SET.len();
+        let missing_host: Vec<&str> = missing
+            .iter()
+            .filter(|name| HOST_BOUND_SET.contains(name))
+            .copied()
+            .collect();
+        let missing_engine: Vec<&str> = missing
+            .iter()
+            .filter(|name| !HOST_BOUND_SET.contains(name))
+            .copied()
+            .collect();
+        // The same classification for an EXTRA name — a swap (one name dropped,
+        // another added) is the shape a silent surface change actually arrives in,
+        // and the message has to blame a half for BOTH halves of the swap.
+        let extra_host: Vec<&str> = extra
+            .iter()
+            .filter(|name| HOST_BOUND_SET.contains(name))
+            .copied()
+            .collect();
+        let extra_engine: Vec<&str> = extra
+            .iter()
+            .filter(|name| !HOST_BOUND_SET.contains(name))
+            .copied()
+            .collect();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "the advertised tool set is no longer the 26 names ADR 0102 pins as \
+             invariant.\n  \
+             split: engine-owned {engine_half} + host-bound {host_half} = {} \
+             (engine-owned = the {} that stay in the engine: the built-ins the \
+             registry carries + the {} loop-internal arms; host-bound = the {} \
+             board/artifact verbs F2 hands to the desktop)\n  \
+             MISSING {missing:?}  →  HOST half {missing_host:?} | ENGINE half \
+             {missing_engine:?}\n  \
+             EXTRA   {extra:?}  →  HOST half {extra_host:?} | ENGINE half \
+             {extra_engine:?}\n  \
+             A drop in the HOST half means the board/artifact verbs left the crate \
+             without arriving as `host_tools` — the model keeps being told they \
+             exist and nothing answers them. A drop in the ENGINE half means a \
+             built-in or a loop arm was lost. Either way the model's surface \
+             changed; the fix is on the side the list above names.",
+            ADVERTISED_SET.len(),
+            ADVERTISED_SET.len() - host_half,
+            LOOP_INTERNAL_SET.len(),
+            host_half,
+        );
+
+        assert_eq!(
+            engine_half + host_half,
+            ADVERTISED_SET.len(),
+            "the split must ADD UP to the invariant: engine-owned {engine_half} + \
+             host-bound {host_half} != {} — the two halves are not a partition of \
+             `ADVERTISED_SET`, so the failure message above would blame the wrong \
+             half",
+            ADVERTISED_SET.len(),
+        );
+        // `HOST_BOUND_SET` ⊆ `ADVERTISED_SET`, else the split above double-counts.
+        for name in HOST_BOUND_SET {
+            assert!(
+                ADVERTISED_SET.contains(name),
+                "`{name}` is host-bound but not advertised — the split's arithmetic \
+                 above silently over-counts"
+            );
+        }
+        assert!(
+            unreachable.is_empty(),
+            "advertised and UNREACHABLE: {unreachable:?} — `tool_specs()` tells the \
+             model these exist and `reachable_names()` cannot reach them. That is \
+             the failure class this census exists for: a tool the model calls for \
+             the whole session and gets `unknown tool` for."
+        );
+
+        // ── the partition: registry set ⊎ loop-internal set = advertised set ──
+        // The BOUNDED claim of ADR 0102 §2.2, asserted rather than asserted-about.
+        // `builtins()` returning an empty Vec reddens here as loudly as it reddens
+        // the set check above, because the union below loses 19 of its 26 members.
+        let registry: BTreeSet<String> = registry_names().into_iter().collect();
+        let loop_internal: BTreeSet<String> =
+            LOOP_INTERNAL_SET.iter().map(|s| s.to_string()).collect();
+
+        // Disjoint: a name in BOTH would be dispatched by the registry lookup that
+        // runs BEFORE `dispatch_tool`'s `match`, silently shadowing its loop arm —
+        // which is the failure mode that turns `ask` into a non-interactive stub.
+        let both: Vec<&str> = registry
+            .iter()
+            .filter(|name| loop_internal.contains::<str>(name))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            both.is_empty(),
+            "not disjoint — {both:?} is BOTH a registry entry and a loop-internal \
+             arm. `dispatch_tool` resolves the registry FIRST, so a name in both \
+             silently loses its loop arm: the `&mut AgentLoop` half that makes it \
+             interactive, recursive or turn-raced never runs."
+        );
+
+        // Union = advertised, exactly.
+        let union: BTreeSet<String> = registry
+            .iter()
+            .chain(loop_internal.iter())
+            .cloned()
+            .collect();
+        assert_eq!(
+            union,
+            expected,
+            "registry set ⊎ loop-internal set != advertised set. Registry has {} \
+             entries, the loop arms contribute {}, the union is {} and the \
+             invariant is {}. Registry-only: {:?}. Advertised-but-in-neither: {:?}",
+            registry.len(),
+            loop_internal.len(),
+            union.len(),
+            expected.len(),
+            union
+                .iter()
+                .filter(|name| !expected.contains::<str>(name))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .filter(|name| !union.contains::<str>(name))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// The partition's counts, pinned separately so a drift names the number that
+    /// moved: 19 registry entries ⊎ 7 loop arms = the 26 advertised names.
+    #[test]
+    fn the_registry_and_the_loop_arms_partition_the_advertised_set() {
+        let registry = registry_names();
+        assert_eq!(
+            registry.len(),
+            19,
+            "the registry carries 19 entries (12 native/web + the 7 board verbs). \
+             F2 replaces the 7 with `host_entries(env.host_tools)` and this stays 19."
+        );
+        assert_eq!(
+            LOOP_INTERNAL_SET.len(),
+            7,
+            "and 7 names are loop arms, so 19 + 7 = the advertised 26"
+        );
+        assert_eq!(
+            registry.len() + LOOP_INTERNAL_SET.len(),
+            ADVERTISED_SET.len(),
+            "19 + 7 must be 26 — the arithmetic the census above asserts as sets"
+        );
+    }
+
+    /// The 7 host-bound verbs are 7, and the engine half is 19 — the two numbers
+    /// every later commit in this run is stated against (`tool_specs()` 26 → 19,
+    /// `host_tools` 0 → 7). Pinned apart from the big census so a drift says which
+    /// number moved.
+    #[test]
+    fn the_advertised_split_is_nineteen_engine_owned_and_seven_host_bound() {
+        assert_eq!(
+            HOST_BOUND_SET.len(),
+            7,
+            "the host-bound half is the 7 board/artifact verbs the spec names"
+        );
+        assert_eq!(
+            ADVERTISED_SET.len() - HOST_BOUND_SET.len(),
+            19,
+            "and the engine half is therefore 19"
+        );
+        assert_eq!(
+            LOOP_INTERNAL_SET.len(),
+            7,
+            "the loop-internal set is 7 (6 `match` arms + the `subagent` branch that \
+             runs BEFORE the match — `dispatch_subagent` the NAME is an alias, not an \
+             8th arm and not an advertised name)"
+        );
+    }
 }

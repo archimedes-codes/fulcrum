@@ -45,6 +45,7 @@ use super::support::*;
 use crate::events::RpcEvent;
 use crate::harness::provider::{FinishReason, ProviderEvent, ToolCall};
 use crate::harness::retry::RetryPolicy;
+use crate::tools::exec::script_access;
 use crate::tools::ContentBlock;
 
 /// The text of a [`ToolResult`]'s first block (the `result_text` helper is
@@ -1141,11 +1142,308 @@ async fn the_discovery_globals_describe_the_advertised_set() {
         )
         .await
         .0;
-    let expected = tool_specs().len() - 6;
+    // (ADR 0102 F1) Re-anchored. This used to be `tool_specs().len() - 6`, an
+    // arithmetic on the FULL advertised set with the excluded count written as a
+    // literal `6`. It is now derived from the SAME two things the bridge derives
+    // its callable set from — this loop's advertised specs and each name's
+    // `ScriptAccess` in the registry — because the `- 6` silently changes MEANING
+    // when the 7 host verbs leave `tool_specs()` in F3: 19 − 6 = 13 where
+    // 26 − 6 = 20 was meant, and the pin would then assert a number nobody chose.
+    //
+    // The old expression was also accidentally right rather than right: this
+    // fixture's loop is a CHILD (`subagent: None`), so `advertised_specs()` is 24,
+    // not 26 — and only 4 of the 6 excluded names are still in it (`subagent` and
+    // `list_agents` were already dropped by the child filter). 24 − 4 = 20 and
+    // 26 − 6 = 20 agree by coincidence. The two asserts below say WHICH six and
+    // WHICH four, so neither half of that coincidence is load-bearing any more.
+    let registry = loop_.tool_registry().to_vec();
+    let advertised = loop_.advertised_specs();
+    let callable: Vec<&str> = advertised
+        .iter()
+        .filter(|spec| script_access(&registry, &spec.name).is_callable())
+        .map(|spec| spec.name.as_str())
+        .collect();
+    let expected = callable.len();
+    // A SET: WHICH names are withheld is the fact, the order `tool_specs()` happens
+    // to list them in is not what this pin is about.
+    let withheld: std::collections::BTreeSet<&str> = advertised
+        .iter()
+        .filter(|spec| !script_access(&registry, &spec.name).is_callable())
+        .map(|spec| spec.name.as_str())
+        .collect();
+    assert_eq!(
+        withheld,
+        // The 6 excluded names MINUS the two the child filter already removed.
+        std::collections::BTreeSet::from(["ask", "sudo_exec", "manage_todo_list", "codemode"]),
+        "the names withheld from a script are these — a change here is a change to \
+         what a script can reach, and `LOOP_INTERNAL_SCRIPT` is where the decision \
+         lives (`subagent` and `list_agents` are absent because THIS fixture is a \
+         child loop, which drops them from the advertised set before the exclusion)"
+    );
     assert_eq!(
         text(&result),
         format!("{expected}:true"),
-        "ALL_TOOLS is the advertised set minus the six excluded tools"
+        "ALL_TOOLS is the advertised set minus the excluded names"
+    );
+}
+
+/// (ADR 0102 / issue #183 F1) A NESTED call resolves through the loop's REGISTRY,
+/// not through `execute_tool`.
+///
+/// This is the pin the advertised-set census cannot be. The census drives
+/// `dispatch_tool`; the codemode bridge is a SEPARATE dispatch path, and it is the
+/// one ADR 0092 chose `execute_tool` arms for in the first place. Left calling
+/// `execute_tool` — a free function that only knows the built-ins — a host entry
+/// would be advertised to a script and DEAD to it: `ALL_TOOLS` is built from the
+/// advertised set, so `tools.<name>` would exist, the script would call it, and
+/// `dispatch_nested` would answer `unknown tool`. Every other test in this file
+/// stays green through that bug, because none of them has a host entry.
+///
+/// The fixture installs a composed registry (`builtins() ++ host_entries([…])`) —
+/// exactly what F2 builds from `StartEnv::host_tools` — and reaches the entry
+/// through the raw `__codemodeCall` closure, because a host spec is not in
+/// `advertised_specs()` yet at F1 and so gets no `tools.<name>` global. That is
+/// the F1-shaped way to prove the DISPATCH half; F2 moves the discovery half by
+/// making the composed set the advertised set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nested_call_reaches_a_host_entry() {
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(terminal_scripts());
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let turn = CancellationToken::new();
+
+    // The composition F2 performs, done here by hand so the PIN is about dispatch.
+    let mut registry = crate::tools::exec::builtins();
+    registry.extend(crate::tools::exec::host_entries(vec![
+        crate::harness::provider::ToolSpec {
+            name: "mark_ready".to_string(),
+            description: "Mark the session ready (a host verb).".to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+    ]));
+    assert_eq!(registry.len(), 20, "the 19 built-ins + the one host entry");
+    loop_.set_tool_registry(registry);
+
+    let result = loop_
+        .dispatch_tool(
+            &ToolCall {
+                id: "h1".to_string(),
+                name: "codemode".to_string(),
+                arguments: json!({
+                    // `__codemodeCall` is the RAW closure and answers a JSON
+                    // STRING (the uniform triple is applied by the `__codemodeBind`
+                    // wrapper the `tools.<name>` globals are built from, which a
+                    // host name has no global for at F1). So the script parses it
+                    // and reports what the CALL actually answered.
+                    "code": "const raw = await __codemodeCall('mark_ready', '{}');\n\
+                             const r = JSON.parse(raw);\n\
+                             r.isError + '|' + r.text;"
+                }),
+                defect: None,
+            },
+            &turn,
+        )
+        .await
+        .0;
+    let answer = text(&result);
+    assert!(
+        !answer.contains("unknown tool"),
+        "`mark_ready` is a HOST ENTRY in the loop's registry and the script saw \
+         {answer:?} — that is `execute_tool`'s miss sentence, which means the bridge \
+         is still resolving nested calls through the built-ins-only path. A host tool \
+         would then be advertised to scripts and dead to them, and NO other test in \
+         this file would notice."
+    );
+    assert!(
+        answer.contains("host-owned"),
+        "the nested call reached `HostTool` and the script saw its loud refusal: \
+         {answer:?}"
+    );
+
+    // And the ROW — the UI's view of the same call — agrees.
+    let rows = result
+        .details
+        .as_ref()
+        .and_then(|d| d.get("calls"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 1, "the nested call made a row: {rows:?}");
+    let row_text = rows[0]["text"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !row_text.contains("unknown tool"),
+        "and the row agrees: {row_text:?}"
+    );
+    assert!(
+        row_text.contains("host-owned"),
+        "the row carries the host refusal too: {row_text:?}"
+    );
+}
+
+/// (ADR 0102 F1, hazard H2) The THIRD enforcement layer is now an explicit check.
+///
+/// It used to be `execute_tool`'s `unknown tool` fall-through — the loop arms were
+/// simply unreachable from a nested built-in. That stop
+/// being a mechanism the moment the registry became the answer: "not in the
+/// registry" and "excluded from scripts" are different facts, and after F2 the
+/// registry is a value someone hands the engine.
+///
+/// The script reaches the excluded name through the raw `__codemodeCall` closure,
+/// which the prelude never deletes — the route `an_excluded_tool_is_not_installed_
+/// as_a_script_global` proves bypasses the absent `tools.<name>` global.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_excluded_name_reached_through_the_raw_closure_is_refused_by_name() {
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(terminal_scripts());
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let turn = CancellationToken::new();
+
+    for name in [
+        "ask",
+        "sudo_exec",
+        "manage_todo_list",
+        "subagent",
+        "list_agents",
+        "codemode",
+    ] {
+        let result = loop_
+            .dispatch_tool(
+                &ToolCall {
+                    id: format!("raw-{name}"),
+                    name: "codemode".to_string(),
+                    arguments: json!({
+                        "code": format!("const r = await __codemodeCall('{name}', '{{}}');\n\
+                                         typeof r === 'string' ? r : JSON.stringify(r);")
+                    }),
+                    defect: None,
+                },
+                &turn,
+            )
+            .await
+            .0;
+        let rows = result
+            .details
+            .as_ref()
+            .and_then(|d| d.get("calls"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(rows.len(), 1, "`{name}` made exactly one row: {rows:?}");
+        let row_text = rows[0]["text"].as_str().unwrap_or_default().to_string();
+        assert!(
+            row_text.contains("not callable from a codemode script"),
+            "`{name}` reached the bridge and must be refused BY NAME, got {row_text:?}"
+        );
+        assert!(
+            !row_text.contains("unknown tool"),
+            "`{name}` was refused by the `ScriptAccess` check, not by falling \
+             through to a miss: {row_text:?}"
+        );
+        assert!(
+            rows[0]["isError"].as_bool() == Some(true),
+            "and the row reads `error`: {rows:?}",
+        );
+    }
+}
+
+/// (ADR 0102 F1, H2) The refusal is a NAME check, not an "is it in the registry"
+/// check — and that distinction is the whole point of it.
+///
+/// The test above proves today's behaviour, where an excluded name has no entry
+/// and a miss would coincidentally also refuse it. That coincidence is exactly
+/// what F2 breaks: once `builtins() ++ host_entries(…)` is the registry and a host
+/// is allowed to hand specs back, "no entry" and "not callable" are different
+/// facts. So put an EXCLUDED name in the registry as a real, dispatchable entry
+/// and assert a script still cannot reach it. If the bridge were written as
+/// `lookup(…).unwrap_or(refuse)`, this is the test that reddens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_excluded_name_is_refused_even_when_the_registry_carries_it() {
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let (provider, _calls) = ScriptedProvider::new(terminal_scripts());
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        events_tx,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let turn = CancellationToken::new();
+
+    // A registry that carries `ask` as a WORKING entry. The executor answers a
+    // sentence no other tool answers, so the assertion below can tell "refused by
+    // name" apart from "dispatched" apart from "missed".
+    struct Canary;
+    impl crate::tools::exec::ToolExecutor for Canary {
+        fn execute(
+            &self,
+            _ctx: &crate::tools::ToolCtx,
+            _params: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send>> {
+            Box::pin(async { ToolResult::ok_text("CANARY-RAN".to_string(), None) })
+        }
+    }
+    let mut registry = loop_.tool_registry().to_vec();
+    registry.push(crate::tools::exec::ToolEntry {
+        spec: crate::harness::provider::ToolSpec {
+            name: "ask".to_string(),
+            description: "a registry entry that must NOT be script-reachable".to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+        executor: Arc::new(Canary),
+        script: crate::tools::exec::ScriptAccess::Excluded("interactive"),
+    });
+    // The entry is real and reachable by NAME through the registry — the bridge is
+    // the thing that must refuse it, not an absent lookup.
+    assert!(
+        crate::tools::exec::lookup(&registry, "ask").is_some(),
+        "the fixture put `ask` IN the registry"
+    );
+    loop_.set_tool_registry(registry);
+
+    let result = loop_
+        .dispatch_tool(
+            &ToolCall {
+                id: "ex1".to_string(),
+                name: "codemode".to_string(),
+                arguments: json!({
+                    "code": "const raw = await __codemodeCall('ask', '{}');\n\
+                             const r = JSON.parse(raw);\n\
+                             r.isError + '|' + r.text;"
+                }),
+                defect: None,
+            },
+            &turn,
+        )
+        .await
+        .0;
+    let answer = text(&result);
+    assert!(
+        !answer.contains("CANARY-RAN"),
+        "the bridge dispatched an `Excluded` entry because it was in the registry: \
+         {answer:?} — a script would then open an `ask` prompt it has no way to \
+         answer, which is the exact stall the exclusion exists to prevent"
+    );
+    assert!(
+        answer.contains("not callable from a codemode script"),
+        "the refusal is BY NAME and reaches a script that named the tool: {answer:?}"
+    );
+    assert!(
+        !answer.contains("unknown tool"),
+        "and it is NOT a lookup miss dressed up as a refusal — the registry has the \
+         entry, so a miss here would mean the check is `unwrap_or(refuse)` and would \
+         break the moment F2 composes host specs in: {answer:?}"
     );
 }
 

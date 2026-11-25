@@ -77,7 +77,11 @@ use crate::harness::r#loop::tools::cancelled_tool_result;
 use crate::harness::tool_specs::unknown_param_error;
 use crate::mcp::mcp_tool;
 use crate::policy::Decision;
-use crate::tools::{execute_tool, ContentBlock, ToolCtx, ToolResult};
+// (ADR 0102 F1) The bridge no longer calls `execute_tool` — it resolves through the
+// loop's registry, so a host entry reaches a script instead of being advertised to
+// it and dead to it.
+use crate::tools::exec::{lookup, script_access, ToolEntry};
+use crate::tools::{ContentBlock, ToolCtx, ToolResult};
 
 /// The script's wall-clock bound (spec §7.1's budget for one `codemode` call).
 const WALL_CLOCK: Duration = Duration::from_secs(300);
@@ -95,32 +99,43 @@ const MCP_TIMEOUT: Duration = Duration::from_secs(60);
 /// than waiting for it forever.
 const ORPHAN_DRAIN: Duration = Duration::from_secs(30);
 
-/// The tools a script may NOT reach, each with the reason (spec §7.1's decision,
-/// plus the recursion the spec could not have listed because it predates the
-/// `codemode` tool existing).
-///
-/// `ask` / `sudo_exec` / `manage_todo_list` are INTERACTIVE: they open a prompt or a
-/// dialog the script has no way to answer, and a program that blocks on a human is a
-/// stall wearing a costume. `subagent` / `list_agents` are RECURSIVE — a nested child
-/// is a whole turn of its own. `codemode` is recursive for exactly the `subagent`
-/// reason (a nested `codemode` is a second engine running a second script), so it is
-/// excluded here too.
-///
-/// The exclusion is enforced TWICE on purpose: these names are absent from
-/// `ALL_TOOLS`, and `tools.<name>` is built FROM `ALL_TOOLS`, so a name that is not
-/// discoverable is also not callable — a script that hard-codes the spelling gets a
-/// JS `TypeError`, not a dispatch. A nested built-in then dispatches through
-/// `execute_tool`, which cannot reach them at all: the third layer.
-const EXCLUDED_FROM_SCRIPT: &[(&str, &str)] = &[
-    ("ask", "interactive"),
-    ("sudo_exec", "interactive"),
-    ("manage_todo_list", "interactive"),
-    ("subagent", "recursive"),
-    ("list_agents", "recursive"),
-    ("codemode", "recursive"),
-];
+// The tools a script may NOT reach, each with the reason (spec §7.1's decision,
+// plus the recursion the spec could not have listed because it predates the
+// `codemode` tool existing).
+//
+// (ADR 0102 / issue #183 F1) This const is GONE, and its content is not: it moved
+// to `crate::tools::exec::LOOP_INTERNAL_SCRIPT`, beside the `ScriptAccess` field
+// that now carries the same decision for every registry entry. The reason it lives
+// in the registry module and not here is the point of the change — script reach is
+// a property of a TOOL, and a bridge that keeps its own name list is a second owner
+// of it, which is precisely the shape that cannot survive a host tool (a name this
+// file has never seen would default to whatever this const's absence implies).
+//
+// What the list said, preserved verbatim in the table it became: `ask` /
+// `sudo_exec` / `manage_todo_list` are INTERACTIVE — they open a prompt or a dialog
+// the script has no way to answer, and a program that blocks on a human is a stall
+// wearing a costume. `subagent` / `list_agents` are RECURSIVE — a nested child is a
+// whole turn of its own. `codemode` is recursive for exactly the `subagent` reason
+// (a nested `codemode` is a second engine running a second script).
+//
+// The exclusion is still enforced THREE times, and the third layer is the one this
+// commit had to move (H2): these names are absent from `ALL_TOOLS`, and
+// `tools.<name>` is built FROM `ALL_TOOLS`, so a name that is not discoverable is
+// also not callable — a script that hard-codes the spelling gets a JS `TypeError`,
+// not a dispatch. And a script that bypasses the global by calling the raw
+// `__codemodeCall('sudo_exec', …)` closure, which the prelude never deletes, now
+// lands on the explicit `ScriptAccess::Excluded` refusal in `Bridge::dispatch_nested`
+// — where the third layer used to be `execute_tool`'s `unknown tool` fall-through.
+// It cannot stay the registry's answer: after F2 the registry CAN carry these names,
+// so "not in the registry" stops implying "not callable" and only an explicit check
+// keeps the property.
+//
+// The ARGUMENT-level half — `mcp` `action: "auth"` — is NOT in that table and never
+// was; [`interactive_args`] below stays a special case because no name-level field
+// can express "this name, except when…".
 
-/// The ARGUMENT-level half of [`EXCLUDED_FROM_SCRIPT`].
+/// The ARGUMENT-level half of the script exclusion — the half the NAME-level
+/// [`ScriptAccess`] field cannot express.
 ///
 /// The name list above cannot express this case, because the interactivity is not in
 /// the tool's NAME — it is in one of `mcp`'s ACTIONS. `mcp` is deliberately NOT
@@ -378,18 +393,20 @@ fn clock_expired(base: &Instant, at: u64) -> bool {
     at != NO_DEADLINE && base.elapsed().as_nanos() as u64 >= at
 }
 
-/// The specs a script may call AND discover: the advertised set minus
-/// [`EXCLUDED_FROM_SCRIPT`]. A DISABLED tool is already absent, because
+/// The specs a script may call AND discover: the advertised set minus the names
+/// whose [`ScriptAccess`] is `Excluded`. A DISABLED tool is already absent, because
 /// `advertised_specs()` applied the `enabled_tools` filter — a tool the model was not
 /// allowed to call is not discoverable from a script either.
-fn callable_specs(specs: &[ToolSpec]) -> Vec<Value> {
+///
+/// (ADR 0102 F1) The second parameter is new and the filter is now per-entry rather
+/// than a name list. It stays INTERSECTED with the advertised specs and is never
+/// REPLACED by the registry's own set: the registry says which tools are REACHABLE,
+/// `advertised_specs()` says which the SESSION is allowed to use, and a registry
+/// that carries a tool the user switched off must not leak it into a script.
+fn callable_specs(specs: &[ToolSpec], registry: &[ToolEntry]) -> Vec<Value> {
     specs
         .iter()
-        .filter(|spec| {
-            !EXCLUDED_FROM_SCRIPT
-                .iter()
-                .any(|(name, _)| *name == spec.name.as_str())
-        })
+        .filter(|spec| script_access(registry, &spec.name).is_callable())
         .map(|spec| {
             json!({
                 "name": spec.name,
@@ -646,7 +663,9 @@ pub(super) async fn exec_codemode(
     // cancellation) is REPLACED with one that also watches this bridge's deadline,
     // because the clock C1 armed belongs to `eval`, which is never called here.
     let specs = loop_.advertised_specs();
-    let callable = callable_specs(&specs);
+    // (ADR 0102 F1) The exclusion now comes from the loop's registry (per-entry
+    // `ScriptAccess`), not from a name list in this file.
+    let callable = callable_specs(&specs, &loop_.tool_registry);
     let (request_tx, request_rx) = mpsc::unbounded_channel::<HostRequest>();
     let clock = WallClock::new();
     let handler_token = turn.clone();
@@ -1058,19 +1077,57 @@ impl Bridge<'_> {
         }
     }
 
-    /// Run a gated nested call: a built-in through `execute_tool` on the CLONED
-    /// [`ToolCtx`] (NEVER `dispatch_tool`, which holds `&mut self` for the whole turn
-    /// and would deadlock a script running inside it), or MCP through A1's shared
-    /// handle.
+    /// Run a gated nested call: a registry entry through its own executor on the
+    /// CLONED [`ToolCtx`] (NEVER `dispatch_tool`, which holds `&mut self` for the
+    /// whole turn and would deadlock a script running inside it), or MCP through
+    /// A1's shared handle.
+    ///
+    /// (ADR 0102 / issue #183 F1) Two changes, both load-bearing:
+    ///
+    /// - **The registry, not `execute_tool`.** `execute_tool` resolves the
+    ///   BUILT-INS ONLY — it is a free function with no loop to read a registry
+    ///   from. Left calling it, a host entry would be advertised to scripts and
+    ///   DEAD to them: `ALL_TOOLS` is built from the advertised set, so
+    ///   `tools.create_task(…)` would be discoverable while this answered
+    ///   `unknown tool`. The advertised-set census does not catch that, because it
+    ///   drives `dispatch_tool`. Pinned by `a_nested_call_reaches_a_host_entry`.
+    /// - **The explicit `Excluded` refusal** — the third enforcement layer, which
+    ///   used to BE `execute_tool`'s `unknown tool` fall-through (H2). It cannot
+    ///   stay that: after F2 the registry may carry one of these names, so "no
+    ///   entry" stops implying "not callable". A script that calls the raw
+    ///   `__codemodeCall` closure (which the prelude never deletes) instead of the
+    ///   absent `tools.<name>` global lands HERE, and it is the only place the
+    ///   refusal is decided — `run_nested` deliberately gains no second copy of
+    ///   the check, so there is one site that answers it.
     async fn dispatch_nested(&self, nested: &ToolCall) -> ToolResult {
         if nested.name == "mcp" {
             // RACED against the TURN token exactly as the direct arm races it.
+            // The registry CANNOT express this: `mcp_tool` takes `&McpManager`, not
+            // a `ToolCtx`, which is one of the reasons `mcp` stays a loop arm.
             tokio::select! {
                 result = mcp_tool(&self.loop_.mcp, &nested.arguments, self.turn) => result,
                 _ = self.turn.cancelled() => cancelled_tool_result(),
             }
+        } else if !script_access(&self.loop_.tool_registry, &nested.name).is_callable() {
+            // The third layer, spelled out rather than fallen into.
+            ToolResult::fail(
+                format!(
+                    "`{}` is not callable from a codemode script (interactive or \
+                     recursive)",
+                    nested.name
+                ),
+                None,
+            )
         } else {
-            execute_tool(&self.ctx, &nested.name, &nested.arguments).await
+            match lookup(&self.loop_.tool_registry, &nested.name) {
+                Some(entry) => {
+                    let executor = Arc::clone(&entry.executor);
+                    executor.execute(&self.ctx, nested.arguments.clone()).await
+                }
+                // A name with no entry and no loop arm: today's sentence, from the
+                // same place it comes from on the direct route.
+                None => ToolResult::fail(format!("unknown tool: {}", nested.name), None),
+            }
         }
     }
 
@@ -1122,7 +1179,7 @@ impl Bridge<'_> {
     /// `skipped` rather than silently shrinking the world.
     async fn search_tools(&self, query: &str, limit: Option<usize>) -> String {
         let mut hits: Vec<Value> = Vec::new();
-        for spec in callable_specs(&self.loop_.advertised_specs()) {
+        for spec in callable_specs(&self.loop_.advertised_specs(), &self.loop_.tool_registry) {
             let name = spec["name"].as_str().unwrap_or_default();
             let description = spec["description"].as_str().unwrap_or_default();
             if matches_query(query, name, description) {
@@ -1186,10 +1243,7 @@ impl Bridge<'_> {
         {
             // An EXCLUDED name still has a spec, and answering it plainly would
             // advertise the very tool the bridge refuses to install.
-            if EXCLUDED_FROM_SCRIPT
-                .iter()
-                .any(|(excluded, _)| *excluded == name)
-            {
+            if !script_access(&self.loop_.tool_registry, name).is_callable() {
                 return json!({
                     "name": name,
                     "error": "not callable from a codemode script (interactive or recursive)",
@@ -1406,17 +1460,25 @@ mod tests {
         assert_eq!(snapshot[1]["status"], "running", "in flight reads running");
     }
 
-    /// The excluded set is the spec's §7.1 decision plus the recursion the spec could
-    /// not have listed. Every name here is ABSENT from the callable set; every other
-    /// advertised tool is present.
+    /// The excluded set is the spec's §7.1 decision plus the recursion the spec
+    /// could not have listed. Every name in the table is ABSENT from the callable
+    /// set; every other advertised tool is present.
+    ///
+    /// (ADR 0102 F1) It reads `LOOP_INTERNAL_SCRIPT` — the table that replaced
+    /// `EXCLUDED_FROM_SCRIPT` — rather than a const in this file, because the
+    /// bridge no longer owns that decision. The pin's SHAPE is unchanged and that
+    /// is the point: it still iterates the source of truth and still asks the
+    /// bridge's own projection of it.
     #[test]
     fn the_excluded_tools_are_neither_callable_nor_discoverable() {
-        let callable = callable_specs(&crate::harness::r#loop::tool_specs());
+        // The registry a default loop carries (built in `AgentLoop::new`).
+        let registry = crate::tools::exec::builtins();
+        let callable = callable_specs(&crate::harness::r#loop::tool_specs(), &registry);
         let names: Vec<&str> = callable
             .iter()
             .map(|spec| spec["name"].as_str().unwrap_or_default())
             .collect();
-        for (name, _) in EXCLUDED_FROM_SCRIPT {
+        for (name, _) in crate::tools::exec::LOOP_INTERNAL_SCRIPT {
             assert!(
                 !names.contains(name),
                 "`{name}` is excluded from scripts but reached the callable set: {names:?}"
@@ -1525,7 +1587,7 @@ mod tests {
             .into_iter()
             .find(|s| s.name == "bash")
             .expect("`bash` is advertised");
-        let callable = callable_specs(std::slice::from_ref(&spec));
+        let callable = callable_specs(std::slice::from_ref(&spec), &crate::tools::exec::builtins());
         assert_eq!(callable.len(), 1);
         assert_eq!(
             callable[0]["description"].as_str().expect("a description"),

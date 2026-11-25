@@ -1,0 +1,473 @@
+//! (ADR 0102 / issue #183 F1) The registry's own censuses.
+//!
+//! Three things are pinned here and nowhere else, because the registry is the
+//! only place all three are visible at once:
+//!
+//! 1. **Object safety + the `Arc` shape.** The trait is unusable if it is not
+//!    object safe, and the failure would be a compile error in `builtins()`
+//!    rather than a red test — so the pin is the one the crate already uses for
+//!    `TaskStore` (`seams.rs`'s `task_store_is_object_safe_and_shareable`): build
+//!    an `Arc<dyn …>`, call through it, assert `Send + Sync`.
+//! 2. **The registry's own membership** — the 19 built-in names, and the fact
+//!    that no built-in is excluded from scripts.
+//! 3. **The composition seam.** `host_entries` is what F2 fills in; its contract
+//!    at F1 is "every spec you hand me comes back, `Allowed`, answering loudly".
+
+use std::sync::Arc;
+
+use serde_json::json;
+
+use super::super::{
+    builtins, default_registry, host_entries, lookup, script_access, ScriptAccess, ToolEntry,
+    ToolExecutor, BUILTIN_TOOLS, LOOP_INTERNAL_SCRIPT,
+};
+use crate::provider_types::ToolSpec;
+use crate::tools::exec::execute_tool;
+use crate::tools::exec::registry::NativeTool;
+
+use super::support::{ctx, temp_cwd, text_of};
+
+/// The 19 names [`builtins`] must carry: the 12 native/web executors + the 7
+/// board/artifact verbs. FROZEN, for the same reason the advertised-set census is
+/// frozen — a count cannot say WHICH name vanished, and `builtins()` dropping one
+/// is precisely the silent drop this run is most likely to produce (it is the
+/// function F2 edits).
+const BUILTIN_NAMES: &[&str] = &[
+    "bash",
+    "read",
+    "write",
+    "edit",
+    "find",
+    "grep",
+    "ls",
+    "list_skills",
+    "read_skill",
+    "web_search",
+    "fetch_content",
+    "get_search_content",
+    "list_board",
+    "get_task",
+    "create_task",
+    "edit_task",
+    "move_task",
+    "get_artifact",
+    "write_artifact",
+];
+
+#[test]
+fn builtins_are_the_nineteen_engine_owned_names() {
+    let names: Vec<String> = builtins().into_iter().map(|e| e.spec.name).collect();
+    let expected: Vec<String> = BUILTIN_NAMES.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        names, expected,
+        "`builtins()` is no longer the 19 engine-owned names in `tool_specs()` order. \
+         A missing name here is a tool the model is STILL advertised (the advertised \
+         set is `tool_specs()`, which this does not touch) and which now answers \
+         `unknown tool` from `execute_tool` — the advertised-and-unreachable class. \
+         An EXTRA name is a tool the registry dispatches that nobody advertises."
+    );
+    assert_eq!(
+        names.len(),
+        19,
+        "and the count is 19 (12 + the 7 board verbs)"
+    );
+}
+
+#[test]
+fn builtin_tools_table_and_builtins_agree() {
+    // The `match`'s successor list and the built registry must be the same list.
+    // If they drift, `builtins()` silently SKIPS (a `filter_map` on the spec
+    // lookup), so the drift is invisible at runtime and only this census says
+    // which of the two moved.
+    let table: Vec<&str> = BUILTIN_TOOLS.iter().map(|(name, _)| *name).collect();
+    let registry = builtins();
+    let built: Vec<&str> = registry.iter().map(|e| e.name()).collect();
+    assert_eq!(
+        table, built,
+        "`BUILTIN_TOOLS` and `builtins()` disagree — a name in the table with no \
+         `tool_specs()` entry is silently dropped by `builtins()`'s `filter_map`"
+    );
+}
+
+#[test]
+fn every_builtin_entry_carries_its_advertised_spec_verbatim() {
+    // ADR 0102's byte-identity rule: the entry's spec IS the spec `tool_specs()`
+    // hands the model, not a re-statement of it. A registry that carries its own
+    // description string is a second owner of the advertised surface, which is the
+    // thing the whole ADR exists to prevent.
+    let advertised = crate::harness::tool_specs::tool_specs();
+    for entry in builtins() {
+        let spec = advertised
+            .iter()
+            .find(|s| s.name == entry.spec.name)
+            .unwrap_or_else(|| panic!("`{}` is registered but not advertised", entry.spec.name));
+        assert_eq!(
+            (&entry.spec.description, &entry.spec.parameters),
+            (&spec.description, &spec.parameters),
+            "`{}`: the registry's spec must be BYTE-IDENTICAL to `tool_specs()`'s",
+            entry.spec.name
+        );
+    }
+}
+
+#[test]
+fn builtins_exclude_nothing_for_scripts() {
+    // The preservation rule, read from the registry side: the six names the old
+    // `EXCLUDED_FROM_SCRIPT` carried are ALL loop-internal, so no built-in was ever
+    // excluded. A `builtins()` that starts excluding one of its own names silently
+    // deletes script reach that ADR 0092 chose `execute_tool` arms to CREATE (the
+    // `roadmap` case: one script turning an approved backlog into N Tasks).
+    for entry in builtins() {
+        assert!(
+            entry.script.is_callable(),
+            "`{}` is a built-in and `ScriptAccess::Excluded` — no built-in was ever \
+             excluded from scripts, and the 7 board verbs in particular are \
+             script-reachable ON PURPOSE (ADR 0092)",
+            entry.name()
+        );
+    }
+}
+
+#[test]
+fn the_loop_internal_script_table_is_the_six_excluded_names() {
+    // `EXCLUDED_FROM_SCRIPT`'s successor. Exactly six, exactly those reasons, and
+    // `codemode` is among them (a nested `codemode` is a second engine running a
+    // second script) while `mcp` is NOT (it is the sanctioned way for a script to
+    // reach a server; only its `action: "auth"` is refused, at ARGUMENT level).
+    let table: Vec<(&str, &str)> = LOOP_INTERNAL_SCRIPT
+        .iter()
+        .map(|(name, access)| {
+            let reason = match access {
+                ScriptAccess::Excluded(reason) => *reason,
+                ScriptAccess::Allowed => "<allowed>",
+            };
+            (*name, reason)
+        })
+        .collect();
+    assert_eq!(
+        table,
+        vec![
+            ("ask", "interactive"),
+            ("sudo_exec", "interactive"),
+            ("manage_todo_list", "interactive"),
+            ("subagent", "recursive"),
+            ("list_agents", "recursive"),
+            ("codemode", "recursive"),
+        ],
+        "the excluded set moved. Its membership is a SECURITY-adjacent decision: an \
+         added name breaks a script that works today, a removed name lets a script \
+         block on a human (`ask`) or fork a whole turn (`subagent`)."
+    );
+    assert!(
+        !LOOP_INTERNAL_SCRIPT.iter().any(|(name, _)| *name == "mcp"),
+        "`mcp` must NOT be name-excluded — its `auth` ACTION is refused at argument \
+         level by `codemode::interactive_args`, which stays a special case because no \
+         name-level field can express \"this name, except when…\""
+    );
+}
+
+#[test]
+fn script_access_reads_the_entry_first_and_the_loop_table_second() {
+    let registry = builtins();
+
+    // An entry's own field WINS — including against the loop table, which is what
+    // makes the field the primary record rather than a decoration.
+    let mut overridden = builtins();
+    let bash = overridden
+        .iter_mut()
+        .find(|e| e.name() == "bash")
+        .expect("`bash` is a built-in");
+    bash.script = ScriptAccess::Excluded("test-only");
+    assert_eq!(
+        script_access(&overridden, "bash"),
+        ScriptAccess::Excluded("test-only"),
+        "the per-entry field must be what `script_access` reports"
+    );
+    assert_eq!(
+        script_access(&registry, "bash"),
+        ScriptAccess::Allowed,
+        "and the default registry still allows it (the override above was local)"
+    );
+
+    // A loop-internal name (no entry) falls to the table.
+    for name in [
+        "ask",
+        "sudo_exec",
+        "manage_todo_list",
+        "subagent",
+        "list_agents",
+        "codemode",
+    ] {
+        assert!(
+            !script_access(&registry, name).is_callable(),
+            "`{name}` is loop-internal and must not be script-callable"
+        );
+    }
+
+    // A name NEITHER knows is `Allowed` — the F2 fall-through. A host spec the
+    // engine has never seen must be callable, or the `roadmap` case dies quietly.
+    assert_eq!(
+        script_access(&registry, "mark_ready"),
+        ScriptAccess::Allowed,
+        "an unknown name defaults to `Allowed`: defaulting a name the engine has \
+         never seen to `Excluded` would silently delete the script reach ADR 0092 \
+         built these arms to have"
+    );
+}
+
+#[test]
+fn registry_lookup_hits_a_builtin_and_misses_the_loop_internal_names() {
+    let registry = builtins();
+    assert!(lookup(&registry, "bash").is_some());
+    for name in ["ask", "mcp", "codemode", "subagent", "dispatch_subagent"] {
+        assert!(
+            lookup(&registry, name).is_none(),
+            "`{name}` must not resolve through the registry — its executor is \
+             `&mut AgentLoop`, not a `ToolCtx`"
+        );
+    }
+}
+
+/// The trait is usable as a trait object behind the `Arc` every entry holds it
+/// in, and the future it returns is `Send` — the shape
+/// `seams::task_store_is_object_safe_and_shareable` pins for `TaskStore`, copied.
+#[test]
+fn the_tool_executor_trait_is_object_safe_and_shareable() {
+    struct AlwaysOk;
+    impl ToolExecutor for AlwaysOk {
+        fn execute(
+            &self,
+            _ctx: &crate::tools::types::ToolCtx,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::tools::types::ToolResult> + Send>,
+        > {
+            Box::pin(async { crate::tools::types::ToolResult::ok_text("ok".into(), None) })
+        }
+    }
+
+    let entries: Vec<ToolEntry> = vec![ToolEntry {
+        spec: ToolSpec {
+            name: "always_ok".into(),
+            description: "a fixture".into(),
+            parameters: json!({"type": "object"}),
+        },
+        executor: Arc::new(AlwaysOk) as Arc<dyn ToolExecutor>,
+        script: ScriptAccess::Allowed,
+    }];
+
+    // Object safety: this line does not compile if the trait stops being object
+    // safe (an `async fn` in the trait, or a generic method, breaks it).
+    let dyn_handle: Arc<dyn ToolExecutor> = Arc::clone(&entries[0].executor);
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    assert_send_sync(&dyn_handle);
+
+    // And the SHARING is real: an `Arc` clone reaches the SAME executor, which is
+    // what lets a `ToolCtx`-shaped clone of an entry cost two refcount bumps.
+    let clone = Arc::clone(&entries[0].executor);
+    assert!(
+        Arc::ptr_eq(&dyn_handle, &clone),
+        "the Arc is SHARED, not copied"
+    );
+}
+
+#[tokio::test]
+async fn a_registry_entry_executes_and_the_boxed_future_is_send() {
+    // The `tokio::spawn` is the `Send` proof that actually matters: the crate
+    // spawns a `RenderRequester` future the same way (`sandbox/tests/mod.rs`), and
+    // a `!Send` boxed future would fail to compile HERE rather in a doc comment.
+    let registry = default_registry();
+    let entry = lookup(registry, "read").expect("`read` is a built-in");
+    let cwd = temp_cwd("registry-read");
+    let ctx = ctx(&cwd);
+    let executor = Arc::clone(&entry.executor);
+    let params = json!({ "path": "nope.txt" });
+    let handle = tokio::spawn(async move { executor.execute(&ctx, params).await });
+    let result = handle.await.expect("the spawned executor ran");
+    assert!(
+        result.is_error,
+        "reading a file that is not there fails: {}",
+        text_of(&result)
+    );
+    assert!(
+        !text_of(&result).contains("unknown tool"),
+        "it reached `exec_read` and not the miss arm: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn native_tool_is_the_same_call_the_old_match_arm_made() {
+    // Behaviour-neutral by construction, CHECKED: the adapter must produce the
+    // SAME answer as `execute_tool` for the same name, because it wraps the same
+    // `exec_*` function with the same references. `web_search` with no `query`
+    // picks this because its refusal sentence is executor-specific — a name that
+    // routed to the wrong arm could not reproduce it.
+    let cwd = temp_cwd("registry-neutral");
+    let tool_ctx = ctx(&cwd);
+    let entry = lookup(default_registry(), "web_search").expect("`web_search` is a built-in");
+
+    let via_entry = entry.executor.execute(&tool_ctx, json!({})).await;
+    let via_execute_tool = execute_tool(&tool_ctx, "web_search", &json!({})).await;
+
+    assert_eq!(
+        text_of(&via_entry),
+        text_of(&via_execute_tool),
+        "the registry path and `execute_tool` must answer identically"
+    );
+    assert!(
+        text_of(&via_entry).contains("web_search requires 'query' or 'queries'"),
+        "and the answer is `exec_web_search`'s own refusal, not a routing miss: {}",
+        text_of(&via_entry)
+    );
+}
+
+#[tokio::test]
+async fn execute_tool_still_answers_the_unknown_tool_sentence() {
+    // The registry's MISS sentence is the old `other =>` arm's, byte-for-byte.
+    // `unknown_tool_is_error` in `fs_tools.rs` pins the same thing from the
+    // dispatcher's side; this pins that the sentence belongs to the registry and
+    // not to a `match` that no longer exists.
+    let cwd = temp_cwd("registry-miss");
+    let r = execute_tool(&ctx(&cwd), "nope", &json!({})).await;
+    assert!(r.is_error);
+    assert_eq!(text_of(&r), "unknown tool: nope");
+}
+
+#[tokio::test]
+async fn host_entries_carry_their_specs_allowed_and_refuse_loudly() {
+    // `host_entries` is the composition seam F2 fills in. Its F1 contract is
+    // three things, all of which F2 must not break: every spec comes back, in
+    // order; each is `Allowed` (the preservation rule); and the refusal is a
+    // `ToolResult::fail` that NAMES itself, never a silent park. A host tool that
+    // parks with no Supervisor answering is a hang until the turn is cancelled —
+    // which is why the daemon's `task-request` refusal exists today and why
+    // `HostTool` starts out loud.
+    let specs = vec![
+        ToolSpec {
+            name: "mark_ready".into(),
+            description: "Mark the session ready.".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+        ToolSpec {
+            name: "list_board".into(),
+            description: "a host-owned board".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+    ];
+    let entries = host_entries(specs);
+
+    assert_eq!(
+        entries.iter().map(|e| e.name()).collect::<Vec<_>>(),
+        vec!["mark_ready", "list_board"],
+        "every spec comes back, in the order it arrived"
+    );
+    assert!(
+        entries.iter().all(|e| e.script.is_callable()),
+        "host entries are `Allowed` — a `Default` of `Excluded` would silently \
+         delete the script reach ADR 0092 built these arms to have"
+    );
+
+    let cwd = temp_cwd("registry-host");
+    for entry in &entries {
+        let r = entry.executor.execute(&ctx(&cwd), json!({})).await;
+        assert!(
+            r.is_error,
+            "`{}` refuses rather than pretending to succeed",
+            entry.name()
+        );
+        let text = text_of(&r);
+        assert!(
+            !text.contains("unknown tool"),
+            "`{}` resolves through the registry, so it must NOT answer the miss \
+             sentence (that is the bug F2's frame exists to fix): {text:?}",
+            entry.name()
+        );
+        assert!(
+            text.contains("host-owned"),
+            "and the refusal says WHY in terms a user can act on: {text:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_host_entry_reaches_through_a_composed_registry_where_execute_tool_cannot() {
+    // The hazard the advertised-set census CANNOT see, pinned at its smallest:
+    // `builtins() ++ host_entries(…)` is the composed set a loop carries, and a
+    // host name resolves THERE and not through the free `execute_tool`. This is
+    // the exact shape `dispatch_nested` must resolve against — resolving against
+    // `execute_tool` instead is the mutation this test reddens on.
+    let composed = {
+        let mut registry = builtins();
+        registry.extend(host_entries(vec![ToolSpec {
+            name: "mark_ready".into(),
+            description: "Mark the session ready.".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }]));
+        registry
+    };
+
+    let entry = lookup(&composed, "mark_ready").expect("the composed set carries it");
+    let cwd = temp_cwd("registry-composed");
+    let r = entry.executor.execute(&ctx(&cwd), json!({})).await;
+    assert!(
+        !text_of(&r).contains("unknown tool"),
+        "the composed registry answers it: {}",
+        text_of(&r)
+    );
+
+    // …and the free function, which only knows the built-ins, does not.
+    let r = execute_tool(&ctx(&cwd), "mark_ready", &json!({})).await;
+    assert_eq!(
+        text_of(&r),
+        "unknown tool: mark_ready",
+        "`execute_tool` is the built-ins-only path — a loop must resolve against \
+         its OWN registry, which is why `dispatch_nested` was moved"
+    );
+}
+
+#[test]
+fn default_registry_is_the_builtins_and_is_shared() {
+    // The `LazyLock` is a SHARED registry (an `Arc` per executor, one set for the
+    // process), and it is `builtins()` — the two must not drift.
+    assert_eq!(
+        default_registry().len(),
+        builtins().len(),
+        "`default_registry()` is `builtins()`"
+    );
+    assert!(
+        Arc::ptr_eq(
+            &default_registry()[0].executor,
+            &default_registry()[0].executor
+        ),
+        "the entries are behind `Arc`s the process shares"
+    );
+    assert_eq!(
+        default_registry().len(),
+        19,
+        "and the default registry is 19 (the advertised 26 minus the 7 loop arms)"
+    );
+}
+
+#[test]
+fn the_native_adapter_wraps_a_free_executor_without_capturing() {
+    // `NativeRun` is a `fn` POINTER, so a `NativeTool` cannot accidentally capture
+    // loop state — the type is the guarantee that a built-in adapter is a
+    // reference to a free function and nothing more.
+    fn always_ok(
+        _ctx: crate::tools::types::ToolCtx,
+        _params: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::types::ToolResult> + Send>>
+    {
+        Box::pin(async { crate::tools::types::ToolResult::ok_text("ok".into(), None) })
+    }
+    let tool = NativeTool::new(always_ok);
+    let arc: Arc<dyn ToolExecutor> = Arc::new(tool);
+    assert_eq!(
+        std::mem::size_of::<NativeTool>(),
+        std::mem::size_of::<super::super::NativeRun>(),
+        "a `NativeTool` is one `fn` pointer wide — no capture, no vtable"
+    );
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    assert_send_sync(&arc);
+}

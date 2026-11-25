@@ -63,8 +63,24 @@
 //! - **E6 [`crate::mcp::OpenRequester`] — already LIVE**, landed in S3 with three
 //!   working pins, because `mcp` moved then. It is the contrast case for the two
 //!   traits here: the shape a seam has when it has a caller.
-//! - **E.6's executor trait — NOT here.** Inverting `execute_tool` touches the hot
-//!   dispatch path and is a separate step, proved by the two-sided e2e tests.
+//! - **E.6's executor trait — HERE IT IS NOW, and it is NOT in this file.** ADR
+//!   0102 / issue #183 F1 re-opened E.6 and landed the inversion:
+//!   [`crate::tools::exec::ToolExecutor`], with [`crate::tools::exec::ToolEntry`]
+//!   and [`crate::tools::exec::ScriptAccess`] beside it in `tools/exec/registry.rs`.
+//!   The bullet that used to sit here said "NOT here — inverting `execute_tool`
+//!   touches the hot dispatch path and is a separate step, proved by the two-sided
+//!   e2e tests", and both halves of that were right at the time: it IS a separate
+//!   step, and it was taken. It landed in `tools/exec/` rather than here because
+//!   the trait's only job is to be the dispatch authority of THIS crate's engine,
+//!   not to be a host seam: the desktop hands an engine a registry as DATA
+//!   (`StartEnv::host_tools`, F2), never as a Rust object, so no cross-repo
+//!   implementer ever names this trait. `seams.rs` is the catalog of edges the
+//!   crate crosses; a trait with no edge to cross does not belong in it. The
+//!   object-safety shape is the one this file's own [`TaskCaller`] uses, for the
+//!   same reason (`async fn` in a trait object is not object safe), and the
+//!   re-opening is recorded in ADR 0102 §1 against ADR 0092's original rejection:
+//!   the old ruling weighed a premise (the package cycle was gone, so there was
+//!   nothing left to sever) that engine optionality overturns.
 
 use crate::store_rows::{MessageRow, SessionInfo, SessionRow};
 use crate::subagent_types::SubagentOutcome;

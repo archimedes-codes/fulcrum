@@ -842,6 +842,28 @@ pub struct AgentLoop {
     /// write-boundary root, the trust key and the subagent parent's cwd, not
     /// permission state) and arrives as `to_tool_ctx`'s `cwd` argument.
     permissions: PermissionContext,
+    /// (ADR 0102 / issue #183 F1) The tool registry — the engine's sole dispatch
+    /// authority for every tool whose executor is a `ToolCtx`.
+    ///
+    /// Built in [`AgentLoop::new`] from [`crate::tools::exec::builtins`], and NOT
+    /// behind a `LazyLock`: `exec_codemode` and its `Bridge` hold a SHARED borrow
+    /// of the loop, so a field built on first use would need `&mut` exactly where
+    /// the bridge cannot get it. It also takes no `new` parameter — the set is a
+    /// closed default at F1, and `new` is already 23 positional args with a
+    /// source-lint counting the production call site's shape.
+    ///
+    /// F2 replaces the initialiser with
+    /// `builtins() ++ host_entries(env.host_tools)`. That is why this is a field
+    /// and not a call: an engine that advertises a spec no Rust code in fulcrum
+    /// has ever named has to be HOLDING that spec somewhere, and both dispatch
+    /// paths (`dispatch_tool`'s built-in arm and the codemode bridge's
+    /// `dispatch_nested`) read it from here.
+    ///
+    /// The bound on what it governs: registry set ⊎ loop-internal set = advertised
+    /// set, disjoint. The seven loop-internal tools are NOT entries here — their
+    /// executor is `&mut AgentLoop`, not a `ToolCtx` — which is pinned by
+    /// `every_advertised_tool_reaches_an_executor`.
+    tool_registry: Vec<crate::tools::exec::ToolEntry>,
     // ── per-session internal state (owned by the loop task) ──
     thinking_level: Option<String>,
     /// The normalizer's turn state (the `messageId` counter + the
@@ -1027,6 +1049,11 @@ impl AgentLoop {
             sudo,
             retry,
             permissions,
+            // (ADR 0102 F1) The default registry: the engine's 19 built-ins. F2
+            // composes the host's specs onto this (`builtins() ++
+            // host_entries(env.host_tools)`) — see the field's docs for why it is
+            // a field built HERE rather than a lazy one.
+            tool_registry: crate::tools::exec::builtins(),
             thinking_level: None,
             turn_state: std::sync::Mutex::new(TurnState::stamped(incarnation)),
             text_acc: std::sync::Mutex::new(HashMap::new()),
@@ -1175,6 +1202,27 @@ impl AgentLoop {
     /// panicking or hanging.
     pub fn set_task_store(&mut self, store: Option<Arc<dyn crate::seams::TaskCaller>>) {
         self.permissions.task_store = store;
+    }
+
+    /// (ADR 0102 / issue #183 F1) Replace this loop's tool registry — the
+    /// [`Self::set_task_store`] precedent directly above, for the same reason: the
+    /// composed set is not available at `AgentLoop::new`'s call site (F2 builds it
+    /// from `StartEnv::host_tools`, which arrives on the envelope), and a 24th
+    /// positional argument would rewrite every call site in the crate for a value
+    /// most of them do not have.
+    ///
+    /// F1 exposes it and does NOT use it: `new` initialises the registry to
+    /// [`crate::tools::exec::builtins`] and nothing at F1 has host specs to
+    /// compose. F2's body is `loop_.set_tool_registry(builtins().append(&mut
+    /// host_entries(env.host_tools)))` (or the equivalent `Vec::from_iter`), and
+    /// the census `every_advertised_tool_reaches_an_executor` is what proves the
+    /// composition still lands on the same 26 names.
+    ///
+    /// REPLACES, never extends: a second call is a new surface, not an addition to
+    /// the old one, and an additive setter would make "what can this session reach"
+    /// depend on call order.
+    pub fn set_tool_registry(&mut self, registry: Vec<crate::tools::exec::ToolEntry>) {
+        self.tool_registry = registry;
     }
 
     /// Queue a prompt (best-effort — a full / closed queue is dropped).
@@ -2066,6 +2114,17 @@ impl AgentLoop {
     /// with the API param (ADR 0017).
     pub fn advertised_specs(&self) -> Vec<ToolSpec> {
         Self::advertised_tool_specs(&self.permissions.enabled_tools, self.subagent.is_none())
+    }
+
+    /// (ADR 0102 / issue #183 F1) The registry this loop dispatches through.
+    ///
+    /// `&[…]`, not a `Vec`, because both dispatch paths read it per call and an
+    /// entry is a spec clone plus an `Arc`. It is `pub` for the same reason
+    /// `advertised_specs` is: the STAYING desktop reads the loop's tool surface,
+    /// and after F2 the two are the same question — "what can this session
+    /// reach". F2 composes the host specs onto the field in `AgentLoop::new`.
+    pub fn tool_registry(&self) -> &[crate::tools::exec::ToolEntry] {
+        &self.tool_registry
     }
 
     /// The tool specs advertised to the model (finding B): `tool_specs()`

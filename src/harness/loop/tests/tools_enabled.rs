@@ -541,21 +541,38 @@ async fn list_agents_tool_flattens_block_scalar_descriptions() {
     );
 }
 
-/// (issue #180 F1) EVERY advertised tool reaches an executor through
-/// `dispatch_tool` — the census the two `tool_specs.rs` param censuses cannot be.
+/// (issue #180 F1, generalised by ADR 0102 / issue #183 F1) EVERY advertised tool
+/// reaches an executor, and what reaches it PARTITIONS the advertised set:
+/// **registry set ⊎ loop-internal set = advertised set, and the two are disjoint.**
 ///
-/// Those two compare `tool_specs()` against `exec_param_keys()`, both of which are
-/// tables a half-registered tool can join perfectly while `dispatch_tool`'s built-in
-/// OR-list still omits its name. That omission is NOT a compile error: the match falls
-/// through to the `unknown tool:` arm, so the model is told the tool exists, calls it,
-/// and gets "unknown tool" for the whole session. A silent gap of exactly the kind the
-/// spec's four-mandatory-registration-sites rule exists to prevent.
+/// # What changed and what did not
 ///
-/// So: for every name `tool_specs()` advertises that is NOT loop-internal, dispatch a
-/// call and assert the result is not the `unknown tool` sentence. No task store is
-/// attached (these fixtures build a loop with no Supervisor), which is the point — a
-/// routed task arm answers "no task store", an UNROUTED one answers "unknown tool", and
-/// the two sentences are what this test tells apart.
+/// The failure class is unchanged and it is still the one this test exists for: a
+/// tool ADVERTISED and UNREACHABLE. `tool_specs()` tells the model the tool exists,
+/// the model calls it, and `dispatch_tool` answers `unknown tool` for the whole
+/// session — not a compile error, and invisible to the two `tool_specs.rs` param
+/// censuses, which compare `tool_specs()` against tables a half-registered tool can
+/// join perfectly.
+///
+/// What changed is the SUBJECT of the set half. It used to be `dispatch_tool`'s
+/// built-in OR-list, a list of 19 names written out in the `match`; the disjointness
+/// was implicit in nobody having written the same name twice. Now the engine asks a
+/// registry, so the reachable set is a VALUE — `loop_.tool_registry()`'s membership —
+/// and it can be compared, dropped from, and overlapped with the loop arms. That is
+/// why the census is generalised rather than a new test written beside it: the set
+/// it needed to reason about did not exist before, and it does now.
+///
+/// # Why both halves are here and not one
+///
+/// The set half is cheap and static; the dispatch half is the one that can lie about
+/// nothing. A registry entry whose executor exists but whose name never reaches it
+/// (a lookup that runs in the wrong place, a name shadowed by a loop arm) is caught
+/// only by actually dispatching. So: dispatch every advertised name that is not
+/// loop-internal and assert the answer is not the `unknown tool` sentence, THEN
+/// assert the partition over the sets. No task store is attached — these fixtures
+/// build a loop with no Supervisor — which is the point: a routed task arm answers
+/// "no task store", an UNROUTED one answers "unknown tool", and the two sentences
+/// are what this test tells apart.
 #[tokio::test]
 async fn every_advertised_tool_reaches_an_executor() {
     let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
@@ -567,7 +584,7 @@ async fn every_advertised_tool_reaches_an_executor() {
         RetryPolicy::new_with(5, Duration::from_millis(1)),
     );
     // The loop-internal names are excluded for the reason their own census gives:
-    // their arms are not `execute_tool`, and several would BLOCK on a prompt or
+    // their arms are not registry entries, and several would BLOCK on a prompt or
     // dispatch a child rather than answer. `codemode` is excluded because its arm
     // needs a live engine and is covered by `codemode_dispatch_runs_a_script_through_agent_loop`.
     const LOOP_INTERNAL: &[&str] = &[
@@ -604,8 +621,10 @@ async fn every_advertised_tool_reaches_an_executor() {
         assert!(
             !text.contains("unknown tool"),
             "`{}` is ADVERTISED by `tool_specs()` but `dispatch_tool` routes it to \
-             `unknown tool` ({text:?}) — add it to the built-in OR-list (or to the \
-             loop-internal arms) in `loop/tools.rs`",
+             `unknown tool` ({text:?}) — it is in neither the loop's tool registry \
+             (`tools/exec/registry.rs`'s `builtins()`) nor the loop-internal arms in \
+             `loop/tools.rs`. Before ADR 0102 F1 the message said \"add it to the \
+             built-in OR-list\"; there is no OR-list any more.",
             spec.name
         );
         checked += 1;
@@ -613,6 +632,71 @@ async fn every_advertised_tool_reaches_an_executor() {
     assert!(
         checked >= 19,
         "the census must actually walk the advertised set, counted {checked}"
+    );
+
+    // ── the partition, over the loop's OWN registry ───────────────────────────
+    // The registry the loop was built with (`AgentLoop::new` → `builtins()`), read
+    // from the loop rather than re-derived — the same reason the dispatch half
+    // above drives this loop instead of calling `execute_tool` directly.
+    let registry: Vec<&str> = loop_.tool_registry.iter().map(|e| e.name()).collect();
+    let advertised: Vec<String> = crate::harness::tool_specs::tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+
+    // Disjoint. A name in BOTH is dispatched by the registry lookup, which runs
+    // BEFORE `dispatch_tool`'s `match`, and silently loses its loop arm — the
+    // `&mut AgentLoop` half that makes `ask` interactive or `subagent` recursive.
+    let shadowed: Vec<&str> = registry
+        .iter()
+        .filter(|name| LOOP_INTERNAL.contains(name))
+        .copied()
+        .collect();
+    assert!(
+        shadowed.is_empty(),
+        "{shadowed:?} is BOTH a registry entry and a loop-internal arm — the \
+         registry lookup in `dispatch_tool` shadows the loop arm, so the interactive \
+         or recursive half of that tool silently stops running",
+    );
+
+    // Registry ⊎ loop = advertised, exactly. `dispatch_subagent` is in the
+    // `LOOP_INTERNAL` list above but NOT advertised (it is an alias resolved before
+    // the `match`), so the union is compared against the advertised set through the
+    // advertised names, not by raw set equality.
+    let reachable: std::collections::BTreeSet<&str> = registry
+        .iter()
+        .copied()
+        .chain(LOOP_INTERNAL.iter().copied())
+        .collect();
+    let silent: Vec<&str> = advertised
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !reachable.contains(name))
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "advertised and in NEITHER half of the partition: {silent:?} — the loop's \
+         registry has {} entries and the loop arms cover {}; every advertised name \
+         must be in exactly one of them.",
+        registry.len(),
+        LOOP_INTERNAL.len(),
+    );
+    // And the registry's own size is the 19 the split is stated against. A registry
+    // that drops a name reddens THIS as well as the walk above and the frozen-name
+    // census in `tool_specs.rs` — three independent sentences about the same drop,
+    // because `checked >= 19` has exactly zero slack by design.
+    assert_eq!(
+        registry.len(),
+        19,
+        "the loop's registry carries {} entries, not 19 — {}",
+        registry.len(),
+        if registry.is_empty() {
+            "an EMPTY registry is the loudest possible form of this failure: every \
+             built-in the model is advertised now answers `unknown tool`"
+                .to_string()
+        } else {
+            format!("registry: {registry:?}")
+        },
     );
 }
 
