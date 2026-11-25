@@ -402,6 +402,57 @@ pub fn builtins() -> Vec<ToolEntry> {
         .collect()
 }
 
+/// The drop sentence for host specs the engine refused, or `None` when there is
+/// nothing to report.
+///
+/// # Why a pure function returning `Option<String>`
+///
+/// The `turn::settled_with_nothing_dispatched` precedent, for the same reason: the
+/// sentence is the part that can be WRONG, and a line written straight to stderr is
+/// unobservable from inside `cargo test` (no stderr-capture crate in
+/// `[dev-dependencies]`). Building it from the refused names makes the message
+/// testable and leaves the call site as two calls.
+///
+/// # What may appear in it
+///
+/// The refused NAMES, and nothing else — no `description`, no `parameters`, no
+/// prompt. A host spec's name is host-supplied text that reaches this line from the
+/// wire, so each is escaped with `{:?}`: Rust's `Debug` for `str` escapes every
+/// control character and both Unicode line separators (`\n` → `\n`, U+2028 →
+/// `\u{2028}`), which is what keeps a hostile name from forging a line in
+/// `diagnostics.log`. That is the same corridor `provider/mod.rs`'s
+/// `one_field_per_line` closes for `m.id`, closed here with the standard formatter
+/// because that sanitizer is deliberately private to its own module (its doc says
+/// so) and this call site is in a different crate module tree.
+///
+/// # Why BOTH channels get it
+///
+/// `eprintln!` is the only thing an UNARMED Worker writes (an old Supervisor, the
+/// `fulcrum serve` daemon, every `StartEnv::from_parts` fixture — `diagnostics` is
+/// unarmed until a host injects a directory), and `diagnostics::record` is what an
+/// ARMED Worker and any other host receives. `loop.rs`'s settle line keeps both for
+/// the identical reason and states the rule: neither half is redundant, and deleting
+/// one makes the other the only reader a third of the crate's hosts have. A name
+/// dropped here is invisible otherwise, and an invisible drop is the exact thing
+/// this module's docs elsewhere call the fail-open shape.
+pub(crate) fn refused_host_tool_names(refused: &[ToolSpec]) -> Option<String> {
+    if refused.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = refused
+        .iter()
+        .map(|spec| format!("{:?}", spec.name))
+        .collect();
+    Some(format!(
+        "host tool(s) {} are names the engine already owns and were NOT registered — \
+         the engine dispatches its own for those names (a host entry would shadow the \
+         built-in executor or the loop arm that `dispatch_tool`'s registry lookup runs \
+         before its `match`). The Supervisor must send these verbs under names the \
+         engine does not advertise.",
+        names.join(", ")
+    ))
+}
+
 /// The composition seam: the tools whose SUBSTANCE is the host's, arriving as
 /// data. `StartEnv::host_tools` (F2) carries these specs over the wire and the
 /// ENGINE composes `builtins() ++ host_entries(env.host_tools)` — the desktop
@@ -428,8 +479,50 @@ pub fn builtins() -> Vec<ToolEntry> {
 /// is the pin, and its fixture deliberately uses a name NO built-in owns — with a
 /// board verb here, `script_access`'s first-wins lookup would find the built-in's
 /// `Allowed` and the test would pass on the broken thing.
+///
+/// # The engine's OWN names are refused, and this is where the refusal lives
+///
+/// A host spec whose name [`tool_specs`](crate::harness::tool_specs::tool_specs)
+/// already carries is DROPPED here. That is
+/// the shape ADR 0102 lists among its REJECTED options ("Host entries shadow
+/// built-ins by name"), and the shape F1's census comment on this module names as
+/// the failure mode: `dispatch_tool`'s [`lookup`] runs BEFORE its `match`, so an
+/// entry named `ask` answers from the host frame and the loop arm — the
+/// `&mut AgentLoop` half that makes `ask` interactive, `codemode` recursive, `mcp`
+/// turn-raced — never runs. The advertised surface was never the hole
+/// (`advertised_tool_specs` dedupes engine-first, so a shadow is not shown twice);
+/// the registry was, because `lookup` is a plain first-match `find` and a host spec
+/// is the only entry that can arrive at compose time.
+///
+/// **`tool_specs()` is the name source, deliberately.** It is the engine's own
+/// advertised set and it carries BOTH halves — the 12 built-ins and the 7
+/// loop-internal arms — so the refusal needs no third name list to forget a name
+/// in. A fourth list of engine-owned names is exactly the failure this module was
+/// built to remove.
+///
+/// # DROPPED, not failed — and the drop is recorded
+///
+/// Two options were available and DROP is the one that cannot break a session. A
+/// hard failure would make the whole `Start` unstartable over ONE bad name in a
+/// 7-name envelope, which turns a desktop bug into "the agent does not start" and
+/// gives the person no way to act on it; the engine's own rule for a name it cannot
+/// serve is a refusal at the name, not a dead session. The drop is therefore
+/// LOUD: [`refused_host_tool_names`] builds the sentence and this function writes it
+/// to both channels the crate already uses for exactly this class of line — see
+/// [`refused_host_tool_names`] for why BOTH.
 pub fn host_entries(tools: Vec<ToolSpec>) -> Vec<ToolEntry> {
-    tools
+    let owned: Vec<String> = crate::harness::tool_specs::tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    let (refused, accepted): (Vec<ToolSpec>, Vec<ToolSpec>) = tools
+        .into_iter()
+        .partition(|spec| owned.contains(&spec.name));
+    if let Some(line) = refused_host_tool_names(&refused) {
+        eprintln!("harness: {line}");
+        crate::diagnostics::record(&line);
+    }
+    accepted
         .into_iter()
         .map(|spec| {
             let name = spec.name.clone();

@@ -2164,6 +2164,12 @@ impl AgentLoop {
     ///   Advertising and dispatching agree about who answers a shadowed name; a
     ///   last-wins filter here would advertise the host's description while
     ///   dispatching the engine's executor.
+    ///   (PR #39 review, Finding 1: this branch is now DEFENCE IN DEPTH and not the
+    ///   only thing standing between a host and an engine name — `host_entries`
+    ///   refuses an engine-owned name at compose time, so such a spec never reaches
+    ///   a registry entry at all. The dedupe stays: it is what keeps advertising
+    ///   correct for any entry this filter is handed, and a filter that assumed the
+    ///   refusal would be a second owner of the rule.)
     /// * A child's drop list is name-based (`subagent` / `list_agents`), so a host
     ///   tool is inherited by a child as an ordinary tool — it is not a delegation
     ///   route, and the recursion guard is about dispatch, not about host verbs.

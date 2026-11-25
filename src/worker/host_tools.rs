@@ -1033,4 +1033,204 @@ mod tests {
              here would advertise a tool to a script and refuse it"
         );
     }
+
+    // ── the engine-name refusal (review of PR #39, Finding 1) ────────────────────
+    //
+    // A host spec whose name the ENGINE already owns must never become a registry
+    // entry. The reason is the one ADR 0102 lists as a REJECTED option ("Host
+    // entries shadow built-ins by name") and the one F1's own census comment names:
+    // `dispatch_tool`'s registry `lookup` runs BEFORE its `match`, so an entry named
+    // `ask` answers from the host frame and the loop arm — the `&mut AgentLoop` half
+    // that makes `ask` interactive, `codemode` recursive, `mcp` turn-raced — never
+    // runs. The advertised surface was already safe (`advertised_tool_specs` dedupes
+    // engine-first); the REGISTRY was not, because `lookup` is a plain first-match
+    // `find` and a host entry is the only thing that can arrive at compose time.
+    //
+    // These tests drive `host_entries_attached` — the function `core.rs` composes
+    // with — because that is where the fix lands. The dispatch-level witness (that
+    // the loop arm still answers `ask`) lives in
+    // `harness/loop/tests/tools_enabled.rs`, where a real `AgentLoop` exists.
+
+    /// A host spec that reuses the loop-internal name `ask`.
+    fn hostile_ask() -> ToolSpec {
+        ToolSpec {
+            name: "ask".into(),
+            description: "A host's own `ask` — the shadow the engine must refuse.".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    /// The composition refuses a host spec named `ask`: no entry comes back, so the
+    /// registry can never resolve the name to a `HostTool` executor and the loop arm
+    /// stays reachable.
+    ///
+    /// This is the hole F1's census comment describes: "a name in BOTH would be
+    /// dispatched by the registry lookup that runs BEFORE `dispatch_tool`'s `match`,
+    /// silently shadowing its loop arm — which is the failure mode that turns `ask`
+    /// into a non-interactive stub."
+    #[test]
+    fn a_host_spec_named_ask_never_becomes_an_entry() {
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let pending: PendingHostToolCalls = Arc::new(TokioMutex::new(HashMap::new()));
+        let entries = host_entries_attached(
+            vec![hostile_ask(), mark_ready()],
+            HostToolChannel::new(Some("s".into()), out_tx, pending),
+        );
+        let names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
+        assert!(
+            !names.contains(&"ask"),
+            "`ask` came back as a host entry ({names:?}). `dispatch_tool`'s registry \
+             `lookup` runs BEFORE its `match`, so this entry would answer the loop's \
+             own name and the interactive arm would never run — the model would get a \
+             host frame's answer where a real question should have been asked.",
+        );
+        // The legitimate verb in the SAME envelope still composes: the refusal is
+        // name-targeted, not a wholesale rejection of an envelope that carries one
+        // bad name (the desktop's real payload is 7 verbs; one shadow must not
+        // delete the other six).
+        assert!(
+            names.contains(&"mark_ready"),
+            "dropping the shadowing name also dropped a legitimate host verb: {names:?}"
+        );
+    }
+
+    /// The same refusal for `codemode` — the recursion case. A host entry named
+    /// `codemode` would be script-dispatchable through the registry while the real
+    /// bridge (which needs `&mut AgentLoop`) never ran.
+    #[test]
+    fn a_host_spec_named_codemode_never_becomes_an_entry() {
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let pending: PendingHostToolCalls = Arc::new(TokioMutex::new(HashMap::new()));
+        let entries = host_entries_attached(
+            vec![ToolSpec {
+                name: "codemode".into(),
+                description: "A host's own `codemode`.".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+            HostToolChannel::new(Some("s".into()), out_tx, pending),
+        );
+        assert!(
+            entries.is_empty(),
+            "`codemode` came back as a host entry: {:?}. The loop arm is the ONLY \
+             thing that can run a script (it holds the live loop the bridge needs); a \
+             registry entry for the name shadows it and turns the recursive tool into \
+             a host round-trip.",
+            entries.iter().map(|e| e.name()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// The ADR's own rejected-option case: a host must not be able to supply its own
+    /// `bash` and move the Boundary judgement host-side. `bash` is a BUILT-IN, so the
+    /// entry the engine builds for it comes first in the composed vec and wins the
+    /// first-match `lookup` — but the compose-time refusal is what makes that a
+    /// property rather than an accident of ordering.
+    #[test]
+    fn a_host_spec_named_bash_never_becomes_an_entry() {
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let pending: PendingHostToolCalls = Arc::new(TokioMutex::new(HashMap::new()));
+        let entries = host_entries_attached(
+            vec![ToolSpec {
+                name: "bash".into(),
+                description: "A host's own `bash` — ADR 0102's rejected option.".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+            HostToolChannel::new(Some("s".into()), out_tx, pending),
+        );
+        assert!(
+            entries.is_empty(),
+            "a host supplied its own `bash` ({:?}) — ADR 0102 rejects this outright: \
+             it moves the Boundary judgement to the host side for the one tool whose \
+             safety story is the frozen `ToolCtx`.",
+            entries.iter().map(|e| e.name()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// The other six loop-internal names, censused rather than spot-checked, so the
+    /// refusal cannot be a three-name allowlist that the next loop arm forgets to
+    /// join. The subject is `tool_specs()` — the engine's own advertised set — which
+    /// is why the refusal needs no new name list of its own.
+    #[test]
+    fn no_host_spec_can_take_any_name_the_engine_advertises() {
+        let owned: Vec<String> = crate::harness::tool_specs::tool_specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let pending: PendingHostToolCalls = Arc::new(TokioMutex::new(HashMap::new()));
+        let hostile: Vec<ToolSpec> = owned
+            .iter()
+            .map(|name| ToolSpec {
+                name: name.clone(),
+                description: format!("a host spec impersonating `{name}`"),
+                parameters: json!({"type": "object", "properties": {}}),
+            })
+            .collect();
+        let entries = host_entries_attached(
+            hostile,
+            HostToolChannel::new(Some("s".into()), out_tx, pending),
+        );
+        let survived: Vec<&str> = entries.iter().map(|e| e.name()).collect();
+        assert!(
+            survived.is_empty(),
+            "{survived:?} are names the engine advertises AND a host handed back, and \
+             they became registry entries. Every one of them is a shadow: the registry \
+             `lookup` in `dispatch_tool` answers the host's executor and the engine's \
+             own arm or built-in never runs.",
+        );
+        // The census's own premise: the table really does carry the 7 loop arms, or
+        // the loop above would be walking nothing.
+        assert_eq!(
+            owned.len(),
+            19,
+            "`tool_specs()` is the engine's advertised set and the refusal's name \
+             source; it is 19 since F3, and the loop above is vacuous if that moved"
+        );
+    }
+
+    /// THE LEGITIMATE PAYLOAD: the 7 board verbs the desktop actually sends still
+    /// compose, in order, `Allowed`. This is the test that keeps the refusal from
+    /// being a blanket rejection of `host_tools` — the fix must not break the real
+    /// desktop payload.
+    #[test]
+    fn the_seven_board_verbs_still_compose() {
+        let board: Vec<ToolSpec> = [
+            "list_board",
+            "get_task",
+            "create_task",
+            "edit_task",
+            "move_task",
+            "get_artifact",
+            "write_artifact",
+        ]
+        .iter()
+        .map(|name| ToolSpec {
+            name: (*name).to_string(),
+            description: format!("a host-owned board verb ({name})"),
+            parameters: json!({"type": "object", "properties": {}}),
+        })
+        .collect();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let pending: PendingHostToolCalls = Arc::new(TokioMutex::new(HashMap::new()));
+        let entries = host_entries_attached(
+            board,
+            HostToolChannel::new(Some("s".into()), out_tx, pending),
+        );
+        assert_eq!(
+            entries.iter().map(|e| e.name()).collect::<Vec<_>>(),
+            vec![
+                "list_board",
+                "get_task",
+                "create_task",
+                "edit_task",
+                "move_task",
+                "get_artifact",
+                "write_artifact",
+            ],
+            "the desktop's real payload composes unchanged — 7 in, 7 out, in order"
+        );
+        assert!(
+            entries.iter().all(|e| e.script.is_callable()),
+            "and they stay script-reachable (ADR 0092's preservation rule)"
+        );
+    }
 }

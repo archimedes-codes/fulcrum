@@ -1024,6 +1024,16 @@ async fn the_composed_advertised_set_reaches_its_executors() {
     // A host spec that names a loop-internal tool (`ask`, `codemode`, …) would be
     // SHADOWED by the registry lookup in `dispatch_tool`, which runs BEFORE the
     // `match` — silently deleting the interactive or recursive half of that tool.
+    //
+    // (PR #39 review, Finding 1) That shadow is now refused at compose time:
+    // `host_entries` drops a spec whose name `tool_specs()` carries. What this
+    // assertion checks is therefore the CONSEQUENCE — the registry carries no
+    // engine-owned name — and it stays because it is the cheap, whole-set version of
+    // that claim. The tests that REDDENED on the hole itself are
+    // `worker::host_tools::tests::a_host_spec_named_ask_never_becomes_an_entry` and
+    // friends (composition level) and
+    // `harness::r#loop::tests::tools_enabled::a_host_spec_named_ask_does_not_capture_the_loop_arm`
+    // (dispatch level, driving a real `AgentLoop`).
     const LOOP_INTERNAL: &[&str] = &[
         "ask",
         "sudo_exec",
@@ -1468,5 +1478,240 @@ fn a_host_tool_is_gated_exactly_as_the_board_verbs_are() {
         Some(crate::policy::Decision::Deny),
         "`bash` is policed and the SAME block denies it — the block is live, it just \
          does not speak to un-policed names"
+    );
+}
+
+// ── PR #39 review, Finding 1 — a host spec may not take a name the engine owns ───
+//
+// The composition is `builtins() ++ host_entries_attached(env.host_tools, …)`
+// (`worker/core.rs::default_build_loop`) and `lookup` is a plain first-match `find`.
+// `advertised_tool_specs` dedupes ENGINE-FIRST, so a host spec named `ask` was never
+// shown to the model twice — the advertised surface was safe. The REGISTRY was not:
+// `dispatch_tool`'s `lookup` runs BEFORE its `match`, so a host entry named `ask`
+// answered the loop's own name and the arm — the `&mut AgentLoop` half that makes
+// `ask` interactive, `codemode` recursive, `mcp` turn-raced — never ran. That is
+// exactly the failure F1's census comment names, and ADR 0102 lists "Host entries
+// shadow built-ins by name" among its REJECTED options.
+//
+// The fix is compose-time (`host_entries_attached` drops such a spec and records the
+// drop), so the reddening witnesses are in `worker/host_tools.rs`. What these
+// loop-level tests pin is the CONSEQUENCE a user would feel: the loop arm still
+// answers, and the registry carries one entry per name.
+
+/// The composition with EXPLICIT specs (`compose` takes names and invents the
+/// description; a shadow fixture has to name a tool the engine owns).
+///
+/// `detached` means the same thing it means on `compose`: `true` answers loudly and
+/// instantly, which is what lets a test tell "a host executor answered" apart from
+/// "the loop arm answered" without a Supervisor on the wire.
+fn compose_specs(loop_: &mut AgentLoop, specs: &[(&str, &str)]) {
+    let registry = {
+        let mut registry = crate::tools::exec::builtins();
+        registry.extend(crate::tools::exec::host_entries(
+            specs
+                .iter()
+                .map(|(name, description)| crate::harness::provider::ToolSpec {
+                    name: (*name).to_string(),
+                    description: (*description).to_string(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                })
+                .collect(),
+        ));
+        registry
+    };
+    loop_.set_tool_registry(registry);
+}
+
+/// THE HOLE, at the dispatch site: a host spec named `ask` must not capture the loop
+/// arm. The two sentences are the discriminator — `host-owned` is a host executor
+/// answering (the bug), `User cancelled the question.` is `ask_flow` answering on the
+/// cancelled turn token (the loop arm, which is the whole point of the tool).
+///
+/// The turn token is pre-cancelled for determinism: `ask_flow`'s waiter races the
+/// turn token and has NO deadline, so an uncancelled token here would park until the
+/// test's own timeout — which is itself a pass, because parking means the ARM ran
+/// (a host entry on a detached channel answers instantly).
+#[tokio::test]
+async fn a_host_spec_named_ask_does_not_capture_the_loop_arm() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    compose_specs(&mut loop_, &[("ask", "a host's own `ask`")]);
+
+    let turn = CancellationToken::new();
+    turn.cancel();
+    let r = loop_
+        .dispatch_tool(
+            &ToolCall {
+                id: "t1".to_string(),
+                name: "ask".to_string(),
+                arguments: json!({
+                    "questions": [{
+                        "id": "q1",
+                        "question": "Which?",
+                        "options": [{ "label": "A" }]
+                    }]
+                }),
+                defect: None,
+            },
+            &turn,
+        )
+        .await
+        .0;
+    let text = result_text(&r);
+    assert!(
+        !text.contains("host-owned"),
+        "`ask` was answered by a HOST executor: {text:?}. `dispatch_tool`'s registry \
+         `lookup` runs before its `match`, so a host entry with this name turns the \
+         interactive tool into a stub — the model asks a question nobody is asked. \
+         The engine owns this name (`tool_specs()` carries it) and `ask` is one of the \
+         seven names whose executor is `&mut AgentLoop`."
+    );
+    assert_eq!(
+        text, "User cancelled the question.",
+        "`ask` must answer through `ask_flow` — the loop arm — and a cancelled turn \
+         settles it with the cancelled shape. Anything else means the arm did not run."
+    );
+}
+
+/// The same hole on the BUILT-IN side (ADR 0102's own rejected option: a host
+/// supplying its own `bash`, moving the Boundary judgement host-side). Two halves,
+/// because the two failure shapes differ:
+///
+/// * the registry half reddens on today's code — the composed vec carried TWO
+///   entries named `bash`, and `lookup`'s first-wins is the only thing keeping the
+///   engine's answer; a composition that appended the host half first, or a
+///   `builtins()` that lost the name, and the host's executor answers;
+/// * the dispatch half pins the consequence the model sees: the engine's own `bash`
+///   answers (`bash: missing \`command\` parameter` is `exec_bash`'s sentence), never
+///   the host's.
+#[tokio::test]
+async fn a_host_spec_named_bash_does_not_replace_the_engine_executor() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    compose_specs(&mut loop_, &[("bash", "a host's own `bash`")]);
+
+    // The registry half: ONE entry per name. A duplicate is the shadow, whatever
+    // order the vec happens to be in.
+    let names: Vec<&str> = loop_.tool_registry().iter().map(|e| e.name()).collect();
+    let bash_count = names.iter().filter(|n| **n == "bash").count();
+    assert_eq!(
+        bash_count, 1,
+        "the composed registry carries {bash_count} entries named `bash` — a host \
+         spec took the engine's name. `lookup` is a first-match `find`, so the answer \
+         for `bash` depends on the ORDER of a `Vec` two different modules write, and \
+         ADR 0102 rejects the option outright (`{names:?}`)."
+    );
+
+    // The dispatch half: the engine's executor answers.
+    let r = loop_
+        .dispatch_tool(
+            &ToolCall {
+                id: "t1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({}),
+                defect: None,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .0;
+    assert_eq!(
+        result_text(&r),
+        "bash: missing `command` parameter",
+        "`bash` must answer through the engine's own executor (this sentence is \
+         `exec_bash`'s). A `host-owned` answer means the Boundary judgement moved to \
+         the host side for the one tool family whose whole safety story is the frozen \
+         `ToolCtx`."
+    );
+}
+
+/// The non-regression half: the fix must not break the REAL desktop payload. The 7
+/// board verbs the desktop sends in `hostTools` still compose, still get advertised
+/// on top of the engine's 17 child-half names, and still reach a host executor.
+#[tokio::test]
+async fn the_seven_board_verbs_still_compose_after_the_refusal() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    let board: Vec<(&str, &str)> = [
+        "list_board",
+        "get_task",
+        "create_task",
+        "edit_task",
+        "move_task",
+        "get_artifact",
+        "write_artifact",
+    ]
+    .iter()
+    .map(|name| (*name, "a host-owned board verb"))
+    .collect();
+    compose_specs(&mut loop_, &board);
+
+    let registry: Vec<&str> = loop_.tool_registry().iter().map(|e| e.name()).collect();
+    for name in board.iter().map(|(n, _)| *n) {
+        assert!(
+            registry.contains(&name),
+            "`{name}` — one of the 7 verbs the desktop actually sends — is not in the \
+             composed registry: {registry:?}. The engine-name refusal must be \
+             name-targeted; a session that lost its board verbs cannot do the work a \
+             `roadmap` dispatch was sent to do."
+        );
+    }
+    // 12 built-ins + 7 host verbs. The refusal adds nothing and removes nothing here.
+    assert_eq!(
+        registry.len(),
+        19,
+        "the composed registry is `builtins()` (12) ++ the 7 board verbs, got {}: \
+         {registry:?}",
+        registry.len()
+    );
+
+    // And they are advertised: the child fixture's engine half (17) + the 7.
+    let advertised: Vec<String> = loop_
+        .advertised_specs()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(
+        advertised.len(),
+        24,
+        "the model's surface with the real desktop payload is 17 + 7 = 24 names: \
+         {advertised:?}"
+    );
+
+    // And one reaches its host executor rather than the miss sentence.
+    let r = loop_
+        .dispatch_tool(
+            &ToolCall {
+                id: "t1".to_string(),
+                name: "list_board".to_string(),
+                arguments: json!({}),
+                defect: None,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .0;
+    let text = result_text(&r);
+    assert!(
+        text.contains("host-owned") && !text.contains("unknown tool"),
+        "`list_board` answered {text:?} — a board verb must reach its host entry."
     );
 }

@@ -480,3 +480,175 @@ fn the_native_adapter_wraps_a_free_executor_without_capturing() {
     fn assert_send_sync<T: Send + Sync>(_: &T) {}
     assert_send_sync(&arc);
 }
+
+// ── the engine-name refusal's OBSERVABILITY half ───────────────────────────────
+//
+// `host_entries` DROPS a host spec whose name the engine owns rather than failing
+// the `Start`, and a silent drop is the fail-open this crate names everywhere else.
+// So the drop writes a line, and these tests read it. The message is built by a
+// pure function (`refused_host_tool_names`) for the reason `turn.rs` gives for its
+// own twin: the sentence is the part that can be WRONG, and a line written straight
+// to stderr is unobservable from inside `cargo test`.
+
+use super::super::registry::refused_host_tool_names;
+
+/// The sentence exists ONLY when something was refused, and it NAMES each refused
+/// spec — a drop that does not say which name is a drop nobody can act on.
+#[test]
+fn the_refusal_line_names_every_refused_spec_and_nothing_when_there_is_none() {
+    assert_eq!(
+        refused_host_tool_names(&[]),
+        None,
+        "an envelope with no shadow must record NOTHING — a line on every session \
+         start would make this channel unreadable, which is the volume rule \
+         `diagnostics` states for itself"
+    );
+    let specs = vec![
+        ToolSpec {
+            name: "ask".into(),
+            description: "d1".into(),
+            parameters: json!({}),
+        },
+        ToolSpec {
+            name: "bash".into(),
+            description: "d2".into(),
+            parameters: json!({}),
+        },
+    ];
+    let line = refused_host_tool_names(&specs).expect("two refusals make a line");
+    assert!(
+        line.contains("\"ask\"") && line.contains("\"bash\""),
+        "the line must name BOTH refused specs, got {line:?}"
+    );
+    // The description is NOT in the payload. It is host prose and the channel's rule
+    // is "no user content"; the name is what a supporter needs.
+    assert!(
+        !line.contains("d1") && !line.contains("d2"),
+        "a refused spec's DESCRIPTION must not reach the diagnostics line: {line:?}"
+    );
+}
+
+/// A host spec named with a line separator cannot forge a line in
+/// `diagnostics.log` — the corridor `provider/mod.rs::one_field_per_line` closes for
+/// provider-supplied ids, closed here by `{:?}` escaping on host-supplied names.
+#[test]
+fn a_refused_name_cannot_forge_a_second_diagnostics_line() {
+    let specs = vec![
+        ToolSpec {
+            name: "ask\nFORGED-LINE".into(),
+            description: "d".into(),
+            parameters: json!({}),
+        },
+        ToolSpec {
+            name: "bash\u{2028}FORGED".into(),
+            description: "d".into(),
+            parameters: json!({}),
+        },
+    ];
+    let line = refused_host_tool_names(&specs).expect("two refusals make a line");
+    assert!(
+        !line.contains('\n') && !line.contains('\u{2028}') && !line.contains('\u{2029}'),
+        "the payload carries a raw line terminator and would be TWO lines in the \
+         file a supporter reads: {line:?}"
+    );
+    assert_eq!(
+        line.lines().count(),
+        1,
+        "exactly one line, whatever the name contained: {line:?}"
+    );
+    // And the name is still READABLE after escaping — the point of the line is to
+    // say which name was refused, so escaping must not swallow it.
+    assert!(
+        line.contains("ask") && line.contains("bash"),
+        "the escaped name still identifies the spec: {line:?}"
+    );
+}
+
+/// THE drop is RECORDED, not just returned: an armed diagnostics channel gets the
+/// line when `host_entries` refuses a name.
+///
+/// This is the pin that makes "the drop is observable" a fact. Without the
+/// `record` call the tests above stay green (they read the pure builder) and the
+/// only witness left is an `eprintln!` nobody sees in a shipped build.
+#[test]
+fn a_refused_host_entry_is_recorded_to_diagnostics() {
+    let _guard = crate::test_support::env_lock();
+    crate::diagnostics::init(None);
+    let dir = crate::test_support::ScratchDir::in_env_temp("host-entry-refusal-", "recorded");
+    // Declared AFTER the dir so it drops FIRST (locals drop in reverse) — the global
+    // is cleared before the dir it names is removed, or a sibling's `record`
+    // `create_dir_all`s the deleted dir back into existence.
+    struct DisableOnExit;
+    impl Drop for DisableOnExit {
+        fn drop(&mut self) {
+            crate::diagnostics::init(None);
+        }
+    }
+    let _disable = DisableOnExit;
+    crate::diagnostics::init(Some(dir.to_path_buf()));
+
+    // The accepted half FIRST, so a vacuous pass (nothing recorded at all) cannot be
+    // mistaken for the assertion below: `mark_ready` proves the function ran and
+    // wrote about the name it refused rather than staying silent about both.
+    let entries = host_entries(vec![
+        ToolSpec {
+            name: "mark_ready".into(),
+            description: "a host verb".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+        ToolSpec {
+            name: "ask".into(),
+            description: "a host's own `ask`".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+    ]);
+    assert_eq!(
+        entries.iter().map(|e| e.name()).collect::<Vec<_>>(),
+        vec!["mark_ready"],
+        "the fixture's premise: one accepted, one refused"
+    );
+
+    let path = dir.join(crate::diagnostics::FILE_NAME);
+    let content = std::fs::read_to_string(&path).expect(
+        "the refused name is recorded — an unrecorded drop is invisible in a \
+                 shipped build, which is the fail-open this channel exists to close",
+    );
+    assert!(
+        content.contains("\"ask\""),
+        "the recorded line does not name the refused spec: {content:?}"
+    );
+    assert!(
+        !content.contains("\"mark_ready\""),
+        "an ACCEPTED host verb appears in the refusal line: {content:?}"
+    );
+}
+
+/// And a session with nothing to refuse records NOTHING — the channel's volume rule
+/// ("a handful of lines per session") is a promise only if the ordinary path is
+/// silent.
+#[test]
+fn an_envelope_of_legitimate_host_verbs_records_nothing() {
+    let _guard = crate::test_support::env_lock();
+    crate::diagnostics::init(None);
+    let dir = crate::test_support::ScratchDir::in_env_temp("host-entry-refusal-", "silent");
+    struct DisableOnExit;
+    impl Drop for DisableOnExit {
+        fn drop(&mut self) {
+            crate::diagnostics::init(None);
+        }
+    }
+    let _disable = DisableOnExit;
+    crate::diagnostics::init(Some(dir.to_path_buf()));
+
+    let entries = host_entries(vec![ToolSpec {
+        name: "list_board".into(),
+        description: "a host-owned board verb".into(),
+        parameters: json!({"type": "object", "properties": {}}),
+    }]);
+    assert_eq!(entries.len(), 1, "the legitimate verb composes");
+    assert!(
+        !dir.join(crate::diagnostics::FILE_NAME).exists(),
+        "a legitimate payload wrote a diagnostics line — the ordinary session start \
+         must stay silent"
+    );
+}
