@@ -44,8 +44,9 @@ This repo is a Cargo workspace with two members:
   client does not stop a running session, and `close` ends one. `serve::run` never
   returns — there is no shutdown frame yet, so the daemon is killed, and a killed
   daemon's children exit on their own stdin EOF (`src/worker/mod.rs:186` is that
-  path). It is a member rather than a consumer of the rev pin so it links the engine
-  by `path = ".."` and can never drift from it.
+  path). It is a workspace member rather than a consumer of the crates.io pin, so it
+  links the engine by `path = ".."` and can never drift from it (unlike the desktop,
+  which consumes a published version).
 
 **What the daemon does not do yet**, stated because the gaps are the parts that bite:
 no `attach`, no replay, no re-join after a reconnect (T10); no graceful shutdown, so
