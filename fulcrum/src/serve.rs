@@ -1323,27 +1323,48 @@ fn worker_frame(evt: &WorkerInboundEvent) -> serde_json::Value {
         WorkerInboundEvent::WorkerError { code, message } => serde_json::json!({
             "type": "worker-error", "code": code, "message": message,
         }),
-        // (issue #180 F1, Decision A — a LOUD refusal, never a silent drop) The
-        // daemon is a pre-D2 supervisor: it holds no `TaskStore`, so it cannot
-        // answer a board call. But it must not swallow the frame either. This
-        // function is PURE — it RETURNS the frame, and the pump's `on_event`
-        // closure already broadcasts whatever comes back — so returning a refusal
-        // here is the whole relay: no fan-out plumbing, no new channel.
+        // (ADR 0102 / issue #183 F2, "the daemon answers, it does not shrug") The
+        // refusal, and since F3 the ONLY one on this surface — the `task-unsupported`
+        // arm that used to sit above it went with `WorkerInboundEvent::TaskRequest`.
+        // Its discipline is unchanged and is the reason this arm exists at all: a
+        // LOUD refusal, never a silent drop.
         //
-        // What the refusal does NOT do is answer the Worker. The daemon's `on_event`
-        // carries no inbound writer, so the Worker's oneshot stays unresolved until
-        // the turn token cancels the parked tool and `TaskRequestCleanup` empties the
-        // pending map — the SAME hang-until-turn-cancel the old-desktop window costs.
-        // The difference is what the human sees: a reason on screen instead of a tool
-        // that looks frozen. D2 replaces this with a real answer path; until then the
-        // loud arm stays, because dropping the frame is the one thing that would make
-        // this surface strictly worse than the pre-F1 daemon.
-        WorkerInboundEvent::TaskRequest { request_id, .. } => serde_json::json!({
-            "type": "task-unsupported",
+        // The mechanism is the same and so is its limit. `worker_frame` is PURE — it
+        // RETURNS the frame and the pump's `on_event` closure broadcasts whatever comes
+        // back — so returning a refusal here is the whole relay: no fan-out plumbing, no
+        // new channel. What it does NOT do is answer the Worker: the daemon's `on_event`
+        // carries no inbound writer, so the Worker's oneshot stays unresolved until the
+        // TURN token cancels the parked `HostTool` and `HostToolCleanup` empties the
+        // pending map — a hang-until-turn-cancel — and the difference is what the
+        // human sees: a reason on screen instead of a tool that looks frozen.
+        //
+        // # Why this arm is load-bearing and not a courtesy
+        //
+        // `start_env` forwards the client's `start` payload VERBATIM, so a
+        // `fulcrum serve` client can set `hostTools` and have them ADVERTISED to the
+        // model — while the daemon has no host to answer them. Without a refusal the
+        // tool is advertised, called, and silent: the daemon path is precisely where a
+        // missing answer becomes hang-until-turn-cancel. With it, the model gets a
+        // reason and a client gets a correlating `requestId`. (The Worker-side half of
+        // the same rule: a `HostTool` whose Supervisor never answers returns
+        // `ToolResult::fail` on the turn token, so the refusal is not the only thing
+        // standing between a host tool and a hung turn — it is the thing that makes the
+        // wait legible.)
+        //
+        // It fabricates no `result`: an `Inbound::HostToolResponse` is the ONLY thing
+        // that can settle the park, and the daemon cannot produce one honestly.
+        WorkerInboundEvent::HostToolCall {
+            request_id, tool, ..
+        } => serde_json::json!({
+            "type": "host-tool-unsupported",
             "requestId": request_id,
-            "message": "this supervisor (the daemon) predates D2 and has no task store: \
-                        board and artifact tools are served by the desktop session \
-                        (issue #180 F1)",
+            "tool": tool,
+            "message": format!(
+                "this supervisor (the `fulcrum serve` daemon) hosts no tools: `{}` was \
+                 advertised through `hostTools` but nothing here can run it — host tools \
+                 are served by the desktop session (issue #183 F2)",
+                tool,
+            ),
         }),
     }
 }
@@ -2891,78 +2912,88 @@ mod tests {
         ));
     }
 
-    /// (issue #180 F1, Decision A) The daemon refuses a `TaskRequest` LOUDLY.
+    /// (ADR 0102 / issue #183 F2) The daemon refuses a `HostToolCall` LOUDLY, in its
+    /// OWN frame type. (It was written as the generic twin of
+    /// `a_task_request_gets_a_loud_task_unsupported_refusal`; F3 deleted that one and
+    /// this is now the surface's only refusal pin.)
     ///
-    /// The daemon is a pre-D2 supervisor: it has no `TaskStore` to answer from, so
-    /// the Worker's oneshot cannot be resolved here. What it must NOT do is drop the
-    /// frame — the pump relays whatever `worker_frame` RETURNS, so returning `null`
-    /// would turn "this supervisor cannot serve the board" into a tool that appears
-    /// frozen until the turn is cancelled, which is the exact failure the rest of F1
-    /// works to make visible. So: an unmistakable frame, carrying the `requestId` it
-    /// refuses, through the existing relay.
+    /// Why this is not a courtesy arm: `start_env` forwards the client's `start` payload
+    /// VERBATIM, so a `fulcrum serve` client can set `hostTools` and have them
+    /// advertised to the model with NOTHING on this side able to run them. Returning
+    /// `null` would make that an advertised tool that goes silent until the turn is
+    /// cancelled — the exact failure the F2 turn-token race and this relay together
+    /// exist to prevent.
     #[test]
-    fn a_task_request_gets_a_loud_task_unsupported_refusal() {
-        let frame = worker_frame(&WorkerInboundEvent::TaskRequest {
-            request_id: "task-abc".into(),
-            session_id: None,
-            call: fulcrum_harness::seams::TaskCall::ListBoard {
-                space_path: "/some/space".into(),
-            },
-        });
+    fn a_host_tool_call_gets_a_loud_host_tool_unsupported_refusal() {
+        let event = WorkerInboundEvent::HostToolCall {
+            request_id: "host-abc".into(),
+            session_id: Some("s9".into()),
+            tool: "list_board".into(),
+            params: serde_json::json!({ "spacePath": "/some/space" }),
+        };
+        let frame = worker_frame(&event);
         assert_eq!(
-            frame["type"], "task-unsupported",
-            "the refusal is its own frame type (a client must not have to guess)"
+            frame["type"], "host-tool-unsupported",
+            "the refusal is its OWN frame type — a client must not have to guess \
+             which half of the tool wire it is being refused on. Since F3 this is the \
+             only refusal the daemon has, and the `task-unsupported` type it was \
+             written to be distinguished from no longer exists on this surface."
         );
         assert_eq!(
-            frame["requestId"], "task-abc",
+            frame["requestId"], "host-abc",
             "the refusal names the call it refuses, so a client can correlate it"
+        );
+        assert_eq!(
+            frame["tool"], "list_board",
+            "and it names the TOOL, so the human can tell WHICH advertised host tool \
+             this daemon cannot serve (a session may carry several)"
         );
         let message = frame["message"]
             .as_str()
             .expect("the refusal explains itself");
         assert!(
-            message.contains("task") && (message.contains("desktop") || message.contains("daemon")),
-            "the message says WHY and WHERE the verb is served, got {message}"
+            message.contains("list_board")
+                && message.contains("daemon")
+                && message.contains("desktop"),
+            "the message says WHY, WHICH tool and WHERE it would be served, got {message}"
         );
-        // It is a RELAY, not an answer: no `result` field pretending to be an
-        // `Inbound::TaskResponse`, because the daemon cannot produce one.
+        // It is a RELAY, not an answer.
         assert!(
             frame.get("result").is_none(),
-            "the daemon does not fabricate an answer it did not compute"
+            "the daemon does not fabricate a `ToolResult` it did not compute — an \
+             invented `result` here would be indistinguishable from a real host answer \
+             to anything reading the relay"
         );
-        // And it reaches a client: `event_frame` is what the pump sends, so the
-        // refusal must survive the envelope the relay filters on.
-        let wrapped = event_frame(
-            "s9",
-            false,
-            &WorkerInboundEvent::TaskRequest {
-                request_id: "task-abc".into(),
-                session_id: None,
-                call: fulcrum_harness::seams::TaskCall::ListBoard {
-                    space_path: "/some/space".into(),
-                },
-            },
-        );
+        // And it reaches a client: `event_frame` is what the pump sends, so the refusal
+        // must survive the envelope the relay filters on.
+        let wrapped = event_frame("s9", false, &event);
         assert_eq!(wrapped["sessionId"], "s9", "addressed to the session");
-        assert_eq!(wrapped["frame"]["type"], "task-unsupported");
+        assert_eq!(wrapped["frame"]["type"], "host-tool-unsupported");
+        assert_eq!(
+            wrapped["frame"]["requestId"], "host-abc",
+            "the correlation id survives the envelope"
+        );
         assert!(
             watched(&wrapped, &HashSet::from(["s9".to_string()])),
             "a relay watching the session receives the refusal"
         );
     }
 
-    /// The refusal must not be the SILENT-DROP shape `null`, and must not be
-    /// confused with the store frames' `_ => {}` catch-all in `persist_frame`
-    /// (which is deliberately untouched: persistence has nothing to persist for a
-    /// task call, and a task frame is not a row).
+    /// The generic refusal is never the SILENT-DROP shape `null` either, and it is
+    /// never a half-frame: the two assertions are the same pair the task refusal is
+    /// held to, because the mutation they reject is the same one (return `null` and the
+    /// suite stays green while the tool looks frozen).
+    ///
+    /// The `None` `session_id` is deliberate: a Worker that predates the origin field
+    /// still gets a refusal — the refusal must not depend on a field the daemon does not
+    /// use for it.
     #[test]
-    fn the_task_refusal_is_never_a_silent_drop() {
-        let frame = worker_frame(&WorkerInboundEvent::TaskRequest {
-            request_id: "task-z".into(),
+    fn the_host_tool_refusal_is_never_a_silent_drop() {
+        let frame = worker_frame(&WorkerInboundEvent::HostToolCall {
+            request_id: "host-z".into(),
             session_id: None,
-            call: fulcrum_harness::seams::TaskCall::GetTask {
-                task_id: "tsk_1".into(),
-            },
+            tool: "mark_ready".into(),
+            params: serde_json::json!({}),
         });
         assert!(
             !frame.is_null(),
@@ -2972,6 +3003,11 @@ mod tests {
         assert!(
             frame.as_object().map(|o| !o.is_empty()).unwrap_or(false),
             "the frame carries content, got {frame}"
+        );
+        assert!(
+            frame["tool"].is_string() && frame["message"].is_string(),
+            "and it carries BOTH names a reader needs (the tool and the reason), got \
+             {frame}"
         );
     }
 

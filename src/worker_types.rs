@@ -330,6 +330,60 @@ pub struct StartEnv {
     /// the `encode_line` `.expect` — not a type change here.
     #[serde(default)]
     pub diagnostics_dir: Option<std::path::PathBuf>,
+    /// (ADR 0102 / issue #183 F2) The specs of the tools whose SUBSTANCE lives in
+    /// the SUPERVISOR, arriving as DATA. The wire key is camelCase `hostTools`
+    /// (`StartEnv`'s own `rename_all`).
+    ///
+    /// # Why specs cross the boundary and executors never do
+    ///
+    /// The engine cannot advertise a spec it has never seen, so the spec travels.
+    /// The EXECUTOR stays on this side of the wire: a Worker is a second process of
+    /// the SAME binary (`WorkerHandle::spawn(current_exe())` + `--worker`, ADR
+    /// 0025), so the desktop cannot hand it a Rust object even in principle. The
+    /// engine therefore wraps each spec in
+    /// [`HostTool`](crate::tools::exec::HostTool) itself —
+    /// `builtins() ++ host_entries(env.host_tools)` — and a call to one of them
+    /// goes back out over
+    /// [`Outbound::HostToolCall`](crate::worker::protocol::Outbound::HostToolCall)
+    /// to the Supervisor that owns it. No desktop type crosses the boundary, so ADR
+    /// 0091's rule holds verbatim: *the desktop drives; the crate never pulls.*
+    ///
+    /// # The additive template, verbatim
+    ///
+    /// `#[serde(default)]` on the LAST field, an inert value in `from_parts`, a
+    /// `with_*` builder ([`StartEnv::with_host_tools`]) for the real Supervisor
+    /// path, and NO new `from_parts` parameter — `permission` / `cost_usd` /
+    /// `file_policy` / `diagnostics_dir` are the same template, for the same reason
+    /// (a 13-parameter positional constructor with a call site in every fixture in
+    /// BOTH repos). The `Vec`'s `serde(default)` is the EMPTY vec = "no host tools",
+    /// byte-identical to an old envelope's absence, so a pre-F2 `start` line decodes
+    /// to the surface it spoke. `ToolSpec` needs no new serde attributes: its three
+    /// field names are single lowercase words, so camelCase spells them identically,
+    /// and `parameters` is a raw `Value` so an arbitrary JSON Schema round-trips.
+    ///
+    /// # These are NOT part of `DesktopConfig`, and a child gets them explicitly
+    ///
+    /// `DesktopConfig::from_env` copies exactly the FIVE fields the Worker used to
+    /// read out of `settings.json`; a host tool is not one of those, so folding it
+    /// in would make that bundle's doc a lie. Subagent inheritance is therefore an
+    /// explicit line in `subagent_flow.rs` (`with_host_tools(parent_env.host_tools…)`),
+    /// not a serde default doing it by accident.
+    ///
+    /// # The daemon surface, stated honestly (the reason the loud refusal exists)
+    ///
+    /// `serve.rs`'s `start_env` parses the client's `start` payload and forwards it
+    /// VERBATIM, so a `fulcrum serve` CLIENT can set `hostTools` and have them
+    /// ADVERTISED to the model — while the daemon has no way to ANSWER them (its
+    /// `on_event` carries no inbound writer). That is exactly the
+    /// advertised-but-dead shape, and the same situation `diagnostics_dir`'s doc
+    /// records for its own field. Two mitigations are real: a socket peer whose uid
+    /// is not the daemon's is refused at accept (`TransportError::PeerIdentity`), so
+    /// the reachable set is same-uid only — a peer that can already run this code
+    /// itself; and the unhosted case answers a `ToolResult::fail` through the
+    /// daemon's `host-tool-unsupported` refusal rather than a silent park, so the
+    /// worst a client achieves is a tool that fails with a reason.
+    #[serde(default)]
+    pub host_tools: Vec<crate::provider_types::ToolSpec>,
 }
 
 // ── `DesktopConfig` ─────────────────────────────────────────────────────────────
@@ -454,7 +508,28 @@ impl StartEnv {
             // every `cargo test`. The Supervisor opts a Worker in explicitly with
             // [`StartEnv::with_diagnostics_dir`].
             diagnostics_dir: None,
+            // (ADR 0102 F2) No host tools, and that is the load-bearing default, not
+            // an omission — the same argument `diagnostics_dir` above makes. Every
+            // fixture in both repos builds through `from_parts`, and a fixture that
+            // advertised a host tool with no Supervisor to answer it would park a
+            // real oneshot. The Supervisor opts its session in with
+            // [`StartEnv::with_host_tools`]; a child inherits the parent's through
+            // the explicit line in `subagent_flow.rs`.
+            host_tools: Vec::new(),
         }
+    }
+
+    /// Attach the HOST-OWNED tool specs to an already-built `StartEnv` (ADR 0102
+    /// F2). The Supervisor's only edit of this field, and the sibling of
+    /// [`StartEnv::with_diagnostics_dir`] for the same reason: a builder, not a 14th
+    /// `from_parts` parameter.
+    ///
+    /// REPLACES, never extends — a second call is a new surface, matching
+    /// [`AgentLoop::set_tool_registry`](crate::harness::r#loop::AgentLoop)'s rule, so
+    /// "what this session can reach" never depends on call order.
+    pub fn with_host_tools(mut self, tools: Vec<crate::provider_types::ToolSpec>) -> Self {
+        self.host_tools = tools;
+        self
     }
 
     /// Attach the FIVE packaged desktop-config fields to an already-built

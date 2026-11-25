@@ -4176,3 +4176,157 @@ fn observe_event_records_a_truncation_and_defeats_the_tool_activity_exemption() 
          / `is_bookkeeping_message_id`)"
     );
 }
+
+/// THE child `StartEnv` INHERITS the parent's HOST TOOLS — the hop at
+/// `subagent_flow.rs`'s child-envelope construction (`with_host_tools(parent_env
+/// .host_tools.clone())`), pinned end to end rather than by reading the source.
+///
+/// # Why this test exists
+///
+/// A reviewer claimed "subagent children lose host tools". The inheritance line has
+/// no conditional between it and the enclosing function's early returns, so it
+/// LOOKED unconditional — but "looks unconditional" is not a proof, and the reason
+/// the claim was arguable at all is that NO test could see a child's `host_tools`.
+/// A child Worker is never registered in `state.workers` (only `attach` registers),
+/// so not even the test-only `WorkerManager::test_env_for` can read the envelope
+/// back. The fixture's `session_info` Start echo is the only observable — the same
+/// reason `incarnation` and `diagnosticsDir` are echoed.
+///
+/// # What a missing hop looks like from here
+///
+/// The child's `hostTools` is `[]` while the parent's names a verb: the child then
+/// answers `unknown tool` for a name its own advertised set was built from, and a
+/// child dispatched to do board work (the motivating `roadmap` case — turn an
+/// approved backlog into N Tasks) cannot touch the board. That is the regression
+/// this keeps from coming back.
+///
+/// # What this does NOT assert
+///
+/// That the child may USE the verb. `enabled_tools` is the narrowing and the wire
+/// fixture sends the parent `["bash", "read"]`, so the inherited spec is not in the
+/// child's advertised set here — which is the documented design ("the gate is the
+/// narrowing; the envelope just makes the name POSSIBLE", `subagent_flow.rs`). The
+/// assertion is about the ENVELOPE, which is the thing the claim was about.
+#[tokio::test]
+async fn a_child_worker_inherits_the_parents_host_tools() {
+    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    let host = vec![crate::provider_types::ToolSpec {
+        name: "mark_ready".to_string(),
+        description: "HOST-TOOLS-INHERITANCE-MARKER".to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+    let env = test_env("h1", Some(vec!["bash".to_string()])).with_host_tools(host.clone());
+    // The fixture's premise: `from_parts` leaves the field EMPTY, so a child that
+    // shows `[]` here got nothing, rather than inheriting an already-empty parent.
+    assert_eq!(
+        env.host_tools.len(),
+        1,
+        "the parent envelope carries the host spec — the setter is the Supervisor's \
+         only writer of this field"
+    );
+    manager
+        .attach("h1", &env)
+        .await
+        .expect("the parent attach completes");
+    manager
+        .handle_for("h1")
+        .expect("the parent handle is reachable")
+        .send_prompt("__subagent__", &[])
+        .expect("the prompt encodes");
+
+    // The CHILD's `session_info` Start echo (the `is_subagent` frame the drive's
+    // pump re-emits on the parent's scope) — the same read shape
+    // `a_child_worker_inherits_the_parents_diagnostics_dir` uses.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut child_host_tools: Option<Value>;
+    loop {
+        let got: Vec<(String, bool, WorkerInboundEvent)> =
+            events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        child_host_tools =
+            got.iter()
+                .filter(|(_, is_sub, _)| *is_sub)
+                .find_map(|(_, _, e)| match e {
+                    WorkerInboundEvent::SinkFrame { event, payload }
+                        if event == "session-update" =>
+                    {
+                        payload
+                            .get("update")
+                            .and_then(|u| u.get("hostTools"))
+                            .cloned()
+                    }
+                    _ => None,
+                });
+        if child_host_tools.is_some() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let echoed = child_host_tools.expect("the child's Start echo carries the echoed field");
+    let expected = serde_json::to_value(&host).expect("a `ToolSpec` vec is serialisable");
+    assert_eq!(
+        echoed, expected,
+        "the child's `hostTools` is NOT the parent's — the claim under test. The \
+         child would answer `unknown tool` for a verb its parent could reach, and a \
+         board-shaped dispatch (`roadmap`: an approved backlog into N Tasks) is \
+         exactly such a child."
+    );
+    // The description too, verbatim: the spec travels as DATA, so an inheritance
+    // that rebuilt the spec from the name would pass a name-only assertion.
+    assert_eq!(
+        echoed[0]["description"],
+        serde_json::json!("HOST-TOOLS-INHERITANCE-MARKER"),
+        "the inherited spec is the parent's spec and not a re-invention: {echoed}"
+    );
+    manager.detach("h1");
+}
+
+/// The NEGATIVE half of the inheritance pin: a parent with NO host tools hands the
+/// child `[]`, not a fallback and not a stale surface.
+///
+/// Paired with the positive half for the same reason `diagnosticsDir`'s test carries
+/// both: inheritance is the property, and a `host_tools` that came from anywhere
+/// other than the parent's live registry copy is a bug in the other direction.
+#[tokio::test]
+async fn a_parent_with_no_host_tools_leaves_the_child_with_none() {
+    let (manager, _crashes, events, _sinks) = make_manager(Some(Duration::from_secs(30)));
+    manager
+        .attach("h2", &test_env("h2", Some(vec!["bash".to_string()])))
+        .await
+        .expect("the parent attach completes");
+    manager
+        .handle_for("h2")
+        .expect("the parent handle is reachable")
+        .send_prompt("__subagent__", &[])
+        .expect("the prompt encodes");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut child_host_tools: Option<Value>;
+    loop {
+        let got: Vec<(String, bool, WorkerInboundEvent)> =
+            events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        child_host_tools =
+            got.iter()
+                .filter(|(_, is_sub, _)| *is_sub)
+                .find_map(|(_, _, e)| match e {
+                    WorkerInboundEvent::SinkFrame { event, payload }
+                        if event == "session-update" =>
+                    {
+                        payload
+                            .get("update")
+                            .and_then(|u| u.get("hostTools"))
+                            .cloned()
+                    }
+                    _ => None,
+                });
+        if child_host_tools.is_some() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        child_host_tools.expect("the child's Start echo carries the echoed field"),
+        serde_json::json!([]),
+        "an empty parent must hand the child an EMPTY surface — a child that grew a \
+         host verb its parent never had is a second owner of the tool surface"
+    );
+    manager.detach("h2");
+}

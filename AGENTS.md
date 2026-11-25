@@ -93,7 +93,10 @@ ordinary lib code; each bin is a three-line `main`.
 this package was a workspace member of the desktop, both members' bins landed in ONE shared `target/debug/`, and two
 members declaring a bin of the same name collide on the output filename — cargo only *warns* and **the last writer
 silently wins**, so a suite can spawn the other package's fixture and never notice. That is why the names differ. The
-desktop now consumes this crate as a git dependency, and **a dependency's bins are not built by the dependent**, so the
+desktop now consumes this crate as a registry dependency (a version-only `fulcrum-harness =
+"X.Y.Z"` in its `src-tauri/Cargo.toml`, resolved from crates.io — measured: its `Cargo.lock`
+carries `source = "registry+https://github.com/rust-lang/crates.io-index"` plus a checksum),
+and **a dependency's bins are not built by the dependent**, so the
 collision cannot happen from the desktop's checkout anymore. **The suffix is still load-bearing, because re-adding this
 package to the desktop's `members` — a normal move for local engine work — re-arms the collision silently.** Renaming
 these bins to drop the suffix is the way to reintroduce a bug that produced wrong test results with a green suite.
@@ -342,11 +345,23 @@ The tag message's own words already said it was "a legibility marker, not a semv
 so nothing pinned by it breaks: the desktop's `src-tauri/Cargo.toml` pins by `rev`, and a rev
 pin is unaffected by a tag being deleted or renumbered.
 
-**The version is now load-bearing in a way it was not, and that is the point.** The plan is to
-move the desktop from `rev = "40-hex-chars"` to `tag` + `version`, which cargo honours only
-when the tagged manifest carries that version. That makes the tag and the manifests one
-contract, which is why `check-versions.sh --tag vX.Y.Z` is the first step of
-`release.yml` and not a nicety: a tag outrunning the files produces a pin nothing can install.
+**The version is now load-bearing in a way it was not, and that is the point.** The desktop
+consumes the crate by **version**: `archimedes/src-tauri/Cargo.toml` carries a plain
+`fulcrum-harness = "X.Y.Z"` with no `rev` and no `tag`, and its `Cargo.lock` resolves that
+from the crates.io index. So a published version is not a nicety and a bump is not
+documentation — a BREAKING release that is not published leaves the desktop on the old
+number and structurally unable to take the change, because a version requirement can only
+match a published version. (The older prose in this file and in the README describes the
+desktop as pinned by `rev = "40-hex-chars"`; *that* is the stale half. It was true when the
+extraction landed and the move to a registry pin superseded it. The `tag` + `version` form
+below is a THIRD option that the rename made unsafe, not the present state of the consumer.
+Deliberately no number is written here: the consumer's pin moves on every release and a
+number in this file would be a second, unfalsifiable copy of it.)
+
+The `tag` + `version` form is what cargo honours only when the tagged manifest carries that
+version, which makes the tag and the manifests one contract — and that is why
+`check-versions.sh --tag vX.Y.Z` is the first step of `release.yml` and not a nicety: a tag
+outrunning the files produces a pin nothing can install.
 
 **`--tag` is weaker than that sentence implies, and `v0.1.0` proves it.** The flag parses the
 version out of the tag's *name* and compares it to the agreed manifest version; it never reads
@@ -363,8 +378,8 @@ one — repointing is exactly what the ancestry gate exists to forbid.
 
 **What `release.yml` publishes: a GitHub release and its notes, and nothing else.** There is
 no build stage and no artifact upload, deliberately — no consumer installs a binary today (the
-desktop compiles the engine from source as a git dependency), and an unsigned tarball that
-looks like a supported install channel is worse than none. `cargo publish` is also not part of
+desktop takes the engine as a **crates.io source dependency**, not an executable), and an
+unsigned tarball that looks like a supported install channel is worse than none. `cargo publish` is also not part of
 the workflow, but the engine **is** on crates.io now: `fulcrum-harness` 0.1.0 was published by
 hand from `b52ce68`, and that name is burned permanently — crates.io supports neither rename nor
 delete, the same property that made `fulcrum-core` unusable. `fulcrum-harness-daemon` is NOT

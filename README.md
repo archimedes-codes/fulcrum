@@ -44,8 +44,9 @@ This repo is a Cargo workspace with two members:
   client does not stop a running session, and `close` ends one. `serve::run` never
   returns — there is no shutdown frame yet, so the daemon is killed, and a killed
   daemon's children exit on their own stdin EOF (`src/worker/mod.rs:186` is that
-  path). It is a member rather than a consumer of the rev pin so it links the engine
-  by `path = ".."` and can never drift from it.
+  path). It is a workspace member rather than a consumer of the crates.io pin, so it
+  links the engine by `path = ".."` and can never drift from it (unlike the desktop,
+  which consumes a published version).
 
 **What the daemon does not do yet**, stated because the gaps are the parts that bite:
 no `attach`, no replay, no re-join after a reconnect (T10); no graceful shutdown, so
@@ -347,6 +348,18 @@ fulcrum-harness = { git = "https://github.com/archimedes-codes/fulcrum", rev = "
 The registry route is verified end to end, not assumed: a scratch crate depending on
 `fulcrum-harness = "0.1.0"` resolved from the sparse index, compiled, and ran
 (`SessionId::mint()`), and docs.rs renders the rustdoc.
+
+**And it is the route the real consumer takes.** Archimedes Desktop pins
+`fulcrum-harness` by **version** in `src-tauri/Cargo.toml` — no `rev`, no `tag` — and its
+`Cargo.lock` resolves the crate from `registry+https://github.com/rust-lang/crates.io-index`
+with a checksum. So the crate's version number is a live dependency edge, not a label: a
+BREAKING release that is never published is a change the desktop cannot take at any version.
+(Older prose in this file and in `AGENTS.md` says the desktop compiles the engine from
+source as a **git** dependency pinned by `rev`. That was the state at extraction and it is
+superseded — the consumer's manifest is the authority, and it says crates.io.) The
+consequence for a release is that the bump and the publish are one obligation, not two:
+`cargo publish -p fulcrum-harness` is what makes `0.8.0` reachable, and the desktop's pin
+moves with it.
 
 **A pre-rename git pin keeps working only if you leave the dep line alone.** Measured
 against two scratch consumers at `rev = "ae1fe97"`, which predates PR #17:

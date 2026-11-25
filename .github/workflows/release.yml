@@ -7,10 +7,14 @@ name: Release
 # WHAT THIS RELEASES: a GitHub release object and its notes. Nothing else. There
 # is deliberately no build stage — this repo is a library plus the `fulcrum`
 # binary, and today no consumer installs an artifact: the desktop consumes the
-# engine as a git dependency (a rev pin, moving to `tag` + `version`), which
-# compiles from source and reads nothing off the release page. A build stage
-# would invent consumers before they exist, and an unsigned tarball nobody
-# installs is worse than none: it looks like a supported install channel.
+# engine as a crates.io version dependency (`fulcrum-harness = "X.Y.Z"` in its
+# `src-tauri/Cargo.toml`, no `rev`, no `tag`, resolved from the registry index),
+# which compiles from source and reads nothing off the release page. The version
+# is not a label for all that: a version requirement can only match a published
+# version, so a BREAKING release that is never published leaves the desktop on
+# the old number and structurally unable to take the change. A build stage would
+# invent consumers before they exist, and an unsigned tarball nobody installs is
+# worse than none: it looks like a supported install channel.
 #
 # So the two things this workflow is FOR are (1) refusing to announce a version
 # the tree does not carry, and (2) creating the release. Everything else is a
