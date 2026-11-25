@@ -191,6 +191,37 @@ pub enum Inbound {
         request_id: String,
         result: Result<Value, TaskStoreError>,
     },
+    /// Supervisor → Worker answer to one host-owned tool call (ADR 0102 / issue #183 F2).
+    ///
+    /// `result` is serde's `Result` encoding — `{"Ok": {"content": […],
+    /// "isError": false}}` or `{"Err": "…"}` — because [`ToolResult`]
+    /// ([`crate::tools::ToolResult`]) ALREADY derives `Serialize`/`Deserialize`
+    /// (`content` / `details` / `isError`, the same shape the tool sink frames
+    /// carry). So the answer rides as DATA and the crate needs no per-tool result
+    /// enum: a host tool's success is a `ToolResult`, and a host that could not
+    /// serve the call answers `Err` with the prose the model then sees.
+    ///
+    /// # The `String` error half is deliberate, and it is weaker than the task frame
+    ///
+    /// [`Inbound::TaskResponse`]'s error half is [`TaskStoreError`], which carries a
+    /// machine-readable `kind`. This one is a bare `String`, because the crate has
+    /// NO idea what a host tool is — naming an error type here would put host
+    /// vocabulary back into the engine, which is the whole thing ADR 0102 removes.
+    /// The consequence is real and accepted: the model sees prose, not a kind it can
+    /// branch on. (H8 of the grounding report; do not "fix" it by adding a kind
+    /// enum without re-opening the ADR.)
+    ///
+    /// ADDITIVE on both sides, exactly like the task pair: an older Supervisor never
+    /// sends this, and a Worker that predates F2 routes the line to `Unknown` and
+    /// ignores it. A `request_id` with no pending entry is IGNORED by the handler,
+    /// never an error — the ordinary reason it is absent is that the turn was
+    /// cancelled and [`HostToolCleanup`](crate::worker::host_tools::HostToolCleanup)
+    /// already removed the entry.
+    #[serde(rename = "host-tool-response", rename_all = "camelCase")]
+    HostToolResponse {
+        request_id: String,
+        result: Result<crate::tools::ToolResult, String>,
+    },
     /// An inbound `type` this version of the Worker doesn't know
     /// (permissive — the raw line is preserved; never an error).
     #[serde(rename = "unknown", rename_all = "camelCase")]
@@ -361,6 +392,54 @@ pub enum Outbound {
         session_id: Option<String>,
         call: TaskCall,
     },
+    /// Worker → Supervisor: run ONE host-owned tool (ADR 0102 / issue #183 F2).
+    ///
+    /// # Why one frame carries every host tool, and `task-request` is not it
+    ///
+    /// The frame names a tool by STRING and carries its arguments as the raw JSON
+    /// the model produced, so the engine holds no idea what the tool does. That is
+    /// the point of ADR 0102: `Outbound::TaskRequest` is shaped around seven board
+    /// verbs ([`TaskCall`]) and a host that adds an eighth verb had to change the
+    /// crate. Here a new host tool costs no new frame and no new crate release.
+    /// F3 deletes the task pair and the seven verbs ride THIS frame.
+    ///
+    /// `params` is the call's arguments verbatim — NOT validated here. The engine
+    /// already ran `unknown_param_error` against the spec the host advertised (the
+    /// advertised set is the composed one), so an unknown key is rejected before
+    /// this frame is ever built; what arrives here is what the model meant.
+    ///
+    /// # The answer, and what happens when there is none
+    ///
+    /// The Worker registers its oneshot BEFORE emitting this frame and parks racing
+    /// the TURN token, so a Supervisor that never answers costs a cancelled tool,
+    /// not a hung turn
+    /// ([`HostTool`](crate::tools::exec::HostTool)'s body,
+    /// [`host_tools`](crate::worker::host_tools)). A Supervisor that cannot answer
+    /// says so LOUDLY rather than dropping the frame — see the daemon's
+    /// `host-tool-unsupported` refusal in `fulcrum/src/serve.rs`.
+    ///
+    /// `session_id` is the **ORIGIN** address, exactly as on
+    /// [`Outbound::TaskRequest`]: the id of the Worker that EMITTED this frame, the
+    /// **CHILD** for a Subagent, taken from `StartEnv::session_id` at the
+    /// construction site. It is NOT the pump's delivery id — the manager re-keys a
+    /// child's frames to the PARENT's session id so the child's UI renders in the
+    /// parent's scope
+    /// ([`pump`](crate::worker::manager::pump)), and ADR 0117's rule is that **a
+    /// frame's delivery address is a UI-scope key and never a reply address**. This
+    /// hang is not hypothetical: the 255m55s `get_artifact` stall was a reply sent
+    /// at the delivery id, which for a subagent is the PARENT's — the child's
+    /// oneshot is never resolved. So: a reply
+    /// (`Inbound::HostToolResponse`) MUST be addressed by THIS field and NEVER by
+    /// the delivery id. It is an `Option` so a frame from a Worker that predates the
+    /// field decodes to `None` — an honest absence, and the reason the change is
+    /// additive and [`PROTOCOL_VERSION`] stays `1`.
+    #[serde(rename = "host-tool-call", rename_all = "camelCase")]
+    HostToolCall {
+        request_id: String,
+        session_id: Option<String>,
+        tool: String,
+        params: Value,
+    },
     /// An outbound `type` this version of the Supervisor doesn't know
     /// (permissive — the raw line is preserved; never an error).
     #[serde(rename = "unknown", rename_all = "camelCase")]
@@ -483,7 +562,8 @@ pub fn decode_inbound(line: &str) -> Result<Inbound, ProtoError> {
         | "interactive-response"
         | "subagent-result"
         | "fetch-render-response"
-        | "task-response" => {
+        | "task-response"
+        | "host-tool-response" => {
             serde_json::from_value(value).map_err(|e| ProtoError::Json(e.to_string()))
         }
         // Unknown `type` (and the literal `unknown`) — permissive.
@@ -522,7 +602,23 @@ pub fn decode_outbound(line: &str) -> Result<Outbound, ProtoError> {
         | "sink-frame"
         | "fetch-render-request"
         | "worker-error"
-        | "task-request" => {
+        // (ADR 0102 F2) BOTH frame families of the tool wire are listed. A name
+        // missing here is the silent failure `decode_outbound`'s doc describes: the
+        // permissive decoder swallows the frame as `Unknown` and the parked caller
+        // hangs. `host-tool-call` is the generic half; `task-request` is F3's to
+        // delete. (This list is where F2 nearly got bitten by its own hazard — the
+        // `task-request` name was dropped while adding this one, and seven existing
+        // pins reddened instantly: `decode_outbound_routes_a_task_request_line_to_
+        // its_variant`, `task_request_round_trips_through_the_wire`,
+        // `the_task_request_frame_carries_the_emitting_session_id`,
+        // `a_task_request_line_with_no_session_id_decodes_as_none`,
+        // `a_256_kib_markdown_request_round_trips_byte_for_byte`,
+        // `a_multiline_markdown_stays_one_frame_line` and
+        // `task_store::the_frame_this_file_emits_decodes_as_a_task_request_line`.
+        // That is the mutation the acceptance bar asks for, demonstrated by accident
+        // on the pre-existing pair rather than only on the new one.)
+        | "task-request"
+        | "host-tool-call" => {
             serde_json::from_value(value).map_err(|e| ProtoError::Json(e.to_string()))
         }
         // Unknown `type` (and the literal `unknown`) — permissive.
@@ -701,6 +797,26 @@ mod tests {
             // camelCase WIRE NAME is pinned byte-wise by
             // `the_start_env_carries_the_diagnostics_dir_as_diagnostics_dir`.
             diagnostics_dir: Some(std::path::PathBuf::from("/home/u/.local/share/archimedes")),
+            // (ADR 0102 F2) The HOST tool specs, NON-empty ON PURPOSE for the same
+            // reason as the seven fields above: this literal is what
+            // `every_inbound_variant_round_trips` encodes and DECODES, so the
+            // `Deserialize` half of `Vec<ToolSpec>` — and of `ToolSpec`'s raw `Value`
+            // `parameters` — is exercised on every run. The camelCase WIRE NAME is
+            // pinned byte-wise by `the_start_env_carries_the_host_tools_as_host_tools`,
+            // and the absence half (an old envelope) by
+            // `a_start_envelope_with_no_host_tools_key_decodes_to_no_host_tools`.
+            //
+            // The name is one the ENGINE has never heard of, deliberately: a host spec
+            // whose name collides with a built-in would let a composition bug hide
+            // behind the shadowing rule.
+            host_tools: vec![crate::provider_types::ToolSpec {
+                name: "mark_ready".to_string(),
+                description: "Mark the session ready (a host verb).".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "note": { "type": "string" } },
+                }),
+            }],
         }))
     }
 
@@ -1383,6 +1499,25 @@ mod tests {
                     },
                 )])),
             },
+            // (ADR 0102 / issue #183 F2) The generic host-tool answer. This list is
+            // enumerated BY HAND — see the warning at `every_outbound_variant_round_trips`
+            // — so a variant nobody added here is a coverage hole the codec would hide
+            // (a `rename` typo decodes to `Unknown` and every test stays green). Both
+            // `Result` arms are here, not one: the `Err` half is the one whose payload
+            // type (`String`, not a `kind`-carrying enum) a reader would least expect to
+            // need pinning, and `ToolResult`'s own camelCase (`isError`) lives inside the
+            // `Ok` half.
+            Inbound::HostToolResponse {
+                request_id: "host-1".to_string(),
+                result: Ok(crate::tools::ToolResult::ok_text(
+                    "marked ready".to_string(),
+                    Some(serde_json::json!({ "board": { "spacePath": "/s" } })),
+                )),
+            },
+            Inbound::HostToolResponse {
+                request_id: "host-2".to_string(),
+                result: Err("this session has no board host".to_string()),
+            },
         ];
         for case in cases {
             let line = encode_inbound(&case);
@@ -1667,6 +1802,28 @@ mod tests {
                 code: "worker_panic".to_string(),
                 message: "the loop panicked".to_string(),
                 backtrace: Some("frame 1".to_string()),
+            },
+            // (ADR 0102 / issue #183 F2) The GENERIC host-tool frame, in the hand-
+            // enumerated list this test's own comment warns about: "a new variant
+            // nobody added here is an untested coverage hole — the codec would
+            // round-trip it silently broken (e.g. a `rename` typo that decodes to
+            // `Unknown`) and every test would stay green". The `Some(origin)` half is
+            // deliberate: the subagent case is the one that must round-trip.
+            // (`TaskRequest` is not in this list — it has its own
+            // `task_request_round_trips_through_the_wire`, which walks all seven
+            // verbs. The generic frame needs no such per-verb walk: its payload is a
+            // `String` + a `Value`, so one case covers the shape.)
+            Outbound::HostToolCall {
+                request_id: "host-1".to_string(),
+                session_id: Some("child-1".to_string()),
+                tool: "mark_ready".to_string(),
+                params: serde_json::json!({ "note": "ship it" }),
+            },
+            Outbound::HostToolCall {
+                request_id: "host-2".to_string(),
+                session_id: None,
+                tool: "list_board".to_string(),
+                params: serde_json::json!({}),
             },
         ];
         for case in cases {
@@ -2076,6 +2233,13 @@ mod tests {
                 // built by `from_parts`, so the shape this test proves
                 // field-identical is the UNARMED one every fixture carries.
                 assert_eq!(env_dec.diagnostics_dir, env.diagnostics_dir);
+                // (ADR 0102 F2) `host_tools`, on the same pin — and its `Vec::new()`
+                // here is the point as much as the `start_inbound()` fixture's
+                // one-spec non-emptiness (pinned by
+                // `the_start_env_carries_the_host_tools_as_host_tools`): the shape this
+                // test proves field-identical is the NO-HOST-TOOLS one every fixture
+                // and every pre-F2 Supervisor carries.
+                assert_eq!(env_dec.host_tools, env.host_tools);
             }
             other => panic!("expected `Start`, got {other:?}"),
         }
@@ -2519,6 +2683,18 @@ mod tests {
             r#"{"type":"brand-new-event","foo":1}"#,
             r#"{"type":"task-requestz","foo":1}"#,
             r#"{"type":"task-responsz","foo":1}"#,
+            // (ADR 0102 / issue #183 F2) The generic pair's near-misses, added to the
+            // list rather than written as a new test beside it. `task-requestz` is the
+            // precedent this follows: a name that is ALMOST allow-listed must stay
+            // `Unknown`, which is what proves the allow-list is a list and not a prefix
+            // match. Without these two, adding `host-tool-call` to the list could in
+            // principle be done with a typo (`host-tool-cal`) and the round-trip pins
+            // would still pass on their own spellings.
+            r#"{"type":"host-tool-callz","foo":1}"#,
+            r#"{"type":"host-tool-responsz","foo":1}"#,
+            // The literal `unknown` type stays the fallback on both sides, and it is
+            // NOT captured by the two new names above — the reason the pair is spelled
+            // out here rather than trusted to the `z` variants.
             r#"{"type":"unknown","foo":1}"#,
         ] {
             assert!(
@@ -2550,6 +2726,340 @@ mod tests {
             "adding `task-request` / `task-response` is additive — do NOT bump the wire \
              version (the decoder is permissive by design: an older peer routes the new \
              type to `Unknown` and ignores it)"
+        );
+    }
+
+    /// (ADR 0102 / issue #183 F2) The generic pair is additive on the same argument,
+    /// and the pin is SEPARATE from the one above on purpose: the sentence that has to
+    /// be true after F3 deletes the task pair is this one, and a test that names the
+    /// deleted frames in its message cannot survive the commit that deletes them.
+    #[test]
+    fn the_host_tool_frames_are_additive_so_the_protocol_version_stays_one() {
+        assert_eq!(
+            PROTOCOL_VERSION, 1,
+            "`host-tool-call` / `host-tool-response` are new `type`s on a decoder that is \
+             permissive by design — an older peer routes them to `Unknown` and ignores \
+             them, which is the correct answer to a frame it has no caller for. Do NOT \
+             bump the wire version (the module doc's rule: only a frame an older peer \
+             cannot READ bumps it, and the Supervisor and the Worker are always ONE build \
+             anyway — ADR 0025's self-exec)."
+        );
+    }
+
+    /// THE allow-list pin, outbound direction: a `host-tool-call` line routes to the
+    /// VARIANT, not to `Unknown`.
+    ///
+    /// This is the test that reddens when the name is dropped from `decode_outbound`'s
+    /// allow-list — and it is the ONLY thing that does. The failure is silent by
+    /// construction: the permissive decoder swallows every frame as `Unknown { raw }`,
+    /// the whole suite stays green, and in production the parked `HostTool` hangs until
+    /// the turn token cancels it. `decode_outbound`'s own doc names this as the failure
+    /// mode the sibling hello test exists for; this is that test for this frame.
+    #[test]
+    fn decode_outbound_routes_a_host_tool_call_line_to_its_variant() {
+        let line = r#"{"type":"host-tool-call","requestId":"host-7","sessionId":"child-3","tool":"mark_ready","params":{"note":"ship it"}}"#;
+        match decode_outbound(line).expect("the `host-tool-call` line decodes") {
+            Outbound::HostToolCall {
+                request_id,
+                session_id,
+                tool,
+                params,
+            } => {
+                assert_eq!(request_id, "host-7");
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some("child-3"),
+                    "the ORIGIN address arrives (a reply is addressed to it)"
+                );
+                assert_eq!(tool, "mark_ready");
+                assert_eq!(params["note"], "ship it");
+            }
+            other => panic!(
+                "`host-tool-call` must decode to `Outbound::HostToolCall`, got {other:?} \
+                 (the `decode_outbound` type allow-list is missing `host-tool-call` — the \
+                 permissive decoder would silently swallow every host tool call as \
+                 `Unknown` and the caller would park until the turn was cancelled)"
+            ),
+        }
+    }
+
+    /// THE allow-list pin, inbound direction (the same trap on the answer side). A
+    /// dropped name here is the same hang by a different route: the frame decodes, the
+    /// answer is routed to `Unknown` and ignored, and the caller never wakes.
+    #[test]
+    fn decode_inbound_routes_a_host_tool_response_line_to_its_variant() {
+        let line = r#"{"type":"host-tool-response","requestId":"host-7","result":{"Ok":{"content":[{"type":"text","text":"marked ready"}],"details":null,"isError":false}}}"#;
+        match decode_inbound(line).expect("the `host-tool-response` line decodes") {
+            Inbound::HostToolResponse { request_id, result } => {
+                assert_eq!(request_id, "host-7");
+                let got = result.expect("the Ok arm");
+                assert_eq!(
+                    got,
+                    crate::tools::ToolResult::ok_text("marked ready".to_string(), None),
+                    "the `ToolResult` the host wrote arrives intact (and note the \
+                     `content` block's `type: \"text\"` — `ContentBlock`'s own \
+                     snake_case tag, riding inside the frame unchanged)"
+                );
+            }
+            other => panic!(
+                "`host-tool-response` must decode to `Inbound::HostToolResponse`, got \
+                 {other:?} — with the name missing from `decode_inbound`'s allow-list the \
+                 answer is dropped as `Unknown` and the parked caller never wakes"
+            ),
+        }
+    }
+
+    /// THE ORIGIN-ADDRESS PIN at the codec: the wire key is camelCase `sessionId`, and
+    /// it is the ORIGIN (the emitting Worker), not a delivery address.
+    #[test]
+    fn the_host_tool_call_frame_carries_the_emitting_session_id() {
+        let frame = Outbound::HostToolCall {
+            request_id: "host-orig".into(),
+            session_id: Some("child-1".into()),
+            tool: "mark_ready".into(),
+            params: serde_json::json!({}),
+        };
+        let line = encode_outbound(&frame);
+        assert!(
+            line.contains(r#""sessionId":"child-1""#),
+            "the wire key is `sessionId` (the variant's `rename_all` spells it camelCase), \
+             got {line}"
+        );
+        assert!(
+            line.contains(r#""requestId":"host-orig""#) && line.contains(r#""tool":"mark_ready""#),
+            "and the two other identifying keys are camelCase too: {line}"
+        );
+        match decode_outbound(&line).expect("the line round-trips") {
+            Outbound::HostToolCall {
+                request_id,
+                session_id,
+                ..
+            } => {
+                assert_eq!(request_id, "host-orig");
+                assert_eq!(
+                    session_id.as_deref(),
+                    Some("child-1"),
+                    "the ORIGIN address round-trips — this is the id a reply must be \
+                     addressed to, never the delivery id the pump put on the frame \
+                     (ADR 0117: a delivery address is a UI-scope key). Answering the \
+                     delivery id for a subagent is the recorded 255m55s `get_artifact` \
+                     hang."
+                );
+            }
+            other => panic!("expected `HostToolCall`, got {other:?}"),
+        }
+    }
+
+    /// THE ADDITIVITY PIN, outbound: a `host-tool-call` line with NO `sessionId` key
+    /// still decodes to the variant, with `session_id` = `None`.
+    #[test]
+    fn a_host_tool_call_line_with_no_session_id_decodes_as_none() {
+        let line =
+            r#"{"type":"host-tool-call","requestId":"host-7","tool":"mark_ready","params":{}}"#;
+        assert!(
+            !line.contains("sessionId"),
+            "the fixture is the OLD wire shape — it carries no origin key"
+        );
+        match decode_outbound(line).expect("a line with no origin still decodes") {
+            Outbound::HostToolCall {
+                request_id,
+                session_id,
+                tool,
+                ..
+            } => {
+                assert_eq!(request_id, "host-7");
+                assert_eq!(
+                    session_id, None,
+                    "an absent origin is an honest ABSENCE — not an error, and not the \
+                     empty string (which is exactly why the field is `Option<String>` \
+                     and not `String`: an empty string would be addressable)"
+                );
+                assert_eq!(tool, "mark_ready");
+            }
+            other => panic!(
+                "a `host-tool-call` line with no `sessionId` must route to the VARIANT, \
+                 not to `Unknown` — the permissive decoder would drop every host call \
+                 from an old peer. got {other:?}"
+            ),
+        }
+    }
+
+    /// THE frame-size pin (grounding H9). A host tool that returns a large `ToolResult`
+    /// inherits the SAME unbounded profile the task pair has: both stdio readers are
+    /// unbounded `read_line`s and F1 deliberately added NO crate-side cap (the 256 KiB
+    /// rule is the desktop's command-layer rule). So the answer is exercised at the real
+    /// size rather than a toy, and the frame stays ONE line.
+    #[test]
+    fn a_256_kib_host_tool_result_round_trips_byte_for_byte_as_one_line() {
+        let big = "x".repeat(256 * 1024);
+        let answer = Inbound::HostToolResponse {
+            request_id: "host-big".into(),
+            result: Ok(crate::tools::ToolResult::ok_text(
+                big.clone(),
+                Some(serde_json::json!({ "rows": [1, 2, 3] })),
+            )),
+        };
+        let line = encode_inbound(&answer);
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "a 256 KiB result is still ONE JSONL frame line (a stray newline would split \
+             the frame and desynchronise the reader)"
+        );
+        assert!(
+            !line.contains("\\n"),
+            "and the payload carries no escaped newline the reader could trip on"
+        );
+        match decode_inbound(&line).expect("the large frame decodes") {
+            Inbound::HostToolResponse { request_id, result } => {
+                assert_eq!(request_id, "host-big");
+                let got = result.expect("the Ok arm survives at size");
+                match &got.content[0] {
+                    crate::tools::ContentBlock::Text { text } => {
+                        assert_eq!(text.len(), big.len(), "the length survives");
+                        assert_eq!(text, &big, "and so does every byte of it");
+                    }
+                    other => panic!("expected a text block, got {other:?}"),
+                }
+                assert_eq!(
+                    got.details.expect("the UI half rides at size too")["rows"][2],
+                    3
+                );
+            }
+            other => panic!("expected `HostToolResponse`, got {other:?}"),
+        }
+    }
+
+    // ── `StartEnv.host_tools` (ADR 0102 / issue #183 F2) ───────────────────────
+
+    /// THE camelCase byte-spelling pin: the wire key is `hostTools`, and a snake_case
+    /// spelling never reaches the wire.
+    ///
+    /// Why a round-trip is not enough: `StartEnv` is `rename_all = "camelCase"`, so a
+    /// hand-written line spelling the key `host_tools` decodes to the EMPTY vec
+    /// SILENTLY — the same reason `cost_usd` and `diagnosticsDir` each have their own
+    /// byte-wise pin. This asserts the spelling and then decodes it back.
+    #[test]
+    fn the_start_env_carries_the_host_tools_as_host_tools() {
+        let env = test_env().with_host_tools(vec![crate::provider_types::ToolSpec {
+            name: "mark_ready".into(),
+            description: "Mark the session ready.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "note": { "type": "string" } },
+            }),
+        }]);
+        let line = encode_inbound(&Inbound::from(&env));
+        assert!(
+            line.contains(r#""hostTools":[{"name":"mark_ready""#),
+            "the host specs ride the wire as camelCase `hostTools`, and `ToolSpec`'s own \
+             (uncased) field names spell `name`/`description`/`parameters`: {line}"
+        );
+        assert!(
+            !line.contains(r#""host_tools""#),
+            "no snake_case spelling of the key ever reaches the wire: {line}"
+        );
+
+        // Round trip, through the real `start` decode path — including the arbitrary
+        // JSON Schema, which is a raw `Value` and must come back unchanged.
+        match decode_inbound(&line).expect("the `start` decodes") {
+            Inbound::Start(env_dec) => {
+                assert_eq!(env_dec.host_tools.len(), 1, "the spec count survives");
+                assert_eq!(
+                    env_dec.host_tools, env.host_tools,
+                    "the whole spec round-trips (name, description, and the raw Schema \
+                     `parameters` — which is why no new DTO was needed)"
+                );
+                assert_eq!(
+                    env_dec.host_tools[0].parameters["properties"]["note"]["type"], "string",
+                    "and a nested Schema key is not mangled on the way"
+                );
+            }
+            other => panic!("expected `Start`, got {other:?}"),
+        }
+    }
+
+    /// THE ADDITIVITY PIN for the envelope: a `start` line with the `hostTools` key
+    /// REMOVED by surgery (the exact shape a pre-F2 Supervisor sends) decodes to the
+    /// EMPTY vec — "no host tools", the same inert default `providers` argues for.
+    ///
+    /// This is what makes the field safe against the desktop, which is still on 0.7.0
+    /// and sends nothing: the Worker it starts composes `builtins() ++ []`, i.e. the
+    /// F1 registry, i.e. the same 26 names.
+    #[test]
+    fn a_start_envelope_with_no_host_tools_key_decodes_to_no_host_tools() {
+        // `start_inbound()` carries a NON-empty `hostTools` on purpose, so the key
+        // removal is a real change to a real line and not a no-op.
+        let line = encode_inbound(&start_inbound());
+        assert!(
+            line.contains(r#""hostTools""#),
+            "the fixture line must actually carry the key for the surgery to mean \
+             anything: {line}"
+        );
+        let old = drop_json_key(&line, "hostTools");
+        assert_ne!(
+            old, line,
+            "the rewrite happened (the key was actually removed)"
+        );
+        assert!(
+            !old.contains(r#""hostTools""#),
+            "the old line names no such key"
+        );
+        match decode_inbound(&old).expect("a `start` without `hostTools` decodes") {
+            Inbound::Start(env) => {
+                assert!(
+                    env.host_tools.is_empty(),
+                    "an old envelope's absence is the EMPTY vec — the same value an old \
+                     build would have had, so a pre-F2 Supervisor gets exactly the tool \
+                     surface it spoke before (no host tool is advertised, none can be \
+                     called). got {:?}",
+                    env.host_tools
+                );
+            }
+            other => panic!("expected `Start`, got {other:?}"),
+        }
+    }
+
+    /// `from_parts` leaves `host_tools` EMPTY, and the field-by-field `Start` pin says
+    /// so — the additive-field template's fourth part (`permission` / `cost_usd` /
+    /// `diagnostics_dir` each added their own line here).
+    #[test]
+    fn start_env_from_parts_carries_no_host_tools() {
+        let env = test_env();
+        assert!(
+            env.host_tools.is_empty(),
+            "`from_parts` is what every fixture in BOTH repos calls, and a fixture that \
+             advertised a host tool would park a real oneshot with nothing behind it"
+        );
+        // The builder is the only writer, and it REPLACES.
+        let one = crate::provider_types::ToolSpec {
+            name: "one".into(),
+            description: "d".into(),
+            parameters: serde_json::json!({}),
+        };
+        let two = crate::provider_types::ToolSpec {
+            name: "two".into(),
+            description: "d".into(),
+            parameters: serde_json::json!({}),
+        };
+        let env = env
+            .clone()
+            .with_host_tools(vec![one.clone(), two.clone()])
+            .with_host_tools(vec![one.clone()]);
+        assert_eq!(
+            env.host_tools,
+            vec![one.clone()],
+            "`with_host_tools` REPLACES — a second call is a new surface, not an \
+             addition to the old one (matching `set_tool_registry`'s rule, so 'what can \
+             this session reach' never depends on call order)"
+        );
+        assert_eq!(
+            test_env()
+                .with_host_tools(vec![one.clone(), two])
+                .host_tools
+                .len(),
+            2,
+            "and the two-spec case is the one a real desktop sends"
         );
     }
 }

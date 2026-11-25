@@ -2001,9 +2001,13 @@ mod tests {
 
     /// The names the engine can actually REACH, as opposed to the names it
     /// advertises: the registry's entries plus the loop-internal arms. This is the
-    /// composed set the invariant is asserted over — the read site F2 and F3 move
-    /// to `builtins() ++ host_entries(env.host_tools)` while the frozen 26 above
-    /// does not move with them.
+    /// composed set the invariant is asserted over — and it STAYS exactly this
+    /// through F2, which is purely additive: `builtins()` keeps all 19 names and a
+    /// session's extra HOST entries are per-loop (`AgentLoop::tool_registry`), never
+    /// a change to this static view. **F3 is the deletion owner** — it drops the 7
+    /// board verbs from `builtins()` (this helper then returns 12 + 7 arms) in the
+    /// same commit that takes `tool_specs()` 26 → 19, and the frozen 26 above moves
+    /// with it, not before it.
     fn reachable_names() -> Vec<String> {
         // The registry's own membership, plus the seven names whose executor is
         // `&mut AgentLoop` and which are therefore NOT entries — permanently, and
@@ -2190,7 +2194,9 @@ mod tests {
             registry.len(),
             19,
             "the registry carries 19 entries (12 native/web + the 7 board verbs). \
-             F2 replaces the 7 with `host_entries(env.host_tools)` and this stays 19."
+             F2 is ADDITIVE and leaves this at 19; F3 is the commit that moves the 7 \
+             to `host_entries(env.host_tools)`, and this drops to 12 there — in the \
+             same commit that takes `tool_specs()` 26 → 19."
         );
         assert_eq!(
             LOOP_INTERNAL_SET.len(),

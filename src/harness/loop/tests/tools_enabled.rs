@@ -218,7 +218,14 @@ fn list_agents_is_in_the_default_tool_specs() {
         spec.description,
         "List available subagent configurations (name, description, source, model/tools overrides). Call before dispatching if unsure which agents exist or which fits the task."
     );
-    let advertised = AgentLoop::advertised_tool_specs(&None, false);
+    // (ADR 0102 F2) The third argument is the loop's REGISTRY, and `&[]` here is
+    // the honest fixture: "no host entries". These pins are about the ENGINE table
+    // half of the composed advertised set, and `&[]` is also exactly what a loop
+    // that was never given a registry carries — so the assertion reads "with no host
+    // tools, the advertised set is `tool_specs()`", which is F2's additivity claim.
+    // `the_composed_advertised_set_reaches_its_executors` below is the half with a
+    // host entry in it.
+    let advertised = AgentLoop::advertised_tool_specs(&None, false, &[]);
     assert!(
         advertised.iter().any(|s| s.name == "list_agents"),
         "a native parent advertises `list_agents`"
@@ -341,7 +348,9 @@ fn read_skill_description_is_honest_about_read_and_model_hidden() {
 /// claimed here.
 #[test]
 fn the_child_tool_set_is_pinned() {
-    let child = AgentLoop::advertised_tool_specs(&None, true);
+    // (F2) `&[]` = the registry half contributes nothing, i.e. no host tools — the
+    // state these child-set pins were written against.
+    let child = AgentLoop::advertised_tool_specs(&None, true, &[]);
     assert!(
         !child.iter().any(|s| s.name == "subagent"),
         "a child does not advertise `subagent`"
@@ -351,7 +360,7 @@ fn the_child_tool_set_is_pinned() {
         "a child does not advertise `list_agents`"
     );
     // CONTRAST: the parent advertises BOTH.
-    let parent = AgentLoop::advertised_tool_specs(&None, false);
+    let parent = AgentLoop::advertised_tool_specs(&None, false, &[]);
     assert!(
         parent.iter().any(|s| s.name == "subagent"),
         "a parent advertises `subagent` (contrast)"
@@ -765,7 +774,7 @@ async fn the_seven_task_tools_are_dispatchable() {
 #[test]
 fn a_defective_call_to_a_disabled_tool_reports_the_defect_not_the_disablement() {
     // The real filter, exactly as `advertised_specs()` builds it: `read` only.
-    let advertised = AgentLoop::advertised_tool_specs(&Some(vec!["read".to_string()]), false);
+    let advertised = AgentLoop::advertised_tool_specs(&Some(vec!["read".to_string()]), false, &[]);
     assert!(
         advertised.iter().any(|s| s.name == "read"),
         "the fixture enables `read`"
@@ -841,5 +850,600 @@ fn a_defective_call_to_a_disabled_tool_reports_the_defect_not_the_disablement() 
         ),
         None,
         "and a well-formed unknown tool is `unknown tool:`'s, not this arm's"
+    );
+}
+
+// ── ADR 0102 / issue #183 F2 — the COMPOSED advertised set ───────────────────
+//
+// Everything above this line reasons about `tool_specs()`, which STAYS at 26
+// through F2 (F3 moves it to 19). Everything below reasons about the set the model
+// is ACTUALLY shown — `advertised_specs()`, which after F2 is
+// `tool_specs() ++ (registry entries the table does not carry)` — and the two are
+// the same set until a session is handed host tools.
+//
+// Why these tests are here and not beside `every_advertised_tool_reaches_an_executor`:
+// that census iterates `tool_specs()`, so a host tool is INVISIBLE to it. That is
+// correct for the engine half and it is also a gap — a host tool that is advertised
+// and unreachable (the exact failure the census exists for) passes it green. These
+// tests close the gap by iterating the composed set.
+
+/// The composition F2 performs at the one production call site
+/// (`worker/core.rs::default_build_loop`), spelled here against a loop.
+///
+/// `detached` picks the two `HostTool` shapes and BOTH are needed by the tests
+/// below, for opposite reasons:
+///   * `false` (attached, the production shape) parks on the frame — so a test
+///     using it must cancel the turn, which is also what proves the wired executor
+///     is the one that answered (a miss answers `unknown tool`, a detached entry
+///     answers `host-owned`, the wired one answers `cancelled`).
+///   * `true` (detached, what `host_entries` builds) answers LOUDLY and instantly,
+///     which is what lets a census walk a host name without hanging.
+fn compose(
+    loop_: &mut AgentLoop,
+    names: &[&str],
+    detached: bool,
+) -> Option<mpsc::UnboundedReceiver<crate::worker::protocol::Outbound>> {
+    let specs: Vec<crate::harness::provider::ToolSpec> = names
+        .iter()
+        .map(|name| crate::harness::provider::ToolSpec {
+            name: (*name).to_string(),
+            description: format!("a host-owned tool ({name})"),
+            parameters: json!({"type": "object", "properties": {}}),
+        })
+        .collect();
+    let mut registry = crate::tools::exec::builtins();
+    let mut parked_on = None;
+    if detached {
+        registry.extend(crate::tools::exec::host_entries(specs));
+    } else {
+        // The outbound RECEIVER is RETURNED and the caller must hold it: an
+        // `mpsc::UnboundedSender` whose receiver is dropped FAILS the send, and the
+        // wired `HostTool` correctly reports a closed pipe instead of parking. Holding
+        // it is what makes the wired fixture park, which is the production shape.
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let pending: crate::worker::host_tools::PendingHostToolCalls =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        registry.extend(crate::worker::host_tools::host_entries_attached(
+            specs,
+            crate::worker::host_tools::HostToolChannel::new(Some("s1".into()), out_tx, pending),
+        ));
+        parked_on = Some(out_rx);
+    }
+    loop_.set_tool_registry(registry);
+    parked_on
+}
+
+/// THE CENSUS OVER THE COMPOSED ADVERTISED SET: every name the model is shown
+/// reaches an executor, and the set the model is shown is the engine's 26 names
+/// PLUS exactly the host names — no more, no fewer, no duplicates.
+///
+/// # Why `every_advertised_tool_reaches_an_executor` cannot see this
+///
+/// It iterates `tool_specs()`. A host tool is not in that table (and must never be
+/// — four tests there pin `tool_specs()` at 26), so a host tool advertised and
+/// UNREACHABLE — the one failure that census exists to catch — walks through it
+/// green. This is the same census with the composed set as its subject.
+///
+/// # Why the dispatch half drives a real `dispatch_tool`
+///
+/// The set half is static and cheap; only dispatching can lie about nothing. A host
+/// entry that is in the advertised set but not in the registry (a composition that
+/// appended to one and not the other) is caught only by dispatching the name.
+#[tokio::test]
+async fn the_composed_advertised_set_reaches_its_executors() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    compose(&mut loop_, &["mark_ready", "set_space_icon"], true);
+
+    // ── the set half ─────────────────────────────────────────────────────────
+    // NOTE the fixture loop is a CHILD (`build_loop` gives it `subagent: None`), so
+    // the engine half of its advertised set is 24, not 26 — the two dispatch tools
+    // are dropped for a child (the rule `the_child_tool_set_is_pinned` pins). The
+    // arithmetic below is therefore 24 + 2, and it is stated as `tool_specs()` minus
+    // the two rather than as a bare 26 so the test says WHY.
+    let advertised: Vec<String> = loop_
+        .advertised_specs()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    let mut expected: Vec<String> = tool_specs()
+        .into_iter()
+        .map(|s| s.name)
+        .filter(|name| name != "subagent" && name != "list_agents")
+        .collect();
+    let engine_len = expected.len();
+    assert_eq!(
+        engine_len, 24,
+        "the fixture loop is a CHILD, so the engine half is 26 − 2 = 24 (if this is \
+         not 24 the fixture stopped being a child and the arithmetic below is lying)"
+    );
+    expected.extend(["mark_ready".to_string(), "set_space_icon".to_string()]);
+    assert_eq!(
+        advertised.len(),
+        expected.len(),
+        "the composed advertised set has {} names, not the child engine half (24) + \
+         the 2 host names (26): {advertised:?}",
+        advertised.len()
+    );
+    for name in &expected {
+        assert!(
+            advertised.contains(name),
+            "`{name}` is not advertised any more — the composition must ADD host names, \
+             never displace an engine name"
+        );
+    }
+    for name in &advertised {
+        assert!(
+            expected.contains(name),
+            "`{name}` is advertised and in NEITHER half of the composition — a name the \
+             engine never named and no host asked for"
+        );
+    }
+    // NO DUPLICATES. A host spec reusing an engine name would otherwise appear twice,
+    // and a provider rejects a request with two tools of one name.
+    let unique: std::collections::BTreeSet<&str> = advertised.iter().map(String::as_str).collect();
+    assert_eq!(
+        unique.len(),
+        advertised.len(),
+        "the composed advertised set repeats a name: {advertised:?}"
+    );
+
+    // ── the dispatch half ────────────────────────────────────────────────────
+    let mut host_checked = 0usize;
+    for name in ["mark_ready", "set_space_icon"] {
+        let r = loop_
+            .dispatch_tool(
+                &ToolCall {
+                    id: "t1".to_string(),
+                    name: name.to_string(),
+                    arguments: json!({}),
+                    defect: None,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .0;
+        let text = result_text(&r);
+        assert!(
+            !text.contains("unknown tool"),
+            "`{name}` is ADVERTISED (it is in `advertised_specs()` above) but \
+             `dispatch_tool` answered {text:?} — advertised and unreachable, the exact \
+             failure `every_advertised_tool_reaches_an_executor` hunts and CANNOT see, \
+             because that census iterates `tool_specs()` and a host tool is not in it."
+        );
+        // And it reached a HOST executor, not the registry's miss sentence and not a
+        // loop arm: the loud refusal is `HostTool`'s own.
+        assert!(
+            text.contains("host-owned"),
+            "`{name}` answered {text:?} — expected the `HostTool` refusal (a detached \
+             host entry), which is the sentence proving the name reached THAT executor"
+        );
+        host_checked += 1;
+    }
+    assert_eq!(host_checked, 2, "the census walked both host names");
+
+    // ── the disjointness half, on the COMPOSED registry ──────────────────────
+    // A host spec that names a loop-internal tool (`ask`, `codemode`, …) would be
+    // SHADOWED by the registry lookup in `dispatch_tool`, which runs BEFORE the
+    // `match` — silently deleting the interactive or recursive half of that tool.
+    const LOOP_INTERNAL: &[&str] = &[
+        "ask",
+        "sudo_exec",
+        "manage_todo_list",
+        "subagent",
+        "dispatch_subagent",
+        "list_agents",
+        "mcp",
+        "codemode",
+    ];
+    let registry: Vec<&str> = loop_.tool_registry().iter().map(|e| e.name()).collect();
+    let shadowed: Vec<&str> = registry
+        .iter()
+        .filter(|name| LOOP_INTERNAL.contains(name))
+        .copied()
+        .collect();
+    assert!(
+        shadowed.is_empty(),
+        "{shadowed:?} is BOTH a registry entry and a loop-internal arm — the registry \
+         lookup in `dispatch_tool` shadows the loop arm",
+    );
+    // The composition's own arithmetic: 19 built-ins + 2 host entries.
+    assert_eq!(
+        registry.len(),
+        21,
+        "the composed registry is `builtins()` (19) ++ the host entries (2), got {} \
+         entries: {registry:?}",
+        registry.len()
+    );
+    // And the engine half is UNCHANGED — F2 adds, it does not replace.
+    for name in crate::tools::exec::builtins().iter().map(|e| e.name()) {
+        assert!(
+            registry.contains(&name),
+            "`{name}` left the registry — F2 is additive and `builtins()` stays whole"
+        );
+    }
+}
+
+/// THE SCRIPT-REACH PIN for the composed set: a host tool is callable AND
+/// discoverable from a codemode script, because `script_access` reads the ENTRY
+/// first and `host_entries` marks every entry `Allowed`.
+///
+/// Mutation note: give the host entries `ScriptAccess::Excluded` and this reddens —
+/// and every OTHER test stays green, which is precisely why the field exists. The
+/// loss is ADR 0092's motivating case: a `roadmap` run turning an approved backlog
+/// into N Tasks is one script with a loop, and it was built as `execute_tool` arms
+/// for exactly that reason.
+#[test]
+fn a_host_tool_is_script_reachable_through_the_composed_registry() {
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let pending: crate::worker::host_tools::PendingHostToolCalls =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    // THE NAME MUST NOT BE A BUILT-IN. The first draft of this test used
+    // `create_task`, and it PASSED with `host_entries` mutated to hand out
+    // `ScriptAccess::Excluded` — because `builtins()` still carries `create_task`
+    // and `script_access` finds the FIRST entry of that name, i.e. the built-in's
+    // `Allowed`. A pin that passes on the broken thing is worse than no pin, so the
+    // fixture uses a name only the host owns. (`script_access`'s first-wins is also
+    // what makes the shadowing direction in `tool_specs`/`advertised_tool_specs`
+    // consistent: an engine-owned name always answers through the engine's entry.)
+    let composed = {
+        let mut registry = crate::tools::exec::builtins();
+        registry.extend(crate::worker::host_tools::host_entries_attached(
+            vec![crate::harness::provider::ToolSpec {
+                name: "mark_ready".to_string(),
+                description: "a host verb no built-in owns".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+            crate::worker::host_tools::HostToolChannel::new(None, out_tx, pending),
+        ));
+        registry
+    };
+    assert!(
+        crate::tools::exec::builtins()
+            .iter()
+            .all(|e| e.name() != "mark_ready"),
+        "the fixture's premise: `mark_ready` is ONLY a host entry, so the verdict \
+         below can only come from the host entry's own `ScriptAccess`"
+    );
+
+    // The host name is `Allowed`…
+    assert!(
+        crate::tools::exec::script_access(&composed, "mark_ready").is_callable(),
+        "a host entry must be script-callable — `Excluded` here would advertise it to \
+         a script and refuse it, silently deleting ADR 0092's `roadmap` case (the \
+         mutation this test exists for: every OTHER test in the crate stays green)"
+    );
+    // …and so is a host name the engine has NEVER heard of, via the `Allowed`
+    // fall-through (the second half of the same preservation rule).
+    assert!(
+        crate::tools::exec::script_access(&composed, "a_verb_nobody_has_named").is_callable(),
+        "an unknown name falls through to `Allowed`, which is what keeps a NEW host \
+         verb script-reachable the moment its Supervisor ships it"
+    );
+    // CONTRAST (so the two assertions above are not a vacuous "everything is
+    // callable"): a loop-internal name is still excluded through the same function.
+    assert!(
+        !crate::tools::exec::script_access(&composed, "ask").is_callable(),
+        "`ask` is still excluded — the fall-through is not a blanket `Allowed`"
+    );
+}
+
+/// `enabled_tools` filters the COMPOSED set, so a host tool the session did not
+/// name is NOT advertised — and a host tool it DID name is.
+///
+/// Why this is a decision and not an accident (grounding H2): the wire field IS the
+/// harness allowlist and `core.rs` applies it VERBATIM with no mapping. Appending
+/// host entries AFTER the filter would advertise a tool the user switched off and
+/// then answer `tool not enabled` for the whole session — advertised-and-dead, the
+/// class the census above hunts. Filtering the composed set is the ordering
+/// consistent with every other tool, and `Some(vec![])` still means NO tools.
+#[test]
+fn enabled_tools_filters_the_composed_advertised_set() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    compose(&mut loop_, &["mark_ready"], true);
+
+    // A host tool the session named IS advertised.
+    loop_.set_enabled_tools(Some(vec!["read".to_string(), "mark_ready".to_string()]));
+    let advertised: Vec<String> = loop_
+        .advertised_specs()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(
+        advertised,
+        vec!["read".to_string(), "mark_ready".to_string()],
+        "the allowlist applies to host names and engine names alike, in one pass"
+    );
+
+    // A host tool the session did NOT name is NOT advertised (and neither is `bash`).
+    loop_.set_enabled_tools(Some(vec!["read".to_string()]));
+    let advertised: Vec<String> = loop_
+        .advertised_specs()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(
+        advertised,
+        vec!["read".to_string()],
+        "a host tool the session switched off is NOT advertised — the alternative \
+         ordering would advertise it and then answer `tool not enabled` forever"
+    );
+
+    // `Some(vec![])` is still NO tools, host entries included.
+    loop_.set_enabled_tools(Some(Vec::new()));
+    assert!(
+        loop_.advertised_specs().is_empty(),
+        "`Some(vec![])` = NO tools, and a host entry must not re-expand it (the \
+         recursion guard's shape, applied to host tools)"
+    );
+
+    // `None` = all: the engine half + the host's 1. The engine half is 24 here
+    // because the fixture loop is a CHILD (see
+    // `the_composed_advertised_set_reaches_its_executors` for that note), so the
+    // PARENT case is asserted through the free function with `is_child: false`.
+    loop_.set_enabled_tools(None);
+    assert_eq!(
+        loop_.advertised_specs().len(),
+        25,
+        "with no allowlist the child's composed set is the 24 engine names + the 1 \
+         host name"
+    );
+    // THE PARENT CASE, through the same filter with `is_child: false` — the shape a
+    // main session composes: the FULL 26 engine names + the host name.
+    let parent_registry = {
+        let mut registry = crate::tools::exec::builtins();
+        registry.extend(crate::tools::exec::host_entries(vec![
+            crate::harness::provider::ToolSpec {
+                name: "mark_ready".to_string(),
+                description: "a host verb".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        ]));
+        registry
+    };
+    let parent = AgentLoop::advertised_tool_specs(&None, false, &parent_registry);
+    assert_eq!(
+        parent.len(),
+        27,
+        "a PARENT's composed set is `tool_specs()`'s 26 + the 1 host name — the \
+         number the desktop's session is shown, and the proof F2 ADDS to the surface \
+         rather than reshaping it"
+    );
+    assert!(
+        parent.iter().any(|s| s.name == "subagent"),
+        "and a parent keeps its dispatch tools (the child drop is name-based, so it \
+         says nothing about host tools — a host verb is inherited by a child as an \
+         ordinary tool)"
+    );
+    let child = AgentLoop::advertised_tool_specs(&None, true, &parent_registry);
+    assert!(
+        child.iter().any(|s| s.name == "mark_ready") && !child.iter().any(|s| s.name == "subagent"),
+        "a CHILD keeps the host verb and loses the dispatch tools — the inheritance \
+         decision `subagent_flow.rs` states explicitly"
+    );
+}
+
+/// A host tool that is advertised and DISABLED is refused by the enablement gate,
+/// exactly as an engine tool is — i.e. a host entry goes through `dispatch_tool`'s
+/// existing gates and does not bypass them.
+///
+/// The pair matters on its own: it is the sentence that proves the composition did
+/// not open a route AROUND the gate, which is the invariant ADR 0081 / issue #92
+/// exist to protect ("the executor cannot re-decide differently from its gate").
+#[tokio::test]
+async fn a_disabled_host_tool_is_refused_before_its_executor_runs() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    compose(&mut loop_, &["mark_ready"], true);
+    loop_.set_enabled_tools(Some(vec!["read".to_string()]));
+
+    let r = loop_
+        .dispatch_tool(
+            &ToolCall {
+                id: "t1".to_string(),
+                name: "mark_ready".to_string(),
+                arguments: json!({}),
+                defect: None,
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .0;
+    assert_eq!(
+        result_text(&r),
+        "tool not enabled: mark_ready",
+        "the SAME sentence a disabled engine tool gets — not `unknown tool`, and not \
+         the host executor's own answer (which would mean the gate was bypassed)"
+    );
+}
+
+/// THE WIRED-COMPOSITION PIN: the production composition (attached host entries,
+/// the shape `default_build_loop` builds) is what answers a host call, and the
+/// turn token settles the park.
+///
+/// The three sentences tell the three outcomes apart and that is the whole point:
+/// `unknown tool` = the name never reached a registry entry; `host-owned` = it
+/// reached a DETACHED entry (the wrong composition); `cancelled` = it reached the
+/// WIRED executor and the park raced the turn token, which is the thing that keeps
+/// a Stop from hanging. An already-cancelled token makes this deterministic — the
+/// park's select is `biased` and the answer arm can never be Ready here.
+#[tokio::test]
+async fn the_wired_host_entry_reaches_the_parked_executor_and_the_turn_token_settles_it() {
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    // HELD for the whole test — see `compose`'s note (a dropped receiver makes the
+    // send fail, which is a DIFFERENT correct answer and not the one under test).
+    let _out_rx = compose(&mut loop_, &["mark_ready"], false);
+
+    let turn = CancellationToken::new();
+    turn.cancel();
+    let r = tokio::time::timeout(Duration::from_secs(5), {
+        async {
+            loop_
+                .dispatch_tool(
+                    &ToolCall {
+                        id: "t1".to_string(),
+                        name: "mark_ready".to_string(),
+                        arguments: json!({ "note": "hi" }),
+                        defect: None,
+                    },
+                    &turn,
+                )
+                .await
+                .0
+        }
+    })
+    .await
+    .expect(
+        "a host call on a cancelled turn returns PROMPTLY — if this hangs, the wired \
+         executor is not racing the turn token and every host tool hangs on a Stop",
+    );
+    let text = result_text(&r);
+    assert_eq!(
+        text, "cancelled",
+        "`mark_ready` answered {text:?}. `unknown tool` would mean the composition \
+         never reached `dispatch_tool`'s lookup; `host-owned` would mean the loop was \
+         given DETACHED entries (F1's shape) instead of the wired ones production \
+         builds. `cancelled` is the wired executor answering on the TURN token."
+    );
+}
+
+/// THE GATE-BEHAVIOUR PIN (ADR 0102 §3, the pin the spec's §3 table did not name):
+/// a host tool is gated EXACTLY as the seven board verbs are today, because
+/// `ToolKey` recognises neither and `policy_verdict` polices neither.
+///
+/// # What is being proved, and what deliberately is not
+///
+/// `ToolKey::from_frontmatter_key` hard-codes eleven names; every other name — the
+/// seven verbs included — is retained verbatim as `ToolKey::Unrecognized`, and
+/// `gate.rs::tool_key_matches` matches an `Unrecognized` by exact name. So a
+/// `permission:` block CAN speak about a host tool (the ruleset stays representable,
+/// which is the point of the variant), and it speaks about it the same way it speaks
+/// about `list_board`. `ToolKey` is deliberately NOT widened this run — widening it
+/// would change per-definition permission matching, which is out of scope.
+///
+/// The gate half is the honest one and it records a NON-effect: `policy_verdict`
+/// returns `None` for any name outside `POLICIED_TOOLS`, so a whole-tool `deny` on a
+/// board verb does nothing at that layer TODAY, and a host tool inherits exactly that
+/// (non-)behaviour. The contrast pair below is what makes the assertion a pin rather
+/// than a tautology: the SAME block on `bash` — a policed name — DOES produce a
+/// verdict.
+#[test]
+fn a_host_tool_is_gated_exactly_as_the_board_verbs_are() {
+    use crate::definition_permission::{Action, PermissionBlock, Rules, ToolKey};
+
+    // ── the ToolKey half: identical mapping, name retained verbatim ──────────
+    let host_key = ToolKey::from_frontmatter_key("mark_ready");
+    let board_key = ToolKey::from_frontmatter_key("list_board");
+    assert_eq!(
+        host_key,
+        ToolKey::Unrecognized("mark_ready".to_string()),
+        "a host tool lands in `Unrecognized` (the variant that keeps the name \
+         verbatim so the ruleset stays representable) — `ToolKey` is NOT widened this \
+         run, on purpose"
+    );
+    assert_eq!(
+        board_key,
+        ToolKey::Unrecognized("list_board".to_string()),
+        "and so does a board verb, today, unchanged"
+    );
+    // The structural claim: the two are the SAME VARIANT of the same shape. A widened
+    // `ToolKey` (a new variant naming either one) reddens this and is the signal that
+    // the "identical gate behaviour" premise needs re-checking.
+    assert_eq!(
+        std::mem::discriminant(&host_key),
+        std::mem::discriminant(&board_key),
+        "a host tool and a board verb must reach the gate through the SAME variant"
+    );
+    // CONTRAST: a recognised name is NOT the same variant (so the two assertions
+    // above are not "everything is Unrecognized").
+    assert_ne!(
+        std::mem::discriminant(&host_key),
+        std::mem::discriminant(&ToolKey::from_frontmatter_key("bash")),
+        "`bash` IS a recognised key — the fall-through is a real fall-through"
+    );
+
+    // ── the gate half: identical verdicts, both `None` ───────────────────────
+    let (provider, _calls) = ScriptedProvider::new(vec![Some(Vec::new())]);
+    let (_space, mut loop_) = build_loop(
+        Box::new(provider),
+        mpsc::unbounded_channel().0,
+        Arc::new(StdMutex::new(CancellationToken::new())),
+        watch::channel(0u64).0,
+        RetryPolicy::new_with(5, Duration::from_millis(1)),
+    );
+    compose(&mut loop_, &["mark_ready"], true);
+    // A block that DENIES all three: the host tool, a board verb, and `bash`.
+    loop_.set_permission(Some(PermissionBlock {
+        tools: vec![
+            (
+                ToolKey::Unrecognized("mark_ready".to_string()),
+                Rules::whole_tool(Action::Deny),
+            ),
+            (
+                ToolKey::Unrecognized("list_board".to_string()),
+                Rules::whole_tool(Action::Deny),
+            ),
+            (ToolKey::Bash, Rules::whole_tool(Action::Deny)),
+        ],
+    }));
+
+    let verdict = |name: &str| {
+        loop_.policy_verdict(&ToolCall {
+            id: "t1".to_string(),
+            name: name.to_string(),
+            arguments: json!({}),
+            defect: None,
+        })
+    };
+    assert_eq!(
+        verdict("mark_ready"),
+        verdict("list_board"),
+        "a host tool and a board verb get the SAME gate verdict — that is the whole \
+         claim, and it is what makes `ToolKey` not needing to be widened this run a \
+         fact rather than a hope"
+    );
+    assert_eq!(
+        verdict("mark_ready"),
+        None,
+        "and both are `None`: `policy_verdict` starts at `policed_direction(name)?`, \
+         which knows only the seven path/shell tools. So a `permission:` block cannot \
+         narrow a host tool any more than it can narrow a board verb TODAY — the host \
+         tool inherits that, unchanged. (The `enabled_tools` filter IS the narrowing \
+         that works, and the census above pins it.)"
+    );
+    // CONTRAST: the same block on a POLICED name does produce a verdict, so the two
+    // `None`s above are a real absence of policing and not a fixture that never
+    // reached the gate.
+    assert_eq!(
+        verdict("bash"),
+        Some(crate::policy::Decision::Deny),
+        "`bash` is policed and the SAME block denies it — the block is live, it just \
+         does not speak to un-policed names"
     );
 }

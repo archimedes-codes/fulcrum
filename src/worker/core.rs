@@ -117,6 +117,14 @@ pub struct WorkerCore {
     /// the Worker minted (`task_store::IpcTaskStore` inserts before it emits, this
     /// map's `TaskResponse` handler removes). Per-Worker, so no session-id prefix.
     pub(crate) pending_task_requests: crate::worker::task_store::PendingTaskRequests,
+    /// (ADR 0102 / issue #183 F2) The parked HOST-tool calls, keyed by the bare
+    /// `request_id` the Worker minted — the generic twin of the map above, and a
+    /// SEPARATE one because the answer types differ (`Result<ToolResult, String>` vs
+    /// `Result<Value, TaskStoreError>`) and the `host-` / `task-` id prefixes must keep
+    /// the two families from resolving each other's entries.
+    /// `host_tools::call_host_tool` inserts before it emits, this map's
+    /// `HostToolResponse` handler removes. Per-Worker, so no session-id prefix.
+    pub(crate) pending_host_tool_calls: crate::worker::host_tools::PendingHostToolCalls,
     /// The `IpcDispatcher`'s waiter map (shared — the `SubagentResult`
     /// handler resolves it).
     pub(crate) subagent_waiters: SubagentWaiters,
@@ -268,16 +276,26 @@ impl crate::web::RenderRequester for IpcRenderRequester {
 /// the DESKTOP shell's `run_worker_inner()` wrapper is the call site that
 /// supplies it.
 //
-// 9 args (+2 over the `clippy::too_many_arguments` threshold of 7) — the seventh
-// was the `trust` source, the eighth this commit's injected opener, and the ninth
-// is issue #180 F1's `pending_task_requests`, which MUST be a parameter rather than
-// constructed here: the `WorkerCore::TaskResponse` handler resolves the SAME map the
-// `IpcTaskStore` this closure builds inserts into, and a map built inside the
-// closure would silently answer nothing (a hang, not an error). Kept rather than
-// collapsed into a params struct: the crate's own precedent is
+// 10 args (+3 over the `clippy::too_many_arguments` threshold of 7) — the seventh
+// was the `trust` source, the eighth this commit's injected opener, the ninth
+// issue #180 F1's `pending_task_requests`, and the TENTH ADR 0102 F2's
+// `pending_host_tool_calls`. Both maps MUST be parameters rather than constructed
+// here: the `WorkerCore::TaskResponse` handler resolves the SAME map the
+// `IpcTaskStore` this closure builds inserts into, and the `HostToolResponse` handler
+// resolves the SAME map the `HostTool` executors this closure composes insert into — a
+// map built inside the closure would silently answer nothing (a hang, not an error).
+// Kept rather than collapsed into a params struct: the crate's own precedent is
 // `harness/loop.rs`'s 23-arg `AgentLoop::new`, whose `#[allow]` carries the same
 // reasoning (the commit is the seam, not a lint refactor), and a params struct
-// here would rewrite every field-line of a 23-arg call for a lint.
+// here would rewrite every field-line of a 23-arg call for a lint. F3 drops
+// `pending_task_requests` when it deletes the task pair, returning this to 9.
+//
+// (The lint `the_crate_threads_the_opener_into_its_production_loop` reads THIS
+// signature as a region — from the `pub fn default_build_loop(` line to the first
+// following `-> Box<dyn Fn(&StartEnv) -> LoopHandles` line — and asserts a line
+// starting `open_requester: Arc<dyn crate::mcp::OpenRequester>` is in it. New
+// parameters therefore go INSIDE that region and the `open_requester` line stays
+// byte-put.)
 #[allow(clippy::too_many_arguments)]
 pub fn default_build_loop(
     outbound: mpsc::UnboundedSender<Outbound>,
@@ -287,6 +305,7 @@ pub fn default_build_loop(
     pending_sudo: PendingSudo,
     pending_render: PendingRender,
     pending_task_requests: crate::worker::task_store::PendingTaskRequests,
+    pending_host_tool_calls: crate::worker::host_tools::PendingHostToolCalls,
     trust: Option<Arc<StaticTrustSource>>,
     open_requester: Arc<dyn crate::mcp::OpenRequester>,
 ) -> Box<dyn Fn(&StartEnv) -> LoopHandles + Send> {
@@ -394,6 +413,42 @@ pub fn default_build_loop(
                 pending_task_requests.clone(),
             ));
         loop_.set_task_store(Some(task_store));
+        // (ADR 0102 / issue #183 F2) THE COMPOSITION, ENGINE-SIDE:
+        // `builtins() ++ host_entries_attached(env.host_tools, …)`.
+        //
+        // The desktop never injects Rust objects into a Worker — a Worker is a second
+        // process of the SAME binary (`WorkerHandle::spawn(current_exe())` + `--worker`,
+        // ADR 0025) — so host tools arrive as DATA (`StartEnv::host_tools`) and the
+        // ENGINE wraps each in a `HostTool` here. No desktop type crosses the
+        // boundary; ADR 0091's "the desktop drives; the crate never pulls" holds
+        // verbatim.
+        //
+        // The setter, not a 24th `AgentLoop::new` argument — the `set_task_store`
+        // precedent directly above, for the same reason. REPLACES the field, and the
+        // replacement starts from `builtins()` so the engine half is the SAME set F1
+        // installed (the census `the_composed_advertised_set_reaches_its_executors`
+        // proves the composition lands on the names it must).
+        //
+        // `env.session_id` (the non-optional envelope value, the CHILD's own id for a
+        // Subagent) is the ORIGIN stamped on every frame — NOT `WorkerCore::session_id`,
+        // which is an `Option` still `None` until `Start` is handled. The `pending` map
+        // is the core's own, handed in as a parameter: a map built here would be
+        // resolved by nobody (a hang, not an error).
+        //
+        // With `env.host_tools` EMPTY this is `builtins()` again, byte-identical to
+        // F1's `AgentLoop::new` initialiser — which is what makes F2 additive for the
+        // desktop, still on 0.7.0 and sending no `hostTools` at all.
+        let host_channel = crate::worker::host_tools::HostToolChannel::new(
+            Some(env.session_id.clone()),
+            outbound.clone(),
+            pending_host_tool_calls.clone(),
+        );
+        let mut registry = crate::tools::exec::builtins();
+        registry.extend(crate::worker::host_tools::host_entries_attached(
+            env.host_tools.clone(),
+            host_channel,
+        ));
+        loop_.set_tool_registry(registry);
         // (Fulcrum T3) THE packaging hop: the five desktop-config fields ride
         // the envelope, and this is where they reach the loop that used to read
         // them off `settings.json`. BEFORE the first prompt (and before
@@ -547,6 +602,12 @@ impl WorkerCore {
         // resolves — a second map here would mean answers nobody receives.
         let pending_task_requests: crate::worker::task_store::PendingTaskRequests =
             Arc::new(TokioMutex::new(HashMap::new()));
+        // (ADR 0102 F2) The same shape and the same reason one level over: created
+        // BEFORE the `build_loop` seam so the closure captures the SAME map the
+        // `HostToolResponse` handler resolves. A second map here means answers nobody
+        // receives, which is a hang and not an error.
+        let pending_host_tool_calls: crate::worker::host_tools::PendingHostToolCalls =
+            Arc::new(TokioMutex::new(HashMap::new()));
         let trust = Some(Arc::new(StaticTrustSource::new(false)));
         let core = Self {
             outbound: outbound.clone(),
@@ -556,6 +617,7 @@ impl WorkerCore {
             pending_sudo: pending_sudo.clone(),
             pending_render: pending_render.clone(),
             pending_task_requests: pending_task_requests.clone(),
+            pending_host_tool_calls: pending_host_tool_calls.clone(),
             subagent_waiters: subagent_waiters.clone(),
             trust: trust.clone(),
             loop_control: None,
@@ -570,6 +632,7 @@ impl WorkerCore {
                 pending_sudo,
                 pending_render,
                 pending_task_requests,
+                pending_host_tool_calls,
                 trust,
                 open_requester,
             ),
@@ -973,6 +1036,30 @@ impl WorkerCore {
                 // (mirrors `PermissionResponse` above): the entry is consumed by the
                 // answer, so nothing can resolve a second caller with it.
                 if let Some(tx) = self.pending_task_requests.lock().await.remove(&request_id) {
+                    let _ = tx.send(result);
+                }
+                Vec::new()
+            }
+            Inbound::HostToolResponse { request_id, result } => {
+                // (ADR 0102 / issue #183 F2) Resolve the parked `HostTool` call by its
+                // BARE `request_id` — the same rule as the arm above and for the same
+                // reason (see `PendingHostToolCalls` for why this differs from
+                // `permission_key` / `render_key`: the answer frame carries ONLY the
+                // bare id, so a compound key would miss every call).
+                //
+                // An absent entry is IGNORED, never an error and never a panic. The
+                // ordinary reason it is absent is that the turn was cancelled and
+                // `HostToolCleanup` already removed the entry — so a Supervisor that
+                // answers late is answering a call that no longer exists, which is
+                // routine on the daemon path (nothing answers there at all) and on the
+                // old-Supervisor window. Removal-before-send for the same reason as
+                // above: the entry is consumed by the answer.
+                if let Some(tx) = self
+                    .pending_host_tool_calls
+                    .lock()
+                    .await
+                    .remove(&request_id)
+                {
                     let _ = tx.send(result);
                 }
                 Vec::new()
@@ -2335,6 +2422,169 @@ mod tests {
                 .expect("resolves with no session id known")
                 .expect("Ok"),
             serde_json::json!(7)
+        );
+    }
+
+    /// (ADR 0102 / issue #183 F2) The generic answer handler, from the REMOVE side:
+    /// `Inbound::HostToolResponse` resolves the parked `HostTool` by its BARE
+    /// `request_id`.
+    ///
+    /// The shape is the sibling test's on purpose — NO `Start` handled first, so
+    /// `WorkerCore::session_id` is still `None`. Every compound-key handler in this
+    /// file (`PermissionResponse`, `FetchRenderResponse`) no-ops in exactly this
+    /// state; this one must still resolve, which is what proves the key is bare and
+    /// that a `session_id`-compound key would have missed the answer (a hang, not an
+    /// error).
+    #[tokio::test]
+    async fn a_host_tool_response_resolves_by_the_bare_request_id() {
+        let (mut core, _out_rx, _in_tx) = stub_core();
+        assert!(
+            core.session_id().is_none(),
+            "the fixture state that makes this a real pin: no `Start` was handled"
+        );
+        let (tx, mut rx) = oneshot::channel::<Result<crate::tools::ToolResult, String>>();
+        core.pending_host_tool_calls
+            .lock()
+            .await
+            .insert("host-bare".to_string(), tx);
+        let frames = core
+            .handle(Inbound::HostToolResponse {
+                request_id: "host-bare".to_string(),
+                result: Ok(crate::tools::ToolResult::ok_text(
+                    "marked ready".to_string(),
+                    None,
+                )),
+            })
+            .await;
+        assert!(
+            frames.is_empty(),
+            "the answer is delivered INBOUND — no outbound frame is manufactured"
+        );
+        assert_eq!(
+            rx.try_recv()
+                .expect("resolves with no session id known")
+                .expect("the Ok arm rides through"),
+            crate::tools::ToolResult::ok_text("marked ready".to_string(), None),
+            "the host's `ToolResult` reaches the parked caller intact"
+        );
+        assert!(
+            core.pending_host_tool_calls.lock().await.is_empty(),
+            "the entry is CONSUMED by the answer (remove-before-send), so a second              answer for the same id cannot resolve anything"
+        );
+    }
+
+    /// (F2) An answer for an id nobody parked on is IGNORED — no panic, no frame, no
+    /// error. That is the ordinary case on the daemon path (nothing ever answers a
+    /// `host-tool-call` there, so by the time a late answer arrives the turn has been
+    /// cancelled and `HostToolCleanup` already removed the entry), and it is the same
+    /// discipline the task handler states verbatim.
+    #[tokio::test]
+    async fn a_host_tool_response_for_an_unknown_id_is_ignored() {
+        let (mut core, _out_rx, _in_tx) = stub_core();
+        let frames = core
+            .handle(Inbound::HostToolResponse {
+                request_id: "host-nobody-parked".to_string(),
+                result: Err("late".to_string()),
+            })
+            .await;
+        assert!(
+            frames.is_empty(),
+            "a stale answer produces NO frame — the daemon's refusal is the diagnosis,              not a second frame here"
+        );
+        assert!(
+            core.pending_host_tool_calls.lock().await.is_empty(),
+            "and it inserts nothing (a handler that inserted on a miss would grow the              map per stray answer)"
+        );
+    }
+
+    /// (F2) THE WIRING PIN: the PRODUCTION `default_build_loop` composes the host
+    /// entries from the envelope, and the composed set is what the model is shown.
+    ///
+    /// # Why the assertion is on the seq-0 prompt and not on a frame
+    ///
+    /// `(StartMode::Fresh, None)` builds the main prompt through
+    /// `build_main_prompt(PromptContext { tools: &loop_.advertised_specs(), .. })` —
+    /// the SAME value `model_request` sends as `tools[]` (ADR 0017's one-value rule).
+    /// So the seq-0 row is an OBSERVABLE reading of the loop's composed registry,
+    /// through the production builder, with the seam NOT swapped. A composition that
+    /// exists but is never installed — or is installed on a field nothing reads — is
+    /// invisible to every hand-built fixture and lands here.
+    ///
+    /// # The pair, and what each half rejects
+    ///
+    /// * With `host_tools` set, the host name AND its description appear in the
+    ///   `<tools>` section. Its absence would mean `default_build_loop` never called
+    ///   `set_tool_registry` (or composed onto the wrong field).
+    /// * With `host_tools` EMPTY (the second half), the prompt names no host tool —
+    ///   which is the desktop's situation today on 0.7.0 and the additivity claim.
+    #[tokio::test]
+    async fn default_build_loop_composes_the_host_tools_into_the_advertised_prompt() {
+        // ── the host-tools case ───────────────────────────────────────────────
+        let (mut core, mut out_rx, _in_tx) = production_core();
+        let mut env = test_env(StartMode::Fresh, None, None);
+        env.host_tools = vec![crate::provider_types::ToolSpec {
+            name: "mark_ready".to_string(),
+            description: "MARKREADY-HOST-DESCRIPTION".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        core.handle(Inbound::from(&env)).await;
+        let frames = drain(&mut out_rx);
+        let seq0 = frames
+            .iter()
+            .find_map(|f| match f {
+                Outbound::TranscriptInsert {
+                    seq: 0,
+                    content_json,
+                    ..
+                } => Some(content_json.clone()),
+                _ => None,
+            })
+            .expect("a `Fresh`/`None` start persists the main prompt as the seq-0 row");
+        assert!(
+            seq0.contains("<tools>"),
+            "the fixture's seq-0 row IS the main prompt: {seq0}"
+        );
+        assert!(
+            seq0.contains("mark_ready"),
+            "the HOST tool is not in the advertised `<tools>` section — the production              `default_build_loop` did not install the composed registry, so a host tool              would be answered by the Worker but never offered to the model"
+        );
+        assert!(
+            seq0.contains("MARKREADY-HOST-DESCRIPTION"),
+            "and its DESCRIPTION rides (the spec travels as data, verbatim — not a              placeholder the engine invented)"
+        );
+        // An engine-owned name is still there: the composition ADDS.
+        assert!(
+            seq0.contains("list_board"),
+            "an engine-owned tool vanished from the prompt — the composition must not              displace `tool_specs()`' entries"
+        );
+
+        // ── the additive half: no host tools, no host name ────────────────────
+        let (mut core, mut out_rx, _in_tx) = production_core();
+        let env = test_env(StartMode::Fresh, None, None);
+        assert!(
+            env.host_tools.is_empty(),
+            "`from_parts` leaves the field empty — the shape every pre-F2 Supervisor              and every fixture sends"
+        );
+        core.handle(Inbound::from(&env)).await;
+        let frames = drain(&mut out_rx);
+        let plain = frames
+            .iter()
+            .find_map(|f| match f {
+                Outbound::TranscriptInsert {
+                    seq: 0,
+                    content_json,
+                    ..
+                } => Some(content_json.clone()),
+                _ => None,
+            })
+            .expect("the same prompt, built with no host tools");
+        assert!(
+            !plain.contains("mark_ready"),
+            "an envelope with no `hostTools` advertises no host tool — the desktop is              still on 0.7.0 and sends nothing, so F2 must not change its prompt at all"
+        );
+        assert!(
+            plain.contains("list_board"),
+            "and the engine half is untouched: {plain}"
         );
     }
 }

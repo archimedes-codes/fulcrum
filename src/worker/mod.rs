@@ -23,6 +23,10 @@
 pub mod client;
 pub mod core;
 pub mod dispatch;
+/// (ADR 0102 / issue #183 F2) The generic host-tool requester — the twin of
+/// [`task_store`] that carries NO tool vocabulary. Both stay standing through F2;
+/// F3 deletes the task one.
+pub mod host_tools;
 pub mod manager;
 pub mod protocol;
 pub mod sink;
@@ -32,6 +36,9 @@ pub mod task_store;
 pub use client::{WorkerError, WorkerErrorKind, WorkerHandle, WorkerInboundEvent};
 pub use core::{default_build_loop, LoopControl, LoopHandles, WorkerCore};
 pub use dispatch::IpcDispatcher;
+pub use host_tools::{
+    host_entries_attached, HostToolChannel, HostToolCleanup, PendingHostToolCalls,
+};
 pub use manager::{
     ClosureHooks, SubagentCapture, WorkerFactory, WorkerHooks, WorkerManager,
     DEFAULT_SUBAGENT_DEAD_BOUND,

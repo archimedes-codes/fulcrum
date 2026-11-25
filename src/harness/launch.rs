@@ -250,6 +250,33 @@ pub fn resolve_agent_launch(
     // narrowing) and deliberately does NOT extend to the deny drop below, which
     // empties by INTENT and therefore yields `Some(vec![])`.
     let specs = tool_specs();
+    // (ADR 0102 / issue #183 F2) `narrow` keeps only names in `tool_specs()`, and
+    // HOST tools are deliberately NOT in that table — `tool_specs()` is the ENGINE's
+    // advertised table and stays at 26 through F2 (F3 takes it to 19). So a frontmatter
+    // or override `tools:` list naming ONLY host tools narrows to nothing, and ADR
+    // 0067's "a list that empties out is ABSENT" rule then hands the child the
+    // parent's set instead of narrowing it.
+    //
+    // DECISION, stated rather than left as an accident: **this is accepted, and `narrow`
+    // does not learn about host tools.** Three reasons:
+    //   1. It cannot cheaply. `resolve_agent_launch`'s inputs are the definition, the
+    //      override layer and the CATALOG — it has no parent envelope and no parent
+    //      registry, and threading one would mean re-signaturing the `list_agents`
+    //      modal's shared entry point for a corner case.
+    //   2. The consequence is the ADR 0067 rule doing its documented job, not a new
+    //      hole: emptied-means-ABSENT exists precisely so a typo or a stale name cannot
+    //      zero out a child. A host-only list IS such a list from this layer's view —
+    //      it cannot tell "narrow to host verbs" from "a list of names I have never
+    //      heard of", and guessing the difference is the thing the rule refuses to do.
+    //   3. Nothing becomes advertised-and-dead, which is the failure class that matters
+    //      here. A child narrowed to nothing inherits the parent's list, host tools
+    //      propagate explicitly (`subagent_flow.rs`), and the child's composed
+    //      advertised set is filtered by that inherited list — so every name the child
+    //      is told about is a name it can reach. The lost thing is a NARROWING the
+    //      definition intended, and it is a narrowing this layer cannot validate.
+    // A host tool named ALONGSIDE a known name is dropped from the narrowed list, and
+    // the child then cannot use it (its `enabled_tools` does not name it) — the
+    // conservative direction, and the same one a stale engine name takes today.
     let narrow = |names: &[String]| {
         let known: Vec<String> = names
             .iter()

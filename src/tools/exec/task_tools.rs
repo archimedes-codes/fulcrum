@@ -5,9 +5,19 @@
 //!
 //! ADR 0092's rule, and the concrete case is a batch: turning an approved backlog
 //! into N tasks with a spec each is ONE codemode script with a loop, and codemode
-//! reaches a tool only through `execute_tool` on a cloned [`ToolCtx`]. A
-//! loop-internal tool is invisible to it (the third layer `EXCLUDED_FROM_SCRIPT`'s
-//! doc describes), which is exactly why these seven are NOT in that list.
+//! reaches a tool through the loop's TOOL REGISTRY on a cloned [`ToolCtx`]. A
+//! loop-internal tool is invisible to it, which is exactly why these seven are NOT
+//! script-excluded.
+//!
+//! (The prose here used to say codemode "reaches a tool only through `execute_tool`"
+//! and cited "`EXCLUDED_FROM_SCRIPT`'s doc". Both moved in ADR 0102 F1: the bridge
+//! resolves through `tools::exec::lookup` / `script_access` on the loop's registry,
+//! and the name list is `LOOP_INTERNAL_SCRIPT` in the registry module. The
+//! PRESERVATION rule those two carry is what F2 keeps for a host name —
+//! `host_entries` marks every entry `ScriptAccess::Allowed`, and
+//! `harness::loop::tests::tools_enabled::a_host_tool_is_script_reachable_through_the_
+//! composed_registry` is the pin. **F3 deletes this whole file** when the seven verbs
+//! ride the generic `HostToolCall` frame; nothing in F2 changes what this file does.)
 //!
 //! ## Every arm is the same five parts
 //!

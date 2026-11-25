@@ -235,20 +235,79 @@ impl ToolExecutor for NativeTool {
     }
 }
 
-/// The executor a HOST tool gets. F2 (wave 2) gives this its real body: it frames
-/// one call as `Outbound::HostToolCall { request_id, tool, params }`, parks on the
-/// matching `Inbound::HostToolResponse`, and follows ADR 0092's three rules (register
-/// the oneshot BEFORE emitting; race the TURN token, not the session-teardown token;
-/// a `Drop` guard that empties the pending map when the parked future is dropped).
-/// `worker/task_store.rs` is the template and is still in the tree at F1.
+/// The executor a HOST tool gets (ADR 0102 / issue #183 F2).
 ///
-/// At F1 it REFUSES LOUDLY. That is not a placeholder shrug — the loudness is the
-/// point: an unhosted tool must answer a `ToolResult::fail`, never a silent park
-/// (the daemon's `task-request` refusal in `fulcrum/src/serve.rs` is the same
-/// discipline, and a parked answer on a path with no Supervisor is a hang until the
-/// turn is cancelled).
+/// # The body: one generic frame, parked
+///
+/// A WIRED `HostTool` frames ONE call as
+/// [`Outbound::HostToolCall`](crate::worker::protocol::Outbound::HostToolCall) and
+/// parks on the matching
+/// [`Inbound::HostToolResponse`](crate::worker::protocol::Inbound::HostToolResponse).
+/// The mechanism — the pending map, the register-before-emit order, the `Drop` guard
+/// that empties the map when the parked future is dropped, and the race against the
+/// **TURN** token — lives in
+/// [`call_host_tool`](crate::worker::host_tools::call_host_tool), next to the map it
+/// owns and the tests that mutate it. This type is the handle that carries the
+/// channel; ADR 0092's three rules are enforced there and are not conveniences.
+///
+/// `ctx` is used for exactly one thing — `ctx.cancel`, the turn token the park races —
+/// and that is why the trait signature keeps the `ToolCtx` at all. The tool NAME comes
+/// from `self`, not from `ctx`: one `HostTool` is built per advertised spec, so it
+/// knows its own name and the engine needed no new `ToolCtx` field to tell it.
+///
+/// # The DETACHED half, and why it is not a placeholder shrug
+///
+/// A `HostTool` with no channel ([`HostTool::detached`]) REFUSES LOUDLY. That is not a
+/// stub awaiting a real body — it is the answer for a loop handed host specs with no
+/// Worker channel to put them on, and the loudness is the point: an unhosted tool must
+/// answer a `ToolResult::fail`, never a silent park (the daemon's `task-unsupported` /
+/// `host-tool-unsupported` refusals in `fulcrum/src/serve.rs` are the same discipline,
+/// and a parked answer on a path with no Supervisor is a hang until the turn is
+/// cancelled). [`host_entries`] builds detached entries and that refusal is its pinned
+/// contract;
+/// [`host_entries_attached`](crate::worker::host_tools::host_entries_attached) — the
+/// composition a Worker actually runs — replaces only the executor.
 #[derive(Clone)]
-pub struct HostTool;
+pub struct HostTool {
+    /// The advertised name, i.e. the frame's `tool` field. Held HERE because one
+    /// executor exists per spec, and `ToolCtx` has no notion of the call being made
+    /// (nor should it — it is the frozen permission bundle, not a dispatch envelope).
+    name: String,
+    /// The channel this tool speaks on, or `None` for the DETACHED entry
+    /// [`host_entries`] builds. `Clone` is derived and it SHARES the pending map and
+    /// the outbound sender — the same reason every other handle in this crate is an
+    /// `Arc` or a clonable sender.
+    channel: Option<crate::worker::host_tools::HostToolChannel>,
+}
+
+impl HostTool {
+    /// The DETACHED executor: host specs with no Worker channel. Answers the loud
+    /// refusal; never parks. This is what [`host_entries`] builds.
+    pub fn detached(name: impl Into<String>) -> Self {
+        HostTool {
+            name: name.into(),
+            channel: None,
+        }
+    }
+
+    /// The WIRED executor: frames every call over `channel`. Built by
+    /// [`host_entries_attached`](crate::worker::host_tools::host_entries_attached),
+    /// the only place that has a Worker's outbound sender and pending map to hand it.
+    pub fn attached(
+        name: impl Into<String>,
+        channel: crate::worker::host_tools::HostToolChannel,
+    ) -> Self {
+        HostTool {
+            name: name.into(),
+            channel: Some(channel),
+        }
+    }
+
+    /// The advertised name this executor answers (the frame's `tool` field).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
 
 impl ToolExecutor for HostTool {
     fn execute(
@@ -256,29 +315,55 @@ impl ToolExecutor for HostTool {
         ctx: &ToolCtx,
         params: Value,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send>> {
-        // `_ctx` / `_params` are named away rather than used: F1 has no frame to
-        // put them on. The `ctx` is still needed by F2's body (it carries the turn
-        // token the park must race), which is why the signature keeps it.
-        let _ = (&ctx, &params);
-        Box::pin(async move {
-            ToolResult::fail(
-                "this tool is host-owned and no host is attached to this session \
-                 (the tool was advertised through a host registry that F1 does not \
-                 yet wire)"
-                    .to_string(),
-                None,
-            )
-        })
+        match self.channel.as_ref() {
+            // The park. `ctx` goes in because the turn token it carries is what the
+            // park races; the boxed future this returns is `'static`, so the borrow
+            // ends here (the token is CLONED out of it — a clone observes the same
+            // cancellation).
+            Some(channel) => crate::worker::host_tools::call_host_tool(
+                channel.clone(),
+                self.name.clone(),
+                ctx,
+                params,
+            ),
+            None => {
+                // The DETACHED refusal. A host tool with no channel is an advertised
+                // tool nobody can serve, and the honest answer to that is a `fail` that
+                // names itself — never a park on a frame nobody can answer.
+                let name = self.name.clone();
+                Box::pin(async move {
+                    ToolResult::fail(
+                        format!(
+                            "`{name}` is host-owned and no host is attached to this \
+                             session (the tool was advertised through a host registry \
+                             that has no Worker channel)"
+                        ),
+                        None,
+                    )
+                })
+            }
+        }
     }
 }
 
-/// The engine's built-ins: the 19 tools whose substance the engine already owns.
+/// The engine's built-ins: the 19 tools whose substance the engine owns TODAY.
 ///
 /// Twelve native/web executors (`bash`, the six file/search tools, the two skill
 /// tools, the three web tools) plus the seven board/artifact verbs. The seven are
 /// here because at F1 their substance IS engine-side — arms of `execute_tool`,
-/// reached by codemode on a cloned `ToolCtx` (ADR 0092's deliberate choice). F2
-/// moves them to [`host_entries`] and this function drops to 12.
+/// reached by codemode on a cloned `ToolCtx` (ADR 0092's deliberate choice).
+///
+/// # Who moves the seven, and who does not
+///
+/// **F2 does not.** F2 is purely additive: it lands the generic `HostToolCall`
+/// frame, `StartEnv::host_tools` and the composition, and the seven verbs STAY in
+/// this function, in `execute_tool`, in `dispatch_tool`'s OR-list and in
+/// `tool_specs()` — so `builtins()` STAYS at 19 through F2 and the desktop, still on
+/// 0.7.0, sees no behavioural change at all. **F3 is the deletion owner**: it moves
+/// the seven to `host_entries(env.host_tools)` on the desktop's say-so and this
+/// function drops to 12, in the same commit that takes `tool_specs()` 26 → 19 and
+/// deletes `TaskRequest`/`TaskResponse`. Reading "F2 moves them" as a to-do would
+/// delete a working dispatch path one wave early.
 ///
 /// The SPECS are read from [`tool_specs`](crate::harness::tool_specs::tool_specs),
 /// not re-stated: ADR 0102's byte-identity rule is that the model sees ONE
@@ -317,8 +402,14 @@ pub fn builtins() -> Vec<ToolEntry> {
 /// of the same binary (ADR 0025), so no desktop type crosses the boundary and ADR
 /// 0091's "the desktop drives; the crate never pulls" holds verbatim.
 ///
-/// **The SIGNATURE is F1's and F2 must not change it.** What F2 replaces is the
-/// BODY: [`HostTool`]'s loud refusal becomes the `HostToolCall` frame.
+/// **The SIGNATURE is F1's and F2 did not change it.** F2 gave
+/// [`HostTool`] its real body — the `HostToolCall` frame — and the composition the
+/// Worker actually runs is
+/// [`host_entries_attached`](crate::worker::host_tools::host_entries_attached),
+/// which calls THIS function and replaces only each entry's `executor`, so the
+/// spec, the order and the `ScriptAccess::Allowed` reach keep one definition here.
+/// What `host_entries` itself returns stays the DETACHED entry, whose loud refusal
+/// is its pinned contract (see [`HostTool`]).
 ///
 /// `ScriptAccess::Allowed` for every host entry, and that is a preservation rule
 /// rather than a default: the seven board verbs are script-reachable TODAY, and
@@ -329,10 +420,13 @@ pub fn builtins() -> Vec<ToolEntry> {
 pub fn host_entries(tools: Vec<ToolSpec>) -> Vec<ToolEntry> {
     tools
         .into_iter()
-        .map(|spec| ToolEntry {
-            spec,
-            executor: Arc::new(HostTool) as Arc<dyn ToolExecutor>,
-            script: ScriptAccess::Allowed,
+        .map(|spec| {
+            let name = spec.name.clone();
+            ToolEntry {
+                spec,
+                executor: Arc::new(HostTool::detached(name)) as Arc<dyn ToolExecutor>,
+                script: ScriptAccess::Allowed,
+            }
         })
         .collect()
 }

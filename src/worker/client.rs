@@ -2,9 +2,20 @@
 //! per Worker process — spawns `<exe> --worker` (piped stdio), speaks the
 //! JSONL protocol, and routes the Worker's `Outbound` frames into the
 //! `WorkerInboundEvent` vocabulary (the 4 store-frame variants →
-//! `Store(StoreFrame::…)`; the control frames verbatim). Crash detection
+//! `Store(StoreFrame::…)`; the control frames verbatim; the two REQUEST
+//! frames — `TaskRequest` (issue #180 F1) and `HostToolCall` (ADR 0102 F2) —
+//! as their own events, because the crate holds no substance to answer them
+//! with and the consumer must decide). Crash detection
 //! is the process exit (the read loop ends on the stdout EOF →
 //! `Exited` + the `exited` watch).
+//!
+//! (ADR 0102 F2) The vocabulary's variant COUNT is deliberately not stated
+//! anywhere in this file — it is 13 as F2 lands, and every earlier prose
+//! number in this module was already stale when written. What is stated is the
+//! rule: `WorkerInboundEvent` is a CRATE type the desktop's
+//! `session/router.rs::route_event` matches EXHAUSTIVELY with no `_` arm, so
+//! adding a variant is a SOURCE break for the sibling repo and must land in the
+//! same commit as that repo's arm + crate-pin bump.
 //!
 //! The `exe` PATH is a PARAMETER: production callers pass
 //! `std::env::current_exe()` (the self-exec); tests/e2e pass the
@@ -154,6 +165,51 @@ pub enum WorkerInboundEvent {
         session_id: Option<String>,
         call: crate::seams::TaskCall,
     },
+    /// One host-owned tool call from the Worker's `HostTool` executor (ADR 0102 /
+    /// issue #183 F2) — the GENERIC half of this vocabulary, and the one that outlives
+    /// the variant above (F3 deletes `TaskRequest` and the seven board verbs ride
+    /// THIS).
+    ///
+    /// # The consumer must ANSWER it
+    ///
+    /// The Worker registered its oneshot BEFORE emitting the frame and is parked on it,
+    /// racing the turn token. The desktop answers with
+    /// [`Inbound::HostToolResponse`](crate::worker::protocol::Inbound::HostToolResponse)
+    /// through the handle's inbound writer (`WorkerHandle::send_inbound_frame`); the
+    /// daemon carries a loud refusal instead
+    /// (`fulcrum/src/serve.rs`'s `host-tool-unsupported` arm), because it has no host to
+    /// answer from and its `on_event` carries no inbound writer at all.
+    ///
+    /// # This is the crate-side SOURCE break, and it is a second one
+    ///
+    /// The rule [`Self::TaskRequest`]'s docblock states verbatim applies here
+    /// unchanged: every exhaustive `match` over this enum must gain an arm, and there
+    /// are exactly two — the daemon's `worker_frame` (in this repo, landed here) and
+    /// the desktop's `route_event` (which must therefore land its arm in the SAME
+    /// commit that bumps the crate pin). The wire is unaffected: a new `type` is
+    /// additive and `PROTOCOL_VERSION` stays 1.
+    ///
+    /// # `session_id` is the ORIGIN, and the hang it prevents is a measured one
+    ///
+    /// Relayed verbatim from
+    /// [`Outbound::HostToolCall`](crate::worker::protocol::Outbound::HostToolCall): the
+    /// id of the Worker that emitted the frame, the **CHILD** for a Subagent. The
+    /// consumer MUST address its answer by THIS field and MUST NOT fall back to the
+    /// delivery id for a child — the pump re-keys a child's frames to the PARENT's
+    /// session id so the child's UI renders in the parent's scope, and ADR 0117's rule
+    /// is that **a frame's delivery address is a UI-scope key and never a reply
+    /// address**. Answering the delivery id answers the parent's process, the child's
+    /// parked oneshot is never resolved, and the tool hangs until the turn token cancels
+    /// it. That is not hypothetical: the recorded 255m55s `get_artifact` stall was
+    /// exactly this mistake on the task frame. `None` means the Worker predates the
+    /// field — an honest absence, and the consumer must then behave as it does today
+    /// rather than guessing an id.
+    HostToolCall {
+        request_id: String,
+        session_id: Option<String>,
+        tool: String,
+        params: Value,
+    },
     /// The process exited (crash detection — the read loop ended on
     /// the stdout EOF; the code is the `child.wait()` result).
     Exited(Option<i32>),
@@ -217,9 +273,15 @@ pub struct WorkerHandle {
     /// line the Worker writes. A SEPARATE watch from `ready`, because the
     /// two answer different questions: `ready` is "which build is this"
     /// (the BINARY version) and this is "which wire does it speak".
-    /// Deliberately NOT routed as a `WorkerInboundEvent` (a 12th variant
-    /// would force every consumer, including `session/router.rs`'s
-    /// exhaustive `route_event`, to account for a frame the UI never sees).
+    /// Deliberately NOT routed as a `WorkerInboundEvent` (a variant for it
+    /// would force every consumer, including `session/router.rs`'s exhaustive
+    /// `route_event`, to account for a frame the UI never sees).
+    ///
+    /// (ADR 0102 F2) This comment used to say "a 12th variant", and it was
+    /// already stale when it was written — the enum had 12 variants then and has
+    /// 13 now (`TaskRequest` landed in F1, `HostToolCall` in F2). The COUNT is
+    /// deliberately not restated: a number here goes stale on every variant
+    /// while the reason above never does.
     protocol_version: watch::Sender<Option<u32>>,
     /// The response round-trips (request `id` → oneshot resolved when
     /// the matching `permission-response` / `interactive-response` is
@@ -1051,18 +1113,25 @@ fn clamp_placeholder_row(role: &str, content_json: String) -> String {
 
 /// Route one `Outbound` frame into the `WorkerInboundEvent` vocabulary
 /// (the 4 store-frame variants → `Store(StoreFrame::…)`; the control
-/// frames verbatim; `Hello` → `None` — it lands on the `protocol_version`
+/// frames verbatim; the two request frames the crate cannot answer as
+/// their own events; `Hello` → `None` — it lands on the `protocol_version`
 /// watch in the read task instead; `Unknown` → `None` — an unknown
 /// `type` is ignored, never an error, so a newer Worker cannot wedge an
 /// older Supervisor).
+///
+/// THIS MATCH IS EXHAUSTIVE over `Outbound`, so a new `Outbound` variant is a
+/// compile error HERE — which is the point: the alternative (a `_ =>` arm) would
+/// let a new frame silently route to `None`, i.e. never reach a consumer at all.
 fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
     Some(match frame {
         // The version-negotiation opener is NOT routed as a
         // `WorkerInboundEvent` — it lands on the `protocol_version`
-        // watch in the read task instead (adding a 12th variant here
-        // would force every `WorkerInboundEvent` consumer, including
+        // watch in the read task instead (adding a variant here would
+        // force every `WorkerInboundEvent` consumer, including
         // `session/router.rs`'s exhaustive `route_event`, to account for
-        // a frame the UI never sees).
+        // a frame the UI never sees. The prose here used to say "a 12th
+        // variant" and was already stale when written — the enum had 12
+        // then and 13 now; the count is not restated on purpose.)
         Outbound::Hello { .. } => return None,
         Outbound::Ready { version, .. } => WorkerInboundEvent::Ready { version },
         Outbound::Event { event } => WorkerInboundEvent::Event(event),
@@ -1166,6 +1235,32 @@ fn route_outbound(frame: Outbound) -> Option<WorkerInboundEvent> {
             request_id,
             session_id,
             call,
+        },
+        // (ADR 0102 / issue #183 F2) The GENERIC host-tool frame, relayed as its own
+        // event for the same reason as the arm above: the crate holds no host's
+        // substance, so it cannot answer and the consumer decides. The four fields ride
+        // VERBATIM — including `session_id`, which is the reply address and must not be
+        // replaced by anything this side knows (see the variant's doc: the delivery id
+        // is a UI-scope key, and answering at it is the recorded `get_artifact` hang).
+        //
+        // `params` is the model's arguments, unvalidated HERE on purpose: the engine ran
+        // `unknown_param_error` against the spec the host advertised (the advertised set
+        // is the composed one) before this frame was built, so what arrives is what the
+        // model meant. A host that wants to reject a shape rejects it in its own answer.
+        //
+        // An older Supervisor never sees this event: its decoder routes
+        // `host-tool-call` to `Outbound::Unknown` above and returns `None`, which is why
+        // the Worker's park must race the turn token.
+        Outbound::HostToolCall {
+            request_id,
+            session_id,
+            tool,
+            params,
+        } => WorkerInboundEvent::HostToolCall {
+            request_id,
+            session_id,
+            tool,
+            params,
         },
         // A newer Worker's frame this build predates — ignored, never an
         // error (the permissive-decoder contract; the overall surface is
@@ -2738,5 +2833,107 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod host_tool_routing_tests {
+    //! (ADR 0102 / issue #183 F2) `route_outbound`'s handling of the generic frame.
+    //!
+    //! A separate module because the file's own `mod tests` is the display-upsert log
+    //! summary's, and these are about the ROUTING table — the thing that decides whether
+    //! a consumer EVER sees a host tool call.
+    use super::*;
+    use crate::worker::protocol::{decode_outbound, PROTOCOL_VERSION};
+
+    /// The frame routes to its OWN event with all four fields intact — including the
+    /// ORIGIN, which is the field a consumer must not lose (losing it is how a reply
+    /// ends up addressed at the pump's delivery id, i.e. the parent's process).
+    #[test]
+    fn route_outbound_carries_a_host_tool_call_into_its_own_event() {
+        let line = r#"{"type":"host-tool-call","requestId":"host-9","sessionId":"child-4","tool":"mark_ready","params":{"note":"hi"}}"#;
+        let frame = decode_outbound(line).expect("the frame decodes");
+        let evt = route_outbound(frame).expect("and routes to an event, not `None`");
+        assert_eq!(
+            evt,
+            WorkerInboundEvent::HostToolCall {
+                request_id: "host-9".to_string(),
+                session_id: Some("child-4".to_string()),
+                tool: "mark_ready".to_string(),
+                params: serde_json::json!({ "note": "hi" }),
+            },
+            "every field rides VERBATIM — a re-keyed or dropped `session_id` here is a \
+             consumer answering the wrong process (ADR 0117: a delivery address is a \
+             UI-scope key, never a reply address)"
+        );
+    }
+
+    /// The `None`-origin shape survives the routing too (an honest absence, not a
+    /// guessed id — the consumer must behave as it does today rather than invent one).
+    #[test]
+    fn a_host_tool_call_with_no_origin_still_routes_with_none() {
+        let evt = route_outbound(Outbound::HostToolCall {
+            request_id: "host-9".to_string(),
+            session_id: None,
+            tool: "list_board".to_string(),
+            params: serde_json::json!({}),
+        })
+        .expect("routes");
+        match evt {
+            WorkerInboundEvent::HostToolCall { session_id, .. } => assert_eq!(
+                session_id, None,
+                "`None` stays `None` — it is not replaced by the empty string (an empty \
+                 string is addressable; `None` is the honest absence)"
+            ),
+            other => panic!("expected `HostToolCall`, got {other:?}"),
+        }
+    }
+
+    /// THE CONTRAST that keeps the two assertions above from being a tautology about
+    /// "everything routes": the two frames with no consumer-facing meaning still return
+    /// `None`, and a host-tool event is a DISTINCT variant from the task one (F3 deletes
+    /// the task half; the host half must not be folded into it).
+    #[test]
+    fn hello_and_unknown_still_route_to_nothing_and_the_two_request_events_differ() {
+        assert!(
+            route_outbound(Outbound::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_version: "0.7.0".to_string(),
+            })
+            .is_none(),
+            "`Hello` stays off the event vocabulary (it lands on the version watch)"
+        );
+        assert!(
+            route_outbound(Outbound::Unknown {
+                raw: serde_json::json!({ "type": "from-the-future" }),
+            })
+            .is_none(),
+            "`Unknown` stays ignored — the permissive-decoder contract"
+        );
+        let host = route_outbound(Outbound::HostToolCall {
+            request_id: "host-1".to_string(),
+            session_id: None,
+            tool: "mark_ready".to_string(),
+            params: serde_json::json!({}),
+        })
+        .expect("routes");
+        let task = route_outbound(Outbound::TaskRequest {
+            request_id: "task-1".to_string(),
+            session_id: None,
+            call: crate::seams::TaskCall::ListBoard {
+                space_path: "/s".to_string(),
+            },
+        })
+        .expect("routes");
+        assert!(
+            !matches!(host, WorkerInboundEvent::TaskRequest { .. }),
+            "the generic frame is NOT folded into the task event — F3 deletes the task \
+             variant and the host one outlives it"
+        );
+        assert!(
+            !matches!(task, WorkerInboundEvent::HostToolCall { .. }),
+            "and the task frame is still its own event (F2 is additive: nothing about \
+             the seven verbs changes)"
+        );
     }
 }

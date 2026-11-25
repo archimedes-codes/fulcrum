@@ -852,12 +852,17 @@ pub struct AgentLoop {
     /// closed default at F1, and `new` is already 23 positional args with a
     /// source-lint counting the production call site's shape.
     ///
-    /// F2 replaces the initialiser with
-    /// `builtins() ++ host_entries(env.host_tools)`. That is why this is a field
-    /// and not a call: an engine that advertises a spec no Rust code in fulcrum
-    /// has ever named has to be HOLDING that spec somewhere, and both dispatch
-    /// paths (`dispatch_tool`'s built-in arm and the codemode bridge's
-    /// `dispatch_nested`) read it from here.
+    /// (F2 LANDED THIS.) A loop that is never given a registry keeps this
+    /// initialiser, and that is the additive default: a pre-F2 Supervisor sends no
+    /// `hostTools`, so `default_build_loop` composes `builtins() ++ []` and the
+    /// session sees exactly F1's surface. A session that IS given host specs gets
+    /// `builtins() ++ host_entries_attached(env.host_tools, …)` through
+    /// [`AgentLoop::set_tool_registry`], from the one call site that has a Worker
+    /// channel to attach them to. That is why this is a field and not a call: an
+    /// engine that advertises a spec no Rust code in fulcrum has ever named has to
+    /// be HOLDING that spec somewhere, and both dispatch paths (`dispatch_tool`'s
+    /// built-in arm and the codemode bridge's `dispatch_nested`) read it from here,
+    /// as does `advertised_tool_specs` — the one value four consumers share.
     ///
     /// The bound on what it governs: registry set ⊎ loop-internal set = advertised
     /// set, disjoint. The seven loop-internal tools are NOT entries here — their
@@ -1211,12 +1216,13 @@ impl AgentLoop {
     /// positional argument would rewrite every call site in the crate for a value
     /// most of them do not have.
     ///
-    /// F1 exposes it and does NOT use it: `new` initialises the registry to
-    /// [`crate::tools::exec::builtins`] and nothing at F1 has host specs to
-    /// compose. F2's body is `loop_.set_tool_registry(builtins().append(&mut
-    /// host_entries(env.host_tools)))` (or the equivalent `Vec::from_iter`), and
-    /// the census `every_advertised_tool_reaches_an_executor` is what proves the
-    /// composition still lands on the same 26 names.
+    /// (F2 LANDED THIS.) The one production call site is
+    /// `worker::core::default_build_loop`, which composes
+    /// `builtins() ++ host_entries_attached(env.host_tools, channel)` and hands it
+    /// here. The census that proves a composed set still reaches its executors is
+    /// `harness::loop::tests::tools_enabled::the_composed_advertised_set_reaches_
+    /// its_executors` — the pre-existing `every_advertised_tool_reaches_an_executor`
+    /// iterates `tool_specs()` and so cannot see a host entry at all.
     ///
     /// REPLACES, never extends: a second call is a new surface, not an addition to
     /// the old one, and an additive setter would make "what can this session reach"
@@ -2097,6 +2103,7 @@ impl AgentLoop {
             tools: Self::advertised_tool_specs(
                 &self.permissions.enabled_tools,
                 self.subagent.is_none(),
+                &self.tool_registry,
             ),
             options: ModelOptions {
                 temperature: None,
@@ -2113,7 +2120,11 @@ impl AgentLoop {
     /// as `tools[]`, so the prompt's `<tools>` section can never disagree
     /// with the API param (ADR 0017).
     pub fn advertised_specs(&self) -> Vec<ToolSpec> {
-        Self::advertised_tool_specs(&self.permissions.enabled_tools, self.subagent.is_none())
+        Self::advertised_tool_specs(
+            &self.permissions.enabled_tools,
+            self.subagent.is_none(),
+            &self.tool_registry,
+        )
     }
 
     /// (ADR 0102 / issue #183 F1) The registry this loop dispatches through.
@@ -2122,22 +2133,93 @@ impl AgentLoop {
     /// entry is a spec clone plus an `Arc`. It is `pub` for the same reason
     /// `advertised_specs` is: the STAYING desktop reads the loop's tool surface,
     /// and after F2 the two are the same question — "what can this session
-    /// reach". F2 composes the host specs onto the field in `AgentLoop::new`.
+    /// reach".
+    ///
+    /// (F2) The composition happens at the CONSTRUCTION SITE, not in `new`:
+    /// `worker/core.rs::default_build_loop` hands this field
+    /// `builtins() ++ host_entries_attached(env.host_tools, …)` through
+    /// [`AgentLoop::set_tool_registry`], because the specs arrive on the envelope
+    /// and `new` is already a 23-positional-argument constructor with a
+    /// source-lint reading its call-site shape. A loop that is never given a
+    /// registry keeps F1's `builtins()` and therefore advertises exactly the 26
+    /// names it did before F2 — which is what "purely additive" means here.
     pub fn tool_registry(&self) -> &[crate::tools::exec::ToolEntry] {
         &self.tool_registry
     }
 
-    /// The tool specs advertised to the model (finding B): `tool_specs()`
-    /// filtered by (a) `enabled_tools` (`None` = all; `Some(v)` = exactly
-    /// `v` — `Some(vec![])` = NO tools) and (b) dropping `subagent` AND
-    /// `list_agents` when the session is a subagent child (`is_child` —
-    /// `subagent: None`; the child cannot dispatch subagents, so listing
-    /// dispatch targets is pointless token burn — but a native parent may). The
-    /// `dispatch_tool` gate remains as defense in depth.
-    fn advertised_tool_specs(enabled_tools: &Option<Vec<String>>, is_child: bool) -> Vec<ToolSpec> {
-        tool_specs()
+    /// The tool specs advertised to the model: **the COMPOSED set** (the
+    /// engine's `tool_specs()` table, then the registry's own entries that the
+    /// table does not carry) filtered by (a) `enabled_tools` (`None` = all;
+    /// `Some(v)` = exactly `v` — `Some(vec![])` = NO tools) and (b) dropping
+    /// `subagent` AND `list_agents` when the session is a subagent child
+    /// (`is_child` — `subagent: None`; the child cannot dispatch subagents, so
+    /// listing dispatch targets is pointless token burn — but a native parent
+    /// may). The `dispatch_tool` gate remains as defense in depth.
+    ///
+    /// # Why the registry is a PARAMETER and the second half comes from it
+    ///
+    /// (ADR 0102 §2.3) Reading the registry is what lets an engine advertise a
+    /// tool no Rust code in fulcrum has ever named. The FIRST half stays
+    /// [`tool_specs`] and not the registry's own specs for one reason — the
+    /// registry's entries take their specs FROM `tool_specs()`
+    /// (`registry::builtins` reads it), so the composed set is byte-identical
+    /// either way for every engine-owned name, and keeping the table as the
+    /// primary half is what pins F2 as additive: `tool_specs()` STAYS at 26
+    /// through F2 (F3 moves it to 19) and a session with no host tools gets
+    /// exactly the list it got before.
+    ///
+    /// # The two ordering decisions, both deliberate
+    ///
+    /// * **`enabled_tools` filters the COMPOSED set, not just the table.** The
+    ///   wire field IS the harness allowlist (`core.rs` applies it VERBATIM, no
+    ///   mapping), so a host tool a session did not name is not advertised —
+    ///   which is the only ordering consistent with the existing convention and
+    ///   with the rule `every_advertised_tool_reaches_an_executor` exists to
+    ///   enforce. Appending host entries AFTER the filter would advertise a tool
+    ///   the user switched off and then answer `tool not enabled` for the whole
+    ///   session: advertised-and-dead, the exact class that census hunts.
+    /// * **FIRST occurrence of a name wins.** A host spec that reuses an
+    ///   engine-owned name is therefore shadowed by the engine's own entry, which
+    ///   matches `dispatch_tool`'s precedence exactly (`lookup` finds the
+    ///   built-in first, because `builtins()` comes first in the composed vec).
+    ///   Advertising and dispatching agree about who answers a shadowed name; a
+    ///   last-wins filter here would advertise the host's description while
+    ///   dispatching the engine's executor.
+    /// * A child's drop list is name-based (`subagent` / `list_agents`), so a host
+    ///   tool is inherited by a child as an ordinary tool — it is not a delegation
+    ///   route, and the recursion guard is about dispatch, not about host verbs.
+    fn advertised_tool_specs(
+        enabled_tools: &Option<Vec<String>>,
+        is_child: bool,
+        registry: &[crate::tools::exec::ToolEntry],
+    ) -> Vec<ToolSpec> {
+        let mut specs = tool_specs();
+        // The registry half: every entry the table does not already carry. At F2
+        // that is EXACTLY the host entries (`builtins()` takes its specs from the
+        // table, by construction), and it is why this loop adds no name when there
+        // are no host tools — the pin `advertised_specs` and `tool_specs()` stay
+        // one set.
+        //
+        // Collected through a `Vec` rather than `extend(iter)` because the filter's
+        // predicate reads `specs` itself — the borrow checker's point, not a
+        // design choice, and the clone is one spec per HOST entry only.
+        let carried: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
+        let added: Vec<ToolSpec> = registry
+            .iter()
+            .map(|entry| entry.spec.clone())
+            .filter(|spec| !carried.contains(&spec.name))
+            .collect();
+        specs.extend(added);
+        let mut seen: Vec<String> = Vec::with_capacity(specs.len());
+        specs
             .into_iter()
             .filter(|spec| {
+                // FIRST occurrence wins (the engine's own entry precedes a host
+                // spec of the same name in the composed vec).
+                if seen.contains(&spec.name) {
+                    return false;
+                }
+                seen.push(spec.name.clone());
                 let enabled = match enabled_tools {
                     Some(tools) => tools.contains(&spec.name),
                     None => true,

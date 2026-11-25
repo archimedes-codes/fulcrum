@@ -912,6 +912,37 @@ pub(crate) fn dispatch_subagent(
     // so whatever the Supervisor put on the parent's envelope is what the child
     // arms with — the Worker resolves no directory of its own at any depth.
     let env = env.with_diagnostics_dir(parent_env.diagnostics_dir.clone());
+    // (ADR 0102 / issue #183 F2) THE host-tool inheritance line, and the decision it
+    // records: **a child inherits the parent's HOST tools, and its `enabled_tools`
+    // still decides whether it may use them.**
+    //
+    // Why inherit, stated rather than left to a serde default:
+    //   * A host tool is an ordinary tool to a child — it is not a delegation route, so
+    //     the recursion guard that strips `subagent` / `list_agents` says nothing about
+    //     it, and a child that could not reach the board could not do the work its
+    //     parent dispatched it to do (the motivating `roadmap` case is a child-shaped
+    //     run: turn an approved backlog into N Tasks).
+    //   * NOT inheriting would be the surprising direction: the child's `enabled_tools`
+    //     is the parent's list minus the guard, so a name the parent could reach would
+    //     be named-but-unreachable in the child — and since the spec is what makes a
+    //     name reachable at all, the child would answer `unknown tool` for a name its
+    //     own advertised set was built from.
+    //   * Inheriting is SAFE by construction: the child's `enabled_tools`
+    //     (`Some(child_tools)`, computed above) filters the COMPOSED advertised set, so
+    //     a child narrowed by a frontmatter `tools:` list that does not name the host
+    //     verb never sees it. The gate is the narrowing; the envelope just makes the
+    //     name POSSIBLE.
+    //
+    // Deliberately NOT folded into `DesktopConfig::from_env` beside the five above:
+    // that bundle's doc is "the FIVE desktop-config fields the Worker used to read out
+    // of `settings.json`", and a host tool spec is not one of those. Like
+    // `diagnostics_dir` directly above, it is a sixth-plus value and it gets its own
+    // explicit line — which is also what makes it visible to a reader who is deciding
+    // whether a new envelope field is inherited.
+    //
+    // Read off the parent's LIVE registry copy, exactly like the five and the sixth:
+    // whatever the Supervisor put on the parent's envelope is what the child composes.
+    let env = env.with_host_tools(parent_env.host_tools.clone());
     // 6. The `subagent-session-started` UI lifecycle event (the
     // current driver's step 9 — the PARENT session's sink: the
     // `model` in the COMPOSED `provider/id` form, the
